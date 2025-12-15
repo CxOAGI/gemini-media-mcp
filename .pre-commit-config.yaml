@@ -1,0 +1,47 @@
+# See https://pre-commit.com for more information
+# Run with prek: https://github.com/j178/prek
+repos:
+  # Ruff - Python linter and formatter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # Basedpyright - Python type checker
+  - repo: https://github.com/DetachHead/basedpyright-pre-commit-mirror
+    rev: v1.13.0
+    hooks:
+      - id: basedpyright
+
+  # Detect secrets - Prevent secrets from being committed
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+
+  # Shellcheck - Shell script linter
+  - repo: https://github.com/Anadea/pre-commit-config-shellcheck
+    rev: "0.3.4"
+    hooks:
+      - id: pre-commit-config-shellcheck
+
+  # Pre-commit hooks - Common checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+
+  # Markdown formatter
+  - repo: https://github.com/hukkin/mdformat
+    rev: 0.7.22
+    hooks:
+      - id: mdformat
+        additional_dependencies:
+          - mdformat-gfm

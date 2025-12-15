@@ -1,0 +1,30 @@
+name: Publish to TestPyPI
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "*"
+jobs:
+  build-and-publish:
+    name: Build and Publish to TestPyPI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for Trusted Publishing (OIDC)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required for hatch-vcs versioning
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build package
+        run: uv build
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # If using OIDC (Trusted Publishing), remove the password line.
+          # If using API Token, ensure the secret is set.
+          password: ${{ secrets.TEST_PYPI_TOKEN }}
+          skip-existing: true
