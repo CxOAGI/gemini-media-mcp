@@ -124,8 +124,10 @@ Generate videos using VEO models (requires Vertex AI).
 **VEO 3.1 Parameters** (for `veo-3.1-*` models only):
 - `last_frame_uri`: Last frame image URI for first+last frame control
   - When combined with `image_uri`, generates smooth transitions between frames
-- `reference_image_uris`: List of up to 3 reference image URIs for character/style consistency
-  - Note: Cannot be used together with first/last frame inputs
+- `reference_image_uris`: List of up to 3 reference image URIs for subject preservation
+  - Preserves the appearance of a person, character, or product in the output video
+  - **Note**: Only supports 8-second duration (automatically enforced)
+  - Cannot be used together with first/last frame inputs
 - `extend_video_uri`: URI of existing VEO-generated video to extend
   - Extends the final second of the video and continues the action
   - Can be chained multiple times for longer videos (up to ~148s total)
@@ -135,7 +137,7 @@ Generate videos using VEO models (requires Vertex AI).
 - `text_to_video`: Text-only prompt
 - `image_to_video`: First frame image input
 - `first_last_frame`: First and last frame control
-- `reference_to_video`: Reference images for style/character
+- `reference_to_video`: Reference images for subject preservation (8s only)
 - `extend_video`: Extend existing video
 
 ## Google Vertex AI and Gemini Access
