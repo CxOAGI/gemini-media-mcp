@@ -1,7 +1,7 @@
 """Integration tests for MCP server features.
 
-These tests require GOOGLE_API_KEY environment variable to be set.
-Run with: uv run pytest tests/test_mcp_integration.py -v -s
+These tests require GEMINI_API_KEY environment variable to be set.
+Run with: GEMINI_API_KEY=your_key uv run pytest tests/test_mcp_integration.py -v -s
 """
 
 import asyncio
@@ -10,11 +10,17 @@ import pytest
 import pytest_asyncio
 from pathlib import Path
 
+
+def get_api_key():
+    """Get API key from either GEMINI_API_KEY or GOOGLE_API_KEY."""
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+
 # Skip all tests if no API key
 pytestmark = [
     pytest.mark.skipif(
-        not os.environ.get("GOOGLE_API_KEY"),
-        reason="GOOGLE_API_KEY not set"
+        not get_api_key(),
+        reason="GEMINI_API_KEY or GOOGLE_API_KEY not set"
     ),
     pytest.mark.asyncio,
 ]
@@ -22,7 +28,7 @@ pytestmark = [
 
 @pytest.fixture
 def api_key():
-    return os.environ.get("GOOGLE_API_KEY")
+    return get_api_key()
 
 
 @pytest.fixture
@@ -46,6 +52,9 @@ class TestMCPIntegration:
 
         env = os.environ.copy()
         env["DATA_FOLDER"] = str(temp_data_folder)
+        # Ensure GEMINI_API_KEY is set (server expects this name)
+        if "GEMINI_API_KEY" not in env and "GOOGLE_API_KEY" in env:
+            env["GEMINI_API_KEY"] = env["GOOGLE_API_KEY"]
 
         server_params = StdioServerParameters(
             command="uv",
