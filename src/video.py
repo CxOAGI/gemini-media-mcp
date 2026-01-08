@@ -98,7 +98,7 @@ async def generate_video(
     # Prepare image inputs
     first_frame_input: types.Image | None = None
     last_frame_input: types.Image | None = None
-    reference_image_inputs: list[types.Image] = []
+    reference_image_inputs: list[types.VideoGenerationReferenceImage] = []
 
     if generation_mode == "image_to_video" and image_bytes:
         first_frame_input = _prepare_image_input(image_bytes)
@@ -109,8 +109,15 @@ async def generate_video(
             last_frame_input = _prepare_image_input(last_frame_bytes)
     elif generation_mode == "reference_to_video" and reference_images:
         # VEO 3.1 supports up to 3 reference images
+        # Must wrap in VideoGenerationReferenceImage with referenceType
         for ref_bytes in reference_images[:3]:
-            reference_image_inputs.append(_prepare_image_input(ref_bytes))
+            ref_image = _prepare_image_input(ref_bytes)
+            reference_image_inputs.append(
+                types.VideoGenerationReferenceImage(
+                    image=ref_image,
+                    reference_type="STYLE",  # Use STYLE for general style/character consistency
+                )
+            )
 
     config_kwargs: dict[str, Any] = {
         "number_of_videos": 1,
@@ -124,6 +131,10 @@ async def generate_video(
         )
         config_kwargs["enhance_prompt"] = True
         config_kwargs["generate_audio"] = include_audio
+
+        # Add last frame to config for first+last frame mode
+        if last_frame_input:
+            config_kwargs["last_frame"] = last_frame_input
 
         # Add reference images to config for VEO 3.1
         if reference_image_inputs:
@@ -155,12 +166,9 @@ async def generate_video(
 
     if generation_mode == "image_to_video" and first_frame_input:
         api_kwargs["image"] = first_frame_input
-    elif generation_mode == "first_last_frame":
-        # First and last frame control for VEO 3.1
-        if first_frame_input:
-            api_kwargs["first_frame_image"] = first_frame_input
-        if last_frame_input:
-            api_kwargs["last_frame_image"] = last_frame_input
+    elif generation_mode == "first_last_frame" and first_frame_input:
+        # First frame as image param, last frame in config (already added above)
+        api_kwargs["image"] = first_frame_input
     elif generation_mode == "extend_video" and extend_video_uri:
         # Video extension for VEO 3.1
         api_kwargs["video"] = types.Video(uri=extend_video_uri)
