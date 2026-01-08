@@ -108,14 +108,14 @@ async def generate_video(
         if last_frame_bytes:
             last_frame_input = _prepare_image_input(last_frame_bytes)
     elif generation_mode == "reference_to_video" and reference_images:
-        # VEO 3.1 supports up to 3 reference images
-        # Must wrap in VideoGenerationReferenceImage with referenceType
+        # VEO 3.1 supports up to 3 reference images (asset type)
+        # Must wrap in VideoGenerationReferenceImage with reference_type="asset"
         for ref_bytes in reference_images[:3]:
             ref_image = _prepare_image_input(ref_bytes)
             reference_image_inputs.append(
                 types.VideoGenerationReferenceImage(
                     image=ref_image,
-                    reference_type="STYLE",  # Use STYLE for general style/character consistency
+                    reference_type="asset",  # asset for subject preservation
                 )
             )
 
