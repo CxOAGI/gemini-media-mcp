@@ -729,58 +729,6 @@ async def test_generate_image_image_size(
     ("input", "expected"),
     [
         pytest.param(
-            {"thinking_level": "low"},
-            {"success": True},
-            id="thinking_level_low",
-        ),
-        pytest.param(
-            {"thinking_level": "high"},
-            {"success": True},
-            id="thinking_level_high",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_image_thinking_level(
-    input: dict[str, Any],
-    expected: dict[str, Any],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Test generate_image with thinking_level parameter for Gemini 3 Pro."""
-    images_dir = tmp_path / "images"
-    images_dir.mkdir()
-
-    test_image_bytes = _create_test_image()
-    inline_data = FakeInlineData("image/png", test_image_bytes)
-    part = FakePart(inline_data=inline_data)
-    content = FakeContent([part])
-    candidate = FakeCandidate(content)
-    gemini_response = FakeGeminiResponse([candidate])
-
-    def mock_client(**kwargs: Any) -> FakeGenaiClient:
-        return FakeGenaiClient(gemini_response=gemini_response)
-
-    monkeypatch.setattr("src.image.genai.Client", mock_client)
-
-    initial_client = FakeGenaiClient(gemini_response=gemini_response)
-
-    result = await generate_image(
-        client=initial_client,  # type: ignore[arg-type]
-        prompt="Test prompt",
-        images_dir=images_dir,
-        model="gemini-3-pro-image-preview",
-        thinking_level=input["thinking_level"],
-    )
-
-    assert result["message"] == "Image generated successfully"
-
-
-@pytest.mark.parametrize(
-    ("input", "expected"),
-    [
-        pytest.param(
             {"media_resolution": "MEDIA_RESOLUTION_LOW"},
             {"success": True},
             id="media_resolution_low",
@@ -1065,7 +1013,6 @@ async def test_generate_image_all_gemini3_params(
         image_bytes=test_image_bytes,
         reference_images=reference_images,
         image_size="4K",
-        thinking_level="high",
         media_resolution="MEDIA_RESOLUTION_HIGH",
         thought_signature="previous_signature",
     )

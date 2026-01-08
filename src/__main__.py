@@ -19,7 +19,7 @@ from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
 from mcp.types import TextContent
 
-from .image import ImageModel, ImageSize, MediaResolution, ThinkingLevel
+from .image import ImageModel, ImageSize, MediaResolution
 from .image import generate_image as generate_image_impl
 from .video import VideoModel
 from .video import generate_video as generate_video_impl
@@ -184,7 +184,6 @@ async def generate_image(
     image_base64: str | None = None,
     reference_image_uris: list[str] | None = None,
     image_size: ImageSize | None = None,
-    thinking_level: ThinkingLevel | None = None,
     media_resolution: MediaResolution | None = None,
     thought_signature: str | None = None,
 ):
@@ -205,14 +204,10 @@ async def generate_image(
         reference_image_uris: List of reference image URIs (up to 14 for Gemini 3 Pro).
             Use up to 6 object images for high-fidelity inclusion,
             up to 5 human images for character consistency across scenes.
-        image_size: Output image size for Gemini 3 Pro:
-            - "small": 1K (1024px)
-            - "medium": 2K (2048px)
-            - "large": 2K (2048px)
-            - "xlarge": 4K (4096px)
-        thinking_level: Reasoning depth for Gemini 3 Pro:
-            - "low": Minimizes latency, best for simple tasks
-            - "high": Maximizes reasoning depth for complex generation
+        image_size: Output image size for Gemini 3 Pro (must use uppercase K):
+            - "1K": 1024px
+            - "2K": 2048px
+            - "4K": 4096px
         media_resolution: Input image processing resolution:
             - "MEDIA_RESOLUTION_LOW": Faster, lower token usage
             - "MEDIA_RESOLUTION_MEDIUM": Balanced
@@ -251,7 +246,6 @@ async def generate_image(
             image_bytes=image_bytes,
             reference_images=reference_images if reference_images else None,
             image_size=image_size,
-            thinking_level=thinking_level,
             media_resolution=media_resolution,
             thought_signature=thought_signature,
         )

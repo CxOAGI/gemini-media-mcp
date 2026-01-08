@@ -99,7 +99,6 @@ Generate images using Gemini or Imagen models.
   - Up to 6 object images for high-fidelity inclusion
   - Up to 5 human images for character consistency across scenes
 - `image_size`: Output resolution (`1K`, `2K`, `4K`) - must use uppercase K
-- `thinking_level`: Reasoning depth (`low` for fast, `high` for complex generation)
 - `media_resolution`: Input image processing quality (`MEDIA_RESOLUTION_LOW`, `MEDIA_RESOLUTION_MEDIUM`, `MEDIA_RESOLUTION_HIGH`)
 - `thought_signature`: For multi-turn editing workflows - pass back the signature from previous responses
 
