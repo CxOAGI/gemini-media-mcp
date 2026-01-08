@@ -216,13 +216,17 @@ async def generate_image(
             - "MEDIA_RESOLUTION_LOW": Faster, lower token usage
             - "MEDIA_RESOLUTION_MEDIUM": Balanced
             - "MEDIA_RESOLUTION_HIGH": Best quality, higher token usage
-        thought_signature: Thought signature from previous turn for multi-turn editing.
-            Required for conversational image editing workflows - pass back the
-            thought_signature from the previous response.
+        thought_signature: For multi-turn image editing conversations. When you receive
+            a response with thought_signature, pass it back in subsequent calls to
+            maintain editing context. Example workflow:
+            1. First call: generate_image(prompt="Draw a cat") → returns thought_signature
+            2. Second call: generate_image(prompt="Make it orange", thought_signature=<from step 1>)
+            3. Third call: generate_image(prompt="Add a hat", thought_signature=<from step 2>)
 
     Returns:
-        Image preview and file path details. For multi-turn editing,
-        includes thought_signature to pass to the next call.
+        JSON with image_url, image_preview, and model info. For Gemini 3 Pro,
+        also includes thought_signature - save this and pass it to the next call
+        if you want to continue editing the same image in a conversation.
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
@@ -323,8 +327,8 @@ async def generate_video(
             When provided with image_uri, generates smooth transition between frames.
         last_frame_base64: Base64 encoded last frame image (prefer last_frame_uri)
         reference_image_uris: List of up to 3 reference image URIs (VEO3.1 only).
-            Use for style/character consistency across generated video.
-            Note: Cannot be used together with first/last frame inputs.
+            Preserves appearance of a person, character, or product in the video.
+            Note: Automatically uses 8-second duration. Cannot combine with first/last frame.
         extend_video_uri: URI of existing VEO-generated video to extend (VEO3.1 only).
             Extends the final second of the video and continues the action.
             Note: Cannot be used together with other image inputs.
