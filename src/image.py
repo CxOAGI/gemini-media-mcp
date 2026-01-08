@@ -71,10 +71,6 @@ async def generate_image(
     """
     model_id = str(model)
 
-    # Gemini 3 Pro Image requires global location
-    if model == "gemini-3-pro-image-preview":
-        client = genai.Client(vertexai=True, location="global")
-
     # Prepare input images
     pil_images: list[Image.Image] = []
     if image_bytes:

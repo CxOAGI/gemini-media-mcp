@@ -81,7 +81,6 @@ class TestMCPIntegration:
 
     # ==================== Gemini 3 Pro Image Tests ====================
 
-    @pytest.mark.skipif(not is_vertex_ai(), reason="Requires Vertex AI")
     async def test_gemini3_pro_image_basic(self, mcp_client):
         """Test Gemini 3 Pro Image basic generation."""
         result = await mcp_client.call_tool(
@@ -95,7 +94,6 @@ class TestMCPIntegration:
         print(f"✓ Gemini 3 Pro Image: {text[:200]}")
         assert "image_url" in text.lower() or "error" in text.lower()
 
-    @pytest.mark.skipif(not is_vertex_ai(), reason="Requires Vertex AI")
     async def test_gemini3_pro_image_size(self, mcp_client):
         """Test Gemini 3 Pro Image with image_size parameter (1K/2K/4K)."""
         result = await mcp_client.call_tool(
@@ -110,7 +108,6 @@ class TestMCPIntegration:
         print(f"✓ Gemini 3 Pro with 2K size: {text[:200]}")
         assert "image_url" in text.lower() or "error" in text.lower()
 
-    @pytest.mark.skipif(not is_vertex_ai(), reason="Requires Vertex AI")
     async def test_gemini3_pro_thinking_level(self, mcp_client):
         """Test Gemini 3 Pro Image with thinking_level parameter."""
         result = await mcp_client.call_tool(
