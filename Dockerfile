@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM ghcr.io/astral-sh/uv:python3.13-alpine AS builder
+FROM ghcr.io/astral-sh/uv:python3.14-alpine AS builder
 
 # Apply security patches
 RUN apk upgrade --no-cache
@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
 # Runtime stage
-FROM python:3.13-alpine
+FROM python:3.14-alpine
 
 # Apply security patches to fix known vulnerabilities
 RUN apk upgrade --no-cache
