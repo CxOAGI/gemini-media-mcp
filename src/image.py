@@ -169,7 +169,11 @@ async def generate_image(
                             output_bytes = part.inline_data.data
                         # Capture thought signature for multi-turn editing
                         if hasattr(part, "thought_signature") and part.thought_signature:
-                            response_thought_signature = part.thought_signature
+                            sig = part.thought_signature
+                            # Convert bytes to string if needed for JSON serialization
+                            if isinstance(sig, bytes):
+                                sig = base64.b64encode(sig).decode("utf-8")
+                            response_thought_signature = sig
 
             if not output_bytes:
                 if text_parts:
