@@ -671,24 +671,19 @@ async def test_generate_image_thumbnail_preview(
     ("input", "expected"),
     [
         pytest.param(
-            {"image_size": "small"},
+            {"image_size": "1K"},
             {"success": True},
-            id="image_size_small",
+            id="image_size_1K",
         ),
         pytest.param(
-            {"image_size": "medium"},
+            {"image_size": "2K"},
             {"success": True},
-            id="image_size_medium",
+            id="image_size_2K",
         ),
         pytest.param(
-            {"image_size": "large"},
+            {"image_size": "4K"},
             {"success": True},
-            id="image_size_large",
-        ),
-        pytest.param(
-            {"image_size": "xlarge"},
-            {"success": True},
-            id="image_size_xlarge_4k",
+            id="image_size_4K",
         ),
     ],
 )
@@ -1069,7 +1064,7 @@ async def test_generate_image_all_gemini3_params(
         model="gemini-3-pro-image-preview",
         image_bytes=test_image_bytes,
         reference_images=reference_images,
-        image_size="xlarge",
+        image_size="4K",
         thinking_level="high",
         media_resolution="MEDIA_RESOLUTION_HIGH",
         thought_signature="previous_signature",

@@ -22,7 +22,8 @@ ImageModel = Literal[
 ]
 
 # Output image size options for Gemini 3 Pro Image
-ImageSize = Literal["small", "medium", "large", "xlarge"]
+# Must use uppercase K (1K, 2K, 4K)
+ImageSize = Literal["1K", "2K", "4K"]
 
 # Thinking level options for Gemini 3 models
 ThinkingLevel = Literal["low", "high"]
