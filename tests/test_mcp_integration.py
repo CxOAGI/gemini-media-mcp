@@ -85,7 +85,7 @@ class TestMCPIntegration:
             "generate_image",
             {
                 "prompt": "A simple red circle on white background",
-                "model": "gemini-2.0-flash-preview-image-generation",
+                "model": "gemini-2.5-flash-image",
             }
         )
 
