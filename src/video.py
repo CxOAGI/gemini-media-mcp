@@ -125,10 +125,14 @@ async def generate_video(
     }
 
     if is_veo3:
-        allowed = [4, 6, 8]
-        config_kwargs["duration_seconds"] = min(
-            allowed, key=lambda x: abs(x - duration_seconds)
-        )
+        # Reference-to-video only supports 8 seconds
+        if generation_mode == "reference_to_video":
+            config_kwargs["duration_seconds"] = 8
+        else:
+            allowed = [4, 6, 8]
+            config_kwargs["duration_seconds"] = min(
+                allowed, key=lambda x: abs(x - duration_seconds)
+            )
         config_kwargs["enhance_prompt"] = True
         config_kwargs["generate_audio"] = include_audio
 
