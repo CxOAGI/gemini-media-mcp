@@ -7,13 +7,17 @@ Run with: uv run pytest tests/test_mcp_integration.py -v -s
 import asyncio
 import os
 import pytest
+import pytest_asyncio
 from pathlib import Path
 
 # Skip all tests if no API key
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("GOOGLE_API_KEY"),
-    reason="GOOGLE_API_KEY not set"
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not os.environ.get("GOOGLE_API_KEY"),
+        reason="GOOGLE_API_KEY not set"
+    ),
+    pytest.mark.asyncio,
+]
 
 
 @pytest.fixture
@@ -34,7 +38,7 @@ def temp_data_folder(tmp_path):
 class TestMCPIntegration:
     """Test MCP server via stdio client."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def mcp_client(self, temp_data_folder):
         """Create MCP client connected to server."""
         from mcp import ClientSession, StdioServerParameters
