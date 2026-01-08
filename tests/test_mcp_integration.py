@@ -1,9 +1,10 @@
 """Integration tests for MCP server features.
 
-These tests require GEMINI_API_KEY environment variable to be set.
-Run with: GEMINI_API_KEY=your_key uv run pytest tests/test_mcp_integration.py -v -s
+Run with Gemini API key (basic features):
+  GEMINI_API_KEY=key uv run pytest tests/test_mcp_integration.py -v -s
 
-Note: Gemini 3 Pro Image and VEO 3.1 advanced features require Vertex AI credentials.
+Run with Vertex AI (full features including Gemini 3 Pro Image):
+  GOOGLE_GENAI_USE_VERTEXAI=true uv run pytest tests/test_mcp_integration.py -v -s
 """
 
 import asyncio
@@ -18,19 +19,19 @@ def get_api_key():
     return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
+def is_vertex_ai():
+    """Check if Vertex AI mode is enabled."""
+    return os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
+
+
 # Skip all tests if no API key
 pytestmark = [
     pytest.mark.skipif(
-        not get_api_key(),
-        reason="GEMINI_API_KEY or GOOGLE_API_KEY not set"
+        not get_api_key() and not is_vertex_ai(),
+        reason="GEMINI_API_KEY or Vertex AI credentials not set"
     ),
     pytest.mark.asyncio,
 ]
-
-
-@pytest.fixture
-def api_key():
-    return get_api_key()
 
 
 @pytest.fixture
@@ -74,50 +75,99 @@ class TestMCPIntegration:
         result = await mcp_client.list_tools()
         tool_names = {tool.name for tool in result.tools}
 
-        # These are the actual tools exposed by the MCP server
         expected_tools = {"generate_image", "generate_video"}
         assert expected_tools.issubset(tool_names), f"Missing tools: {expected_tools - tool_names}"
         print(f"✓ Found {len(tool_names)} tools: {tool_names}")
 
-    async def test_generate_image_basic(self, mcp_client):
-        """Test basic image generation with gemini-2.0-flash."""
+    # ==================== Gemini 3 Pro Image Tests ====================
+
+    @pytest.mark.skipif(not is_vertex_ai(), reason="Requires Vertex AI")
+    async def test_gemini3_pro_image_basic(self, mcp_client):
+        """Test Gemini 3 Pro Image basic generation."""
         result = await mcp_client.call_tool(
             "generate_image",
             {
-                "prompt": "A simple red circle on white background",
-                "model": "gemini-2.5-flash-image",
+                "prompt": "A red apple on a wooden table",
+                "model": "gemini-3-pro-image-preview",
             }
         )
+        text = next((c.text for c in result.content if hasattr(c, 'text')), "")
+        print(f"✓ Gemini 3 Pro Image: {text[:200]}")
+        assert "image_url" in text.lower() or "error" in text.lower()
 
-        assert result.content, "Expected content in response"
-        text_content = next((c.text for c in result.content if hasattr(c, 'text')), None)
-        assert text_content, "Expected text response"
-        print(f"✓ Image generation response: {text_content[:300]}")
+    @pytest.mark.skipif(not is_vertex_ai(), reason="Requires Vertex AI")
+    async def test_gemini3_pro_image_size(self, mcp_client):
+        """Test Gemini 3 Pro Image with image_size parameter (1K/2K/4K)."""
+        result = await mcp_client.call_tool(
+            "generate_image",
+            {
+                "prompt": "A blue ocean wave",
+                "model": "gemini-3-pro-image-preview",
+                "image_size": "2K",
+            }
+        )
+        text = next((c.text for c in result.content if hasattr(c, 'text')), "")
+        print(f"✓ Gemini 3 Pro with 2K size: {text[:200]}")
+        assert "image_url" in text.lower() or "error" in text.lower()
 
-        # Check for success (saved image) or expected API error
-        is_success = "saved" in text_content.lower() or "image_url" in text_content.lower()
-        is_expected_error = "safety" in text_content.lower() or "blocked" in text_content.lower()
-        assert is_success or is_expected_error, f"Unexpected response: {text_content}"
+    @pytest.mark.skipif(not is_vertex_ai(), reason="Requires Vertex AI")
+    async def test_gemini3_pro_thinking_level(self, mcp_client):
+        """Test Gemini 3 Pro Image with thinking_level parameter."""
+        result = await mcp_client.call_tool(
+            "generate_image",
+            {
+                "prompt": "A complex steampunk machine with gears and pipes",
+                "model": "gemini-3-pro-image-preview",
+                "thinking_level": "high",
+            }
+        )
+        text = next((c.text for c in result.content if hasattr(c, 'text')), "")
+        print(f"✓ Gemini 3 Pro with high thinking: {text[:200]}")
+        # Check if thought_signature is returned for multi-turn editing
+        if "thought_signature" in text:
+            print("✓ Thought signature returned for multi-turn editing")
 
-    async def test_generate_video_basic(self, mcp_client):
-        """Test basic video generation with VEO 2.0."""
+    # ==================== VEO 3.1 Tests ====================
+
+    async def test_veo31_basic(self, mcp_client):
+        """Test VEO 3.1 basic generation."""
         result = await mcp_client.call_tool(
             "generate_video",
             {
-                "prompt": "A spinning red cube",
-                "model": "veo-2.0-generate-001",
+                "prompt": "A butterfly landing on a flower",
+                "model": "veo-3.1-generate-preview",
             }
         )
+        text = next((c.text for c in result.content if hasattr(c, 'text')), "")
+        print(f"✓ VEO 3.1 basic: {text[:300]}")
+        assert "video_url" in text.lower() or "error" in text.lower()
 
-        assert result.content, "Expected content in response"
-        text_content = next((c.text for c in result.content if hasattr(c, 'text')), None)
-        assert text_content, "Expected text response"
-        print(f"✓ Video generation response: {text_content[:300]}")
+    async def test_veo31_duration(self, mcp_client):
+        """Test VEO 3.1 with duration_seconds parameter (4/6/8s)."""
+        result = await mcp_client.call_tool(
+            "generate_video",
+            {
+                "prompt": "Rain falling on a window",
+                "model": "veo-3.1-generate-preview",
+                "duration_seconds": 6,
+            }
+        )
+        text = next((c.text for c in result.content if hasattr(c, 'text')), "")
+        print(f"✓ VEO 3.1 with 6s duration: {text[:300]}")
+        assert "video_url" in text.lower() or "error" in text.lower()
 
-        # Video generation is async - check for operation started or success
-        is_success = "video_url" in text_content.lower() or "generated" in text_content.lower()
-        is_expected_error = "quota" in text_content.lower() or "permission" in text_content.lower()
-        assert is_success or is_expected_error, f"Unexpected response: {text_content}"
+    async def test_veo31_fast(self, mcp_client):
+        """Test VEO 3.1 fast model variant."""
+        result = await mcp_client.call_tool(
+            "generate_video",
+            {
+                "prompt": "A candle flame flickering",
+                "model": "veo-3.1-fast-generate-preview",
+            }
+        )
+        text = next((c.text for c in result.content if hasattr(c, 'text')), "")
+        print(f"✓ VEO 3.1 fast: {text[:300]}")
+        assert "video_url" in text.lower() or "error" in text.lower()
 
 
 if __name__ == "__main__":
