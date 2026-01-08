@@ -19,7 +19,7 @@ from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
 from mcp.types import TextContent
 
-from .image import ImageModel
+from .image import ImageModel, ImageSize, MediaResolution, ThinkingLevel
 from .image import generate_image as generate_image_impl
 from .video import VideoModel
 from .video import generate_video as generate_video_impl
@@ -182,6 +182,11 @@ async def generate_image(
     model: ImageModel,
     image_uri: str | None = None,
     image_base64: str | None = None,
+    reference_image_uris: list[str] | None = None,
+    image_size: ImageSize | None = None,
+    thinking_level: ThinkingLevel | None = None,
+    media_resolution: MediaResolution | None = None,
+    thought_signature: str | None = None,
 ):
     """Generate an image using Google Gemini or Imagen models.
 
@@ -189,17 +194,36 @@ async def generate_image(
         ctx: MCP context with application state
         prompt: Text description of the image to generate
         model: Model to use - options include:
-               - "gemini": Gemini 2.5 Flash (fast, creative editing, supports image input)
-               - "gemini3-pro": Gemini 3 Pro Image Preview (highest quality, 4K resolution)
-               - "imagen3": Imagen 3 (high quality, text-only input)
-               - "imagen4": Imagen 4 Standard (balanced quality/speed)
-               - "imagen4-ultra": Imagen 4 Ultra (highest quality, slower)
-               - "imagen4-fast": Imagen 4 Fast (fastest generation)
+               - "gemini-2.5-flash-image": Gemini 2.5 Flash (fast, creative editing)
+               - "gemini-3-pro-image-preview": Gemini 3 Pro (highest quality, 4K, multi-reference)
+               - "imagen-3.0-generate-002": Imagen 3 (high quality, text-only)
+               - "imagen-4.0-generate-001": Imagen 4 Standard (balanced)
+               - "imagen-4.0-ultra-generate-001": Imagen 4 Ultra (highest quality)
+               - "imagen-4.0-fast-generate-001": Imagen 4 Fast (fastest)
         image_uri: Input image URI (gs://, http://, file://) for image-to-image
         image_base64: Base64 encoded input image (prefer image_uri)
+        reference_image_uris: List of reference image URIs (up to 14 for Gemini 3 Pro).
+            Use up to 6 object images for high-fidelity inclusion,
+            up to 5 human images for character consistency across scenes.
+        image_size: Output image size for Gemini 3 Pro:
+            - "small": 1K (1024px)
+            - "medium": 2K (2048px)
+            - "large": 2K (2048px)
+            - "xlarge": 4K (4096px)
+        thinking_level: Reasoning depth for Gemini 3 Pro:
+            - "low": Minimizes latency, best for simple tasks
+            - "high": Maximizes reasoning depth for complex generation
+        media_resolution: Input image processing resolution:
+            - "MEDIA_RESOLUTION_LOW": Faster, lower token usage
+            - "MEDIA_RESOLUTION_MEDIUM": Balanced
+            - "MEDIA_RESOLUTION_HIGH": Best quality, higher token usage
+        thought_signature: Thought signature from previous turn for multi-turn editing.
+            Required for conversational image editing workflows - pass back the
+            thought_signature from the previous response.
 
     Returns:
-        Image preview and file path details
+        Image preview and file path details. For multi-turn editing,
+        includes thought_signature to pass to the next call.
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
@@ -210,6 +234,14 @@ async def generate_image(
         elif image_base64:
             image_bytes = base64.b64decode(image_base64)
 
+        # Fetch reference images
+        reference_images: list[bytes] = []
+        if reference_image_uris:
+            for ref_uri in reference_image_uris[:14]:  # Max 14 for Gemini 3 Pro
+                ref_bytes = await fetch(ref_uri)
+                if ref_bytes:
+                    reference_images.append(ref_bytes)
+
         await ctx.info(f"Generating image with model={model}")
         result = await generate_image_impl(
             client=app_ctx.client,
@@ -217,8 +249,25 @@ async def generate_image(
             images_dir=app_ctx.images_dir,
             model=model,
             image_bytes=image_bytes,
+            reference_images=reference_images if reference_images else None,
+            image_size=image_size,
+            thinking_level=thinking_level,
+            media_resolution=media_resolution,
+            thought_signature=thought_signature,
         )
         await ctx.info("Image generated successfully")
+
+        # Build response dict
+        response_data: dict[str, Any] = {
+            "message": result["message"],
+            "image_url": result["image_url"],
+            "prompt": result["prompt"],
+            "model": result["model"],
+        }
+
+        # Include thought_signature for multi-turn editing
+        if "thought_signature" in result:
+            response_data["thought_signature"] = result["thought_signature"]
 
         # Return image preview and structured JSON response
         preview_b64 = result["image_preview"].split(",")[1]
@@ -227,15 +276,7 @@ async def generate_image(
             Image(data=preview_bytes, format="jpeg"),
             TextContent(
                 type="text",
-                text=json.dumps(
-                    {
-                        "message": result["message"],
-                        "image_url": result["image_url"],
-                        "prompt": result["prompt"],
-                        "model": result["model"],
-                    },
-                    indent=2,
-                ),
+                text=json.dumps(response_data, indent=2),
             ),
         ]
     except Exception as e:
@@ -257,6 +298,10 @@ async def generate_video(
     seed: int | None = None,
     image_uri: str | None = None,
     image_base64: str | None = None,
+    last_frame_uri: str | None = None,
+    last_frame_base64: str | None = None,
+    reference_image_uris: list[str] | None = None,
+    extend_video_uri: str | None = None,
 ) -> str:
     """Generate a video using Google VEO models.
 
@@ -264,29 +309,54 @@ async def generate_video(
         ctx: MCP context with application state
         prompt: Text description of the video to generate
         model: Model to use - options include:
-               - "veo2": VEO 2.0 (stable, 5-8s duration, no audio)
-               - "veo3": VEO 3.1 Preview (highest quality, 4/6/8s duration, audio support)
-               - "veo3-fast": VEO 3.1 Fast (faster generation, 4/6/8s duration, audio support)
+               - "veo-2.0-generate-001": VEO 2.0 (stable, 5-8s duration, no audio)
+               - "veo-3.1-generate-preview": VEO 3.1 (highest quality, 4/6/8s, audio)
+               - "veo-3.1-fast-generate-preview": VEO 3.1 Fast (faster, 4/6/8s, audio)
         aspect_ratio: 16:9 (default) or 9:16
         duration_seconds: Video duration (VEO2: 5-8s, VEO3: 4/6/8s)
         include_audio: Enable audio generation (VEO3 only)
         audio_prompt: Audio description (VEO3 only)
         negative_prompt: Things to avoid in the video
         seed: Random seed for reproducibility
-        image_uri: Input image URI for image-to-video
-        image_base64: Base64 encoded input image (prefer image_uri)
+        image_uri: First frame image URI for image-to-video
+        image_base64: Base64 encoded first frame image (prefer image_uri)
+        last_frame_uri: Last frame image URI for first+last frame control (VEO3.1 only).
+            When provided with image_uri, generates smooth transition between frames.
+        last_frame_base64: Base64 encoded last frame image (prefer last_frame_uri)
+        reference_image_uris: List of up to 3 reference image URIs (VEO3.1 only).
+            Use for style/character consistency across generated video.
+            Note: Cannot be used together with first/last frame inputs.
+        extend_video_uri: URI of existing VEO-generated video to extend (VEO3.1 only).
+            Extends the final second of the video and continues the action.
+            Note: Cannot be used together with other image inputs.
 
     Returns:
-        JSON with video_url and generation details
+        JSON with video_url and generation details including generation_mode
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
 
+        # Fetch first frame image
         image_bytes = None
         if image_uri:
             image_bytes = await fetch(image_uri)
         elif image_base64:
             image_bytes = base64.b64decode(image_base64)
+
+        # Fetch last frame image (VEO 3.1 first+last frame mode)
+        last_frame_bytes = None
+        if last_frame_uri:
+            last_frame_bytes = await fetch(last_frame_uri)
+        elif last_frame_base64:
+            last_frame_bytes = base64.b64decode(last_frame_base64)
+
+        # Fetch reference images (VEO 3.1 reference mode)
+        reference_images: list[bytes] = []
+        if reference_image_uris:
+            for ref_uri in reference_image_uris[:3]:  # Max 3 for VEO 3.1
+                ref_bytes = await fetch(ref_uri)
+                if ref_bytes:
+                    reference_images.append(ref_bytes)
 
         await ctx.info(f"Generating video with model={model}")
         result = await generate_video_impl(
@@ -302,6 +372,9 @@ async def generate_video(
             negative_prompt=negative_prompt,
             seed=seed,
             log_callback=ctx.info,
+            last_frame_bytes=last_frame_bytes,
+            reference_images=reference_images if reference_images else None,
+            extend_video_uri=extend_video_uri,
         )
         await ctx.info("Video generated successfully")
         return json.dumps(result, indent=2)

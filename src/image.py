@@ -21,6 +21,20 @@ ImageModel = Literal[
     "imagen-4.0-fast-generate-001",
 ]
 
+# Output image size options for Gemini 3 Pro Image
+ImageSize = Literal["small", "medium", "large", "xlarge"]
+
+# Thinking level options for Gemini 3 models
+ThinkingLevel = Literal["low", "high"]
+
+# Media resolution options for input processing
+# Valid values are the enum values from google.genai.types.MediaResolution
+MediaResolution = Literal[
+    "MEDIA_RESOLUTION_LOW",
+    "MEDIA_RESOLUTION_MEDIUM",
+    "MEDIA_RESOLUTION_HIGH",
+]
+
 
 async def generate_image(
     client: genai.Client,
@@ -28,18 +42,52 @@ async def generate_image(
     images_dir: Path,
     model: ImageModel = "gemini-2.5-flash-image",
     image_bytes: bytes | None = None,
+    reference_images: list[bytes] | None = None,
+    image_size: ImageSize | None = None,
+    thinking_level: ThinkingLevel | None = None,
+    media_resolution: MediaResolution | None = None,
+    thought_signature: str | None = None,
+    conversation_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Generate an image using Gemini or Imagen models."""
+    """Generate an image using Gemini or Imagen models.
+
+    Args:
+        client: Google GenAI client
+        prompt: Text description of the image to generate
+        images_dir: Directory to save generated images
+        model: Model to use for generation
+        image_bytes: Input image bytes for editing
+        reference_images: List of reference image bytes (up to 14 for Gemini 3 Pro)
+        image_size: Output image size (small=1K, medium=2K, large=2K, xlarge=4K)
+            Only supported by gemini-3-pro-image-preview
+        thinking_level: Thinking depth control (low/high) for Gemini 3
+        media_resolution: Input image resolution processing (low/medium/high)
+        thought_signature: Thought signature from previous turn for multi-turn editing
+        conversation_history: Previous conversation history for multi-turn editing
+
+    Returns:
+        Dictionary with image_url, image_preview, and generation metadata
+    """
     model_id = str(model)
 
     # Gemini 3 Pro Image requires global location
     if model == "gemini-3-pro-image-preview":
         client = genai.Client(vertexai=True, location="global")
 
-    pil_image = None
+    # Prepare input images
+    pil_images: list[Image.Image] = []
     if image_bytes:
         pil_image = Image.open(BytesIO(image_bytes))
         pil_image.load()
+        pil_images.append(pil_image)
+
+    # Process reference images (up to 14 for Gemini 3 Pro)
+    if reference_images:
+        max_refs = 14 if model == "gemini-3-pro-image-preview" else 1
+        for ref_bytes in reference_images[:max_refs]:
+            ref_image = Image.open(BytesIO(ref_bytes))
+            ref_image.load()
+            pil_images.append(ref_image)
 
     try:
         if model_id.startswith("imagen"):
@@ -57,12 +105,43 @@ async def generate_image(
             if image_obj is None or image_obj.image_bytes is None:
                 raise ValueError("Imagen returned no image bytes")
             output_bytes = image_obj.image_bytes
+            response_thought_signature = None
         else:
-            contents: list[Any] = [prompt]
-            if pil_image:
-                contents.append(pil_image)
+            # Build contents for Gemini models
+            contents: list[Any] = []
 
-            config = types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
+            # Handle conversation history for multi-turn editing
+            if conversation_history:
+                contents.extend(conversation_history)
+
+            # Add current turn content
+            current_turn: list[Any] = [prompt]
+            for pil_img in pil_images:
+                current_turn.append(pil_img)
+            contents.extend(current_turn)
+
+            # Build config with new Gemini 3 parameters
+            config_kwargs: dict[str, Any] = {
+                "response_modalities": ["TEXT", "IMAGE"],
+            }
+
+            # Add image_size for Gemini 3 Pro (xlarge = 4K output)
+            if image_size and model == "gemini-3-pro-image-preview":
+                config_kwargs["image_config"] = types.ImageConfig(
+                    image_size=image_size
+                )
+
+            # Add thinking_level for Gemini 3 models
+            if thinking_level and model == "gemini-3-pro-image-preview":
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=thinking_level
+                )
+
+            # Add media_resolution for input processing
+            if media_resolution:
+                config_kwargs["media_resolution"] = media_resolution
+
+            config = types.GenerateContentConfig(**config_kwargs)
             response = await asyncio.to_thread(
                 client.models.generate_content,
                 model=model_id,
@@ -72,6 +151,8 @@ async def generate_image(
 
             output_bytes = None
             text_parts: list[str] = []
+            response_thought_signature = None
+
             candidates = response.candidates if response else None
             if candidates:
                 content = candidates[0].content
@@ -86,15 +167,20 @@ async def generate_image(
                             and part.inline_data.mime_type.startswith("image/")
                         ):
                             output_bytes = part.inline_data.data
-                            break
+                        # Capture thought signature for multi-turn editing
+                        if hasattr(part, "thought_signature") and part.thought_signature:
+                            response_thought_signature = part.thought_signature
 
             if not output_bytes:
                 if text_parts:
-                    return {
+                    result: dict[str, Any] = {
                         "message": "Model returned text only",
                         "generated_text": " ".join(text_parts),
                         "model": model_id,
                     }
+                    if response_thought_signature:
+                        result["thought_signature"] = response_thought_signature
+                    return result
                 raise ValueError("Gemini returned no image")
 
         filename = f"{uuid.uuid4()}.png"
@@ -113,7 +199,7 @@ async def generate_image(
         thumb_image.close()
 
         file_url = f"file://{filepath}"
-        return {
+        result = {
             "message": "Image generated successfully",
             "image_url": file_url,
             "image_preview": f"data:image/jpeg;base64,{thumb_base64}",
@@ -121,8 +207,15 @@ async def generate_image(
             "model": model_id,
         }
 
+        # Include thought signature for multi-turn editing workflows
+        if response_thought_signature:
+            result["thought_signature"] = response_thought_signature
+
+        return result
+
     except google_auth_exceptions.RefreshError:
         raise ValueError("Authentication error - check API key or credentials")
     finally:
-        if pil_image:
-            pil_image.close()
+        # Clean up all PIL images
+        for pil_img in pil_images:
+            pil_img.close()
