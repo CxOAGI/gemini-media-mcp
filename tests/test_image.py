@@ -967,7 +967,11 @@ async def test_generate_image_returns_thought_signature(
     )
 
     assert result["message"] == "Image generated successfully"
-    assert result["thought_signature"] == "encrypted_thought_signature_abc123"
+    assert "thought_signature_url" in result
+    # Verify file exists and contains signature
+    sig_path = Path(result["thought_signature_url"].replace("file://", ""))
+    assert sig_path.exists()
+    assert sig_path.read_text() == "encrypted_thought_signature_abc123"
 
 
 @pytest.mark.asyncio
@@ -1027,7 +1031,10 @@ async def test_generate_image_text_only_with_thought_signature(
     )
 
     assert result["message"] == "Model returned text only"
-    assert result["thought_signature"] == "signature_for_text_response"
+    assert "thought_signature_url" in result
+    sig_path = Path(result["thought_signature_url"].replace("file://", ""))
+    assert sig_path.exists()
+    assert sig_path.read_text() == "signature_for_text_response"
 
 
 # ============================================================================
@@ -1056,11 +1063,11 @@ async def test_generate_image_all_gemini3_params(
     gemini_response = FakeGeminiResponse([candidate])
 
     def mock_client(**kwargs: Any) -> FakeGenaiClient:
-        return FakeGenaiClient(gemini_response=gemini_response)
+        return FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
 
     monkeypatch.setattr("src.image.genai.Client", mock_client)
 
-    initial_client = FakeGenaiClient(gemini_response=gemini_response)
+    initial_client = FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
 
     reference_images = [
         _create_test_image(color="blue"),
@@ -1082,4 +1089,7 @@ async def test_generate_image_all_gemini3_params(
 
     assert result["message"] == "Image generated successfully"
     assert result["model"] == "gemini-3-pro-image-preview"
-    assert result["thought_signature"] == "new_signature"
+    assert "thought_signature_url" in result
+    sig_path = Path(result["thought_signature_url"].replace("file://", ""))
+    assert sig_path.exists()
+    assert sig_path.read_text() == "new_signature"

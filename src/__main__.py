@@ -189,7 +189,7 @@ async def generate_image(
     image_size: ImageSize | None = None,
     thinking_level: ThinkingLevel | None = None,
     media_resolution: MediaResolution | None = None,
-    thought_signature: str | None = None,
+    thought_signature_url: str | None = None,
 ):
     """Generate an image using Google Gemini or Imagen models.
 
@@ -219,17 +219,14 @@ async def generate_image(
             - "MEDIA_RESOLUTION_LOW": Faster, lower token usage
             - "MEDIA_RESOLUTION_MEDIUM": Balanced
             - "MEDIA_RESOLUTION_HIGH": Best quality, higher token usage
-        thought_signature: For multi-turn image editing conversations. When you receive
-            a response with thought_signature, pass it back in subsequent calls to
-            maintain editing context. Example workflow:
-            1. First call: generate_image(prompt="Draw a cat") → returns thought_signature
-            2. Second call: generate_image(prompt="Make it orange", thought_signature=<from step 1>)
-            3. Third call: generate_image(prompt="Add a hat", thought_signature=<from step 2>)
+        thought_signature_url: For multi-turn image editing. Pass the thought_signature_url
+            from a previous response to continue editing. Example workflow:
+            1. First call: generate_image(prompt="Draw a cat") → returns thought_signature_url
+            2. Second call: generate_image(prompt="Make it orange", thought_signature_url=<from step 1>)
 
     Returns:
         JSON with image_url, image_preview, and model info. For Gemini 3 Pro,
-        also includes thought_signature - save this and pass it to the next call
-        if you want to continue editing the same image in a conversation.
+        includes thought_signature_url pointing to a file with editing context.
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
@@ -247,6 +244,13 @@ async def generate_image(
                 ref_bytes = await fetch(ref_uri)
                 if ref_bytes:
                     reference_images.append(ref_bytes)
+
+        # Read thought signature from file if URL provided
+        thought_signature = None
+        if thought_signature_url and thought_signature_url.startswith("file://"):
+            sig_path = Path(thought_signature_url[7:])
+            if sig_path.exists():
+                thought_signature = sig_path.read_text()
 
         await ctx.info(f"Generating image with model={model}")
         result = await generate_image_impl(
@@ -271,9 +275,9 @@ async def generate_image(
             "model": result["model"],
         }
 
-        # Include thought_signature for multi-turn editing
-        if "thought_signature" in result:
-            response_data["thought_signature"] = result["thought_signature"]
+        # Include thought_signature_url for multi-turn editing
+        if "thought_signature_url" in result:
+            response_data["thought_signature_url"] = result["thought_signature_url"]
 
         # Return image preview and structured JSON response
         preview_b64 = result["image_preview"].split(",")[1]

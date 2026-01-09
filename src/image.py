@@ -187,7 +187,10 @@ async def generate_image(
                         "model": model_id,
                     }
                     if response_thought_signature:
-                        result["thought_signature"] = response_thought_signature
+                        sig_filename = f"{uuid.uuid4()}_thought.txt"
+                        sig_path = images_dir / sig_filename
+                        sig_path.write_text(response_thought_signature)
+                        result["thought_signature_url"] = f"file://{sig_path}"
                     return result
                 raise ValueError("Gemini returned no image")
 
@@ -215,9 +218,13 @@ async def generate_image(
             "model": model_id,
         }
 
-        # Include thought signature for multi-turn editing workflows
+        # Save thought signature to file for multi-turn editing workflows
+        # (can be 1MB+, too large for MCP response)
         if response_thought_signature:
-            result["thought_signature"] = response_thought_signature
+            sig_filename = f"{filepath.stem}_thought.txt"
+            sig_path = images_dir / sig_filename
+            sig_path.write_text(response_thought_signature)
+            result["thought_signature_url"] = f"file://{sig_path}"
 
         return result
 
