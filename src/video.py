@@ -130,6 +130,9 @@ async def generate_video(
         # Reference-to-video only supports 8 seconds
         if generation_mode == "reference_to_video":
             config_kwargs["duration_seconds"] = 8
+        # Extend video requires exactly 7 seconds output
+        elif generation_mode == "extend_video":
+            config_kwargs["duration_seconds"] = 7
         else:
             allowed = [4, 6, 8]
             config_kwargs["duration_seconds"] = min(
