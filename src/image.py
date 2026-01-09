@@ -145,6 +145,12 @@ async def generate_image(
             if media_resolution:
                 config_kwargs["media_resolution"] = media_resolution
 
+            # Add thought_signature for multi-turn editing continuity
+            # It's a Part field expecting bytes, decode from base64 string
+            if thought_signature:
+                sig_bytes = base64.b64decode(thought_signature)
+                contents.insert(0, types.Part(thought_signature=sig_bytes))
+
             config = types.GenerateContentConfig(**config_kwargs)
             response = await asyncio.to_thread(
                 client.models.generate_content,

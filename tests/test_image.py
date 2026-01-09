@@ -992,13 +992,15 @@ async def test_generate_image_accepts_thought_signature(
 
     client = FakeGenaiClient(gemini_response=gemini_response)
 
-    # Pass a thought signature from a previous turn
+    # Pass a thought signature from a previous turn (must be valid base64)
+    import base64
+    prev_sig = base64.b64encode(b"previous_turn_signature").decode()
     result = await generate_image(
         client=client,  # type: ignore[arg-type]
         prompt="Make the background sunset",
         images_dir=images_dir,
         model="gemini-2.5-flash-image",
-        thought_signature="previous_turn_signature",
+        thought_signature=prev_sig,
     )
 
     assert result["message"] == "Image generated successfully"
@@ -1074,6 +1076,9 @@ async def test_generate_image_all_gemini3_params(
         _create_test_image(color="green"),
     ]
 
+    # thought_signature must be valid base64
+    import base64
+    prev_sig = base64.b64encode(b"previous_signature").decode()
     result = await generate_image(
         client=initial_client,  # type: ignore[arg-type]
         prompt="Generate high quality 4K image",
@@ -1084,7 +1089,7 @@ async def test_generate_image_all_gemini3_params(
         image_size="4K",
         thinking_level="high",
         media_resolution="MEDIA_RESOLUTION_HIGH",
-        thought_signature="previous_signature",
+        thought_signature=prev_sig,
     )
 
     assert result["message"] == "Image generated successfully"
