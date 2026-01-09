@@ -312,6 +312,7 @@ async def generate_video(
     last_frame_base64: str | None = None,
     reference_image_uris: list[str] | None = None,
     extend_video_uri: str | None = None,
+    output_gcs_uri: str | None = None,
 ) -> str:
     """Generate a video using Google VEO models.
 
@@ -339,6 +340,8 @@ async def generate_video(
         extend_video_uri: URI of existing VEO-generated video to extend (VEO3.1 only).
             Extends the final second of the video and continues the action.
             Note: Cannot be used together with other image inputs.
+        output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
+            Required for longer duration videos that exceed inline response limits.
 
     Returns:
         JSON with video_url and generation details including generation_mode
@@ -385,6 +388,7 @@ async def generate_video(
             last_frame_bytes=last_frame_bytes,
             reference_images=reference_images if reference_images else None,
             extend_video_uri=extend_video_uri,
+            output_gcs_uri=output_gcs_uri,
         )
         await ctx.info("Video generated successfully")
         return json.dumps(result, indent=2)
