@@ -25,9 +25,6 @@ ImageModel = Literal[
 # Must use uppercase K (1K, 2K, 4K)
 ImageSize = Literal["1K", "2K", "4K"]
 
-# Thinking level options for Gemini 3 models
-ThinkingLevel = Literal["minimal", "low", "medium", "high"]
-
 # Media resolution options for input processing
 # Valid values are the enum values from google.genai.types.MediaResolution
 MediaResolution = Literal[
@@ -45,7 +42,6 @@ async def generate_image(
     image_bytes: bytes | None = None,
     reference_images: list[bytes] | None = None,
     image_size: ImageSize | None = None,
-    thinking_level: ThinkingLevel | None = None,
     media_resolution: MediaResolution | None = None,
     thought_signature: str | None = None,
     conversation_history: list[dict[str, Any]] | None = None,
@@ -60,8 +56,6 @@ async def generate_image(
         image_bytes: Input image bytes for editing
         reference_images: List of reference image bytes (up to 14 for Gemini 3 Pro)
         image_size: Output image size (1K, 2K, 4K) - must use uppercase K
-        thinking_level: Thinking depth (low/high) for Gemini 3 Pro
-            Only supported by gemini-3-pro-image-preview
         media_resolution: Input image resolution processing (low/medium/high)
         thought_signature: Thought signature from previous turn for multi-turn editing
         conversation_history: Previous conversation history for multi-turn editing
@@ -132,13 +126,6 @@ async def generate_image(
             if image_size and model == "gemini-3-pro-image-preview":
                 config_kwargs["image_config"] = types.ImageConfig(
                     image_size=image_size
-                )
-
-            # Add thinking_level for Gemini 3 Pro
-            if thinking_level and model == "gemini-3-pro-image-preview":
-                level_enum = getattr(types.ThinkingLevel, thinking_level.upper())
-                config_kwargs["thinking_config"] = types.ThinkingConfig(
-                    thinking_level=level_enum
                 )
 
             # Add media_resolution for input processing
