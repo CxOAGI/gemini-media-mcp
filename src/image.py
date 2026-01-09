@@ -201,7 +201,7 @@ async def generate_image(
         if thumb_image.mode in ("RGBA", "P"):
             thumb_image = thumb_image.convert("RGB")
         thumb_buffer = BytesIO()
-        thumb_image.save(thumb_buffer, format="JPEG", quality=80)
+        thumb_image.save(thumb_buffer, format="JPEG", quality=60)
         thumb_bytes = thumb_buffer.getvalue()
         thumb_base64 = base64.b64encode(thumb_bytes).decode("utf-8")
         thumb_image.close()
