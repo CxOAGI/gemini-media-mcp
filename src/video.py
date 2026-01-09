@@ -77,8 +77,8 @@ async def generate_video(
         log_callback: Async callback for progress logging
         last_frame_bytes: Last frame image bytes for first+last frame control (VEO3.1)
         reference_images: List of reference image bytes (up to 3) for style/character (VEO3.1)
-        extend_video_uri: URI of existing VEO video to extend (VEO3.1)
-        output_gcs_uri: GCS URI for output (required for large videos, e.g. gs://bucket/path/)
+        extend_video_uri: URI of existing VEO video to extend (VEO3.1). REQUIRES output_gcs_uri.
+        output_gcs_uri: GCS URI for output (required for extensions and large videos)
 
     Returns:
         Dictionary with video_url and generation metadata

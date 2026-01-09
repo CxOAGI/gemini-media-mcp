@@ -343,8 +343,10 @@ async def generate_video(
         extend_video_uri: URI of existing VEO-generated video to extend (VEO3.1 only).
             Extends the final second of the video and continues the action.
             Note: Cannot be used together with other image inputs.
+            IMPORTANT: Video extension ALWAYS requires output_gcs_uri - extensions produce
+            larger combined videos that exceed inline response limits.
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
-            Required for longer duration videos that exceed inline response limits.
+            Required for video extensions and longer duration videos.
 
     Returns:
         JSON with video_url and generation details including generation_mode
