@@ -110,6 +110,13 @@ class FakeModels:
         return self._operation or FakeOperation()
 
 
+class FakeApiClient:
+    """Test double for internal API client."""
+
+    def __init__(self, vertexai: bool = False) -> None:
+        self.vertexai = vertexai
+
+
 class FakeGenaiClient:
     """Test double for Google GenAI client."""
 
@@ -117,10 +124,12 @@ class FakeGenaiClient:
         self,
         operation: FakeOperation | None = None,
         raise_error: Exception | None = None,
+        vertexai: bool = False,
     ) -> None:
         self.models = FakeModels(operation, raise_error)
         self.operations = FakeOperations(operation or FakeOperation())
         self.files = FakeFiles()
+        self._api_client = FakeApiClient(vertexai=vertexai)
 
 
 def _create_test_image(width: int = 100, height: int = 100, mode: str = "RGB") -> bytes:
@@ -352,7 +361,9 @@ async def test_generate_video_veo3(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    # Set vertexai=True when testing audio features (only supported in Vertex AI)
+    use_vertexai = input.get("include_audio", False)
+    client = FakeGenaiClient(operation=operation, vertexai=use_vertexai)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -667,7 +678,7 @@ async def test_generate_video_log_callback(
     )
 
     assert len(log_messages) >= 2
-    assert any("Starting video generation" in msg for msg in log_messages)
+    assert any("Starting" in msg and "video" in msg for msg in log_messages)
     assert any("Polling operation" in msg for msg in log_messages)
 
 
@@ -707,3 +718,370 @@ async def test_generate_video_creates_file(
     assert file_path.exists()
     assert file_path.suffix == ".mp4"
     assert file_path.read_bytes() == video_content
+
+
+# ============================================================================
+# generate_video tests - VEO 3.1 First and Last Frame Control
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_first_last_frame(
+    tmp_path: Path,
+) -> None:
+    """Test generate_video with first and last frame control for VEO 3.1."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    first_frame = _create_test_image(width=100, height=100, mode="RGB")
+    last_frame = _create_test_image(width=100, height=100, mode="RGB")
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Transition from first to last frame",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+        image_bytes=first_frame,
+        last_frame_bytes=last_frame,
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert gen_result["generation_mode"] == "first_last_frame"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_first_frame_only_is_image_to_video(
+    tmp_path: Path,
+) -> None:
+    """Test that first frame only falls back to image_to_video mode."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    first_frame = _create_test_image(width=100, height=100, mode="RGB")
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Animate this image",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+        image_bytes=first_frame,
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert gen_result["generation_mode"] == "image_to_video"
+
+
+# ============================================================================
+# generate_video tests - VEO 3.1 Reference Images
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_reference_images(
+    tmp_path: Path,
+) -> None:
+    """Test generate_video with reference images for VEO 3.1."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    reference_images = [
+        _create_test_image(width=100, height=100, mode="RGB"),
+        _create_test_image(width=100, height=100, mode="RGB"),
+        _create_test_image(width=100, height=100, mode="RGB"),
+    ]
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Video featuring the character from references",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+        reference_images=reference_images,
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert gen_result["generation_mode"] == "reference_to_video"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_reference_images_limited_to_3(
+    tmp_path: Path,
+) -> None:
+    """Test that reference images are limited to 3 for VEO 3.1."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    # Create 5 reference images (should be limited to 3)
+    reference_images = [
+        _create_test_image(width=100, height=100, mode="RGB")
+        for _ in range(5)
+    ]
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Video with references",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+        reference_images=reference_images,
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert gen_result["generation_mode"] == "reference_to_video"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_reference_not_supported_veo2(
+    tmp_path: Path,
+) -> None:
+    """Test that reference images fall back to text_to_video for VEO 2.0."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    reference_images = [
+        _create_test_image(width=100, height=100, mode="RGB"),
+    ]
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Video with references",
+        videos_dir=videos_dir,
+        model="veo-2.0-generate-001",
+        reference_images=reference_images,
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    # VEO 2.0 doesn't support reference mode, falls back to text_to_video
+    assert gen_result["generation_mode"] == "text_to_video"
+
+
+# ============================================================================
+# generate_video tests - VEO 3.1 Video Extension
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_extend(
+    tmp_path: Path,
+) -> None:
+    """Test generate_video with video extension for VEO 3.1."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"extended video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Continue the action",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+        extend_video_uri="gs://bucket/original_video.mp4",
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert gen_result["generation_mode"] == "extend_video"
+    assert gen_result["extended_from"] == "gs://bucket/original_video.mp4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_extend_not_supported_veo2(
+    tmp_path: Path,
+) -> None:
+    """Test that video extension falls back to text_to_video for VEO 2.0."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Continue the action",
+        videos_dir=videos_dir,
+        model="veo-2.0-generate-001",
+        extend_video_uri="gs://bucket/original_video.mp4",
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    # VEO 2.0 doesn't support extend mode, falls back to text_to_video
+    assert gen_result["generation_mode"] == "text_to_video"
+
+
+# ============================================================================
+# generate_video tests - Generation mode priority
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_mode_priority_extend_wins(
+    tmp_path: Path,
+) -> None:
+    """Test that extend_video has highest priority in generation mode."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    # Provide all inputs - extend_video should win
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Test priority",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+        image_bytes=_create_test_image(),
+        last_frame_bytes=_create_test_image(),
+        reference_images=[_create_test_image()],
+        extend_video_uri="gs://bucket/video.mp4",
+    )
+
+    assert gen_result["generation_mode"] == "extend_video"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_mode_priority_reference_over_frames(
+    tmp_path: Path,
+) -> None:
+    """Test that reference_images wins over first/last frame."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    # Provide first frame and reference images - reference should win
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Test priority",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+        image_bytes=_create_test_image(),
+        reference_images=[_create_test_image()],
+    )
+
+    assert gen_result["generation_mode"] == "reference_to_video"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_text_only_mode(
+    tmp_path: Path,
+) -> None:
+    """Test generate_video with text only (no images or video input)."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="A bird flying",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-preview",
+    )
+
+    assert gen_result["generation_mode"] == "text_to_video"
+
+
+# ============================================================================
+# generate_video tests - VEO 3.1 Fast model
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_veo3_fast_with_features(
+    tmp_path: Path,
+) -> None:
+    """Test VEO 3.1 Fast model supports all VEO 3.1 features."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    first_frame = _create_test_image(width=100, height=100, mode="RGB")
+    last_frame = _create_test_image(width=100, height=100, mode="RGB")
+
+    video_obj = FakeVideoObject(video_bytes=b"video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+
+    # Set vertexai=True because we're testing audio (only supported in Vertex AI)
+    client = FakeGenaiClient(operation=operation, vertexai=True)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Fast transition",
+        videos_dir=videos_dir,
+        model="veo-3.1-fast-generate-preview",
+        image_bytes=first_frame,
+        last_frame_bytes=last_frame,
+        include_audio=True,
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert gen_result["generation_mode"] == "first_last_frame"
+    assert gen_result["audio_enabled"] is True

@@ -84,9 +84,24 @@ Generate images using Gemini or Imagen models.
 
 **Parameters:**
 - `prompt` (required): Text description of the image
-- `model`: `GEMINI` (default), `GEMINI3_PRO`, `IMAGEN3`, `IMAGEN4`, `IMAGEN4_ULTRA`, `IMAGEN4_FAST`
+- `model`: Model to use:
+  - `gemini-2.5-flash-image` (default): Fast, creative editing
+  - `gemini-3-pro-image-preview`: Highest quality, 4K resolution, multi-reference support
+  - `imagen-3.0-generate-002`: High quality, text-only input
+  - `imagen-4.0-generate-001`: Balanced quality/speed
+  - `imagen-4.0-ultra-generate-001`: Highest quality
+  - `imagen-4.0-fast-generate-001`: Fastest generation
 - `image_uri`: Input image URI for image-to-image generation
 - `image_base64`: Base64 encoded input image
+
+**Gemini 3 Pro Image Parameters** (for `gemini-3-pro-image-preview` only):
+- `reference_image_uris`: List of up to 14 reference image URIs for multi-image composition
+  - Up to 6 object images for high-fidelity inclusion
+  - Up to 5 human images for character consistency across scenes
+- `image_size`: Output resolution (`1K`, `2K`, `4K`) - must use uppercase K
+- `thinking_level`: Reasoning depth (`low` for fast, `high` for complex generation)
+- `media_resolution`: Input image processing quality (`MEDIA_RESOLUTION_LOW`, `MEDIA_RESOLUTION_MEDIUM`, `MEDIA_RESOLUTION_HIGH`)
+- `thought_signature`: For multi-turn editing workflows - pass back the signature from previous responses
 
 ### generate_video
 
@@ -94,14 +109,36 @@ Generate videos using VEO models (requires Vertex AI).
 
 **Parameters:**
 - `prompt` (required): Text description of the video
-- `model`: `VEO2` (default, 5-8s), `VEO3` (4/6/8s with audio), `VEO3_FAST`
+- `model`: Model to use:
+  - `veo-2.0-generate-001` (default): Stable, 5-8s duration, no audio
+  - `veo-3.1-generate-preview`: Highest quality, 4/6/8s duration, audio support
+  - `veo-3.1-fast-generate-preview`: Faster generation with audio support
 - `aspect_ratio`: `16:9` (default) or `9:16`
 - `duration_seconds`: Video duration (VEO2: 5-8s, VEO3: 4/6/8s)
 - `include_audio`: Enable audio generation (VEO3 only)
 - `audio_prompt`: Audio description (VEO3 only)
 - `negative_prompt`: Things to avoid in the video
 - `seed`: Random seed for reproducibility
-- `image_uri`: Input image URI for image-to-video generation
+- `image_uri`: First frame image URI for image-to-video generation
+
+**VEO 3.1 Parameters** (for `veo-3.1-*` models only):
+- `last_frame_uri`: Last frame image URI for first+last frame control
+  - When combined with `image_uri`, generates smooth transitions between frames
+- `reference_image_uris`: List of up to 3 reference image URIs for subject preservation
+  - Preserves the appearance of a person, character, or product in the output video
+  - **Note**: Only supports 8-second duration (automatically enforced)
+  - Cannot be used together with first/last frame inputs
+- `extend_video_uri`: URI of existing VEO-generated video to extend
+  - Extends the final second of the video and continues the action
+  - Can be chained multiple times for longer videos (up to ~148s total)
+  - Note: Cannot be used together with other image inputs
+
+**Generation Modes** (automatically selected based on inputs):
+- `text_to_video`: Text-only prompt
+- `image_to_video`: First frame image input
+- `first_last_frame`: First and last frame control
+- `reference_to_video`: Reference images for subject preservation (8s only)
+- `extend_video`: Extend existing video
 
 ## Google Vertex AI and Gemini Access
 

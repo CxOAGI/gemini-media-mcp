@@ -104,6 +104,13 @@ class FakeModels:
         return self._imagen_response or FakeImagenResponse()
 
 
+class FakeApiClient:
+    """Test double for internal API client."""
+
+    def __init__(self, vertexai: bool = False) -> None:
+        self.vertexai = vertexai
+
+
 class FakeGenaiClient:
     """Test double for Google GenAI client."""
 
@@ -112,8 +119,10 @@ class FakeGenaiClient:
         gemini_response: FakeGeminiResponse | None = None,
         imagen_response: FakeImagenResponse | None = None,
         raise_error: Exception | None = None,
+        vertexai: bool = False,
     ) -> None:
         self.models = FakeModels(gemini_response, imagen_response, raise_error)
+        self._api_client = FakeApiClient(vertexai=vertexai)
 
 
 def _create_test_image(
@@ -452,7 +461,8 @@ async def test_generate_image_gemini3_pro(
     monkeypatch.setattr("src.image.genai.Client", mock_client)
 
     # Initial client (will be replaced for gemini-3-pro-image-preview)
-    initial_client = FakeGenaiClient(gemini_response=gemini_response)
+    # Must set vertexai=True to trigger global location logic
+    initial_client = FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
 
     result = await generate_image(
         client=initial_client,  # type: ignore[arg-type]
@@ -660,3 +670,378 @@ async def test_generate_image_thumbnail_preview(
     assert preview_img.width <= 512
     assert preview_img.height <= 512
     preview_img.close()
+
+
+# ============================================================================
+# generate_image tests - Gemini 3 Pro new parameters
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("input", "expected"),
+    [
+        pytest.param(
+            {"image_size": "1K"},
+            {"success": True},
+            id="image_size_1K",
+        ),
+        pytest.param(
+            {"image_size": "2K"},
+            {"success": True},
+            id="image_size_2K",
+        ),
+        pytest.param(
+            {"image_size": "4K"},
+            {"success": True},
+            id="image_size_4K",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_image_size(
+    input: dict[str, Any],
+    expected: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test generate_image with image_size parameter for Gemini 3 Pro."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePart(inline_data=inline_data)
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    def mock_client(**kwargs: Any) -> FakeGenaiClient:
+        return FakeGenaiClient(gemini_response=gemini_response)
+
+    monkeypatch.setattr("src.image.genai.Client", mock_client)
+
+    initial_client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=initial_client,  # type: ignore[arg-type]
+        prompt="Test prompt",
+        images_dir=images_dir,
+        model="gemini-3-pro-image-preview",
+        image_size=input["image_size"],
+    )
+
+    assert result["message"] == "Image generated successfully"
+    assert "image_url" in result
+
+
+@pytest.mark.parametrize(
+    ("input", "expected"),
+    [
+        pytest.param(
+            {"media_resolution": "MEDIA_RESOLUTION_LOW"},
+            {"success": True},
+            id="media_resolution_low",
+        ),
+        pytest.param(
+            {"media_resolution": "MEDIA_RESOLUTION_MEDIUM"},
+            {"success": True},
+            id="media_resolution_medium",
+        ),
+        pytest.param(
+            {"media_resolution": "MEDIA_RESOLUTION_HIGH"},
+            {"success": True},
+            id="media_resolution_high",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_media_resolution(
+    input: dict[str, Any],
+    expected: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    """Test generate_image with media_resolution parameter."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePart(inline_data=inline_data)
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="Test prompt",
+        images_dir=images_dir,
+        model="gemini-2.5-flash-image",
+        image_bytes=test_image_bytes,
+        media_resolution=input["media_resolution"],
+    )
+
+    assert result["message"] == "Image generated successfully"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_multiple_reference_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test generate_image with multiple reference images for Gemini 3 Pro."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePart(inline_data=inline_data)
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    def mock_client(**kwargs: Any) -> FakeGenaiClient:
+        return FakeGenaiClient(gemini_response=gemini_response)
+
+    monkeypatch.setattr("src.image.genai.Client", mock_client)
+
+    initial_client = FakeGenaiClient(gemini_response=gemini_response)
+
+    # Create multiple reference images
+    reference_images = [
+        _create_test_image(color="blue"),
+        _create_test_image(color="green"),
+        _create_test_image(color="yellow"),
+    ]
+
+    result = await generate_image(
+        client=initial_client,  # type: ignore[arg-type]
+        prompt="Combine these reference images",
+        images_dir=images_dir,
+        model="gemini-3-pro-image-preview",
+        reference_images=reference_images,
+    )
+
+    assert result["message"] == "Image generated successfully"
+    assert "image_url" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_max_reference_images_limited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that reference images are limited to 14 for Gemini 3 Pro."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePart(inline_data=inline_data)
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    def mock_client(**kwargs: Any) -> FakeGenaiClient:
+        return FakeGenaiClient(gemini_response=gemini_response)
+
+    monkeypatch.setattr("src.image.genai.Client", mock_client)
+
+    initial_client = FakeGenaiClient(gemini_response=gemini_response)
+
+    # Create 20 reference images (should be limited to 14)
+    reference_images = [_create_test_image(color="red") for _ in range(20)]
+
+    result = await generate_image(
+        client=initial_client,  # type: ignore[arg-type]
+        prompt="Combine references",
+        images_dir=images_dir,
+        model="gemini-3-pro-image-preview",
+        reference_images=reference_images,
+    )
+
+    assert result["message"] == "Image generated successfully"
+
+
+# ============================================================================
+# generate_image tests - Thought signature handling
+# ============================================================================
+
+
+class FakePartWithSignature(FakePart):
+    """Test double for response part with thought signature."""
+
+    def __init__(
+        self,
+        text: str | None = None,
+        inline_data: FakeInlineData | None = None,
+        thought_signature: str | None = None,
+    ) -> None:
+        super().__init__(text, inline_data)
+        self.thought_signature = thought_signature
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_returns_thought_signature(
+    tmp_path: Path,
+) -> None:
+    """Test generate_image returns thought_signature when present."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePartWithSignature(
+        inline_data=inline_data,
+        thought_signature="encrypted_thought_signature_abc123",
+    )
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="Test prompt",
+        images_dir=images_dir,
+        model="gemini-2.5-flash-image",
+    )
+
+    assert result["message"] == "Image generated successfully"
+    assert "thought_signature_url" in result
+    # Verify file exists and contains signature
+    sig_path = Path(result["thought_signature_url"].replace("file://", ""))
+    assert sig_path.exists()
+    assert sig_path.read_text() == "encrypted_thought_signature_abc123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_accepts_thought_signature(
+    tmp_path: Path,
+) -> None:
+    """Test generate_image accepts thought_signature for multi-turn editing."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePart(inline_data=inline_data)
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    # Pass a thought signature from a previous turn (must be valid base64)
+    import base64
+    prev_sig = base64.b64encode(b"previous_turn_signature").decode()
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="Make the background sunset",
+        images_dir=images_dir,
+        model="gemini-2.5-flash-image",
+        thought_signature=prev_sig,
+    )
+
+    assert result["message"] == "Image generated successfully"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_text_only_with_thought_signature(
+    tmp_path: Path,
+) -> None:
+    """Test text-only response includes thought_signature if present."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePartWithSignature(
+        text="This is a description",
+        thought_signature="signature_for_text_response",
+    )
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="Describe this",
+        images_dir=images_dir,
+        model="gemini-2.5-flash-image",
+    )
+
+    assert result["message"] == "Model returned text only"
+    assert "thought_signature_url" in result
+    sig_path = Path(result["thought_signature_url"].replace("file://", ""))
+    assert sig_path.exists()
+    assert sig_path.read_text() == "signature_for_text_response"
+
+
+# ============================================================================
+# generate_image tests - Combined parameters
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_all_gemini3_params(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test generate_image with all Gemini 3 Pro parameters combined."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePartWithSignature(
+        inline_data=inline_data,
+        thought_signature="new_signature",
+    )
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    def mock_client(**kwargs: Any) -> FakeGenaiClient:
+        return FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
+
+    monkeypatch.setattr("src.image.genai.Client", mock_client)
+
+    initial_client = FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
+
+    reference_images = [
+        _create_test_image(color="blue"),
+        _create_test_image(color="green"),
+    ]
+
+    # thought_signature must be valid base64
+    import base64
+    prev_sig = base64.b64encode(b"previous_signature").decode()
+    result = await generate_image(
+        client=initial_client,  # type: ignore[arg-type]
+        prompt="Generate high quality 4K image",
+        images_dir=images_dir,
+        model="gemini-3-pro-image-preview",
+        image_bytes=test_image_bytes,
+        reference_images=reference_images,
+        image_size="4K",
+        media_resolution="MEDIA_RESOLUTION_HIGH",
+        thought_signature=prev_sig,
+    )
+
+    assert result["message"] == "Image generated successfully"
+    assert result["model"] == "gemini-3-pro-image-preview"
+    assert "thought_signature_url" in result
+    sig_path = Path(result["thought_signature_url"].replace("file://", ""))
+    assert sig_path.exists()
+    assert sig_path.read_text() == "new_signature"

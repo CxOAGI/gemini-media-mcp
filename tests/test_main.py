@@ -479,9 +479,18 @@ async def test_app_lifespan_default_dirs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test app_lifespan with default directories."""
-    # Clear environment
+    # Clear environment and ensure not detected as container
     monkeypatch.delenv("DATA_FOLDER", raising=False)
+    monkeypatch.delenv("RUNNING_IN_CONTAINER", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    # Mock Path.exists to return False for /.dockerenv
+    original_exists = Path.exists
+    def mock_exists(self: Path) -> bool:
+        if str(self) == "/.dockerenv":
+            return False
+        return original_exists(self)
+    monkeypatch.setattr(Path, "exists", mock_exists)
 
     # Mock genai.Client
     mock_client = MagicMock()
@@ -541,17 +550,29 @@ def test_is_running_in_container_env_var(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("RUNNING_IN_CONTAINER", "TRUE")
     assert is_running_in_container() is True
 
-    monkeypatch.setenv("RUNNING_IN_CONTAINER", "false")
-    assert is_running_in_container() is False
-
 
 def test_is_running_in_container_dockerenv(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test container detection via /.dockerenv file."""
     monkeypatch.delenv("RUNNING_IN_CONTAINER", raising=False)
-    # Without /.dockerenv, should return False (unless actually in container)
-    # We can't easily test the /.dockerenv path without mocking Path
+
+    # Mock Path.exists to control /.dockerenv detection
+    original_exists = Path.exists
+    def mock_exists_true(self: Path) -> bool:
+        if str(self) == "/.dockerenv":
+            return True
+        return original_exists(self)
+    def mock_exists_false(self: Path) -> bool:
+        if str(self) == "/.dockerenv":
+            return False
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", mock_exists_true)
+    assert is_running_in_container() is True
+
+    monkeypatch.setattr(Path, "exists", mock_exists_false)
+    assert is_running_in_container() is False
 
 
 def test_is_running_in_container_not_in_container(
@@ -559,9 +580,15 @@ def test_is_running_in_container_not_in_container(
 ) -> None:
     """Test container detection returns False when not in container."""
     monkeypatch.delenv("RUNNING_IN_CONTAINER", raising=False)
-    # This will check /.dockerenv which shouldn't exist on host
-    # Result depends on actual environment, but env var takes precedence
-    monkeypatch.setenv("RUNNING_IN_CONTAINER", "false")
+
+    # Mock Path.exists to return False for /.dockerenv
+    original_exists = Path.exists
+    def mock_exists(self: Path) -> bool:
+        if str(self) == "/.dockerenv":
+            return False
+        return original_exists(self)
+    monkeypatch.setattr(Path, "exists", mock_exists)
+
     assert is_running_in_container() is False
 
 
