@@ -195,9 +195,9 @@ async def generate_image(
         filepath = images_dir / filename
         filepath.write_bytes(output_bytes)
 
-        # Create thumbnail for inline preview (max 512px, JPEG for size)
+        # Create thumbnail for inline preview (max 256px, JPEG for smaller size)
         thumb_image = Image.open(BytesIO(output_bytes))
-        thumb_image.thumbnail((512, 512))
+        thumb_image.thumbnail((256, 256))
         if thumb_image.mode in ("RGBA", "P"):
             thumb_image = thumb_image.convert("RGB")
         thumb_buffer = BytesIO()
