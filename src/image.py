@@ -26,16 +26,7 @@ ImageModel = Literal[
 ImageSize = Literal["1K", "2K", "4K"]
 
 # Thinking level options for Gemini 3 models
-# Maps to types.ThinkingLevel enum values
 ThinkingLevel = Literal["minimal", "low", "medium", "high"]
-
-# Map string values to ThinkingLevel enum
-THINKING_LEVEL_MAP = {
-    "minimal": types.ThinkingLevel.MINIMAL,
-    "low": types.ThinkingLevel.LOW,
-    "medium": types.ThinkingLevel.MEDIUM,
-    "high": types.ThinkingLevel.HIGH,
-}
 
 # Media resolution options for input processing
 # Valid values are the enum values from google.genai.types.MediaResolution
@@ -145,11 +136,10 @@ async def generate_image(
 
             # Add thinking_level for Gemini 3 Pro
             if thinking_level and model == "gemini-3-pro-image-preview":
-                level_enum = THINKING_LEVEL_MAP.get(thinking_level.lower())
-                if level_enum:
-                    config_kwargs["thinking_config"] = types.ThinkingConfig(
-                        thinking_level=level_enum
-                    )
+                level_enum = getattr(types.ThinkingLevel, thinking_level.upper())
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=level_enum
+                )
 
             # Add media_resolution for input processing
             if media_resolution:
