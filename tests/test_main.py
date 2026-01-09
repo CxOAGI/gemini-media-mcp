@@ -479,8 +479,9 @@ async def test_app_lifespan_default_dirs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test app_lifespan with default directories."""
-    # Clear environment
+    # Clear environment and ensure not detected as container
     monkeypatch.delenv("DATA_FOLDER", raising=False)
+    monkeypatch.setenv("RUNNING_IN_CONTAINER", "false")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
 
     # Mock genai.Client

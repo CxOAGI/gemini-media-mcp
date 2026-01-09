@@ -96,8 +96,11 @@ def create_client() -> genai.Client:
 
 def is_running_in_container() -> bool:
     """Check if running inside a container."""
-    if os.environ.get("RUNNING_IN_CONTAINER", "").lower() == "true":
+    env_val = os.environ.get("RUNNING_IN_CONTAINER", "").lower()
+    if env_val == "true":
         return True
+    if env_val == "false":
+        return False
     return Path("/.dockerenv").exists()
 
 

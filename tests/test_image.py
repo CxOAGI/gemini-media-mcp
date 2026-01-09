@@ -104,6 +104,13 @@ class FakeModels:
         return self._imagen_response or FakeImagenResponse()
 
 
+class FakeApiClient:
+    """Test double for internal API client."""
+
+    def __init__(self, vertexai: bool = False) -> None:
+        self.vertexai = vertexai
+
+
 class FakeGenaiClient:
     """Test double for Google GenAI client."""
 
@@ -112,8 +119,10 @@ class FakeGenaiClient:
         gemini_response: FakeGeminiResponse | None = None,
         imagen_response: FakeImagenResponse | None = None,
         raise_error: Exception | None = None,
+        vertexai: bool = False,
     ) -> None:
         self.models = FakeModels(gemini_response, imagen_response, raise_error)
+        self._api_client = FakeApiClient(vertexai=vertexai)
 
 
 def _create_test_image(
@@ -452,7 +461,8 @@ async def test_generate_image_gemini3_pro(
     monkeypatch.setattr("src.image.genai.Client", mock_client)
 
     # Initial client (will be replaced for gemini-3-pro-image-preview)
-    initial_client = FakeGenaiClient(gemini_response=gemini_response)
+    # Must set vertexai=True to trigger global location logic
+    initial_client = FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
 
     result = await generate_image(
         client=initial_client,  # type: ignore[arg-type]

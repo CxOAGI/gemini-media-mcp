@@ -110,6 +110,13 @@ class FakeModels:
         return self._operation or FakeOperation()
 
 
+class FakeApiClient:
+    """Test double for internal API client."""
+
+    def __init__(self, vertexai: bool = False) -> None:
+        self.vertexai = vertexai
+
+
 class FakeGenaiClient:
     """Test double for Google GenAI client."""
 
@@ -117,10 +124,12 @@ class FakeGenaiClient:
         self,
         operation: FakeOperation | None = None,
         raise_error: Exception | None = None,
+        vertexai: bool = False,
     ) -> None:
         self.models = FakeModels(operation, raise_error)
         self.operations = FakeOperations(operation or FakeOperation())
         self.files = FakeFiles()
+        self._api_client = FakeApiClient(vertexai=vertexai)
 
 
 def _create_test_image(width: int = 100, height: int = 100, mode: str = "RGB") -> bytes:
@@ -352,7 +361,9 @@ async def test_generate_video_veo3(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    # Set vertexai=True when testing audio features (only supported in Vertex AI)
+    use_vertexai = input.get("include_audio", False)
+    client = FakeGenaiClient(operation=operation, vertexai=use_vertexai)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -1058,7 +1069,8 @@ async def test_generate_video_veo3_fast_with_features(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    # Set vertexai=True because we're testing audio (only supported in Vertex AI)
+    client = FakeGenaiClient(operation=operation, vertexai=True)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
