@@ -71,6 +71,12 @@ async def generate_image(
     """
     model_id = str(model)
 
+    # Gemini 3 Pro Image requires global location when using Vertex AI
+    if model == "gemini-3-pro-image-preview":
+        if getattr(client._api_client, 'vertexai', False):
+            # Re-create client with global location for Vertex AI
+            client = genai.Client(vertexai=True, location="global")
+
     # Prepare input images
     pil_images: list[Image.Image] = []
     if image_bytes:
