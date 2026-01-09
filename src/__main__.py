@@ -35,6 +35,7 @@ class AppContext:
     videos_dir: Path
     client: genai.Client
     temp_creds_path: Path | None = None
+    video_gcs_bucket: str | None = None  # Default GCS bucket for video output
 
 
 def setup_vertex_credentials() -> Path | None:
@@ -123,6 +124,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 
     temp_creds_path = setup_vertex_credentials()
     client = create_client()
+    video_gcs_bucket = os.environ.get("VIDEO_GCS_BUCKET")
 
     try:
         yield AppContext(
@@ -130,6 +132,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             videos_dir=videos_dir,
             client=client,
             temp_creds_path=temp_creds_path,
+            video_gcs_bucket=video_gcs_bucket,
         )
     finally:
         cleanup_credentials(temp_creds_path)
@@ -371,6 +374,9 @@ async def generate_video(
                 if ref_bytes:
                     reference_images.append(ref_bytes)
 
+        # Use default GCS bucket from env if not provided
+        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
+
         await ctx.info(f"Generating video with model={model}")
         result = await generate_video_impl(
             client=app_ctx.client,
@@ -388,7 +394,7 @@ async def generate_video(
             last_frame_bytes=last_frame_bytes,
             reference_images=reference_images if reference_images else None,
             extend_video_uri=extend_video_uri,
-            output_gcs_uri=output_gcs_uri,
+            output_gcs_uri=gcs_uri,
         )
         await ctx.info("Video generated successfully")
         return json.dumps(result, indent=2)
