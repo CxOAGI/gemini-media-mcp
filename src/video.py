@@ -177,7 +177,17 @@ async def generate_video(
         api_kwargs["image"] = first_frame_input
     elif generation_mode == "extend_video" and extend_video_uri:
         # Video extension for VEO 3.1
-        api_kwargs["video"] = types.Video(uri=extend_video_uri)
+        # For file:// URIs, load from local file to get proper mime type
+        if extend_video_uri.startswith("file://"):
+            local_path = extend_video_uri[7:]  # Remove file:// prefix
+            api_kwargs["video"] = types.Video.from_file(
+                location=local_path, mime_type="video/mp4"
+            )
+        else:
+            # Remote URI - pass with mime type
+            api_kwargs["video"] = types.Video(
+                uri=extend_video_uri, mimeType="video/mp4"
+            )
 
     operation = await asyncio.to_thread(
         client.models.generate_videos,
