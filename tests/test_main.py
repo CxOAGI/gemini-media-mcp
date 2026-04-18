@@ -1132,6 +1132,139 @@ async def test_generate_video(
 
 
 # ============================================================================
+# Sidecar manifest tests
+# ============================================================================
+
+
+def test_write_sidecar_writes_json_next_to_media(tmp_path: Path) -> None:
+    """Sidecar is written as <stem>.json next to a file:// media URL."""
+    from src.__main__ import _write_sidecar
+
+    media = tmp_path / "abc.mp4"
+    media.write_bytes(b"x")
+    sidecar_url = _write_sidecar(f"file://{media}", {"kind": "video", "a": 1})
+    assert sidecar_url == f"file://{tmp_path / 'abc.json'}"
+    assert (tmp_path / "abc.json").exists()
+    import json as _json
+
+    content = _json.loads((tmp_path / "abc.json").read_text())
+    assert content["kind"] == "video"
+    assert content["a"] == 1
+
+
+def test_write_sidecar_skips_remote(tmp_path: Path) -> None:
+    """Remote URIs (gs://) do not yield a local sidecar."""
+    from src.__main__ import _write_sidecar
+
+    assert _write_sidecar("gs://bucket/obj.mp4", {"kind": "video"}) is None
+
+
+# ============================================================================
+# generate_transition tool tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_transition_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_transition fetches both frames and produces a video."""
+    from src.__main__ import generate_transition
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    # Two frames stored inside DATA_FOLDER so fetch() accepts them.
+    frame_a = images_dir / "a.png"
+    frame_b = images_dir / "b.png"
+    frame_a.write_bytes(_create_test_image())
+    frame_b.write_bytes(_create_test_image())
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "out.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs.get("prompt", ""),
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": "first_last_frame",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result_json = await generate_transition(
+        ctx=mock_ctx,
+        first_frame_uri=f"file://{frame_a}",
+        last_frame_uri=f"file://{frame_b}",
+        prompt="crossfade",
+    )
+    result = json.loads(result_json)
+    assert result["generation_mode"] == "first_last_frame"
+    assert result["first_frame_uri"] == f"file://{frame_a}"
+    assert result["last_frame_uri"] == f"file://{frame_b}"
+    assert result["sidecar_url"].endswith("out.json")
+
+    # Sidecar content is the manifest.
+    sidecar = Path(result["sidecar_url"][7:])
+    assert sidecar.exists()
+    manifest = json.loads(sidecar.read_text())
+    assert manifest["kind"] == "transition"
+    assert manifest["first_frame_uri"] == f"file://{frame_a}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_transition_missing_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_transition returns an error JSON when a frame cannot be fetched."""
+    from src.__main__ import generate_transition
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl should not be called when a frame is missing")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result_json = await generate_transition(
+        ctx=mock_ctx,
+        first_frame_uri=f"file://{tmp_path / 'missing_a.png'}",
+        last_frame_uri=f"file://{tmp_path / 'missing_b.png'}",
+    )
+    result = json.loads(result_json)
+    assert "error" in result
+
+
+# ============================================================================
 # main function tests
 # ============================================================================
 

@@ -60,6 +60,25 @@ def _parse_gcs_bucket(uri: str) -> str | None:
     return remainder or None
 
 
+def _write_sidecar(media_url: str, metadata: dict[str, Any]) -> str | None:
+    """Write <stem>.json next to a file:// media URL and return its file:// URL.
+
+    For remote media (gs://), no sidecar is written locally. Returns None in
+    that case so callers can still include the manifest inline in the
+    response.
+    """
+    if not media_url.startswith("file://"):
+        return None
+    media_path = Path(media_url[7:])
+    sidecar = media_path.with_suffix(".json")
+    try:
+        sidecar.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+    except OSError as e:
+        logger.warning("Failed to write sidecar %s: %s", sidecar, e)
+        return None
+    return f"file://{sidecar}"
+
+
 def _compute_allowed_gcs_buckets() -> frozenset[str]:
     """Build the allowlist from GCS_ALLOWED_BUCKETS and VIDEO_GCS_BUCKET."""
     raw = os.environ.get("GCS_ALLOWED_BUCKETS", "")
@@ -443,6 +462,23 @@ async def generate_image(
         if "thought_signature_url" in result:
             response_data["thought_signature_url"] = result["thought_signature_url"]
 
+        # Write sidecar manifest so downstream tools (e.g. vfx-mcp) can read
+        # generation parameters without parsing response JSON.
+        manifest: dict[str, Any] = {
+            "kind": "image",
+            "prompt": prompt,
+            "model": model,
+            "image_url": result["image_url"],
+            "image_size": image_size,
+            "media_resolution": media_resolution,
+            "reference_image_uris": reference_image_uris,
+            "source_image_uri": image_uri,
+            "thought_signature_url": result.get("thought_signature_url"),
+        }
+        sidecar_url = _write_sidecar(result["image_url"], manifest)
+        if sidecar_url:
+            response_data["sidecar_url"] = sidecar_url
+
         # Return image preview and structured JSON response
         preview_b64 = result["image_preview"].split(",")[1]
         preview_bytes = base64.b64decode(preview_b64)
@@ -584,9 +620,149 @@ async def generate_video(
             output_gcs_uri=gcs_uri,
         )
         await ctx.info("Video generated successfully")
+
+        # Write sidecar manifest alongside local video output.
+        manifest: dict[str, Any] = {
+            "kind": "video",
+            "prompt": prompt,
+            "audio_prompt": audio_prompt,
+            "negative_prompt": negative_prompt,
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "audio_enabled": result.get("audio_enabled", include_audio),
+            "generation_mode": result.get("generation_mode"),
+            "seed": seed,
+            "video_url": result.get("video_url"),
+            "source_image_uri": image_uri,
+            "last_frame_uri": last_frame_uri,
+            "reference_image_uris": reference_image_uris,
+            "extend_video_uri": extend_video_uri,
+        }
+        sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
+        if sidecar_url:
+            result["sidecar_url"] = sidecar_url
+
         return json.dumps(result, indent=2)
     except Exception as e:
         await ctx.error(f"Video generation failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def generate_transition(
+    ctx: Context[ServerSession, AppContext],
+    first_frame_uri: str,
+    last_frame_uri: str,
+    prompt: str = "smooth cinematic transition between the two frames",
+    model: VideoModel = "veo-3.1-fast-generate-001",
+    duration_seconds: float = 4.0,
+    aspect_ratio: str = "16:9",
+    include_audio: bool = False,
+    audio_prompt: str | None = None,
+    negative_prompt: str | None = None,
+    seed: int | None = None,
+    output_gcs_uri: str | None = None,
+) -> str:
+    """Generate a transition video between two still frames using VEO 3.1.
+
+    Intended for agent workflows that combine this MCP with a cutting MCP
+    (e.g. vfx-mcp). The cutting MCP extracts the last frame of clip A and the
+    first frame of clip B; this tool generates the in-between video using
+    VEO 3.1's first+last frame mode.
+
+    Args:
+        first_frame_uri: URI of the starting still (gs://, https://, file://)
+        last_frame_uri: URI of the ending still (gs://, https://, file://)
+        prompt: Description of the transition motion and style
+        model: VEO model (defaults to fast; lite is supported too)
+        duration_seconds: Transition length (4/6/8s; snapped to nearest)
+        aspect_ratio: 16:9 or 9:16 (must match clip aspect for clean cuts)
+        include_audio: Generate transitional audio
+        audio_prompt: Audio description
+        negative_prompt: Things to avoid in the transition
+        seed: Random seed for reproducibility
+        output_gcs_uri: GCS output URI for large videos
+
+    Returns:
+        JSON with video_url, sidecar_url, and generation metadata.
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        data_dir = app_ctx.data_folder
+
+        first_bytes = await fetch(
+            first_frame_uri,
+            allowed_dir=data_dir,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+        last_bytes = await fetch(
+            last_frame_uri,
+            allowed_dir=data_dir,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+        if first_bytes is None or last_bytes is None:
+            raise ValueError(
+                "Could not fetch one or both transition frames. "
+                f"first_frame_uri={first_frame_uri}, last_frame_uri={last_frame_uri}"
+            )
+
+        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
+        if gcs_uri:
+            bucket = _parse_gcs_bucket(gcs_uri)
+            if bucket is None:
+                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
+            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
+                raise ValueError(
+                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
+                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
+                )
+
+        await ctx.info(f"Generating transition with model={model}")
+        result = await generate_video_impl(
+            client=app_ctx.client,
+            prompt=prompt,
+            videos_dir=app_ctx.videos_dir,
+            model=model,
+            image_bytes=first_bytes,
+            last_frame_bytes=last_bytes,
+            allowed_dir=data_dir,
+            aspect_ratio=aspect_ratio,
+            duration_seconds=duration_seconds,
+            include_audio=include_audio,
+            audio_prompt=audio_prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            log_callback=ctx.info,
+            output_gcs_uri=gcs_uri,
+        )
+        await ctx.info("Transition generated successfully")
+
+        manifest: dict[str, Any] = {
+            "kind": "transition",
+            "prompt": prompt,
+            "audio_prompt": audio_prompt,
+            "negative_prompt": negative_prompt,
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "audio_enabled": result.get("audio_enabled", include_audio),
+            "generation_mode": result.get("generation_mode"),
+            "seed": seed,
+            "video_url": result.get("video_url"),
+            "first_frame_uri": first_frame_uri,
+            "last_frame_uri": last_frame_uri,
+        }
+        sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
+        if sidecar_url:
+            result["sidecar_url"] = sidecar_url
+        result["first_frame_uri"] = first_frame_uri
+        result["last_frame_uri"] = last_frame_uri
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        await ctx.error(f"Transition generation failed: {e}")
         logger.exception("Tool error")
         return json.dumps({"error": str(e)})
 
