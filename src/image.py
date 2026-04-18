@@ -12,6 +12,9 @@ from google.auth import exceptions as google_auth_exceptions
 from google.genai import types
 from PIL import Image
 
+# Cap decoded pixel count to prevent decompression-bomb DoS.
+Image.MAX_IMAGE_PIXELS = 50_000_000
+
 ImageModel = Literal[
     "gemini-2.5-flash-image",
     "gemini-3-pro-image-preview",

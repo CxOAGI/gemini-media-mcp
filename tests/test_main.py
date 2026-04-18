@@ -77,12 +77,28 @@ class FakeFastMCP:
     pass
 
 
+class FakeContentStream:
+    """Test double for aiohttp response content with iter_chunked."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def _iter(self, n: int) -> Any:
+        if self._data:
+            yield self._data
+
+    def iter_chunked(self, n: int) -> Any:
+        return self._iter(n)
+
+
 class FakeResponse:
     """Test double for aiohttp response."""
 
     def __init__(self, status: int, data: bytes) -> None:
         self.status = status
         self._data = data
+        self.content_length = len(data) if data else 0
+        self.content = FakeContentStream(data)
 
     async def read(self) -> bytes:
         return self._data
@@ -437,6 +453,10 @@ async def test_fetch(
             "aiohttp.ClientSession",
             lambda *args, **kwargs: FakeClientSession(responses),
         )
+        # Bypass SSRF host-resolution check (no DNS in unit tests)
+        monkeypatch.setattr(
+            "src.__main__._assert_http_host_public", lambda url: None
+        )
     result = await fetch(uri, allowed_dir=tmp_path)
     assert result == expected
 
@@ -484,6 +504,115 @@ async def test_fetch_allows_file_inside_allowed_dir(tmp_path: Path) -> None:
     target.write_bytes(b"ok")
     result = await fetch(f"file://{target}", allowed_dir=data_dir)
     assert result == b"ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_rejects_private_ip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fetch() must reject http URLs resolving to private / loopback IPs."""
+    import socket as _socket
+
+    # Simulate hostname resolving to a loopback address.
+    def fake_getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+        return [(0, 0, 0, "", ("127.0.0.1", 0))]
+
+    monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
+    result = await fetch("http://evil.example.com/x", allowed_dir=tmp_path)
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_rejects_metadata_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fetch() must block cloud-metadata link-local IPs."""
+    import socket as _socket
+
+    def fake_getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+        return [(0, 0, 0, "", ("169.254.169.254", 0))]
+
+    monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
+    result = await fetch(
+        "http://metadata.google.internal/", allowed_dir=tmp_path
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_enforces_size_cap_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fetch() must cap HTTP response size."""
+    big = b"x" * 1024
+    responses = {"https://example.com/big": (200, big)}
+    monkeypatch.setattr(
+        "aiohttp.ClientSession",
+        lambda *a, **kw: FakeClientSession(responses),
+    )
+    monkeypatch.setattr("src.__main__._assert_http_host_public", lambda url: None)
+    # Cap smaller than payload
+    result = await fetch(
+        "https://example.com/big", allowed_dir=tmp_path, max_bytes=100
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_enforces_size_cap_local(tmp_path: Path) -> None:
+    """fetch() must cap local file size."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = data_dir / "big.bin"
+    target.write_bytes(b"x" * 1024)
+    result = await fetch(
+        f"file://{target}", allowed_dir=data_dir, max_bytes=100
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_gcs_allowlist_rejects_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fetch() must reject gs:// buckets outside the allowlist."""
+    from src.__main__ import fetch as fetch_fn
+
+    # Storage client should never be touched.
+    def fail_client() -> Any:
+        raise AssertionError("storage.Client should not be constructed")
+
+    monkeypatch.setattr("src.__main__.storage.Client", fail_client)
+    result = await fetch_fn(
+        "gs://forbidden/path.mp4",
+        allowed_dir=tmp_path,
+        allowed_gcs_buckets=frozenset({"mybucket"}),
+    )
+    assert result is None
+
+
+def test_compute_allowed_gcs_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allowlist combines GCS_ALLOWED_BUCKETS and VIDEO_GCS_BUCKET."""
+    from src.__main__ import _compute_allowed_gcs_buckets
+
+    monkeypatch.setenv("GCS_ALLOWED_BUCKETS", "a, b ,c")
+    monkeypatch.setenv("VIDEO_GCS_BUCKET", "gs://d/sub/")
+    result = _compute_allowed_gcs_buckets()
+    assert result == frozenset({"a", "b", "c", "d"})
+
+
+def test_compute_allowed_gcs_buckets_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty env yields empty allowlist."""
+    from src.__main__ import _compute_allowed_gcs_buckets
+
+    monkeypatch.delenv("GCS_ALLOWED_BUCKETS", raising=False)
+    monkeypatch.delenv("VIDEO_GCS_BUCKET", raising=False)
+    assert _compute_allowed_gcs_buckets() == frozenset()
 
 
 @pytest.mark.asyncio
@@ -808,6 +937,7 @@ async def test_generate_image(
     mock_ctx.error = AsyncMock()
 
     mock_app_ctx = AppContext(
+        data_folder=tmp_path,
         images_dir=images_dir,
         videos_dir=tmp_path / "videos",
         client=MagicMock(),
@@ -956,6 +1086,7 @@ async def test_generate_video(
     mock_ctx.error = AsyncMock()
 
     mock_app_ctx = AppContext(
+        data_folder=tmp_path,
         images_dir=tmp_path / "images",
         videos_dir=videos_dir,
         client=MagicMock(),

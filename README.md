@@ -30,6 +30,18 @@ export GEMINI_API_KEY=your-api-key
 
 **→ See [Gemini API Setup](#gemini-api-setup-image-generation-only) for detailed instructions**
 
+Optional security hardening:
+
+```bash
+# Restrict gs:// fetches and output_gcs_uri to specific buckets.
+# If unset and VIDEO_GCS_BUCKET is not set, gs:// fetches log a warning.
+export GCS_ALLOWED_BUCKETS=bucket-a,bucket-b
+```
+
+Local file:// and bare-path inputs are always restricted to `DATA_FOLDER`.
+HTTP(S) fetches reject hosts that resolve to private, loopback, link-local,
+or metadata IPs, and downloads are capped at 50 MB.
+
 ### Claude Desktop Configuration
 
 Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):

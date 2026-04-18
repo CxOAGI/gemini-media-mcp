@@ -12,6 +12,9 @@ from google import genai
 from google.genai import types
 from PIL import Image
 
+# Cap decoded pixel count to prevent decompression-bomb DoS.
+Image.MAX_IMAGE_PIXELS = 50_000_000
+
 # Type for async log callback from MCP context
 LogCallback = Callable[[str], Awaitable[None]]
 

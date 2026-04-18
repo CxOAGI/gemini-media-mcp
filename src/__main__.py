@@ -2,9 +2,11 @@
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import os
+import socket
 import sys
 import tempfile
 from collections.abc import AsyncIterator
@@ -12,6 +14,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 from google import genai
@@ -19,6 +22,7 @@ from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
 from mcp.types import TextContent
+from PIL import Image as PILImage
 
 from .image import ImageModel, ImageSize, MediaResolution
 from .image import generate_image as generate_image_impl
@@ -27,16 +31,44 @@ from .video import generate_video as generate_video_impl
 
 logger = logging.getLogger(__name__)
 
+# 50 MB cap on any single fetch to prevent memory/disk exhaustion.
+MAX_FETCH_BYTES = 50 * 1024 * 1024
+
+# Cap decoded pixel count to prevent decompression-bomb DoS on input images.
+# 50 megapixels fits up to ~7000x7000; well above any realistic user input.
+PILImage.MAX_IMAGE_PIXELS = 50_000_000
+
 
 @dataclass
 class AppContext:
     """Application context with resources and configuration."""
 
+    data_folder: Path
     images_dir: Path
     videos_dir: Path
     client: genai.Client
     temp_creds_path: Path | None = None
     video_gcs_bucket: str | None = None  # Default GCS bucket for video output
+    allowed_gcs_buckets: frozenset[str] = frozenset()  # Allowlist for gs:// URIs
+
+
+def _parse_gcs_bucket(uri: str) -> str | None:
+    """Return the bucket name from a gs:// URI, or None if invalid."""
+    if not uri.startswith("gs://"):
+        return None
+    remainder = uri[5:].split("/", 1)[0]
+    return remainder or None
+
+
+def _compute_allowed_gcs_buckets() -> frozenset[str]:
+    """Build the allowlist from GCS_ALLOWED_BUCKETS and VIDEO_GCS_BUCKET."""
+    raw = os.environ.get("GCS_ALLOWED_BUCKETS", "")
+    buckets = {b.strip() for b in raw.split(",") if b.strip()}
+    video_bucket = os.environ.get("VIDEO_GCS_BUCKET", "").strip()
+    if video_bucket:
+        parsed = _parse_gcs_bucket(video_bucket) or video_bucket
+        buckets.add(parsed)
+    return frozenset(buckets)
 
 
 def setup_vertex_credentials() -> Path | None:
@@ -57,6 +89,11 @@ def setup_vertex_credentials() -> Path | None:
             path = Path(path_str)
             with open(fd, "w") as f:
                 json.dump(data, f)
+            # mkstemp creates 0600 on POSIX; make it explicit for clarity.
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
             logger.info("Created temp credentials file: %s", path)
             return path
@@ -123,14 +160,17 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     temp_creds_path = setup_vertex_credentials()
     client = create_client()
     video_gcs_bucket = os.environ.get("VIDEO_GCS_BUCKET")
+    allowed_gcs_buckets = _compute_allowed_gcs_buckets()
 
     try:
         yield AppContext(
+            data_folder=data_folder,
             images_dir=images_dir,
             videos_dir=videos_dir,
             client=client,
             temp_creds_path=temp_creds_path,
             video_gcs_bucket=video_gcs_bucket,
+            allowed_gcs_buckets=allowed_gcs_buckets,
         )
     finally:
         cleanup_credentials(temp_creds_path)
@@ -154,11 +194,86 @@ def _validate_local_path(path: Path, allowed_dir: Path) -> Path:
     return resolved
 
 
-async def fetch(uri: str, allowed_dir: Path | None = None) -> bytes | None:
+def _assert_http_host_public(url: str) -> None:
+    """Reject http(s) URLs whose host resolves to a private or loopback IP.
+
+    Mitigates SSRF against cloud metadata (169.254.169.254), localhost, or
+    internal networks. Does not protect against DNS rebinding between this
+    check and the actual request — acceptable for single-shot fetches.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"URL missing host: {url}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve host '{host}': {e}") from e
+    for info in infos:
+        addr = info[4][0]
+        ip = ipaddress.ip_address(addr)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"Refusing to fetch non-public address: {host} -> {addr}"
+            )
+
+
+def _assert_gcs_bucket_allowed(bucket: str, allowed: frozenset[str]) -> None:
+    """Reject gs:// buckets not in the allowlist, when one is configured.
+
+    If no allowlist is configured (empty set), defers to ambient credentials
+    and logs a warning. This preserves backward compatibility but is noisy
+    so operators notice.
+    """
+    if not allowed:
+        logger.warning(
+            "gs:// fetch with no allowlist configured; set GCS_ALLOWED_BUCKETS "
+            "or VIDEO_GCS_BUCKET to restrict access. Bucket: %s",
+            bucket,
+        )
+        return
+    if bucket not in allowed:
+        raise ValueError(
+            f"GCS bucket '{bucket}' is not in the allowlist. "
+            f"Configured buckets: {sorted(allowed)}"
+        )
+
+
+async def _read_capped_http(resp: aiohttp.ClientResponse, limit: int) -> bytes:
+    """Read an HTTP response body with a hard size cap."""
+    if resp.content_length is not None and resp.content_length > limit:
+        raise ValueError(
+            f"Response Content-Length {resp.content_length} exceeds cap {limit}"
+        )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(f"Response body exceeded size cap of {limit} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def fetch(
+    uri: str,
+    allowed_dir: Path | None = None,
+    allowed_gcs_buckets: frozenset[str] = frozenset(),
+    max_bytes: int = MAX_FETCH_BYTES,
+) -> bytes | None:
     """Fetch bytes from URI (gs://, http://, https://, file://).
 
-    Local file access (file:// and bare paths) is restricted to allowed_dir
-    to prevent arbitrary file reads.
+    - Local file access (file:// and bare paths) is restricted to allowed_dir.
+    - http(s):// hosts must resolve to public IPs (SSRF guard).
+    - gs:// buckets must be in allowed_gcs_buckets when configured.
+    - All responses are capped at max_bytes.
     """
     try:
         if uri.startswith("gs://"):
@@ -166,16 +281,27 @@ async def fetch(uri: str, allowed_dir: Path | None = None) -> bytes | None:
             if len(parts) != 2:
                 raise ValueError(f"Invalid GCS URI: {uri}")
             bucket_name, object_path = parts
+            _assert_gcs_bucket_allowed(bucket_name, allowed_gcs_buckets)
             client = storage.Client()
             blob = client.bucket(bucket_name).blob(object_path)
-            return await asyncio.to_thread(blob.download_as_bytes)
+
+            def _download_capped() -> bytes:
+                blob.reload()
+                if blob.size is not None and blob.size > max_bytes:
+                    raise ValueError(
+                        f"GCS object size {blob.size} exceeds cap {max_bytes}"
+                    )
+                return blob.download_as_bytes(start=0, end=max_bytes)
+
+            return await asyncio.to_thread(_download_capped)
 
         if uri.startswith(("http://", "https://")):
+            _assert_http_host_public(uri)
             timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(uri) as resp:
                     if resp.status == 200:
-                        return await resp.read()
+                        return await _read_capped_http(resp, max_bytes)
                     raise ValueError(f"HTTP {resp.status}")
 
         # Local file access — require allowed_dir
@@ -186,11 +312,15 @@ async def fetch(uri: str, allowed_dir: Path | None = None) -> bytes | None:
 
         if uri.startswith("file://"):
             path = _validate_local_path(Path(uri[7:]), allowed_dir)
+            if path.stat().st_size > max_bytes:
+                raise ValueError(f"File exceeds size cap {max_bytes}: {path}")
             return path.read_bytes()
 
         path = Path(uri)
         if path.exists():
             validated = _validate_local_path(path, allowed_dir)
+            if validated.stat().st_size > max_bytes:
+                raise ValueError(f"File exceeds size cap {max_bytes}: {validated}")
             return validated.read_bytes()
 
         raise ValueError(f"Unsupported URI: {uri}")
@@ -256,11 +386,15 @@ async def generate_image(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
-        data_dir = app_ctx.images_dir.parent  # DATA_FOLDER
+        data_dir = app_ctx.data_folder
 
         image_bytes = None
         if image_uri:
-            image_bytes = await fetch(image_uri, allowed_dir=data_dir)
+            image_bytes = await fetch(
+                image_uri,
+                allowed_dir=data_dir,
+                allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+            )
         elif image_base64:
             image_bytes = base64.b64decode(image_base64)
 
@@ -268,7 +402,11 @@ async def generate_image(
         reference_images: list[bytes] = []
         if reference_image_uris:
             for ref_uri in reference_image_uris[:14]:  # Max 14 for Gemini 3.x
-                ref_bytes = await fetch(ref_uri, allowed_dir=data_dir)
+                ref_bytes = await fetch(
+                    ref_uri,
+                    allowed_dir=data_dir,
+                    allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                )
                 if ref_bytes:
                     reference_images.append(ref_bytes)
 
@@ -377,19 +515,27 @@ async def generate_video(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
-        data_dir = app_ctx.videos_dir.parent  # DATA_FOLDER
+        data_dir = app_ctx.data_folder
 
         # Fetch first frame image
         image_bytes = None
         if image_uri:
-            image_bytes = await fetch(image_uri, allowed_dir=data_dir)
+            image_bytes = await fetch(
+                image_uri,
+                allowed_dir=data_dir,
+                allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+            )
         elif image_base64:
             image_bytes = base64.b64decode(image_base64)
 
         # Fetch last frame image (VEO 3.1 first+last frame mode)
         last_frame_bytes = None
         if last_frame_uri:
-            last_frame_bytes = await fetch(last_frame_uri, allowed_dir=data_dir)
+            last_frame_bytes = await fetch(
+                last_frame_uri,
+                allowed_dir=data_dir,
+                allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+            )
         elif last_frame_base64:
             last_frame_bytes = base64.b64decode(last_frame_base64)
 
@@ -397,12 +543,25 @@ async def generate_video(
         reference_images: list[bytes] = []
         if reference_image_uris:
             for ref_uri in reference_image_uris[:3]:  # Max 3 for VEO 3.1
-                ref_bytes = await fetch(ref_uri, allowed_dir=data_dir)
+                ref_bytes = await fetch(
+                    ref_uri,
+                    allowed_dir=data_dir,
+                    allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                )
                 if ref_bytes:
                     reference_images.append(ref_bytes)
 
-        # Use default GCS bucket from env if not provided
+        # Use default GCS bucket from env if not provided; validate against allowlist.
         gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
+        if gcs_uri:
+            bucket = _parse_gcs_bucket(gcs_uri)
+            if bucket is None:
+                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
+            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
+                raise ValueError(
+                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
+                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
+                )
 
         await ctx.info(f"Generating video with model={model}")
         result = await generate_video_impl(
