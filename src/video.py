@@ -146,9 +146,10 @@ async def generate_video(
         config_kwargs["duration_seconds"] = min(
             allowed, key=lambda x: abs(x - duration_seconds)
         )
-    config_kwargs["enhance_prompt"] = True
-    # generate_audio only supported in Vertex AI, not Gemini API
-    if include_audio and getattr(client._api_client, 'vertexai', False):
+    # generate_audio is only supported on Vertex AI. Veo 3.1 already applies prompt
+    # rewriting automatically, so `enhance_prompt` is Veo-2-only and must not be sent.
+    is_vertexai = getattr(client._api_client, 'vertexai', False)
+    if include_audio and is_vertexai:
         config_kwargs["generate_audio"] = include_audio
 
     # Add last frame to config for first+last frame mode
