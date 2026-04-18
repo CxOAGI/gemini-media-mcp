@@ -434,10 +434,73 @@ async def test_fetch(
             return FakeClientSession(responses)
 
         monkeypatch.setattr(
-            "aiohttp.ClientSession", lambda: FakeClientSession(responses)
+            "aiohttp.ClientSession",
+            lambda *args, **kwargs: FakeClientSession(responses),
         )
-    result = await fetch(uri)
+    result = await fetch(uri, allowed_dir=tmp_path)
     assert result == expected
+
+
+# ============================================================================
+# Security: path traversal / LFI prevention
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_rejects_path_traversal(tmp_path: Path) -> None:
+    """fetch() must reject paths outside allowed_dir."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_bytes(b"secret")
+
+    # Absolute path outside allowed_dir
+    result = await fetch(f"file://{outside}", allowed_dir=data_dir)
+    assert result is None
+
+    # Traversal via ../ inside file://
+    result = await fetch(f"file://{data_dir}/../secret.txt", allowed_dir=data_dir)
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_rejects_local_without_allowed_dir(tmp_path: Path) -> None:
+    """fetch() must reject local file access when allowed_dir is not provided."""
+    target = tmp_path / "f.txt"
+    target.write_bytes(b"data")
+    result = await fetch(f"file://{target}")
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_allows_file_inside_allowed_dir(tmp_path: Path) -> None:
+    """fetch() must allow files inside allowed_dir."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = data_dir / "f.txt"
+    target.write_bytes(b"ok")
+    result = await fetch(f"file://{target}", allowed_dir=data_dir)
+    assert result == b"ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_rejects_symlink_escape(tmp_path: Path) -> None:
+    """fetch() must reject symlinks that escape allowed_dir."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"secret")
+    link = data_dir / "link.txt"
+    try:
+        link.symlink_to(secret)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported")
+    result = await fetch(f"file://{link}", allowed_dir=data_dir)
+    assert result is None
 
 
 # ============================================================================

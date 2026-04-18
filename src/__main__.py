@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 from google import genai
@@ -135,8 +136,30 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         cleanup_credentials(temp_creds_path)
 
 
-async def fetch(uri: str) -> bytes | None:
-    """Fetch bytes from URI (gs://, http://, https://, file://)."""
+def _validate_local_path(path: Path, allowed_dir: Path) -> Path:
+    """Validate that a local file path is within the allowed directory.
+
+    Prevents arbitrary file read (LFI) by resolving symlinks and ensuring
+    the path is inside the data folder.
+    """
+    resolved = path.resolve()
+    allowed = allowed_dir.resolve()
+    if not str(resolved).startswith(str(allowed) + os.sep) and resolved != allowed:
+        raise ValueError(
+            f"Access denied: '{path}' is outside the allowed directory '{allowed_dir}'. "
+            f"Only files within DATA_FOLDER are accessible."
+        )
+    if not resolved.is_file():
+        raise ValueError(f"File not found: {path}")
+    return resolved
+
+
+async def fetch(uri: str, allowed_dir: Path | None = None) -> bytes | None:
+    """Fetch bytes from URI (gs://, http://, https://, file://).
+
+    Local file access (file:// and bare paths) is restricted to allowed_dir
+    to prevent arbitrary file reads.
+    """
     try:
         if uri.startswith("gs://"):
             parts = uri[5:].split("/", 1)
@@ -148,21 +171,27 @@ async def fetch(uri: str) -> bytes | None:
             return await asyncio.to_thread(blob.download_as_bytes)
 
         if uri.startswith(("http://", "https://")):
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(uri) as resp:
                     if resp.status == 200:
                         return await resp.read()
                     raise ValueError(f"HTTP {resp.status}")
 
+        # Local file access — require allowed_dir
+        if allowed_dir is None:
+            raise ValueError(
+                f"Local file access is not allowed without a configured DATA_FOLDER: {uri}"
+            )
+
         if uri.startswith("file://"):
-            path = Path(uri[7:])
-            if path.is_file():
-                return path.read_bytes()
-            raise ValueError(f"File not found: {path}")
+            path = _validate_local_path(Path(uri[7:]), allowed_dir)
+            return path.read_bytes()
 
         path = Path(uri)
-        if path.is_file():
-            return path.read_bytes()
+        if path.exists():
+            validated = _validate_local_path(path, allowed_dir)
+            return validated.read_bytes()
 
         raise ValueError(f"Unsupported URI: {uri}")
     except Exception as e:
@@ -227,10 +256,11 @@ async def generate_image(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        data_dir = app_ctx.images_dir.parent  # DATA_FOLDER
 
         image_bytes = None
         if image_uri:
-            image_bytes = await fetch(image_uri)
+            image_bytes = await fetch(image_uri, allowed_dir=data_dir)
         elif image_base64:
             image_bytes = base64.b64decode(image_base64)
 
@@ -238,7 +268,7 @@ async def generate_image(
         reference_images: list[bytes] = []
         if reference_image_uris:
             for ref_uri in reference_image_uris[:14]:  # Max 14 for Gemini 3.x
-                ref_bytes = await fetch(ref_uri)
+                ref_bytes = await fetch(ref_uri, allowed_dir=data_dir)
                 if ref_bytes:
                     reference_images.append(ref_bytes)
 
@@ -246,8 +276,8 @@ async def generate_image(
         thought_signature = None
         if thought_signature_url and thought_signature_url.startswith("file://"):
             sig_path = Path(thought_signature_url[7:])
-            if sig_path.exists():
-                thought_signature = sig_path.read_text()
+            validated_sig = _validate_local_path(sig_path, data_dir)
+            thought_signature = validated_sig.read_text()
 
         await ctx.info(f"Generating image with model={model}")
         result = await generate_image_impl(
@@ -318,6 +348,8 @@ async def generate_video(
         model: Model to use - options include:
                - "veo-3.1-generate-001": VEO 3.1 (highest quality, 4/6/8s, audio)
                - "veo-3.1-fast-generate-001": VEO 3.1 Fast (faster, 4/6/8s, audio)
+               - "veo-3.1-lite-generate-preview": VEO 3.1 Lite (most cost-effective,
+                 4/6/8s, audio; does NOT support video extension or 4K)
         aspect_ratio: 16:9 (default) or 9:16
         duration_seconds: Video duration (4/6/8s)
         include_audio: Enable audio generation
@@ -345,18 +377,19 @@ async def generate_video(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        data_dir = app_ctx.videos_dir.parent  # DATA_FOLDER
 
         # Fetch first frame image
         image_bytes = None
         if image_uri:
-            image_bytes = await fetch(image_uri)
+            image_bytes = await fetch(image_uri, allowed_dir=data_dir)
         elif image_base64:
             image_bytes = base64.b64decode(image_base64)
 
         # Fetch last frame image (VEO 3.1 first+last frame mode)
         last_frame_bytes = None
         if last_frame_uri:
-            last_frame_bytes = await fetch(last_frame_uri)
+            last_frame_bytes = await fetch(last_frame_uri, allowed_dir=data_dir)
         elif last_frame_base64:
             last_frame_bytes = base64.b64decode(last_frame_base64)
 
@@ -364,7 +397,7 @@ async def generate_video(
         reference_images: list[bytes] = []
         if reference_image_uris:
             for ref_uri in reference_image_uris[:3]:  # Max 3 for VEO 3.1
-                ref_bytes = await fetch(ref_uri)
+                ref_bytes = await fetch(ref_uri, allowed_dir=data_dir)
                 if ref_bytes:
                     reference_images.append(ref_bytes)
 
@@ -378,6 +411,7 @@ async def generate_video(
             videos_dir=app_ctx.videos_dir,
             model=model,
             image_bytes=image_bytes,
+            allowed_dir=data_dir,
             aspect_ratio=aspect_ratio,
             duration_seconds=duration_seconds,
             include_audio=include_audio,
