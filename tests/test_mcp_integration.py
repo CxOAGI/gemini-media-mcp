@@ -241,6 +241,44 @@ class TestMCPIntegration:
             print(f"✓ VEO 3.1 fast: {text[:300]}")
             assert "video_url" in text.lower() or "error" in text.lower()
 
+    @requires_api
+    async def test_veo31_lite(self, temp_data_folder):
+        """Test VEO 3.1 Lite preview model."""
+        async with _mcp_session(temp_data_folder) as session:
+            result = await session.call_tool(
+                "generate_video",
+                {
+                    "prompt": "A paper airplane gliding through the sky",
+                    "model": "veo-3.1-lite-generate-preview",
+                    "duration_seconds": 4,
+                },
+            )
+            text = next(
+                (c.text for c in result.content if hasattr(c, "text")), ""
+            )
+            print(f"✓ VEO 3.1 Lite: {text[:300]}")
+            assert "video_url" in text.lower() or "error" in text.lower()
+
+    @requires_api
+    async def test_veo31_lite_rejects_extend(self, temp_data_folder):
+        """VEO 3.1 Lite must reject video-extension requests (doesn't
+        support extension per model card)."""
+        async with _mcp_session(temp_data_folder) as session:
+            result = await session.call_tool(
+                "generate_video",
+                {
+                    "prompt": "continue this clip",
+                    "model": "veo-3.1-lite-generate-preview",
+                    "extend_video_uri": "gs://example/clip.mp4",
+                },
+            )
+            text = next(
+                (c.text for c in result.content if hasattr(c, "text")), ""
+            )
+            print(f"✓ VEO 3.1 Lite rejects extend: {text[:200]}")
+            assert "error" in text.lower()
+            assert "extension" in text.lower() or "does not support" in text.lower()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

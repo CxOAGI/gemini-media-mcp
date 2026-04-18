@@ -523,7 +523,10 @@ async def generate_video(
                - "veo-3.1-generate-001": VEO 3.1 (highest quality, 4/6/8s, audio)
                - "veo-3.1-fast-generate-001": VEO 3.1 Fast (faster, 4/6/8s, audio)
                - "veo-3.1-lite-generate-preview": VEO 3.1 Lite (most cost-effective,
-                 4/6/8s, audio; does NOT support video extension or 4K)
+                 4/6/8s, audio; does NOT support video extension or 4K).
+                 Availability note: as of launch, Lite is served via the Gemini
+                 API / AI Studio; Vertex AI projects may return 404 until the
+                 model is published there.
         aspect_ratio: 16:9 (default) or 9:16
         duration_seconds: Video duration (4/6/8s)
         include_audio: Enable audio generation

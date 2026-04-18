@@ -125,7 +125,7 @@ Generate videos using VEO models (requires Vertex AI).
 - `model`: Model to use:
   - `veo-3.1-generate-001` (default): Highest quality, 4/6/8s duration, audio support
   - `veo-3.1-fast-generate-001`: Faster generation with audio support
-  - `veo-3.1-lite-generate-preview`: Most cost-effective, 4/6/8s, audio; no video extension or 4K
+  - `veo-3.1-lite-generate-preview`: Most cost-effective, 4/6/8s, audio; no video extension or 4K. Currently served via the Gemini API; Vertex AI projects may return 404 until Google publishes the model on Vertex.
 - `aspect_ratio`: `16:9` (default) or `9:16`
 - `duration_seconds`: Video duration (4/6/8s)
 - `include_audio`: Enable audio generation
