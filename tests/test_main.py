@@ -1265,6 +1265,123 @@ async def test_generate_transition_missing_frame(
 
 
 # ============================================================================
+# End-to-end: image -> transition (vfx-mcp workflow)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_e2e_image_to_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chain: generate two images, read their sidecars, feed URLs into
+    generate_transition, verify the transition's sidecar references both.
+
+    This is the agent-style workflow a vfx-mcp would orchestrate.
+    """
+    from src.__main__ import generate_image, generate_transition
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    app_ctx = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    def _make_ctx() -> MagicMock:
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+        ctx.error = AsyncMock()
+        ctx.request_context.lifespan_context = app_ctx
+        return ctx
+
+    # Mock image impl: write a file and return its url + preview.
+    image_bytes = _create_test_image()
+    call_index = {"n": 0}
+
+    async def mock_image_impl(**kwargs: Any) -> dict[str, Any]:
+        call_index["n"] += 1
+        fname = images_dir / f"img{call_index['n']}.png"
+        fname.write_bytes(image_bytes)
+        thumb_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{fname}",
+            "image_preview": f"data:image/jpeg;base64,{thumb_b64}",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_image_impl)
+
+    # Generate two frames.
+    r_a = await generate_image(
+        ctx=_make_ctx(),
+        prompt="opening frame: sunrise",
+        model="gemini-2.5-flash-image",
+    )
+    r_b = await generate_image(
+        ctx=_make_ctx(),
+        prompt="closing frame: sunset",
+        model="gemini-2.5-flash-image",
+    )
+
+    # Each result is [Image, TextContent]; parse JSON from the text part.
+    text_a = r_a[1].text
+    text_b = r_b[1].text
+    data_a = json.loads(text_a)
+    data_b = json.loads(text_b)
+    assert "sidecar_url" in data_a
+    assert "sidecar_url" in data_b
+
+    # Sidecar files exist and carry the original prompt.
+    sidecar_a = Path(data_a["sidecar_url"][7:])
+    manifest_a = json.loads(sidecar_a.read_text())
+    assert manifest_a["kind"] == "image"
+    assert manifest_a["prompt"] == "opening frame: sunrise"
+
+    # Mock video impl for the transition step.
+    async def mock_video_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "transition.mp4"
+        out.write_bytes(b"mp4-bytes")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+            "audio_enabled": False,
+            "generation_mode": "first_last_frame",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_video_impl)
+
+    # Feed both image urls into generate_transition.
+    result_json = await generate_transition(
+        ctx=_make_ctx(),
+        first_frame_uri=data_a["image_url"],
+        last_frame_uri=data_b["image_url"],
+        prompt="dissolve from sunrise to sunset",
+    )
+    result = json.loads(result_json)
+
+    assert result["generation_mode"] == "first_last_frame"
+    assert result["first_frame_uri"] == data_a["image_url"]
+    assert result["last_frame_uri"] == data_b["image_url"]
+
+    # Transition sidecar cross-references the two source frames.
+    sidecar_t = Path(result["sidecar_url"][7:])
+    manifest_t = json.loads(sidecar_t.read_text())
+    assert manifest_t["kind"] == "transition"
+    assert manifest_t["first_frame_uri"] == data_a["image_url"]
+    assert manifest_t["last_frame_uri"] == data_b["image_url"]
+
+
+# ============================================================================
 # main function tests
 # ============================================================================
 
