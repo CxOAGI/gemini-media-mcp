@@ -2,6 +2,29 @@
 
 MCP server for generating images and videos using Google Gemini and VEO models.
 
+## Quick start
+
+```bash
+uvx gemini-media-mcp setup
+```
+
+The `setup` wizard walks you through the whole onboarding flow end-to-end:
+
+1. Pick a credential mode: **Gemini API** (images only, easier) or **Vertex AI** (images + video).
+2. Enter your API key, or your Google Cloud project plus a service account JSON (file path or inline paste).
+3. Choose where generated media should be written (defaults to `~/gemini-media`).
+4. Optionally set a `VIDEO_GCS_BUCKET` for large video output, and auto-populate `GCS_ALLOWED_BUCKETS`.
+5. Validate your credentials by constructing a Google GenAI client.
+6. Print a ready-to-paste Claude Desktop JSON block. On macOS, the wizard can also merge the block directly into `~/Library/Application Support/Claude/claude_desktop_config.json` (existing servers are preserved and the prior file is backed up to `.bak`).
+
+For scripted use, all prompts can be supplied via flags:
+
+```bash
+uvx gemini-media-mcp setup --non-interactive --mode=gemini --api-key=AIzaSy...
+```
+
+If you prefer to configure everything by hand, the manual steps are below.
+
 ## Setup
 
 ### Prerequisites
@@ -29,6 +52,18 @@ export GEMINI_API_KEY=your-api-key
 ```
 
 **→ See [Gemini API Setup](#gemini-api-setup-image-generation-only) for detailed instructions**
+
+Optional security hardening:
+
+```bash
+# Restrict gs:// fetches and output_gcs_uri to specific buckets.
+# If unset and VIDEO_GCS_BUCKET is not set, gs:// fetches log a warning.
+export GCS_ALLOWED_BUCKETS=bucket-a,bucket-b
+```
+
+Local file:// and bare-path inputs are always restricted to `DATA_FOLDER`.
+HTTP(S) fetches reject hosts that resolve to private, loopback, link-local,
+or metadata IPs, and downloads are capped at 50 MB.
 
 ### Claude Desktop Configuration
 
@@ -84,14 +119,17 @@ Generate images using Gemini or Imagen models.
 
 **Parameters:**
 - `prompt` (required): Text description of the image
-- `model`: Model to use:
-  - `gemini-2.5-flash-image` (default): Fast, creative editing
-  - `gemini-3-pro-image-preview`: Highest quality, 4K resolution, multi-reference support
-  - `gemini-3.1-flash-image-preview`: Fast 3.1 model, 4K resolution, multi-reference support
-  - `imagen-3.0-generate-002`: High quality, text-only input
-  - `imagen-4.0-generate-001`: Balanced quality/speed
-  - `imagen-4.0-ultra-generate-001`: Highest quality
-  - `imagen-4.0-fast-generate-001`: Fastest generation
+- `model`: Pick by use case.
+  **GA (stable) — preferred in production:**
+  - `gemini-2.5-flash-image` (Nano Banana) — default; fastest, cheapest, great for conversational editing
+  - `imagen-4.0-fast-generate-001` — cheapest photoreal
+  - `imagen-4.0-generate-001` — balanced photoreal
+  - `imagen-4.0-ultra-generate-001` — highest-fidelity photoreal, precise text rendering
+  - `imagen-3.0-generate-002` — legacy, kept for compatibility
+
+  **Preview — newest capabilities, may change without notice:**
+  - `gemini-3.1-flash-image-preview` (Nano Banana 2) — 4K output, up to 14 reference images, fast
+  - `gemini-3-pro-image-preview` (Nano Banana Pro) — 4K, reasoning, `thought_signature` for multi-turn editing
 - `image_uri`: Input image URI for image-to-image generation
 - `image_base64`: Base64 encoded input image
 
@@ -113,6 +151,7 @@ Generate videos using VEO models (requires Vertex AI).
 - `model`: Model to use:
   - `veo-3.1-generate-001` (default): Highest quality, 4/6/8s duration, audio support
   - `veo-3.1-fast-generate-001`: Faster generation with audio support
+  - `veo-3.1-lite-generate-preview`: Most cost-effective, 4/6/8s, audio; no video extension or 4K. Currently served via the Gemini API; Vertex AI projects may return 404 until Google publishes the model on Vertex.
 - `aspect_ratio`: `16:9` (default) or `9:16`
 - `duration_seconds`: Video duration (4/6/8s)
 - `include_audio`: Enable audio generation

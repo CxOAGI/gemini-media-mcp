@@ -4,12 +4,11 @@ import base64
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
 
-from src.image import ImageModel, generate_image
+from src.image import generate_image
 
 # ============================================================================
 # Test Doubles

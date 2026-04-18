@@ -4,12 +4,11 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 from PIL import Image
 
-from src.video import VideoModel, generate_video
+from src.video import generate_video
 
 # ============================================================================
 # Test Doubles
@@ -1022,3 +1021,81 @@ async def test_generate_video_veo3_fast_with_features(
     assert gen_result["message"] == "Video generated successfully"
     assert gen_result["generation_mode"] == "first_last_frame"
     assert gen_result["audio_enabled"] is True
+
+
+# ============================================================================
+# generate_video tests - VEO 3.1 Lite
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_veo_lite_text_to_video(tmp_path: Path) -> None:
+    """VEO 3.1 Lite supports basic text-to-video."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="A dog running",
+        videos_dir=videos_dir,
+        model="veo-3.1-lite-generate-preview",
+    )
+
+    assert gen_result["model"] == "veo-3.1-lite-generate-preview"
+    assert gen_result["generation_mode"] == "text_to_video"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_veo_lite_rejects_extension(tmp_path: Path) -> None:
+    """VEO 3.1 Lite does not support video extension."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation)
+
+    with pytest.raises(ValueError, match="does not support video extension"):
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="Continue",
+            videos_dir=videos_dir,
+            model="veo-3.1-lite-generate-preview",
+            extend_video_uri="gs://bucket/video.mp4",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> None:
+    """extend_video_uri with file:// must be validated against allowed_dir."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    data_dir = tmp_path  # allowed root
+    outside = tmp_path.parent / "escape.mp4"
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation)
+
+    with pytest.raises(ValueError, match="Access denied"):
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="Extend",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+            extend_video_uri=f"file://{outside}",
+            allowed_dir=data_dir,
+        )
