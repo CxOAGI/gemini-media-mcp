@@ -28,6 +28,7 @@ from .image import ImageModel, ImageSize, MediaResolution
 from .image import generate_image as generate_image_impl
 from .video import VideoModel
 from .video import generate_video as generate_video_impl
+from .video_utils import extract_frame_png
 
 logger = logging.getLogger(__name__)
 
@@ -766,6 +767,337 @@ async def generate_transition(
         return json.dumps(result, indent=2)
     except Exception as e:
         await ctx.error(f"Transition generation failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def generate_bridge(
+    ctx: Context[ServerSession, AppContext],
+    from_clip_uri: str,
+    to_clip_uri: str,
+    prompt: str = "smooth cinematic cut between the two clips",
+    model: VideoModel = "veo-3.1-fast-generate-001",
+    duration_seconds: float = 4.0,
+    aspect_ratio: str = "16:9",
+    include_audio: bool = False,
+    audio_prompt: str | None = None,
+    negative_prompt: str | None = None,
+    seed: int | None = None,
+    output_gcs_uri: str | None = None,
+) -> str:
+    """Generate a short transition video that bridges two existing clips.
+
+    Decodes the last frame of `from_clip_uri` and the first frame of
+    `to_clip_uri`, then calls VEO 3.1 first+last frame mode to produce
+    an in-between clip. Pair with a cutting MCP (e.g. vfx-mcp) to splice
+    the output between the two originals.
+
+    Args:
+        from_clip_uri: URI of the clip whose last frame is the start of
+            the bridge. gs://, https://, or file:// within DATA_FOLDER.
+        to_clip_uri: URI of the clip whose first frame ends the bridge.
+        prompt: Description of the transition motion and style.
+        model: VEO model (fast by default).
+        duration_seconds: Bridge length (4/6/8s, snapped).
+        aspect_ratio: Must match source clips for a clean cut.
+        include_audio: Generate transitional audio.
+        audio_prompt: Audio description.
+        negative_prompt: Things to avoid in the bridge.
+        seed: Random seed for reproducibility.
+        output_gcs_uri: GCS URI for large video output.
+
+    Returns:
+        JSON with video_url, sidecar_url, and the source clip URIs.
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        data_dir = app_ctx.data_folder
+
+        from_bytes = await fetch(
+            from_clip_uri,
+            allowed_dir=data_dir,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+        to_bytes = await fetch(
+            to_clip_uri,
+            allowed_dir=data_dir,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+        if from_bytes is None or to_bytes is None:
+            raise ValueError(
+                "Could not fetch one or both bridge clips. "
+                f"from_clip_uri={from_clip_uri}, to_clip_uri={to_clip_uri}"
+            )
+
+        await ctx.info("Extracting bridge frames")
+        first_frame_png = await asyncio.to_thread(
+            extract_frame_png, from_bytes, "end"
+        )
+        last_frame_png = await asyncio.to_thread(
+            extract_frame_png, to_bytes, "start"
+        )
+
+        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
+        if gcs_uri:
+            bucket = _parse_gcs_bucket(gcs_uri)
+            if bucket is None:
+                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
+            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
+                raise ValueError(
+                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
+                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
+                )
+
+        await ctx.info(f"Generating bridge with model={model}")
+        result = await generate_video_impl(
+            client=app_ctx.client,
+            prompt=prompt,
+            videos_dir=app_ctx.videos_dir,
+            model=model,
+            image_bytes=first_frame_png,
+            last_frame_bytes=last_frame_png,
+            allowed_dir=data_dir,
+            aspect_ratio=aspect_ratio,
+            duration_seconds=duration_seconds,
+            include_audio=include_audio,
+            audio_prompt=audio_prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            log_callback=ctx.info,
+            output_gcs_uri=gcs_uri,
+        )
+        await ctx.info("Bridge generated successfully")
+
+        manifest: dict[str, Any] = {
+            "kind": "bridge",
+            "prompt": prompt,
+            "audio_prompt": audio_prompt,
+            "negative_prompt": negative_prompt,
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "audio_enabled": result.get("audio_enabled", include_audio),
+            "generation_mode": result.get("generation_mode"),
+            "seed": seed,
+            "video_url": result.get("video_url"),
+            "from_clip_uri": from_clip_uri,
+            "to_clip_uri": to_clip_uri,
+        }
+        sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
+        if sidecar_url:
+            result["sidecar_url"] = sidecar_url
+        result["from_clip_uri"] = from_clip_uri
+        result["to_clip_uri"] = to_clip_uri
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        await ctx.error(f"Bridge generation failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def generate_clip(
+    ctx: Context[ServerSession, AppContext],
+    beats: list[dict[str, Any]],
+    aspect_ratio: str = "9:16",
+    model: VideoModel = "veo-3.1-fast-generate-001",
+    include_audio: bool = True,
+    add_bridges: bool = False,
+    output_gcs_uri: str | None = None,
+) -> str:
+    """Generate a multi-beat short clip — the building block for a reel / short.
+
+    Runs each `beat` through `generate_video` sequentially. When
+    `add_bridges=True`, between each pair of beats a transition is
+    generated using the last frame of beat N and the first frame of beat
+    N+1 (same primitive as generate_bridge, just chained).
+
+    The returned manifest is an ordered list of segments (beats and
+    bridges, in playback order) that a downstream cutting MCP can splice
+    into a final clip.
+
+    Args:
+        beats: Ordered list of beat specs. Each item accepts:
+            {prompt: str, duration_seconds?: float, seed?: int,
+             first_frame_uri?: str, negative_prompt?: str,
+             audio_prompt?: str}
+        aspect_ratio: Default 9:16 for vertical social clips.
+        model: VEO model applied to every beat.
+        include_audio: Enable audio on each beat (only effective on Vertex).
+        add_bridges: Generate a bridge clip between consecutive beats.
+        output_gcs_uri: GCS URI for all outputs (optional).
+
+    Returns:
+        JSON clip manifest:
+        {
+          "kind": "clip",
+          "aspect_ratio": "9:16",
+          "segments": [
+            {"kind": "beat", "video_url": ..., "sidecar_url": ..., "prompt": ...},
+            {"kind": "bridge", "video_url": ..., "sidecar_url": ...},
+            ...
+          ],
+          "total_duration_seconds": <sum>
+        }
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        data_dir = app_ctx.data_folder
+
+        if not beats:
+            raise ValueError("beats list must not be empty")
+
+        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
+        if gcs_uri:
+            bucket = _parse_gcs_bucket(gcs_uri)
+            if bucket is None:
+                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
+            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
+                raise ValueError(
+                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
+                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
+                )
+
+        segments: list[dict[str, Any]] = []
+        total_duration = 0.0
+        prev_video_bytes: bytes | None = None
+
+        for idx, beat in enumerate(beats):
+            prompt = beat.get("prompt")
+            if not prompt:
+                raise ValueError(f"beat {idx} missing required 'prompt'")
+            duration = float(beat.get("duration_seconds", 4.0))
+            seed = beat.get("seed")
+
+            # Optional per-beat first frame (image_to_video).
+            first_frame_uri = beat.get("first_frame_uri")
+            image_bytes = None
+            if first_frame_uri:
+                image_bytes = await fetch(
+                    first_frame_uri,
+                    allowed_dir=data_dir,
+                    allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                )
+
+            await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
+            beat_result = await generate_video_impl(
+                client=app_ctx.client,
+                prompt=prompt,
+                videos_dir=app_ctx.videos_dir,
+                model=model,
+                image_bytes=image_bytes,
+                allowed_dir=data_dir,
+                aspect_ratio=aspect_ratio,
+                duration_seconds=duration,
+                include_audio=include_audio,
+                audio_prompt=beat.get("audio_prompt"),
+                negative_prompt=beat.get("negative_prompt"),
+                seed=seed,
+                log_callback=ctx.info,
+                output_gcs_uri=gcs_uri,
+            )
+
+            beat_manifest = {
+                "kind": "beat",
+                "index": idx,
+                "prompt": prompt,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "duration_seconds": beat_result.get("duration_seconds", duration),
+                "seed": seed,
+                "video_url": beat_result.get("video_url"),
+                "generation_mode": beat_result.get("generation_mode"),
+            }
+            sidecar_url = _write_sidecar(
+                beat_result.get("video_url", ""), beat_manifest
+            )
+            if sidecar_url:
+                beat_manifest["sidecar_url"] = sidecar_url
+
+            # If bridging, generate the bridge between the previous beat and
+            # this one now that we have both endpoints. Insert before the
+            # current beat in the segments list.
+            if add_bridges and idx > 0 and prev_video_bytes is not None:
+                # Read this beat's bytes to extract its first frame.
+                beat_url = beat_result.get("video_url", "")
+                cur_bytes: bytes | None = None
+                if beat_url.startswith("file://"):
+                    try:
+                        cur_bytes = Path(beat_url[7:]).read_bytes()
+                    except OSError as e:
+                        logger.warning(
+                            "Skipping bridge before beat %d: %s", idx, e
+                        )
+
+                if cur_bytes is not None:
+                    end_frame = await asyncio.to_thread(
+                        extract_frame_png, prev_video_bytes, "end"
+                    )
+                    start_frame = await asyncio.to_thread(
+                        extract_frame_png, cur_bytes, "start"
+                    )
+                    await ctx.info(f"Generating bridge before beat {idx + 1}")
+                    bridge_result = await generate_video_impl(
+                        client=app_ctx.client,
+                        prompt="smooth cinematic cut between the two beats",
+                        videos_dir=app_ctx.videos_dir,
+                        model=model,
+                        image_bytes=end_frame,
+                        last_frame_bytes=start_frame,
+                        allowed_dir=data_dir,
+                        aspect_ratio=aspect_ratio,
+                        duration_seconds=4.0,
+                        include_audio=False,
+                        log_callback=ctx.info,
+                        output_gcs_uri=gcs_uri,
+                    )
+                    bridge_manifest = {
+                        "kind": "bridge",
+                        "between_beats": [idx - 1, idx],
+                        "model": model,
+                        "aspect_ratio": aspect_ratio,
+                        "duration_seconds": bridge_result.get(
+                            "duration_seconds", 4.0
+                        ),
+                        "video_url": bridge_result.get("video_url"),
+                    }
+                    b_sidecar = _write_sidecar(
+                        bridge_result.get("video_url", ""), bridge_manifest
+                    )
+                    if b_sidecar:
+                        bridge_manifest["sidecar_url"] = b_sidecar
+                    segments.append(bridge_manifest)
+                    total_duration += float(
+                        bridge_manifest["duration_seconds"]
+                    )
+
+            segments.append(beat_manifest)
+            total_duration += float(beat_manifest["duration_seconds"])
+
+            # Cache bytes for the next iteration's bridge extraction.
+            if add_bridges:
+                beat_url = beat_result.get("video_url", "")
+                if beat_url.startswith("file://"):
+                    try:
+                        prev_video_bytes = Path(beat_url[7:]).read_bytes()
+                    except OSError:
+                        prev_video_bytes = None
+                else:
+                    prev_video_bytes = None
+
+        clip_manifest = {
+            "kind": "clip",
+            "aspect_ratio": aspect_ratio,
+            "model": model,
+            "segments": segments,
+            "total_duration_seconds": total_duration,
+            "beat_count": len(beats),
+        }
+        return json.dumps(clip_manifest, indent=2)
+    except Exception as e:
+        await ctx.error(f"Clip generation failed: {e}")
         logger.exception("Tool error")
         return json.dumps({"error": str(e)})
 

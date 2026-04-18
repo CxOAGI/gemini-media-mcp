@@ -1265,6 +1265,296 @@ async def test_generate_transition_missing_frame(
 
 
 # ============================================================================
+# generate_bridge tool tests
+# ============================================================================
+
+
+def _make_fake_mp4() -> bytes:
+    """Encode a minimal MP4 with two solid-color frames."""
+    import imageio.v3 as iio
+    import numpy as np
+
+    frames = np.stack([
+        np.full((64, 64, 3), (200, 30, 30), dtype=np.uint8),
+        np.full((64, 64, 3), (30, 30, 200), dtype=np.uint8),
+    ])
+    buf = BytesIO()
+    iio.imwrite(
+        buf,
+        frames,
+        extension=".mp4",
+        fps=8,
+        codec="libx264",
+        pixelformat="yuv420p",
+    )
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_generate_bridge_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_bridge extracts frames from two clips, produces a video."""
+    from src.__main__ import generate_bridge
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    clip_a = videos_dir / "a.mp4"
+    clip_b = videos_dir / "b.mp4"
+    clip_a.write_bytes(_make_fake_mp4())
+    clip_b.write_bytes(_make_fake_mp4())
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        # Record what the tool passed through so we can assert frames were
+        # extracted and supplied.
+        captured["image_bytes_len"] = len(kwargs.get("image_bytes") or b"")
+        captured["last_frame_bytes_len"] = len(
+            kwargs.get("last_frame_bytes") or b""
+        )
+        out = videos_dir / "bridge.mp4"
+        out.write_bytes(b"bridge-mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs.get("prompt", ""),
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": "first_last_frame",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result_json = await generate_bridge(
+        ctx=mock_ctx,
+        from_clip_uri=f"file://{clip_a}",
+        to_clip_uri=f"file://{clip_b}",
+        prompt="dissolve",
+    )
+    result = json.loads(result_json)
+
+    assert result["generation_mode"] == "first_last_frame"
+    assert result["from_clip_uri"] == f"file://{clip_a}"
+    assert result["to_clip_uri"] == f"file://{clip_b}"
+    assert result["sidecar_url"].endswith("bridge.json")
+
+    # Confirm we actually extracted frames and fed them through.
+    assert captured["image_bytes_len"] > 0
+    assert captured["last_frame_bytes_len"] > 0
+
+    sidecar = Path(result["sidecar_url"][7:])
+    manifest = json.loads(sidecar.read_text())
+    assert manifest["kind"] == "bridge"
+    assert manifest["from_clip_uri"] == f"file://{clip_a}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_bridge_missing_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing source clip yields an error JSON, no impl call."""
+    from src.__main__ import generate_bridge
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl should not be called when a clip is missing")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result_json = await generate_bridge(
+        ctx=mock_ctx,
+        from_clip_uri=f"file://{tmp_path / 'missing_a.mp4'}",
+        to_clip_uri=f"file://{tmp_path / 'missing_b.mp4'}",
+    )
+    assert "error" in json.loads(result_json)
+
+
+# ============================================================================
+# generate_clip tool tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_generate_clip_three_beats_no_bridges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three beats without bridges produce three segments and correct duration."""
+    from src.__main__ import generate_clip
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    call_index = {"n": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        call_index["n"] += 1
+        out = videos_dir / f"beat{call_index['n']}.mp4"
+        out.write_bytes(_make_fake_mp4())
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs.get("prompt", ""),
+            "model": kwargs.get("model", ""),
+            "audio_enabled": kwargs.get("include_audio", False),
+            "generation_mode": "text_to_video",
+            "duration_seconds": kwargs.get("duration_seconds"),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result_json = await generate_clip(
+        ctx=mock_ctx,
+        beats=[
+            {"prompt": "hook", "duration_seconds": 4},
+            {"prompt": "body", "duration_seconds": 6},
+            {"prompt": "outro", "duration_seconds": 4},
+        ],
+        add_bridges=False,
+    )
+    result = json.loads(result_json)
+
+    assert result["kind"] == "clip"
+    assert result["aspect_ratio"] == "9:16"
+    assert result["beat_count"] == 3
+    assert len(result["segments"]) == 3
+    assert all(seg["kind"] == "beat" for seg in result["segments"])
+    assert result["total_duration_seconds"] == 14.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_generate_clip_with_bridges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bridges are inserted between consecutive beats."""
+    from src.__main__ import generate_clip
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    call_index = {"n": 0}
+    fake_mp4 = _make_fake_mp4()
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        call_index["n"] += 1
+        out = videos_dir / f"seg{call_index['n']}.mp4"
+        out.write_bytes(fake_mp4)
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs.get("prompt", ""),
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": (
+                "first_last_frame"
+                if kwargs.get("last_frame_bytes") is not None
+                else "text_to_video"
+            ),
+            "duration_seconds": kwargs.get("duration_seconds"),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result_json = await generate_clip(
+        ctx=mock_ctx,
+        beats=[
+            {"prompt": "hook", "duration_seconds": 4},
+            {"prompt": "body", "duration_seconds": 4},
+        ],
+        add_bridges=True,
+    )
+    result = json.loads(result_json)
+
+    # 2 beats + 1 bridge = 3 segments, ordered [beat, bridge, beat].
+    assert result["beat_count"] == 2
+    assert len(result["segments"]) == 3
+    kinds = [seg["kind"] for seg in result["segments"]]
+    assert kinds == ["beat", "bridge", "beat"]
+    # beat(4) + bridge(4) + beat(4) = 12
+    assert result["total_duration_seconds"] == 12.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_empty_beats(tmp_path: Path) -> None:
+    """Empty beats list returns an error."""
+    from src.__main__ import generate_clip
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    result_json = await generate_clip(ctx=mock_ctx, beats=[])
+    assert "error" in json.loads(result_json)
+
+
+# ============================================================================
 # End-to-end: image -> transition (vfx-mcp workflow)
 # ============================================================================
 

@@ -84,3 +84,4 @@ Thumbs.db
 # Project specific
 src/_version.py
 data/
+.claude/worktrees/

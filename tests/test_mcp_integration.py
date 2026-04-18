@@ -88,6 +88,8 @@ class TestMCPIntegration:
                 "generate_image",
                 "generate_video",
                 "generate_transition",
+                "generate_bridge",
+                "generate_clip",
             }
             assert expected_tools.issubset(
                 tool_names
