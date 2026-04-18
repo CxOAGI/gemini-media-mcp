@@ -146,10 +146,12 @@ async def generate_video(
         config_kwargs["duration_seconds"] = min(
             allowed, key=lambda x: abs(x - duration_seconds)
         )
-    config_kwargs["enhance_prompt"] = True
-    # generate_audio only supported in Vertex AI, not Gemini API
-    if include_audio and getattr(client._api_client, 'vertexai', False):
-        config_kwargs["generate_audio"] = include_audio
+    # enhance_prompt and generate_audio are only supported on Vertex AI, not the Gemini API
+    is_vertexai = getattr(client._api_client, 'vertexai', False)
+    if is_vertexai:
+        config_kwargs["enhance_prompt"] = True
+        if include_audio:
+            config_kwargs["generate_audio"] = include_audio
 
     # Add last frame to config for first+last frame mode
     if last_frame_input:
