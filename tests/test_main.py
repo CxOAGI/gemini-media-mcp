@@ -1,10 +1,7 @@
 """Tests for __main__.py MCP server."""
 
-import asyncio
 import base64
 import json
-import tempfile
-from collections.abc import AsyncIterator
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -702,9 +699,6 @@ async def test_app_lifespan_cleanup_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test app_lifespan cleans up temporary credentials."""
-    images_dir = tmp_path / "images"
-    videos_dir = tmp_path / "videos"
-
     monkeypatch.setenv("DATA_FOLDER", str(tmp_path))
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     monkeypatch.setenv(
@@ -800,7 +794,7 @@ async def test_app_lifespan_container_requires_data_folder(
     server = FakeFastMCP()
 
     with pytest.raises(ValueError, match="DATA_FOLDER must be set"):
-        async with app_lifespan(server) as ctx:  # type: ignore[arg-type]
+        async with app_lifespan(server) as _ctx:  # type: ignore[arg-type]
             pass
 
 
@@ -1527,6 +1521,117 @@ async def test_generate_clip_with_bridges(
     assert kinds == ["beat", "bridge", "beat"]
     # beat(4) + bridge(4) + beat(4) = 12
     assert result["total_duration_seconds"] == 12.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_generate_clip_partial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If one beat fails the clip still returns a manifest for the successful
+    beats, plus an `errors` entry identifying the failed beat index."""
+    from src.__main__ import generate_clip
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    call_index = {"n": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        call_index["n"] += 1
+        if call_index["n"] == 2:
+            raise RuntimeError("simulated API failure on beat 2")
+        out = videos_dir / f"beat{call_index['n']}.mp4"
+        out.write_bytes(_make_fake_mp4())
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs.get("prompt", ""),
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": "text_to_video",
+            "duration_seconds": kwargs.get("duration_seconds"),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result_json = await generate_clip(
+        ctx=mock_ctx,
+        beats=[
+            {"prompt": "a", "duration_seconds": 4},
+            {"prompt": "b_fails", "duration_seconds": 4},
+            {"prompt": "c", "duration_seconds": 4},
+        ],
+        add_bridges=False,
+    )
+    result = json.loads(result_json)
+
+    # Two successful beats land in the manifest, one error is recorded.
+    assert result["beat_count"] == 3
+    assert len(result["segments"]) == 2
+    assert [s["prompt"] for s in result["segments"]] == ["a", "c"]
+    assert result["total_duration_seconds"] == 8.0
+    assert result["errors"] == [
+        {"beat_index": 1, "error": "simulated API failure on beat 2"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_strict_first_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A beat with an unfetchable first_frame_uri fails rather than silently
+    falling back to text-to-video."""
+    from src.__main__ import generate_clip
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=videos_dir,
+        client=MagicMock(),
+    )
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl should not be called when first_frame fetch fails")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result_json = await generate_clip(
+        ctx=mock_ctx,
+        beats=[
+            {
+                "prompt": "a",
+                "first_frame_uri": f"file://{tmp_path / 'nope.png'}",
+            },
+        ],
+        add_bridges=False,
+    )
+    result = json.loads(result_json)
+    assert result["beat_count"] == 1
+    assert result["segments"] == []
+    assert len(result["errors"]) == 1
+    assert "first_frame_uri" in result["errors"][0]["error"]
 
 
 @pytest.mark.asyncio

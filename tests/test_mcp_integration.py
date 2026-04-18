@@ -7,7 +7,6 @@ Run with Vertex AI (full features including Gemini 3 Pro Image):
   GOOGLE_GENAI_USE_VERTEXAI=true uv run pytest tests/test_mcp_integration.py -v -s
 """
 
-import asyncio
 import os
 from contextlib import asynccontextmanager
 

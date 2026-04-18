@@ -119,14 +119,17 @@ Generate images using Gemini or Imagen models.
 
 **Parameters:**
 - `prompt` (required): Text description of the image
-- `model`: Model to use:
-  - `gemini-2.5-flash-image` (default): Fast, creative editing
-  - `gemini-3-pro-image-preview`: Highest quality, 4K resolution, multi-reference support
-  - `gemini-3.1-flash-image-preview`: Fast 3.1 model, 4K resolution, multi-reference support
-  - `imagen-3.0-generate-002`: High quality, text-only input
-  - `imagen-4.0-generate-001`: Balanced quality/speed
-  - `imagen-4.0-ultra-generate-001`: Highest quality
-  - `imagen-4.0-fast-generate-001`: Fastest generation
+- `model`: Pick by use case.
+  **GA (stable) — preferred in production:**
+  - `gemini-2.5-flash-image` (Nano Banana) — default; fastest, cheapest, great for conversational editing
+  - `imagen-4.0-fast-generate-001` — cheapest photoreal
+  - `imagen-4.0-generate-001` — balanced photoreal
+  - `imagen-4.0-ultra-generate-001` — highest-fidelity photoreal, precise text rendering
+  - `imagen-3.0-generate-002` — legacy, kept for compatibility
+
+  **Preview — newest capabilities, may change without notice:**
+  - `gemini-3.1-flash-image-preview` (Nano Banana 2) — 4K output, up to 14 reference images, fast
+  - `gemini-3-pro-image-preview` (Nano Banana Pro) — 4K, reasoning, `thought_signature` for multi-turn editing
 - `image_uri`: Input image URI for image-to-image generation
 - `image_base64`: Base64 encoded input image
 

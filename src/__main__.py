@@ -220,6 +220,8 @@ def _assert_http_host_public(url: str) -> None:
     Mitigates SSRF against cloud metadata (169.254.169.254), localhost, or
     internal networks. Does not protect against DNS rebinding between this
     check and the actual request — acceptable for single-shot fetches.
+    Synchronous; use `_assert_http_host_public_async` from async code so
+    the DNS lookup does not block the event loop.
     """
     parsed = urlparse(url)
     host = parsed.hostname
@@ -243,6 +245,11 @@ def _assert_http_host_public(url: str) -> None:
             raise ValueError(
                 f"Refusing to fetch non-public address: {host} -> {addr}"
             )
+
+
+async def _assert_http_host_public_async(url: str) -> None:
+    """Async wrapper that runs the DNS lookup off the event loop."""
+    await asyncio.to_thread(_assert_http_host_public, url)
 
 
 def _assert_gcs_bucket_allowed(bucket: str, allowed: frozenset[str]) -> None:
@@ -316,7 +323,7 @@ async def fetch(
             return await asyncio.to_thread(_download_capped)
 
         if uri.startswith(("http://", "https://")):
-            _assert_http_host_public(uri)
+            await _assert_http_host_public_async(uri)
             timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(uri) as resp:
@@ -374,14 +381,23 @@ async def generate_image(
     Args:
         ctx: MCP context with application state
         prompt: Text description of the image to generate
-        model: Model to use - options include:
-               - "gemini-2.5-flash-image": Gemini 2.5 Flash (fast, creative editing)
-               - "gemini-3-pro-image-preview": Gemini 3 Pro (highest quality, 4K, multi-reference)
-               - "gemini-3.1-flash-image-preview": Gemini 3.1 Flash (fast, 4K, multi-reference)
-               - "imagen-3.0-generate-002": Imagen 3 (high quality, text-only)
-               - "imagen-4.0-generate-001": Imagen 4 Standard (balanced)
-               - "imagen-4.0-ultra-generate-001": Imagen 4 Ultra (highest quality)
-               - "imagen-4.0-fast-generate-001": Imagen 4 Fast (fastest)
+        model: Which model to call. Pick by use case:
+               - Default / conversational edits / fast iteration:
+                 "gemini-2.5-flash-image" (Nano Banana, GA, cheapest)
+               - Need 4K output or up to 14 reference images:
+                 "gemini-3.1-flash-image-preview" (Nano Banana 2, preview)
+               - Need reasoning + precise text rendering:
+                 "gemini-3-pro-image-preview" (Nano Banana Pro, preview, most capable)
+               - Need photorealism + precise text:
+                 "imagen-4.0-ultra-generate-001" (Imagen 4 Ultra, GA)
+               - Balanced photoreal:
+                 "imagen-4.0-generate-001" (Imagen 4 Standard, GA)
+               - Cheapest photoreal:
+                 "imagen-4.0-fast-generate-001" (Imagen 4 Fast, GA)
+               - Legacy (kept for compatibility):
+                 "imagen-3.0-generate-002"
+               Preview models may change behavior or pricing without notice;
+               default to GA models in production pipelines.
         image_uri: Input image URI (gs://, http://, file://) for image-to-image
         image_base64: Base64 encoded input image (prefer image_uri)
         reference_image_uris: List of reference image URIs (up to 14 for Gemini 3.x image models).
@@ -918,15 +934,24 @@ async def generate_clip(
     bridges, in playback order) that a downstream cutting MCP can splice
     into a final clip.
 
+    Individual beat failures do not abort the whole clip: the failed
+    beat's error is recorded in the manifest's `errors` list and the
+    tool continues with the next beat. Subsequent bridges that would
+    have used the failed beat are skipped.
+
     Args:
         beats: Ordered list of beat specs. Each item accepts:
             {prompt: str, duration_seconds?: float, seed?: int,
              first_frame_uri?: str, negative_prompt?: str,
-             audio_prompt?: str}
+             audio_prompt?: str}. If `first_frame_uri` is supplied and
+            cannot be fetched, the beat fails (rather than silently
+            falling back to text-to-video).
         aspect_ratio: Default 9:16 for vertical social clips.
         model: VEO model applied to every beat.
         include_audio: Enable audio on each beat (only effective on Vertex).
         add_bridges: Generate a bridge clip between consecutive beats.
+            Bridges require local (file://) beat outputs; skipped when
+            beats land in GCS.
         output_gcs_uri: GCS URI for all outputs (optional).
 
     Returns:
@@ -934,12 +959,9 @@ async def generate_clip(
         {
           "kind": "clip",
           "aspect_ratio": "9:16",
-          "segments": [
-            {"kind": "beat", "video_url": ..., "sidecar_url": ..., "prompt": ...},
-            {"kind": "bridge", "video_url": ..., "sidecar_url": ...},
-            ...
-          ],
-          "total_duration_seconds": <sum>
+          "segments": [ ... ordered beat / bridge segments ... ],
+          "total_duration_seconds": <sum>,
+          "errors": [ {"beat_index": N, "error": "..."} ],  // only on failure
         }
     """
     try:
@@ -961,43 +983,58 @@ async def generate_clip(
                 )
 
         segments: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
         total_duration = 0.0
         prev_video_bytes: bytes | None = None
 
         for idx, beat in enumerate(beats):
-            prompt = beat.get("prompt")
-            if not prompt:
-                raise ValueError(f"beat {idx} missing required 'prompt'")
-            duration = float(beat.get("duration_seconds", 4.0))
-            seed = beat.get("seed")
+            try:
+                prompt = beat.get("prompt")
+                if not prompt:
+                    raise ValueError(f"beat {idx} missing required 'prompt'")
+                duration = float(beat.get("duration_seconds", 4.0))
+                seed = beat.get("seed")
 
-            # Optional per-beat first frame (image_to_video).
-            first_frame_uri = beat.get("first_frame_uri")
-            image_bytes = None
-            if first_frame_uri:
-                image_bytes = await fetch(
-                    first_frame_uri,
+                # Optional per-beat first frame (image_to_video). Fail loudly
+                # if the user supplied one and it can't be fetched.
+                first_frame_uri = beat.get("first_frame_uri")
+                image_bytes = None
+                if first_frame_uri:
+                    image_bytes = await fetch(
+                        first_frame_uri,
+                        allowed_dir=data_dir,
+                        allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                    )
+                    if image_bytes is None:
+                        raise ValueError(
+                            f"Could not fetch first_frame_uri: {first_frame_uri}"
+                        )
+
+                await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
+                beat_result = await generate_video_impl(
+                    client=app_ctx.client,
+                    prompt=prompt,
+                    videos_dir=app_ctx.videos_dir,
+                    model=model,
+                    image_bytes=image_bytes,
                     allowed_dir=data_dir,
-                    allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                    aspect_ratio=aspect_ratio,
+                    duration_seconds=duration,
+                    include_audio=include_audio,
+                    audio_prompt=beat.get("audio_prompt"),
+                    negative_prompt=beat.get("negative_prompt"),
+                    seed=seed,
+                    log_callback=ctx.info,
+                    output_gcs_uri=gcs_uri,
                 )
-
-            await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
-            beat_result = await generate_video_impl(
-                client=app_ctx.client,
-                prompt=prompt,
-                videos_dir=app_ctx.videos_dir,
-                model=model,
-                image_bytes=image_bytes,
-                allowed_dir=data_dir,
-                aspect_ratio=aspect_ratio,
-                duration_seconds=duration,
-                include_audio=include_audio,
-                audio_prompt=beat.get("audio_prompt"),
-                negative_prompt=beat.get("negative_prompt"),
-                seed=seed,
-                log_callback=ctx.info,
-                output_gcs_uri=gcs_uri,
-            )
+            except Exception as beat_err:
+                await ctx.error(f"Beat {idx} failed: {beat_err}")
+                logger.exception("Beat %d failed", idx)
+                errors.append({"beat_index": idx, "error": str(beat_err)})
+                # Invalidate the rolling bridge source so the next beat
+                # doesn't try to bridge from a beat that never rendered.
+                prev_video_bytes = None
+                continue
 
             beat_manifest = {
                 "kind": "beat",
@@ -1020,7 +1057,6 @@ async def generate_clip(
             # this one now that we have both endpoints. Insert before the
             # current beat in the segments list.
             if add_bridges and idx > 0 and prev_video_bytes is not None:
-                # Read this beat's bytes to extract its first frame.
                 beat_url = beat_result.get("video_url", "")
                 cur_bytes: bytes | None = None
                 if beat_url.startswith("file://"):
@@ -1032,46 +1068,59 @@ async def generate_clip(
                         )
 
                 if cur_bytes is not None:
-                    end_frame = await asyncio.to_thread(
-                        extract_frame_png, prev_video_bytes, "end"
-                    )
-                    start_frame = await asyncio.to_thread(
-                        extract_frame_png, cur_bytes, "start"
-                    )
-                    await ctx.info(f"Generating bridge before beat {idx + 1}")
-                    bridge_result = await generate_video_impl(
-                        client=app_ctx.client,
-                        prompt="smooth cinematic cut between the two beats",
-                        videos_dir=app_ctx.videos_dir,
-                        model=model,
-                        image_bytes=end_frame,
-                        last_frame_bytes=start_frame,
-                        allowed_dir=data_dir,
-                        aspect_ratio=aspect_ratio,
-                        duration_seconds=4.0,
-                        include_audio=False,
-                        log_callback=ctx.info,
-                        output_gcs_uri=gcs_uri,
-                    )
-                    bridge_manifest = {
-                        "kind": "bridge",
-                        "between_beats": [idx - 1, idx],
-                        "model": model,
-                        "aspect_ratio": aspect_ratio,
-                        "duration_seconds": bridge_result.get(
-                            "duration_seconds", 4.0
-                        ),
-                        "video_url": bridge_result.get("video_url"),
-                    }
-                    b_sidecar = _write_sidecar(
-                        bridge_result.get("video_url", ""), bridge_manifest
-                    )
-                    if b_sidecar:
-                        bridge_manifest["sidecar_url"] = b_sidecar
-                    segments.append(bridge_manifest)
-                    total_duration += float(
-                        bridge_manifest["duration_seconds"]
-                    )
+                    try:
+                        end_frame = await asyncio.to_thread(
+                            extract_frame_png, prev_video_bytes, "end"
+                        )
+                        start_frame = await asyncio.to_thread(
+                            extract_frame_png, cur_bytes, "start"
+                        )
+                        await ctx.info(f"Generating bridge before beat {idx + 1}")
+                        bridge_result = await generate_video_impl(
+                            client=app_ctx.client,
+                            prompt="smooth cinematic cut between the two beats",
+                            videos_dir=app_ctx.videos_dir,
+                            model=model,
+                            image_bytes=end_frame,
+                            last_frame_bytes=start_frame,
+                            allowed_dir=data_dir,
+                            aspect_ratio=aspect_ratio,
+                            duration_seconds=4.0,
+                            include_audio=False,
+                            log_callback=ctx.info,
+                            output_gcs_uri=gcs_uri,
+                        )
+                    except Exception as bridge_err:
+                        await ctx.error(
+                            f"Bridge before beat {idx} failed: {bridge_err}"
+                        )
+                        logger.exception("Bridge before beat %d failed", idx)
+                        errors.append(
+                            {
+                                "bridge_between_beats": [idx - 1, idx],
+                                "error": str(bridge_err),
+                            }
+                        )
+                    else:
+                        bridge_manifest = {
+                            "kind": "bridge",
+                            "between_beats": [idx - 1, idx],
+                            "model": model,
+                            "aspect_ratio": aspect_ratio,
+                            "duration_seconds": bridge_result.get(
+                                "duration_seconds", 4.0
+                            ),
+                            "video_url": bridge_result.get("video_url"),
+                        }
+                        b_sidecar = _write_sidecar(
+                            bridge_result.get("video_url", ""), bridge_manifest
+                        )
+                        if b_sidecar:
+                            bridge_manifest["sidecar_url"] = b_sidecar
+                        segments.append(bridge_manifest)
+                        total_duration += float(
+                            bridge_manifest["duration_seconds"]
+                        )
 
             segments.append(beat_manifest)
             total_duration += float(beat_manifest["duration_seconds"])
@@ -1087,7 +1136,7 @@ async def generate_clip(
                 else:
                     prev_video_bytes = None
 
-        clip_manifest = {
+        clip_manifest: dict[str, Any] = {
             "kind": "clip",
             "aspect_ratio": aspect_ratio,
             "model": model,
@@ -1095,6 +1144,8 @@ async def generate_clip(
             "total_duration_seconds": total_duration,
             "beat_count": len(beats),
         }
+        if errors:
+            clip_manifest["errors"] = errors
         return json.dumps(clip_manifest, indent=2)
     except Exception as e:
         await ctx.error(f"Clip generation failed: {e}")

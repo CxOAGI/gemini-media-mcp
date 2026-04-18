@@ -4,12 +4,11 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 from PIL import Image
 
-from src.video import VideoModel, generate_video
+from src.video import generate_video
 
 # ============================================================================
 # Test Doubles
