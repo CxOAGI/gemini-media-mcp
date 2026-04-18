@@ -12,10 +12,12 @@ from PIL import Image
 
 from src.__main__ import (
     AppContext,
+    _client_for_video_model,
     app_lifespan,
     check_credentials,
     cleanup_credentials,
     create_client,
+    create_gemini_api_client,
     fetch,
     is_running_in_container,
     setup_vertex_credentials,
@@ -341,6 +343,97 @@ def test_create_client(
 
         result = create_client()
         assert result == mock_client
+
+
+# ============================================================================
+# Veo Lite routing tests
+# ============================================================================
+
+
+def _make_fake_client(vertexai: bool) -> MagicMock:
+    client = MagicMock()
+    client._api_client = MagicMock()
+    client._api_client.vertexai = vertexai
+    return client
+
+
+def test_create_gemini_api_client_returns_none_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    assert create_gemini_api_client() is None
+
+
+def test_create_gemini_api_client_builds_client_with_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    fake = MagicMock()
+    monkeypatch.setattr("src.__main__.genai.Client", lambda **kwargs: fake)
+    assert create_gemini_api_client() is fake
+
+
+def test_client_for_video_model_routes_lite_through_api_client(
+    tmp_path: Path,
+) -> None:
+    vertex_client = _make_fake_client(vertexai=True)
+    api_client = _make_fake_client(vertexai=False)
+    ctx = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path,
+        videos_dir=tmp_path,
+        client=vertex_client,
+        gemini_api_client=api_client,
+    )
+    picked = _client_for_video_model(ctx, "veo-3.1-lite-generate-preview")
+    assert picked is api_client
+
+
+def test_client_for_video_model_uses_main_client_for_non_lite(
+    tmp_path: Path,
+) -> None:
+    vertex_client = _make_fake_client(vertexai=True)
+    api_client = _make_fake_client(vertexai=False)
+    ctx = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path,
+        videos_dir=tmp_path,
+        client=vertex_client,
+        gemini_api_client=api_client,
+    )
+    picked = _client_for_video_model(ctx, "veo-3.1-fast-generate-001")
+    assert picked is vertex_client
+
+
+def test_client_for_video_model_lite_without_api_key_raises(
+    tmp_path: Path,
+) -> None:
+    vertex_client = _make_fake_client(vertexai=True)
+    ctx = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path,
+        videos_dir=tmp_path,
+        client=vertex_client,
+        gemini_api_client=None,
+    )
+    with pytest.raises(RuntimeError, match="only available via the Gemini API"):
+        _client_for_video_model(ctx, "veo-3.1-lite-generate-preview")
+
+
+def test_client_for_video_model_lite_on_api_only_passes_through(
+    tmp_path: Path,
+) -> None:
+    """When primary client is already the Gemini API, don't require a second one."""
+    api_client = _make_fake_client(vertexai=False)
+    ctx = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path,
+        videos_dir=tmp_path,
+        client=api_client,
+        gemini_api_client=None,
+    )
+    picked = _client_for_video_model(ctx, "veo-3.1-lite-generate-preview")
+    assert picked is api_client
 
 
 # ============================================================================

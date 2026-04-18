@@ -26,7 +26,7 @@ from PIL import Image as PILImage
 
 from .image import ImageModel, ImageSize, MediaResolution
 from .image import generate_image as generate_image_impl
-from .video import VideoModel
+from .video import _VEO_LITE_MODELS, VideoModel
 from .video import generate_video as generate_video_impl
 from .video_utils import extract_frame_png
 
@@ -48,6 +48,11 @@ class AppContext:
     images_dir: Path
     videos_dir: Path
     client: genai.Client
+    # Dedicated Gemini API (AI Studio) client. Used to route models that
+    # are not yet published on Vertex (e.g. veo-3.1-lite-generate-preview)
+    # when the primary client runs in Vertex mode. None when no
+    # GEMINI_API_KEY is configured.
+    gemini_api_client: genai.Client | None = None
     temp_creds_path: Path | None = None
     video_gcs_bucket: str | None = None  # Default GCS bucket for video output
     allowed_gcs_buckets: frozenset[str] = frozenset()  # Allowlist for gs:// URIs
@@ -153,6 +158,41 @@ def create_client() -> genai.Client:
     raise RuntimeError("No credentials configured")
 
 
+def create_gemini_api_client() -> genai.Client | None:
+    """Create a Gemini API (AI Studio) client if GEMINI_API_KEY is set.
+
+    Force `vertexai=False` so this client stays on the Gemini API even when
+    `GOOGLE_GENAI_USE_VERTEXAI=true` is set in the environment — otherwise
+    the SDK treats the key as a Vertex API key and routes to
+    aiplatform.googleapis.com.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+    return genai.Client(api_key=api_key, vertexai=False)
+
+
+def _client_for_video_model(app_ctx: AppContext, model: str) -> genai.Client:
+    """Pick the right genai.Client for a video model.
+
+    Veo 3.1 Lite is served via the Gemini API / AI Studio only; calling
+    it on Vertex hits aiplatform.googleapis.com and fails. When the
+    primary client is in Vertex mode, route Lite through the Gemini API
+    client instead.
+    """
+    if model in _VEO_LITE_MODELS and getattr(
+        app_ctx.client._api_client, "vertexai", False
+    ):
+        if app_ctx.gemini_api_client is None:
+            raise RuntimeError(
+                f"Model {model} is only available via the Gemini API. "
+                "Set GEMINI_API_KEY so the lite model can be served by "
+                "AI Studio (Vertex AI has not published it yet)."
+            )
+        return app_ctx.gemini_api_client
+    return app_ctx.client
+
+
 def is_running_in_container() -> bool:
     """Check if running inside a container."""
     if os.environ.get("RUNNING_IN_CONTAINER", "").lower() == "true":
@@ -179,6 +219,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
 
     temp_creds_path = setup_vertex_credentials()
     client = create_client()
+    gemini_api_client = create_gemini_api_client()
     video_gcs_bucket = os.environ.get("VIDEO_GCS_BUCKET")
     allowed_gcs_buckets = _compute_allowed_gcs_buckets()
 
@@ -188,6 +229,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             images_dir=images_dir,
             videos_dir=videos_dir,
             client=client,
+            gemini_api_client=gemini_api_client,
             temp_creds_path=temp_creds_path,
             video_gcs_bucket=video_gcs_bucket,
             allowed_gcs_buckets=allowed_gcs_buckets,
@@ -541,9 +583,11 @@ async def generate_video(
                - "veo-3.1-fast-generate-001": VEO 3.1 Fast (faster, 4/6/8s, audio)
                - "veo-3.1-lite-generate-preview": VEO 3.1 Lite (most cost-effective,
                  4/6/8s, audio; does NOT support video extension or 4K).
-                 Availability note: as of launch, Lite is served via the Gemini
-                 API / AI Studio; Vertex AI projects may return 404 until the
-                 model is published there.
+                 Availability note: Lite is served via the Gemini API / AI
+                 Studio only; Vertex AI has not published it. When the server
+                 runs in Vertex mode, Lite calls are automatically routed
+                 through the Gemini API client, so GEMINI_API_KEY must also
+                 be set to use Lite.
         aspect_ratio: 16:9 (default) or 9:16
         duration_seconds: Video duration (4/6/8s)
         include_audio: Enable audio generation
@@ -621,7 +665,7 @@ async def generate_video(
 
         await ctx.info(f"Generating video with model={model}")
         result = await generate_video_impl(
-            client=app_ctx.client,
+            client=_client_for_video_model(app_ctx, model),
             prompt=prompt,
             videos_dir=app_ctx.videos_dir,
             model=model,
@@ -741,7 +785,7 @@ async def generate_transition(
 
         await ctx.info(f"Generating transition with model={model}")
         result = await generate_video_impl(
-            client=app_ctx.client,
+            client=_client_for_video_model(app_ctx, model),
             prompt=prompt,
             videos_dir=app_ctx.videos_dir,
             model=model,
@@ -867,7 +911,7 @@ async def generate_bridge(
 
         await ctx.info(f"Generating bridge with model={model}")
         result = await generate_video_impl(
-            client=app_ctx.client,
+            client=_client_for_video_model(app_ctx, model),
             prompt=prompt,
             videos_dir=app_ctx.videos_dir,
             model=model,
@@ -1012,7 +1056,7 @@ async def generate_clip(
 
                 await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
                 beat_result = await generate_video_impl(
-                    client=app_ctx.client,
+                    client=_client_for_video_model(app_ctx, model),
                     prompt=prompt,
                     videos_dir=app_ctx.videos_dir,
                     model=model,
@@ -1077,7 +1121,7 @@ async def generate_clip(
                         )
                         await ctx.info(f"Generating bridge before beat {idx + 1}")
                         bridge_result = await generate_video_impl(
-                            client=app_ctx.client,
+                            client=_client_for_video_model(app_ctx, model),
                             prompt="smooth cinematic cut between the two beats",
                             videos_dir=app_ctx.videos_dir,
                             model=model,
