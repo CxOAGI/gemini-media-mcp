@@ -2,6 +2,29 @@
 
 MCP server for generating images and videos using Google Gemini and VEO models.
 
+## Quick start
+
+```bash
+uvx gemini-media-mcp setup
+```
+
+The `setup` wizard walks you through the whole onboarding flow end-to-end:
+
+1. Pick a credential mode: **Gemini API** (images only, easier) or **Vertex AI** (images + video).
+2. Enter your API key, or your Google Cloud project plus a service account JSON (file path or inline paste).
+3. Choose where generated media should be written (defaults to `~/gemini-media`).
+4. Optionally set a `VIDEO_GCS_BUCKET` for large video output, and auto-populate `GCS_ALLOWED_BUCKETS`.
+5. Validate your credentials by constructing a Google GenAI client.
+6. Print a ready-to-paste Claude Desktop JSON block. On macOS, the wizard can also merge the block directly into `~/Library/Application Support/Claude/claude_desktop_config.json` (existing servers are preserved and the prior file is backed up to `.bak`).
+
+For scripted use, all prompts can be supplied via flags:
+
+```bash
+uvx gemini-media-mcp setup --non-interactive --mode=gemini --api-key=AIzaSy...
+```
+
+If you prefer to configure everything by hand, the manual steps are below.
+
 ## Setup
 
 ### Prerequisites

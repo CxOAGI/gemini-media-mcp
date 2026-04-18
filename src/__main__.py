@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 from google import genai
@@ -404,13 +405,6 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Gemini Media MCP Server")
     parser.add_argument(
-        "transport",
-        nargs="?",
-        default="stdio",
-        choices=["stdio", "sse", "streamable-http"],
-        help="Transport mode (default: stdio)",
-    )
-    parser.add_argument(
         "--mount-path",
         default=None,
         help="Mount path for SSE/HTTP transport (e.g., /mcp)",
@@ -422,6 +416,48 @@ def main() -> None:
         help="Logging level (default: INFO)",
     )
 
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Transport subcommands preserve the existing positional behavior
+    # (gemini-media-mcp [stdio|sse|streamable-http]).
+    for transport in ("stdio", "sse", "streamable-http"):
+        subparsers.add_parser(
+            transport, help=f"Run the MCP server with {transport} transport"
+        )
+
+    setup_parser = subparsers.add_parser(
+        "setup", help="Interactive setup wizard for credentials and Claude Desktop"
+    )
+    setup_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Do not prompt; all values must be provided via flags.",
+    )
+    setup_parser.add_argument(
+        "--mode",
+        choices=["gemini", "vertex"],
+        help="Credential mode to configure.",
+    )
+    setup_parser.add_argument("--api-key", help="Gemini API key (mode=gemini).")
+    setup_parser.add_argument(
+        "--project-id", help="Google Cloud project ID (mode=vertex)."
+    )
+    setup_parser.add_argument(
+        "--location", help="Google Cloud location (mode=vertex, default us-central1)."
+    )
+    setup_parser.add_argument(
+        "--sa-path", help="Path to service account JSON file (mode=vertex)."
+    )
+    setup_parser.add_argument(
+        "--sa-json", help="Inline service account JSON string (mode=vertex)."
+    )
+    setup_parser.add_argument(
+        "--data-folder", help="Output folder for generated media."
+    )
+    setup_parser.add_argument(
+        "--video-gcs-bucket", help="Optional gs:// URI for large video output."
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -430,14 +466,41 @@ def main() -> None:
         stream=sys.stderr,
     )
 
+    if args.command == "setup":
+        from .setup_wizard import run_wizard
+
+        overrides: dict[str, Any] = {}
+        if args.mode:
+            overrides["mode"] = args.mode
+        if args.api_key:
+            overrides["api_key"] = args.api_key
+        if args.project_id:
+            overrides["project_id"] = args.project_id
+        if args.location:
+            overrides["location"] = args.location
+        if args.sa_path:
+            overrides["sa_path"] = args.sa_path
+        if args.sa_json:
+            overrides["sa_json"] = args.sa_json
+        if args.data_folder:
+            overrides["data_folder"] = args.data_folder
+        if args.video_gcs_bucket:
+            overrides["video_gcs_bucket"] = args.video_gcs_bucket
+
+        run_wizard(interactive=not args.non_interactive, **overrides)
+        return
+
+    transport = args.command or "stdio"
+
     if not check_credentials():
         logger.error(
             "No credentials configured. Set GEMINI_API_KEY or enable "
-            "GOOGLE_GENAI_USE_VERTEXAI=true with appropriate credentials."
+            "GOOGLE_GENAI_USE_VERTEXAI=true with appropriate credentials. "
+            "Run 'gemini-media-mcp setup' for an interactive setup wizard."
         )
         sys.exit(1)
 
-    mcp.run(transport=args.transport, mount_path=args.mount_path)
+    mcp.run(transport=transport, mount_path=args.mount_path)
 
 
 if __name__ == "__main__":
