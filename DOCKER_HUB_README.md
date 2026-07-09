@@ -30,18 +30,19 @@ Generate images using Gemini or Imagen models
 | Parameters | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description of the image to generate |
-| `model` | string *optional* | Model to use: `GEMINI` (default), `GEMINI3_PRO`, `GEMINI31_FLASH`, `IMAGEN3`, `IMAGEN4`, `IMAGEN4_ULTRA`, `IMAGEN4_FAST` |
+| `model` | string *optional* | Model to use (see list below) |
 | `image_uri` | string *optional* | Input image URI for image-to-image generation |
 | `image_base64` | string *optional* | Base64 encoded input image for image-to-image generation |
+| `aspect_ratio` | string *optional* | Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`) |
+| `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
 
-**Available Models:**
-- `GEMINI` - Gemini's built-in image generation (default)
-- `GEMINI3_PRO` - Gemini 3 Pro model
-- `GEMINI31_FLASH` - Gemini 3.1 Flash model (fast, 4K, multi-reference)
-- `IMAGEN3` - Google Imagen 3
-- `IMAGEN4` - Google Imagen 4
-- `IMAGEN4_ULTRA` - Imagen 4 Ultra (highest quality)
-- `IMAGEN4_FAST` - Imagen 4 Fast (faster generation)
+**Available Models (GA):**
+- `gemini-3.1-flash-image` - Nano Banana 2; fast, 4K output, up to 14 reference images
+- `gemini-3-pro-image` - Nano Banana Pro; 4K, reasoning, multi-turn editing
+- `gemini-3.1-flash-lite-image` - cheapest; recommended migration target
+- `gemini-2.5-flash-image` - Nano Banana; now considered legacy (migrate to `gemini-3.1-flash-lite-image`)
+
+> **Note:** `imagen-3.0-generate-002` was shut down on 2025-11-10. The Imagen 4.x models are deprecated with a scheduled shutdown of 2026-08-17; prefer the Gemini image models above.
 
 *This tool may perform destructive updates.*
 
@@ -51,15 +52,17 @@ Generate images using Gemini or Imagen models
 
 ### Tool: **`generate_video`**
 
-Generate videos using VEO models (requires Vertex AI authentication)
+Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the paid tier; Veo 3.1 Lite is Gemini-API-only) and Vertex AI (adds GCS output and Vertex-only features).
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description of the video to generate |
-| `model` | string *optional* | VEO model to use: `veo-3.1-generate-001` (default), `veo-3.1-fast-generate-001` |
+| `model` | string *optional* | VEO model to use: `veo-3.1-generate-001` (default), `veo-3.1-fast-generate-001`, `veo-3.1-lite-generate-preview` |
 | `aspect_ratio` | string *optional* | Video aspect ratio: `16:9` (default) or `9:16` |
+| `resolution` | string *optional* | Output resolution: `720p`, `1080p`, or `4K` (4K not on Lite) |
 | `duration_seconds` | integer *optional* | Video duration in seconds (4/6/8s) |
 | `include_audio` | boolean *optional* | Enable audio generation |
+| `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
 | `audio_prompt` | string *optional* | Audio description |
 | `negative_prompt` | string *optional* | Things to avoid in the video |
 | `seed` | integer *optional* | Random seed for reproducibility |
@@ -68,6 +71,7 @@ Generate videos using VEO models (requires Vertex AI authentication)
 **Available Models:**
 - `veo-3.1-generate-001` - VEO 3.1 (4/6/8 seconds with audio support)
 - `veo-3.1-fast-generate-001` - VEO 3.1 Fast (faster generation)
+- `veo-3.1-lite-generate-preview` - VEO 3.1 Lite (cheapest; Gemini-API-only; text-to-video and image-to-video only)
 
 **Supported Aspect Ratios:**
 - `16:9` - Widescreen (default)
@@ -109,7 +113,7 @@ Generate videos using VEO models (requires Vertex AI authentication)
 }
 ```
 
-### Using Gemini API (Images Only)
+### Using Gemini API (Images + Videos)
 
 ```json
 {
@@ -152,7 +156,7 @@ Generate videos using VEO models (requires Vertex AI authentication)
 | `GOOGLE_APPLICATION_CREDENTIALS` | ✅ | Path to service account JSON key (inside container) |
 | `DATA_FOLDER` | ✅ | Output directory path (must match host path in volume) |
 
-### Gemini API Configuration (Images Only)
+### Gemini API Configuration (Images + Videos)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -163,7 +167,7 @@ Generate videos using VEO models (requires Vertex AI authentication)
 
 ## Google Cloud Setup
 
-For video generation with VEO models, you need Google Cloud Vertex AI access. 
+Video generation with VEO models works on the paid Gemini API tier (Veo 3.1 Lite is Gemini-API-only). Vertex AI is optional and adds GCS output plus Vertex-only features. To use Vertex AI:
 
 ### Quick Setup Steps:
 
@@ -173,7 +177,7 @@ For video generation with VEO models, you need Google Cloud Vertex AI access.
 4. **Download JSON key file** for the service account
 5. **Configure Docker** to mount the key file and set environment variables
 
-For detailed setup instructions, see the [full documentation](https://github.com/CxOAGI/gemini-media-mcp#vertex-ai-setup-required-for-veo-video-generation).
+For detailed setup instructions, see the [full documentation](https://github.com/CxOAGI/gemini-media-mcp#vertex-ai-setup).
 
 **Security Note:** Never commit service account keys to version control!
 

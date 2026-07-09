@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from google import genai
@@ -34,6 +34,41 @@ logger = logging.getLogger(__name__)
 
 # 50 MB cap on any single fetch to prevent memory/disk exhaustion.
 MAX_FETCH_BYTES = 50 * 1024 * 1024
+
+# Maximum number of HTTP redirects to follow during a fetch. Each hop's
+# target is re-validated against the SSRF guard before it is requested.
+MAX_HTTP_REDIRECTS = 5
+
+
+def _decode_base64_capped(data: str, max_bytes: int | None = None) -> bytes:
+    """Base64-decode input and enforce the same size cap as URI fetches.
+
+    Prevents an attacker from bypassing MAX_FETCH_BYTES by supplying a huge
+    inline base64 payload instead of a URI.
+    """
+    if max_bytes is None:
+        max_bytes = MAX_FETCH_BYTES
+    # Strip ASCII whitespace first: MIME base64 wraps at 76 columns and
+    # base64.b64decode ignores whitespace anyway, so removing it lets us reason
+    # about the true payload length. Reject BEFORE decoding only when a LOWER
+    # BOUND on the decoded size exceeds the cap, so wrapped/padded input whose
+    # real decoded size is within the cap is not falsely rejected. For cleaned
+    # length L, decoded size lies in [(L // 4) * 3 - 2, (L // 4) * 3] (trailing
+    # padding removes 1-2 bytes). The exact post-decode check below is the hard
+    # enforcement; this pre-check only guards against multi-hundred-MB
+    # allocations from a clearly oversize payload.
+    cleaned = "".join(data.split())
+    if (len(cleaned) // 4) * 3 - 2 > max_bytes:
+        raise ValueError(
+            f"Base64 input ({len(cleaned)} chars) exceeds decoded cap {max_bytes}"
+        )
+    decoded = base64.b64decode(cleaned)
+    if len(decoded) > max_bytes:
+        raise ValueError(
+            f"Decoded base64 input ({len(decoded)} bytes) exceeds cap {max_bytes}"
+        )
+    return decoded
+
 
 # Cap decoded pixel count to prevent decompression-bomb DoS on input images.
 # 50 megapixels fits up to ~7000x7000; well above any realistic user input.
@@ -193,6 +228,59 @@ def _client_for_video_model(app_ctx: AppContext, model: str) -> genai.Client:
     return app_ctx.client
 
 
+def _validate_aspect_ratio(aspect_ratio: str) -> None:
+    """Raise ValueError for aspect ratios the VEO video models don't support.
+
+    Mirrors the impl-side backstop so the error surfaces up front (before any
+    input image / frame is fetched) rather than after wasted fetch work.
+    """
+    if aspect_ratio not in ("16:9", "9:16"):
+        raise ValueError(
+            f"Unsupported aspect_ratio '{aspect_ratio}'. "
+            "Supported values are '16:9' and '9:16'."
+        )
+
+
+def _resolve_video_gcs(
+    output_gcs_uri: str | None,
+    default_bucket: str | None,
+    allowed_buckets: frozenset[str],
+    is_vertex_client: bool,
+) -> str | None:
+    """Resolve the effective GCS output URI for a video call.
+
+    Combines explicit output_gcs_uri with the env default_bucket, validates
+    gs:// scheme + allowlist. On a non-Vertex client: raises ValueError if
+    output_gcs_uri was explicit (GCS unsupported on the Gemini API), else
+    drops the env default and returns None.
+    """
+    gcs_uri = output_gcs_uri or default_bucket
+    # GCS output only works on Vertex AI. On the Gemini API path, reject an
+    # explicit output_gcs_uri (the caller asked for the impossible) but
+    # silently drop a VIDEO_GCS_BUCKET env default so Lite / text-to-video
+    # still succeed inline. This drop happens BEFORE format validation so a
+    # malformed env default (e.g. a bare bucket name) can't fail calls on a
+    # path where it would never be used anyway.
+    if gcs_uri and not is_vertex_client:
+        if output_gcs_uri:
+            raise ValueError(
+                "output_gcs_uri requires Vertex AI mode. This model is "
+                "served via the Gemini API, which does not support GCS "
+                "output. Omit output_gcs_uri to receive the video inline."
+            )
+        return None
+    if gcs_uri:
+        bucket = _parse_gcs_bucket(gcs_uri)
+        if bucket is None:
+            raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
+        if allowed_buckets and bucket not in allowed_buckets:
+            raise ValueError(
+                f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
+                f"Configured: {sorted(allowed_buckets)}"
+            )
+    return gcs_uri
+
+
 def is_running_in_container() -> bool:
     """Check if running inside a container."""
     if os.environ.get("RUNNING_IN_CONTAINER", "").lower() == "true":
@@ -246,7 +334,7 @@ def _validate_local_path(path: Path, allowed_dir: Path) -> Path:
     """
     resolved = path.resolve()
     allowed = allowed_dir.resolve()
-    if not str(resolved).startswith(str(allowed) + os.sep) and resolved != allowed:
+    if resolved != allowed and not resolved.is_relative_to(allowed):
         raise ValueError(
             f"Access denied: '{path}' is outside the allowed directory '{allowed_dir}'. "
             f"Only files within DATA_FOLDER are accessible."
@@ -284,9 +372,7 @@ def _assert_http_host_public(url: str) -> None:
             or ip.is_reserved
             or ip.is_unspecified
         ):
-            raise ValueError(
-                f"Refusing to fetch non-public address: {host} -> {addr}"
-            )
+            raise ValueError(f"Refusing to fetch non-public address: {host} -> {addr}")
 
 
 async def _assert_http_host_public_async(url: str) -> None:
@@ -365,13 +451,31 @@ async def fetch(
             return await asyncio.to_thread(_download_capped)
 
         if uri.startswith(("http://", "https://")):
-            await _assert_http_host_public_async(uri)
+            # Disable automatic redirects and follow them manually so the
+            # SSRF guard re-runs on every hop. A public URL that 30x-redirects
+            # to 169.254.169.254/ or an internal host is otherwise fetched
+            # with only the original host validated.
             timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(uri) as resp:
-                    if resp.status == 200:
-                        return await _read_capped_http(resp, max_bytes)
-                    raise ValueError(f"HTTP {resp.status}")
+                current_url = uri
+                for _hop in range(MAX_HTTP_REDIRECTS + 1):
+                    await _assert_http_host_public_async(current_url)
+                    async with session.get(current_url, allow_redirects=False) as resp:
+                        if resp.status in (301, 302, 303, 307, 308):
+                            location = resp.headers.get("Location")
+                            if not location:
+                                raise ValueError(
+                                    f"Redirect from {current_url} missing "
+                                    "Location header"
+                                )
+                            current_url = urljoin(current_url, location)
+                            continue
+                        if resp.status == 200:
+                            return await _read_capped_http(resp, max_bytes)
+                        raise ValueError(f"HTTP {resp.status}")
+                raise ValueError(
+                    f"Exceeded redirect limit ({MAX_HTTP_REDIRECTS}) fetching {uri}"
+                )
 
         # Local file access — require allowed_dir
         if allowed_dir is None:
@@ -385,14 +489,19 @@ async def fetch(
                 raise ValueError(f"File exceeds size cap {max_bytes}: {path}")
             return path.read_bytes()
 
-        path = Path(uri)
-        if path.exists():
-            validated = _validate_local_path(path, allowed_dir)
-            if validated.stat().st_size > max_bytes:
-                raise ValueError(f"File exceeds size cap {max_bytes}: {validated}")
-            return validated.read_bytes()
+        # Reject unsupported schemes (ftp://, s3://, data:, ...) with a clear
+        # message instead of letting them fall into local-path validation,
+        # which would misreport them as "outside the allowed directory".
+        if "://" in uri or uri.startswith("data:"):
+            raise ValueError(f"Unsupported URI scheme: {uri}")
 
-        raise ValueError(f"Unsupported URI: {uri}")
+        # Bare path: validate the location BEFORE any filesystem probe so a
+        # path outside allowed_dir never gets an exists()/stat() call that
+        # could leak file existence via timing or differing error paths.
+        validated = _validate_local_path(Path(uri), allowed_dir)
+        if validated.stat().st_size > max_bytes:
+            raise ValueError(f"File exceeds size cap {max_bytes}: {validated}")
+        return validated.read_bytes()
     except Exception as e:
         logger.error("Failed to fetch %s: %s", uri, e)
         return None
@@ -416,6 +525,8 @@ async def generate_image(
     reference_image_uris: list[str] | None = None,
     image_size: ImageSize | None = None,
     media_resolution: MediaResolution | None = None,
+    aspect_ratio: str | None = None,
+    person_generation: str | None = None,
     thought_signature_url: str | None = None,
 ):
     """Generate an image using Google Gemini or Imagen models.
@@ -423,23 +534,19 @@ async def generate_image(
     Args:
         ctx: MCP context with application state
         prompt: Text description of the image to generate
-        model: Which model to call. Pick by use case:
-               - Default / conversational edits / fast iteration:
-                 "gemini-2.5-flash-image" (Nano Banana, GA, cheapest)
-               - Need 4K output or up to 14 reference images:
-                 "gemini-3.1-flash-image-preview" (Nano Banana 2, preview)
-               - Need reasoning + precise text rendering:
-                 "gemini-3-pro-image-preview" (Nano Banana Pro, preview, most capable)
-               - Need photorealism + precise text:
-                 "imagen-4.0-ultra-generate-001" (Imagen 4 Ultra, GA)
-               - Balanced photoreal:
-                 "imagen-4.0-generate-001" (Imagen 4 Standard, GA)
-               - Cheapest photoreal:
-                 "imagen-4.0-fast-generate-001" (Imagen 4 Fast, GA)
-               - Legacy (kept for compatibility):
-                 "imagen-3.0-generate-002"
-               Preview models may change behavior or pricing without notice;
-               default to GA models in production pipelines.
+        model: Which model to call. Prefer the Nano Banana / gemini-3.x GA
+               family — it is the going-forward path. Pick by use case:
+               - Cheapest / fast iteration:
+                 "gemini-3.1-flash-lite-image" (GA, lowest cost)
+               - Default / conversational edits / balanced:
+                 "gemini-3.1-flash-image" (GA)
+               - Most capable: reasoning + precise text rendering, 4K,
+                 up to 14 reference images:
+                 "gemini-3-pro-image" (GA, Nano Banana Pro)
+               Note on Imagen: the Imagen 4.x models are DEPRECATED (Google
+               shutdown scheduled 2026-08-17) and "imagen-3.0-generate-002" is
+               already RETIRED (shut down 2025-11-10). Do not start new work on
+               Imagen; migrate to the gemini-3.x image models above.
         image_uri: Input image URI (gs://, http://, file://) for image-to-image
         image_base64: Base64 encoded input image (prefer image_uri)
         reference_image_uris: List of reference image URIs (up to 14 for Gemini 3.x image models).
@@ -453,6 +560,13 @@ async def generate_image(
             - "MEDIA_RESOLUTION_LOW": Faster, lower token usage
             - "MEDIA_RESOLUTION_MEDIUM": Balanced
             - "MEDIA_RESOLUTION_HIGH": Best quality, higher token usage
+        aspect_ratio: Desired output aspect ratio, e.g. "1:1", "16:9", "9:16",
+            "4:3", "3:4". Applies to both Imagen and gemini-3.x image models.
+        person_generation: Policy for generating people:
+            - "dont_allow": Do not generate people
+            - "allow_adult": Allow generating adults (default behavior)
+            - "allow_all": Allow generating all ages
+            (Some regions restrict these values.)
         thought_signature_url: For multi-turn image editing. Pass the thought_signature_url
             from a previous response to continue editing. Example workflow:
             1. First call: generate_image(prompt="Draw a cat") → returns thought_signature_url
@@ -473,8 +587,13 @@ async def generate_image(
                 allowed_dir=data_dir,
                 allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
             )
+            # Fail loudly: a provided URI that can't be fetched (bad URL,
+            # SSRF rejection, size cap) must not silently downgrade to a
+            # text-to-image generation.
+            if image_bytes is None:
+                raise ValueError(f"Could not fetch image_uri: {image_uri}")
         elif image_base64:
-            image_bytes = base64.b64decode(image_base64)
+            image_bytes = _decode_base64_capped(image_base64)
 
         # Fetch reference images
         reference_images: list[bytes] = []
@@ -485,12 +604,22 @@ async def generate_image(
                     allowed_dir=data_dir,
                     allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
                 )
-                if ref_bytes:
-                    reference_images.append(ref_bytes)
+                # Don't silently drop a reference the caller explicitly asked
+                # for — that would quietly change the generation result.
+                if ref_bytes is None:
+                    raise ValueError(f"Could not fetch reference image: {ref_uri}")
+                reference_images.append(ref_bytes)
 
-        # Read thought signature from file if URL provided
+        # Read thought signature from file if URL provided. A malformed value
+        # must not be silently ignored — that would quietly turn a multi-turn
+        # edit into an unrelated fresh generation.
         thought_signature = None
-        if thought_signature_url and thought_signature_url.startswith("file://"):
+        if thought_signature_url:
+            if not thought_signature_url.startswith("file://"):
+                raise ValueError(
+                    "thought_signature_url must be a file:// URL returned by a "
+                    f"previous generate_image call, got: {thought_signature_url}"
+                )
             sig_path = Path(thought_signature_url[7:])
             validated_sig = _validate_local_path(sig_path, data_dir)
             thought_signature = validated_sig.read_text()
@@ -505,8 +634,17 @@ async def generate_image(
             reference_images=reference_images if reference_images else None,
             image_size=image_size,
             media_resolution=media_resolution,
+            aspect_ratio=aspect_ratio,
+            person_generation=person_generation,
             thought_signature=thought_signature,
         )
+        # The impl returns a dict without image_url/image_preview when the
+        # model responds with text only (e.g. a safety refusal or a clarifying
+        # question). Surface that text instead of crashing on a missing key.
+        if "image_url" not in result:
+            await ctx.info("Model returned text only")
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
         await ctx.info("Image generated successfully")
 
         # Build response dict
@@ -530,6 +668,8 @@ async def generate_image(
             "image_url": result["image_url"],
             "image_size": image_size,
             "media_resolution": media_resolution,
+            "aspect_ratio": aspect_ratio,
+            "person_generation": person_generation,
             "reference_image_uris": reference_image_uris,
             "source_image_uri": image_uri,
             "thought_signature_url": result.get("thought_signature_url"),
@@ -565,6 +705,8 @@ async def generate_video(
     audio_prompt: str | None = None,
     negative_prompt: str | None = None,
     seed: int | None = None,
+    resolution: str | None = None,
+    person_generation: str | None = None,
     image_uri: str | None = None,
     image_base64: str | None = None,
     last_frame_uri: str | None = None,
@@ -582,7 +724,9 @@ async def generate_video(
                - "veo-3.1-generate-001": VEO 3.1 (highest quality, 4/6/8s, audio)
                - "veo-3.1-fast-generate-001": VEO 3.1 Fast (faster, 4/6/8s, audio)
                - "veo-3.1-lite-generate-preview": VEO 3.1 Lite (most cost-effective,
-                 4/6/8s, audio; does NOT support video extension or 4K).
+                 4/6/8s, audio; supports ONLY text-to-video and
+                 image-to-video — no extension, reference images,
+                 first/last-frame, or 4K).
                  Availability note: Lite is served via the Gemini API / AI
                  Studio only; Vertex AI has not published it. When the server
                  runs in Vertex mode, Lite calls are automatically routed
@@ -594,6 +738,10 @@ async def generate_video(
         audio_prompt: Audio description
         negative_prompt: Things to avoid in the video
         seed: Random seed for reproducibility
+        resolution: Output resolution, "720p" or "1080p". "4K" is only
+            available on the non-Lite VEO models (not veo-3.1-lite).
+        person_generation: Person generation policy, "allow_adult" or
+            "allow_all". (Some regions restrict these values.)
         image_uri: First frame image URI for image-to-video
         image_base64: Base64 encoded first frame image (prefer image_uri)
         last_frame_uri: Last frame image URI for first+last frame control.
@@ -605,10 +753,12 @@ async def generate_video(
         extend_video_uri: URI of existing VEO-generated video to extend.
             Extends the final second of the video and continues the action.
             Note: Cannot be used together with other image inputs.
-            IMPORTANT: Video extension ALWAYS requires output_gcs_uri - extensions produce
-            larger combined videos that exceed inline response limits.
+            On Vertex AI, extension requires output_gcs_uri (the larger combined
+            video exceeds inline limits). On the Gemini API the extended clip is
+            returned inline, so no GCS target is needed.
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
-            Required for video extensions and longer duration videos.
+            Vertex AI only — on the Gemini API, output is always returned inline
+            and an explicit output_gcs_uri is rejected.
 
     Returns:
         JSON with video_url and generation details including generation_mode
@@ -616,6 +766,9 @@ async def generate_video(
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
+
+        # Fail fast on an unsupported aspect ratio before any fetch work.
+        _validate_aspect_ratio(aspect_ratio)
 
         # Fetch first frame image
         image_bytes = None
@@ -625,8 +778,12 @@ async def generate_video(
                 allowed_dir=data_dir,
                 allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
             )
+            # Fail loudly rather than silently degrading image-to-video to
+            # text-to-video when the provided URI can't be fetched.
+            if image_bytes is None:
+                raise ValueError(f"Could not fetch image_uri: {image_uri}")
         elif image_base64:
-            image_bytes = base64.b64decode(image_base64)
+            image_bytes = _decode_base64_capped(image_base64)
 
         # Fetch last frame image (VEO 3.1 first+last frame mode)
         last_frame_bytes = None
@@ -636,8 +793,12 @@ async def generate_video(
                 allowed_dir=data_dir,
                 allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
             )
+            # A provided last frame that can't be fetched must not silently
+            # drop first+last mode back to plain image-to-video.
+            if last_frame_bytes is None:
+                raise ValueError(f"Could not fetch last_frame_uri: {last_frame_uri}")
         elif last_frame_base64:
-            last_frame_bytes = base64.b64decode(last_frame_base64)
+            last_frame_bytes = _decode_base64_capped(last_frame_base64)
 
         # Fetch reference images (VEO 3.1 reference mode)
         reference_images: list[bytes] = []
@@ -648,24 +809,47 @@ async def generate_video(
                     allowed_dir=data_dir,
                     allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
                 )
-                if ref_bytes:
-                    reference_images.append(ref_bytes)
+                if ref_bytes is None:
+                    raise ValueError(f"Could not fetch reference image: {ref_uri}")
+                reference_images.append(ref_bytes)
 
-        # Use default GCS bucket from env if not provided; validate against allowlist.
-        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
-        if gcs_uri:
-            bucket = _parse_gcs_bucket(gcs_uri)
-            if bucket is None:
-                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
-            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
+        # Resolve the client up front: Veo Lite (and pure Gemini-API
+        # deployments) route to the Gemini API, which does not support GCS
+        # output. GCS behavior below depends on which backend is used.
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+
+        # Combine explicit output_gcs_uri with the env default, validate the
+        # allowlist, and apply the non-Vertex drop/raise gating.
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+
+        if extend_video_uri:
+            # extend_video_uri is handed straight to the API as a video
+            # source; a gs:// value must pass the same allowlist as every
+            # other gs:// input so it can't reach arbitrary buckets.
+            if extend_video_uri.startswith("gs://"):
+                extend_bucket = _parse_gcs_bucket(extend_video_uri)
+                if extend_bucket is None:
+                    raise ValueError(f"Invalid extend_video_uri: {extend_video_uri}")
+                _assert_gcs_bucket_allowed(extend_bucket, app_ctx.allowed_gcs_buckets)
+            # On Vertex, extensions produce a larger combined video that must be
+            # written to GCS. On the Gemini API there is no GCS output; the
+            # extended clip is downloaded inline, so no GCS target is required.
+            if is_vertex_client and not gcs_uri:
                 raise ValueError(
-                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
-                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
+                    "Video extension on Vertex AI requires output_gcs_uri (or a "
+                    "configured VIDEO_GCS_BUCKET). Extensions produce larger "
+                    "combined videos that exceed inline response limits."
                 )
 
         await ctx.info(f"Generating video with model={model}")
         result = await generate_video_impl(
-            client=_client_for_video_model(app_ctx, model),
+            client=video_client,
             prompt=prompt,
             videos_dir=app_ctx.videos_dir,
             model=model,
@@ -677,6 +861,8 @@ async def generate_video(
             audio_prompt=audio_prompt,
             negative_prompt=negative_prompt,
             seed=seed,
+            resolution=resolution,
+            person_generation=person_generation,
             log_callback=ctx.info,
             last_frame_bytes=last_frame_bytes,
             reference_images=reference_images if reference_images else None,
@@ -694,6 +880,8 @@ async def generate_video(
             "model": model,
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "resolution": resolution,
+            "person_generation": person_generation,
             "audio_enabled": result.get("audio_enabled", include_audio),
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
@@ -703,9 +891,19 @@ async def generate_video(
             "reference_image_uris": reference_image_uris,
             "extend_video_uri": extend_video_uri,
         }
+        # Surface any warnings the impl emitted for silently-dropped caller
+        # intent (e.g. include_audio ignored on the Gemini API path).
+        warnings = result.get("warnings")
+        if warnings:
+            manifest["warnings"] = warnings
         sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
+        else:
+            # No sidecar for remote (gs://) outputs — include the manifest
+            # inline so generation parameters aren't lost for exactly the
+            # large-video path GCS output is meant for.
+            result["manifest"] = manifest
 
         return json.dumps(result, indent=2)
     except Exception as e:
@@ -740,7 +938,8 @@ async def generate_transition(
         first_frame_uri: URI of the starting still (gs://, https://, file://)
         last_frame_uri: URI of the ending still (gs://, https://, file://)
         prompt: Description of the transition motion and style
-        model: VEO model (defaults to fast; lite is supported too)
+        model: VEO model (defaults to fast; Lite does NOT support
+            first/last-frame mode and cannot be used here)
         duration_seconds: Transition length (4/6/8s; snapped to nearest)
         aspect_ratio: 16:9 or 9:16 (must match clip aspect for clean cuts)
         include_audio: Generate transitional audio
@@ -755,6 +954,14 @@ async def generate_transition(
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
+
+        # Fail fast on an unsupported aspect ratio before any fetch work.
+        _validate_aspect_ratio(aspect_ratio)
+
+        # Resolve the client up front so GCS gating can see which backend is
+        # in play (the Gemini API does not support GCS output).
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
 
         first_bytes = await fetch(
             first_frame_uri,
@@ -772,20 +979,16 @@ async def generate_transition(
                 f"first_frame_uri={first_frame_uri}, last_frame_uri={last_frame_uri}"
             )
 
-        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
-        if gcs_uri:
-            bucket = _parse_gcs_bucket(gcs_uri)
-            if bucket is None:
-                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
-            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
-                raise ValueError(
-                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
-                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
-                )
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
 
         await ctx.info(f"Generating transition with model={model}")
         result = await generate_video_impl(
-            client=_client_for_video_model(app_ctx, model),
+            client=video_client,
             prompt=prompt,
             videos_dir=app_ctx.videos_dir,
             model=model,
@@ -818,9 +1021,17 @@ async def generate_transition(
             "first_frame_uri": first_frame_uri,
             "last_frame_uri": last_frame_uri,
         }
+        warnings = result.get("warnings")
+        if warnings:
+            manifest["warnings"] = warnings
         sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
+        else:
+            # No sidecar for remote (gs://) outputs — include the manifest
+            # inline so generation parameters aren't lost for exactly the
+            # large-video path GCS output is meant for.
+            result["manifest"] = manifest
         result["first_frame_uri"] = first_frame_uri
         result["last_frame_uri"] = last_frame_uri
 
@@ -874,6 +1085,14 @@ async def generate_bridge(
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
 
+        # Fail fast on an unsupported aspect ratio before any fetch work.
+        _validate_aspect_ratio(aspect_ratio)
+
+        # Resolve the client up front so GCS gating can see which backend is
+        # in play (the Gemini API does not support GCS output).
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+
         from_bytes = await fetch(
             from_clip_uri,
             allowed_dir=data_dir,
@@ -891,27 +1110,19 @@ async def generate_bridge(
             )
 
         await ctx.info("Extracting bridge frames")
-        first_frame_png = await asyncio.to_thread(
-            extract_frame_png, from_bytes, "end"
-        )
-        last_frame_png = await asyncio.to_thread(
-            extract_frame_png, to_bytes, "start"
-        )
+        first_frame_png = await asyncio.to_thread(extract_frame_png, from_bytes, "end")
+        last_frame_png = await asyncio.to_thread(extract_frame_png, to_bytes, "start")
 
-        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
-        if gcs_uri:
-            bucket = _parse_gcs_bucket(gcs_uri)
-            if bucket is None:
-                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
-            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
-                raise ValueError(
-                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
-                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
-                )
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
 
         await ctx.info(f"Generating bridge with model={model}")
         result = await generate_video_impl(
-            client=_client_for_video_model(app_ctx, model),
+            client=video_client,
             prompt=prompt,
             videos_dir=app_ctx.videos_dir,
             model=model,
@@ -944,9 +1155,17 @@ async def generate_bridge(
             "from_clip_uri": from_clip_uri,
             "to_clip_uri": to_clip_uri,
         }
+        warnings = result.get("warnings")
+        if warnings:
+            manifest["warnings"] = warnings
         sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
+        else:
+            # No sidecar for remote (gs://) outputs — include the manifest
+            # inline so generation parameters aren't lost for exactly the
+            # large-video path GCS output is meant for.
+            result["manifest"] = manifest
         result["from_clip_uri"] = from_clip_uri
         result["to_clip_uri"] = to_clip_uri
 
@@ -1015,19 +1234,30 @@ async def generate_clip(
         if not beats:
             raise ValueError("beats list must not be empty")
 
-        gcs_uri = output_gcs_uri or app_ctx.video_gcs_bucket
-        if gcs_uri:
-            bucket = _parse_gcs_bucket(gcs_uri)
-            if bucket is None:
-                raise ValueError(f"output_gcs_uri must start with gs://: {gcs_uri}")
-            if app_ctx.allowed_gcs_buckets and bucket not in app_ctx.allowed_gcs_buckets:
-                raise ValueError(
-                    f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
-                    f"Configured: {sorted(app_ctx.allowed_gcs_buckets)}"
-                )
+        # Validate the clip-level aspect ratio once, up front. Otherwise the
+        # impl's per-value ValueError fires inside every beat's error handler,
+        # producing a success-shaped manifest with zero segments instead of a
+        # clear top-level failure.
+        _validate_aspect_ratio(aspect_ratio)
+
+        # Resolve the client ONCE, before the beat loop. If the model can't be
+        # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY), let the
+        # RuntimeError propagate to the outer handler so the tool returns a
+        # top-level {"error": ...} rather than failing every beat individually
+        # and returning a success-shaped clip with empty segments.
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
 
         segments: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        clip_warnings: list[str] = []
         total_duration = 0.0
         prev_video_bytes: bytes | None = None
 
@@ -1056,7 +1286,7 @@ async def generate_clip(
 
                 await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
                 beat_result = await generate_video_impl(
-                    client=_client_for_video_model(app_ctx, model),
+                    client=video_client,
                     prompt=prompt,
                     videos_dir=app_ctx.videos_dir,
                     model=model,
@@ -1091,6 +1321,13 @@ async def generate_clip(
                 "video_url": beat_result.get("video_url"),
                 "generation_mode": beat_result.get("generation_mode"),
             }
+            # Surface any warnings the impl emitted for this beat (e.g.
+            # include_audio ignored on the Gemini API path) in the beat
+            # manifest and aggregate them into the clip-level warnings.
+            beat_warnings = beat_result.get("warnings")
+            if beat_warnings:
+                beat_manifest["warnings"] = beat_warnings
+                clip_warnings.extend(beat_warnings)
             sidecar_url = _write_sidecar(
                 beat_result.get("video_url", ""), beat_manifest
             )
@@ -1107,9 +1344,7 @@ async def generate_clip(
                     try:
                         cur_bytes = Path(beat_url[7:]).read_bytes()
                     except OSError as e:
-                        logger.warning(
-                            "Skipping bridge before beat %d: %s", idx, e
-                        )
+                        logger.warning("Skipping bridge before beat %d: %s", idx, e)
 
                 if cur_bytes is not None:
                     try:
@@ -1121,7 +1356,7 @@ async def generate_clip(
                         )
                         await ctx.info(f"Generating bridge before beat {idx + 1}")
                         bridge_result = await generate_video_impl(
-                            client=_client_for_video_model(app_ctx, model),
+                            client=video_client,
                             prompt="smooth cinematic cut between the two beats",
                             videos_dir=app_ctx.videos_dir,
                             model=model,
@@ -1156,15 +1391,17 @@ async def generate_clip(
                             ),
                             "video_url": bridge_result.get("video_url"),
                         }
+                        bridge_warnings = bridge_result.get("warnings")
+                        if bridge_warnings:
+                            bridge_manifest["warnings"] = bridge_warnings
+                            clip_warnings.extend(bridge_warnings)
                         b_sidecar = _write_sidecar(
                             bridge_result.get("video_url", ""), bridge_manifest
                         )
                         if b_sidecar:
                             bridge_manifest["sidecar_url"] = b_sidecar
                         segments.append(bridge_manifest)
-                        total_duration += float(
-                            bridge_manifest["duration_seconds"]
-                        )
+                        total_duration += float(bridge_manifest["duration_seconds"])
 
             segments.append(beat_manifest)
             total_duration += float(beat_manifest["duration_seconds"])
@@ -1190,6 +1427,12 @@ async def generate_clip(
         }
         if errors:
             clip_manifest["errors"] = errors
+        if clip_warnings:
+            # The same warning (e.g. "audio not honored on the Gemini API")
+            # is emitted per beat and per bridge; dedupe at the clip level,
+            # preserving first-seen order, so the manifest carries each
+            # distinct warning once instead of one copy per segment.
+            clip_manifest["warnings"] = list(dict.fromkeys(clip_warnings))
         return json.dumps(clip_manifest, indent=2)
     except Exception as e:
         await ctx.error(f"Clip generation failed: {e}")

@@ -223,16 +223,6 @@ def _create_test_image(width: int = 100, height: int = 100, mode: str = "RGB") -
             {"success": True},
             id="veo2_with_seed",
         ),
-        pytest.param(
-            {
-                "prompt": "Invalid aspect",
-                "model": "veo-3.1-generate-001",
-                "aspect_ratio": "4:3",
-                "duration_seconds": 5.0,
-            },
-            {"success": True},
-            id="veo2_invalid_aspect_ratio_fallback",
-        ),
     ],
 )
 @pytest.mark.asyncio
@@ -378,7 +368,10 @@ async def test_generate_video_veo3(
     assert gen_result["message"] == "Video generated successfully"
     assert gen_result["model"] == input["model"]
 
-    expected_audio = input.get("include_audio", False)
+    # On Vertex AI audio_enabled == include_audio; on the Gemini API path
+    # (non-Vertex) Veo 3.1 always generates audio natively.
+    include_audio = input.get("include_audio", False)
+    expected_audio = include_audio if use_vertexai else True
     assert gen_result["audio_enabled"] == expected_audio
 
 
@@ -835,8 +828,7 @@ async def test_generate_video_reference_images_limited_to_3(
 
     # Create 5 reference images (should be limited to 3)
     reference_images = [
-        _create_test_image(width=100, height=100, mode="RGB")
-        for _ in range(5)
+        _create_test_image(width=100, height=100, mode="RGB") for _ in range(5)
     ]
 
     video_obj = FakeVideoObject(video_bytes=b"fake video content")
@@ -1065,7 +1057,7 @@ async def test_generate_video_veo_lite_rejects_extension(tmp_path: Path) -> None
     operation = FakeOperation(done=True, result=result)
     client = FakeGenaiClient(operation=operation)
 
-    with pytest.raises(ValueError, match="does not support video extension"):
+    with pytest.raises(ValueError, match="does not support extend_video"):
         await generate_video(
             client=client,  # type: ignore[arg-type]
             prompt="Continue",
@@ -1099,3 +1091,463 @@ async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> N
             extend_video_uri=f"file://{outside}",
             allowed_dir=data_dir,
         )
+
+
+# ============================================================================
+# generate_video tests - Duration snapping and reporting
+# ============================================================================
+
+
+def _basic_client() -> "FakeGenaiClient":
+    """Build a client whose fake operation returns a single video with bytes."""
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    return FakeGenaiClient(operation=operation)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (5.0, 4),
+        (5.5, 6),
+        (7.5, 8),
+        (4.0, 4),
+        (100.0, 8),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_duration_snapped_and_returned(
+    requested: float,
+    expected: int,
+    tmp_path: Path,
+) -> None:
+    """Duration is snapped to [4,6,8] and the final value is returned."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    gen_result = await generate_video(
+        client=_basic_client(),  # type: ignore[arg-type]
+        prompt="Duration test",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        duration_seconds=requested,
+    )
+
+    assert gen_result["duration_seconds"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_reference_duration_forced_to_8(tmp_path: Path) -> None:
+    """Reference-to-video forces duration to 8 and reports it."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    gen_result = await generate_video(
+        client=_basic_client(),  # type: ignore[arg-type]
+        prompt="Reference",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        reference_images=[_create_test_image()],
+        duration_seconds=4.0,
+    )
+
+    assert gen_result["duration_seconds"] == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_extend_duration_forced_to_7(tmp_path: Path) -> None:
+    """Extend video forces duration to 7 and reports it."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    gen_result = await generate_video(
+        client=_basic_client(),  # type: ignore[arg-type]
+        prompt="Extend",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        extend_video_uri="gs://bucket/video.mp4",
+    )
+
+    assert gen_result["duration_seconds"] == 7
+
+
+# ============================================================================
+# generate_video tests - Aspect ratio validation
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_invalid_aspect_ratio_raises(tmp_path: Path) -> None:
+    """Unsupported aspect ratios raise instead of being silently coerced."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError, match="Unsupported aspect_ratio"):
+        await generate_video(
+            client=_basic_client(),  # type: ignore[arg-type]
+            prompt="Bad aspect",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+            aspect_ratio="4:3",
+        )
+
+
+# ============================================================================
+# generate_video tests - GCS output requires Vertex AI
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_gcs_output_dropped_on_non_vertex(
+    tmp_path: Path,
+) -> None:
+    """On the Gemini API (non-Vertex) client, output_gcs_uri is silently dropped.
+
+    The impl must not raise (that would break Veo Lite / text-to-video when a
+    VIDEO_GCS_BUCKET default is funneled through). It just omits the Vertex-only
+    field from the config. The generate_video *tool* separately rejects an
+    explicit request — see test_main.py.
+    """
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    captured: dict[str, Any] = {}
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation)  # vertexai=False by default
+
+    def capturing_generate_videos(**kwargs: Any) -> FakeOperation:
+        captured["config"] = kwargs.get("config")
+        return operation
+
+    client.models.generate_videos = capturing_generate_videos  # type: ignore[assignment]
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="GCS output",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        output_gcs_uri="gs://bucket/out.mp4",
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert captured["config"].output_gcs_uri is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_gcs_output_allowed_on_vertex(tmp_path: Path) -> None:
+    """output_gcs_uri is accepted when the client is in Vertex AI mode."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation, vertexai=True)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="GCS output",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        output_gcs_uri="gs://bucket/out.mp4",
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+
+
+# ============================================================================
+# generate_video tests - resolution and person_generation
+# ============================================================================
+
+
+@pytest.mark.parametrize("resolution", ["720p", "1080p", "4K"])
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_resolution_passed_through(
+    resolution: str,
+    tmp_path: Path,
+) -> None:
+    """Valid resolution values are passed through to the config."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    captured: dict[str, Any] = {}
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation)
+
+    def capturing_generate_videos(**kwargs: Any) -> FakeOperation:
+        captured["config"] = kwargs.get("config")
+        return operation
+
+    client.models.generate_videos = capturing_generate_videos  # type: ignore[assignment]
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Resolution test",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        resolution=resolution,
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert captured["config"].resolution == resolution
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_resolution_invalid_raises(tmp_path: Path) -> None:
+    """An unsupported resolution value raises."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError, match="Unsupported resolution"):
+        await generate_video(
+            client=_basic_client(),  # type: ignore[arg-type]
+            prompt="Bad resolution",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+            resolution="8K",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_4k_rejected_for_lite(tmp_path: Path) -> None:
+    """4K resolution is rejected for Veo Lite models."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError, match="does not support 4K"):
+        await generate_video(
+            client=_basic_client(),  # type: ignore[arg-type]
+            prompt="4K lite",
+            videos_dir=videos_dir,
+            model="veo-3.1-lite-generate-preview",
+            resolution="4K",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_person_generation_passed_through(tmp_path: Path) -> None:
+    """person_generation is passed through to the config as-is."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    captured: dict[str, Any] = {}
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation)
+
+    def capturing_generate_videos(**kwargs: Any) -> FakeOperation:
+        captured["config"] = kwargs.get("config")
+        return operation
+
+    client.models.generate_videos = capturing_generate_videos  # type: ignore[assignment]
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Person generation test",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        person_generation="allow_adult",
+    )
+
+    assert gen_result["message"] == "Video generated successfully"
+    assert captured["config"].person_generation == "allow_adult"
+
+
+# ============================================================================
+# generate_video tests - Audio intent warnings (Gemini API path)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_warns_no_audio_on_gemini_api(tmp_path: Path) -> None:
+    """On the Gemini API path, include_audio=False cannot be honored, so warn.
+
+    Veo 3.1 on the Gemini API always generates audio natively. The result must
+    carry a warning AND report audio_enabled=True truthfully.
+    """
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    gen_result = await generate_video(
+        client=_basic_client(),  # type: ignore[arg-type]  # vertexai=False
+        prompt="Silent video please",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        include_audio=False,
+    )
+
+    assert "warnings" in gen_result
+    assert isinstance(gen_result["warnings"], list)
+    assert any(
+        "include_audio=False was not honored" in w for w in gen_result["warnings"]
+    )
+    assert gen_result["audio_enabled"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_no_audio_warning_when_audio_requested_gemini_api(
+    tmp_path: Path,
+) -> None:
+    """include_audio=True on the Gemini API is satisfied, so no audio warning."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    gen_result = await generate_video(
+        client=_basic_client(),  # type: ignore[arg-type]  # vertexai=False
+        prompt="Video with audio",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        include_audio=True,
+    )
+
+    # Nothing else warns here, so the key should be absent entirely.
+    assert "warnings" not in gen_result
+    assert gen_result["audio_enabled"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_no_audio_warning_on_vertex(tmp_path: Path) -> None:
+    """On Vertex AI, include_audio=False is honored, so no warning is added."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    gen_video = FakeGeneratedVideo(video_obj)
+    result = FakeVideoResult([gen_video])
+    operation = FakeOperation(done=True, result=result)
+    client = FakeGenaiClient(operation=operation, vertexai=True)
+
+    gen_result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="Silent video on Vertex",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        include_audio=False,
+    )
+
+    assert "warnings" not in gen_result
+    assert gen_result["audio_enabled"] is False
+
+
+# ============================================================================
+# Round-4 regression tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_last_frame_without_first_raises(
+    tmp_path: Path,
+) -> None:
+    """A last frame without a first frame raises instead of silently
+    degrading to text-to-video and discarding the frame."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError, match="last frame.*without a first frame"):
+        await generate_video(
+            client=FakeGenaiClient(),  # type: ignore[arg-type]
+            prompt="end on this",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+            last_frame_bytes=_create_test_image(),
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs_extra",
+    [
+        pytest.param({"image_bytes": True, "last_frame_bytes": True}, id="first_last"),
+        pytest.param({"reference_images": True}, id="reference"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_lite_rejects_unsupported_modes(
+    kwargs_extra: dict[str, bool],
+    tmp_path: Path,
+) -> None:
+    """Veo 3.1 Lite rejects first/last-frame and reference modes up front."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    img = _create_test_image()
+    kwargs: dict[str, Any] = {}
+    if kwargs_extra.get("image_bytes"):
+        kwargs["image_bytes"] = img
+    if kwargs_extra.get("last_frame_bytes"):
+        kwargs["last_frame_bytes"] = img
+    if kwargs_extra.get("reference_images"):
+        kwargs["reference_images"] = [img]
+
+    with pytest.raises(ValueError, match="Veo 3.1 Lite supports only"):
+        await generate_video(
+            client=FakeGenaiClient(),  # type: ignore[arg-type]
+            prompt="x",
+            videos_dir=videos_dir,
+            model="veo-3.1-lite-generate-preview",
+            **kwargs,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_vertex_sends_generate_audio_false(
+    tmp_path: Path,
+) -> None:
+    """On Vertex, include_audio=False is sent explicitly so the API default
+    (audio on) cannot silently contradict the request."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    captured: dict[str, Any] = {}
+
+    video_obj = FakeVideoObject(video_bytes=b"fake video content")
+    operation = FakeOperation(
+        done=True, result=FakeVideoResult([FakeGeneratedVideo(video_obj)])
+    )
+    client = FakeGenaiClient(operation=operation, vertexai=True)
+
+    def capturing_generate_videos(**kwargs: Any) -> FakeOperation:
+        captured["config"] = kwargs.get("config")
+        return operation
+
+    client.models.generate_videos = capturing_generate_videos  # type: ignore[assignment]
+
+    result = await generate_video(
+        client=client,  # type: ignore[arg-type]
+        prompt="silent clip",
+        videos_dir=videos_dir,
+        model="veo-3.1-generate-001",
+        include_audio=False,
+    )
+
+    assert captured["config"].generate_audio is False
+    assert result["audio_enabled"] is False

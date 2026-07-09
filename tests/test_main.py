@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlparse
 
 import pytest
 from PIL import Image
@@ -93,20 +94,30 @@ class FakeContentStream:
 class FakeResponse:
     """Test double for aiohttp response."""
 
-    def __init__(self, status: int, data: bytes) -> None:
+    def __init__(
+        self,
+        status: int,
+        data: bytes,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status = status
         self._data = data
         self.content_length = len(data) if data else 0
         self.content = FakeContentStream(data)
+        self.headers = headers or {}
 
     async def read(self) -> bytes:
         return self._data
 
 
 class FakeClientSession:
-    """Test double for aiohttp ClientSession."""
+    """Test double for aiohttp ClientSession.
 
-    def __init__(self, responses: dict[str, tuple[int, bytes]]) -> None:
+    Responses may be (status, data) or (status, data, headers) tuples so
+    tests can drive the manual-redirect path via a Location header.
+    """
+
+    def __init__(self, responses: dict[str, tuple[Any, ...]]) -> None:
         self._responses = responses
 
     async def __aenter__(self) -> "FakeClientSession":
@@ -115,9 +126,11 @@ class FakeClientSession:
     async def __aexit__(self, *args: Any) -> None:
         pass
 
-    def get(self, url: str) -> "FakeContextManager":
-        status, data = self._responses.get(url, (404, b"Not found"))
-        return FakeContextManager(FakeResponse(status, data))
+    def get(self, url: str, **kwargs: Any) -> "FakeContextManager":
+        entry = self._responses.get(url, (404, b"Not found"))
+        status, data = entry[0], entry[1]
+        headers = entry[2] if len(entry) > 2 else {}
+        return FakeContextManager(FakeResponse(status, data, headers))
 
 
 class FakeContextManager:
@@ -255,7 +268,9 @@ def test_cleanup_credentials(
     ("input", "expected"),
     [
         pytest.param({}, False, id="no_credentials"),
-        pytest.param({"GOOGLE_GENAI_USE_VERTEXAI": "true"}, True, id="vertexai_enabled"),
+        pytest.param(
+            {"GOOGLE_GENAI_USE_VERTEXAI": "true"}, True, id="vertexai_enabled"
+        ),
         pytest.param(
             {"GOOGLE_GENAI_USE_VERTEXAI": "true"}, True, id="vertexai_enabled"
         ),
@@ -544,9 +559,7 @@ async def test_fetch(
             lambda *args, **kwargs: FakeClientSession(responses),
         )
         # Bypass SSRF host-resolution check (no DNS in unit tests)
-        monkeypatch.setattr(
-            "src.__main__._assert_http_host_public", lambda url: None
-        )
+        monkeypatch.setattr("src.__main__._assert_http_host_public", lambda url: None)
     result = await fetch(uri, allowed_dir=tmp_path)
     assert result == expected
 
@@ -625,9 +638,7 @@ async def test_fetch_rejects_metadata_service(
         return [(0, 0, 0, "", ("169.254.169.254", 0))]
 
     monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
-    result = await fetch(
-        "http://metadata.google.internal/", allowed_dir=tmp_path
-    )
+    result = await fetch("http://metadata.google.internal/", allowed_dir=tmp_path)
     assert result is None
 
 
@@ -645,9 +656,7 @@ async def test_fetch_enforces_size_cap_http(
     )
     monkeypatch.setattr("src.__main__._assert_http_host_public", lambda url: None)
     # Cap smaller than payload
-    result = await fetch(
-        "https://example.com/big", allowed_dir=tmp_path, max_bytes=100
-    )
+    result = await fetch("https://example.com/big", allowed_dir=tmp_path, max_bytes=100)
     assert result is None
 
 
@@ -659,9 +668,7 @@ async def test_fetch_enforces_size_cap_local(tmp_path: Path) -> None:
     data_dir.mkdir()
     target = data_dir / "big.bin"
     target.write_bytes(b"x" * 1024)
-    result = await fetch(
-        f"file://{target}", allowed_dir=data_dir, max_bytes=100
-    )
+    result = await fetch(f"file://{target}", allowed_dir=data_dir, max_bytes=100)
     assert result is None
 
 
@@ -768,10 +775,12 @@ async def test_app_lifespan_default_dirs(
 
     # Mock Path.exists to return False for /.dockerenv
     original_exists = Path.exists
+
     def mock_exists(self: Path) -> bool:
         if str(self) == "/.dockerenv":
             return False
         return original_exists(self)
+
     monkeypatch.setattr(Path, "exists", mock_exists)
 
     # Mock genai.Client
@@ -838,10 +847,12 @@ def test_is_running_in_container_dockerenv(
 
     # Mock Path.exists to control /.dockerenv detection
     original_exists = Path.exists
+
     def mock_exists_true(self: Path) -> bool:
         if str(self) == "/.dockerenv":
             return True
         return original_exists(self)
+
     def mock_exists_false(self: Path) -> bool:
         if str(self) == "/.dockerenv":
             return False
@@ -862,10 +873,12 @@ def test_is_running_in_container_not_in_container(
 
     # Mock Path.exists to return False for /.dockerenv
     original_exists = Path.exists
+
     def mock_exists(self: Path) -> bool:
         if str(self) == "/.dockerenv":
             return False
         return original_exists(self)
+
     monkeypatch.setattr(Path, "exists", mock_exists)
 
     assert is_running_in_container() is False
@@ -984,7 +997,7 @@ def _create_test_image(width: int = 100, height: int = 100) -> bytes:
         pytest.param(
             {
                 "prompt": "Test imagen",
-                "model": "imagen-3.0-generate-002",
+                "model": "imagen-4.0-generate-001",
                 "image_uri": None,
                 "image_base64": None,
             },
@@ -1361,10 +1374,12 @@ def _make_fake_mp4() -> bytes:
     import imageio.v3 as iio
     import numpy as np
 
-    frames = np.stack([
-        np.full((64, 64, 3), (200, 30, 30), dtype=np.uint8),
-        np.full((64, 64, 3), (30, 30, 200), dtype=np.uint8),
-    ])
+    frames = np.stack(
+        [
+            np.full((64, 64, 3), (200, 30, 30), dtype=np.uint8),
+            np.full((64, 64, 3), (30, 30, 200), dtype=np.uint8),
+        ]
+    )
     buf = BytesIO()
     iio.imwrite(
         buf,
@@ -1411,9 +1426,7 @@ async def test_generate_bridge_happy_path(
         # Record what the tool passed through so we can assert frames were
         # extracted and supplied.
         captured["image_bytes_len"] = len(kwargs.get("image_bytes") or b"")
-        captured["last_frame_bytes_len"] = len(
-            kwargs.get("last_frame_bytes") or b""
-        )
+        captured["last_frame_bytes_len"] = len(kwargs.get("last_frame_bytes") or b"")
         out = videos_dir / "bridge.mp4"
         out.write_bytes(b"bridge-mp4")
         return {
@@ -1942,3 +1955,1383 @@ def test_main(
     else:
         main()
         mock_run.assert_called_once()
+
+
+# ============================================================================
+# Security: SSRF via HTTP redirect
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_rejects_redirect_to_private_ip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A public URL that 302-redirects to a private/metadata host must be
+    rejected — the SSRF guard has to re-run on the redirect target."""
+    responses = {
+        "http://public.example.com/x": (
+            302,
+            b"",
+            {"Location": "http://169.254.169.254/latest/meta-data/"},
+        ),
+        # Would leak metadata if the redirect were followed blindly.
+        "http://169.254.169.254/latest/meta-data/": (200, b"SECRET"),
+    }
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *a, **kw: FakeClientSession(responses)
+    )
+
+    def fake_guard(url: str) -> None:
+        if urlparse(url).hostname == "169.254.169.254":
+            raise ValueError("Refusing to fetch non-public address")
+
+    monkeypatch.setattr("src.__main__._assert_http_host_public", fake_guard)
+
+    result = await fetch("http://public.example.com/x", allowed_dir=tmp_path)
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_follows_redirect_to_public(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A redirect to another public URL is followed and its body returned."""
+    responses = {
+        "http://a.example.com/x": (
+            302,
+            b"",
+            {"Location": "http://b.example.com/y"},
+        ),
+        "http://b.example.com/y": (200, b"final-body"),
+    }
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *a, **kw: FakeClientSession(responses)
+    )
+    monkeypatch.setattr("src.__main__._assert_http_host_public", lambda url: None)
+
+    result = await fetch("http://a.example.com/x", allowed_dir=tmp_path)
+    assert result == b"final-body"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_redirect_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A redirect chain longer than the hop limit is rejected (returns None)."""
+
+    class LoopSession(FakeClientSession):
+        def get(self, url: str, **kwargs: Any) -> "FakeContextManager":
+            # Always redirect back to itself -> hop limit trips.
+            return FakeContextManager(FakeResponse(302, b"", {"Location": url}))
+
+    monkeypatch.setattr("aiohttp.ClientSession", lambda *a, **kw: LoopSession({}))
+    monkeypatch.setattr("src.__main__._assert_http_host_public", lambda url: None)
+
+    result = await fetch("http://loop.example.com/x", allowed_dir=tmp_path)
+    assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_redirect_missing_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A redirect status with no Location header is rejected."""
+    responses = {"http://a.example.com/x": (302, b"")}
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *a, **kw: FakeClientSession(responses)
+    )
+    monkeypatch.setattr("src.__main__._assert_http_host_public", lambda url: None)
+
+    result = await fetch("http://a.example.com/x", allowed_dir=tmp_path)
+    assert result is None
+
+
+# ============================================================================
+# base64 size cap
+# ============================================================================
+
+
+def test_decode_base64_capped_ok() -> None:
+    """Small payloads decode normally."""
+    from src.__main__ import _decode_base64_capped
+
+    raw = b"hello world"
+    encoded = base64.b64encode(raw).decode()
+    assert _decode_base64_capped(encoded, max_bytes=1024) == raw
+
+
+def test_decode_base64_capped_rejects_oversize() -> None:
+    """Oversize payloads raise, and are rejected BEFORE the buffer is decoded."""
+    import src.__main__ as main_mod
+    from src.__main__ import _decode_base64_capped
+
+    encoded = base64.b64encode(b"x" * 2048).decode()
+
+    # The guard must reject based on encoded length before allocating the
+    # decoded buffer — otherwise the memory-exhaustion protection is moot.
+    called = False
+    orig_decode = base64.b64decode
+
+    def _tracking_decode(*args: Any, **kwargs: Any) -> bytes:
+        nonlocal called
+        called = True
+        return orig_decode(*args, **kwargs)
+
+    main_mod.base64.b64decode = _tracking_decode  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(ValueError, match="exceeds"):
+            _decode_base64_capped(encoded, max_bytes=1024)
+    finally:
+        main_mod.base64.b64decode = orig_decode  # type: ignore[attr-defined]
+
+    assert not called, "oversize input must be rejected before decoding"
+
+
+def test_decode_base64_capped_accepts_within_cap() -> None:
+    """A payload within the cap decodes normally."""
+    from src.__main__ import _decode_base64_capped
+
+    encoded = base64.b64encode(b"x" * 512).decode()
+    assert _decode_base64_capped(encoded, max_bytes=1024) == b"x" * 512
+
+
+# ============================================================================
+# Path validation ordering (no existence oracle outside allowed_dir)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_bare_path_outside_allowed_dir_rejected(
+    tmp_path: Path,
+) -> None:
+    """A bare path outside allowed_dir is rejected regardless of whether it
+    exists — validation runs before any stat()/exists() probe."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    # Existing file outside the allowed dir.
+    outside_existing = tmp_path / "exists.txt"
+    outside_existing.write_bytes(b"secret")
+    assert await fetch(str(outside_existing), allowed_dir=data_dir) is None
+
+    # Non-existent file outside the allowed dir.
+    outside_missing = tmp_path / "missing.txt"
+    assert await fetch(str(outside_missing), allowed_dir=data_dir) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_bare_path_inside_allowed_dir(tmp_path: Path) -> None:
+    """A bare path inside allowed_dir still works after the reorder."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    target = data_dir / "ok.txt"
+    target.write_bytes(b"data")
+    assert await fetch(str(target), allowed_dir=data_dir) == b"data"
+
+
+# ============================================================================
+# Tool call sites: fail loud + param plumbing + extend validation
+# ============================================================================
+
+
+def _image_ctx(tmp_path: Path) -> MagicMock:
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+    ctx = MagicMock()
+    ctx.info = AsyncMock()
+    ctx.error = AsyncMock()
+    ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=images_dir,
+        videos_dir=tmp_path / "videos",
+        client=MagicMock(),
+    )
+    return ctx
+
+
+def _video_ctx(
+    tmp_path: Path, allowed_gcs_buckets: frozenset[str] = frozenset()
+) -> MagicMock:
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    ctx = MagicMock()
+    ctx.info = AsyncMock()
+    ctx.error = AsyncMock()
+    ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=videos_dir,
+        client=MagicMock(),
+        allowed_gcs_buckets=allowed_gcs_buckets,
+    )
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_raises_on_unfetchable_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provided image_uri that can't be fetched yields an error, not a
+    silent downgrade to text-to-image."""
+    from src.__main__ import generate_image
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when image_uri fetch fails")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="edit",
+        model="gemini-3.1-flash-image",
+        image_uri=f"file://{tmp_path / 'nope.png'}",
+    )
+    assert len(result) == 1
+    payload = json.loads(result[0].text)
+    assert "error" in payload
+    assert "nope.png" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_raises_on_unfetchable_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provided reference image that can't be fetched is not silently
+    dropped — it errors."""
+    from src.__main__ import generate_image
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when a reference fetch fails")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="edit",
+        model="gemini-3.1-flash-image",
+        reference_image_uris=[f"file://{tmp_path / 'missing_ref.png'}"],
+    )
+    payload = json.loads(result[0].text)
+    assert "error" in payload
+    assert "missing_ref.png" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_passes_new_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """aspect_ratio and person_generation reach the impl and the manifest."""
+    from src.__main__ import generate_image
+
+    captured: dict[str, Any] = {}
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        out = images_dir / "out.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        return {
+            "message": "ok",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="gemini-3.1-flash-image",
+        aspect_ratio="16:9",
+        person_generation="allow_adult",
+    )
+    assert captured["aspect_ratio"] == "16:9"
+    assert captured["person_generation"] == "allow_adult"
+
+    # Manifest carries the new fields too.
+    text = result[1].text
+    data = json.loads(text)
+    sidecar = Path(data["sidecar_url"][7:])
+    manifest = json.loads(sidecar.read_text())
+    assert manifest["aspect_ratio"] == "16:9"
+    assert manifest["person_generation"] == "allow_adult"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_rejects_oversize_base64(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversize inline base64 image is rejected before generation."""
+    import src.__main__ as main_mod
+    from src.__main__ import generate_image
+
+    monkeypatch.setattr(main_mod, "MAX_FETCH_BYTES", 16)
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run on oversize base64")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    big_b64 = base64.b64encode(b"x" * 1024).decode()
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="edit",
+        model="gemini-3.1-flash-image",
+        image_base64=big_b64,
+    )
+    payload = json.loads(result[0].text)
+    assert "error" in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_raises_on_unfetchable_image_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provided image_uri that can't be fetched errors instead of silently
+    becoming text-to-video."""
+    from src.__main__ import generate_video
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when image_uri fetch fails")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = await generate_video(
+        ctx=_video_ctx(tmp_path),
+        prompt="p",
+        model="veo-3.1-generate-001",
+        image_uri=f"file://{tmp_path / 'nope.png'}",
+    )
+    payload = json.loads(result)
+    assert "error" in payload
+    assert "nope.png" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_raises_on_unfetchable_last_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provided last_frame_uri that can't be fetched errors."""
+    from src.__main__ import generate_video
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when last_frame fetch fails")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = await generate_video(
+        ctx=_video_ctx(tmp_path),
+        prompt="p",
+        model="veo-3.1-generate-001",
+        last_frame_uri=f"file://{tmp_path / 'nope.png'}",
+    )
+    payload = json.loads(result)
+    assert "error" in payload
+    assert "nope.png" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_passes_new_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """resolution and person_generation reach the impl and the manifest."""
+    from src.__main__ import generate_video
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        out = videos_dir / "v.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+            "audio_enabled": False,
+            "duration_seconds": 8.0,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = await generate_video(
+        ctx=_video_ctx(tmp_path),
+        prompt="p",
+        model="veo-3.1-generate-001",
+        resolution="1080p",
+        person_generation="allow_all",
+    )
+    assert captured["resolution"] == "1080p"
+    assert captured["person_generation"] == "allow_all"
+
+    data = json.loads(result)
+    sidecar = Path(data["sidecar_url"][7:])
+    manifest = json.loads(sidecar.read_text())
+    assert manifest["resolution"] == "1080p"
+    assert manifest["person_generation"] == "allow_all"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_extend_rejects_disallowed_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """extend_video_uri pointing at a bucket outside the allowlist errors."""
+    from src.__main__ import generate_video
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run for a disallowed extend bucket")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = await generate_video(
+        ctx=_video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"good"})),
+        prompt="p",
+        model="veo-3.1-generate-001",
+        extend_video_uri="gs://evil/clip.mp4",
+        output_gcs_uri="gs://good/out/",
+    )
+    payload = json.loads(result)
+    assert "error" in payload
+    assert "allowlist" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_extend_requires_gcs_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Video extension with no resolvable GCS output target errors before
+    starting generation."""
+    from src.__main__ import generate_video
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run without a GCS output target")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    # allowlist empty and no output_gcs_uri / VIDEO_GCS_BUCKET.
+    result = await generate_video(
+        ctx=_video_ctx(tmp_path),
+        prompt="p",
+        model="veo-3.1-generate-001",
+        extend_video_uri="gs://anything/clip.mp4",
+    )
+    payload = json.loads(result)
+    assert "error" in payload
+    assert "output_gcs_uri" in payload["error"]
+
+
+# ============================================================================
+# Regression tests for the post-review fixes
+# ============================================================================
+
+
+def _gemini_api_app_ctx(tmp_path: Path, video_gcs_bucket: str | None = None) -> Any:
+    """AppContext whose client reports the Gemini API (non-Vertex) backend.
+
+    A bare MagicMock has a truthy `_api_client.vertexai`, so it must be pinned
+    to False to exercise the Gemini-API code paths.
+    """
+    client = MagicMock()
+    client._api_client.vertexai = False
+    return AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=client,
+        video_gcs_bucket=video_gcs_bucket,
+    )
+
+
+def _ctx_wrapping(app_ctx: Any) -> Any:
+    """Wrap a pre-built AppContext in a mock MCP context."""
+    mock_ctx = MagicMock()
+    mock_ctx.info = AsyncMock()
+    mock_ctx.error = AsyncMock()
+    mock_ctx.request_context.lifespan_context = app_ctx
+    return mock_ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_explicit_gcs_on_gemini_api_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit output_gcs_uri on a Gemini-API-routed call is a clear error."""
+    from src.__main__ import generate_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when explicit GCS is rejected")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = json.loads(
+        await generate_video(
+            ctx=ctx,
+            prompt="x",
+            model="veo-3.1-generate-001",
+            output_gcs_uri="gs://bucket/out.mp4",
+        )
+    )
+    assert "error" in result
+    assert "Vertex AI" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_env_gcs_default_dropped_on_gemini_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A VIDEO_GCS_BUCKET default must not break Gemini-API generation.
+
+    Regression: the env default was funneled to the impl and the Vertex-only
+    gate then hard-raised, breaking all Veo Lite / text-to-video runs.
+    """
+    from src.__main__ import generate_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(
+        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{tmp_path}/videos/out.mp4",
+            "model": kwargs.get("model", ""),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_video(ctx=ctx, prompt="x", model="veo-3.1-generate-001")
+    )
+    assert result["message"] == "Video generated successfully"
+    # The env-default bucket is dropped on the Gemini API path.
+    assert captured["output_gcs_uri"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_extend_on_gemini_api_without_gcs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Video extension works on the Gemini API without a GCS target.
+
+    Regression: two independently-added checks (extend-requires-GCS and
+    GCS-requires-Vertex) deadlocked extension on Gemini-API deployments.
+    """
+    from src.__main__ import generate_video
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    src_clip = videos_dir / "src.mp4"
+    src_clip.write_bytes(b"fake-mp4")
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured["extend_video_uri"] = kwargs.get("extend_video_uri")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{videos_dir}/out.mp4",
+            "model": kwargs.get("model", ""),
+            "generation_mode": "extend_video",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_video(
+            ctx=ctx,
+            prompt="continue",
+            model="veo-3.1-generate-001",
+            extend_video_uri=f"file://{src_clip}",
+        )
+    )
+    assert result["message"] == "Video generated successfully"
+    assert captured["extend_video_uri"] == f"file://{src_clip}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_image_text_only_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A text-only model response is surfaced, not crashed on a missing key.
+
+    Regression: the tool indexed result["image_url"] unconditionally, so a
+    text-only response (refusal / clarifying question) raised KeyError.
+    """
+    from src.__main__ import generate_image
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(
+        AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=tmp_path / "videos",
+            client=MagicMock(),
+        )
+    )
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "Model returned text only",
+            "generated_text": "I can't create that image.",
+            "model": kwargs.get("model", ""),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_image(
+        ctx=ctx, prompt="something", model="gemini-2.5-flash-image"
+    )
+    # Single TextContent with the model's text — no KeyError, no image part.
+    assert len(result) == 1
+    payload = json.loads(result[0].text)
+    assert payload["generated_text"] == "I can't create that image."
+    assert "error" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_invalid_aspect_ratio_top_level_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invalid clip aspect ratio fails top-level, not as a per-beat error.
+
+    Regression: the impl's per-value ValueError fired inside each beat handler,
+    producing a success-shaped clip manifest with zero segments.
+    """
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(
+        AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=tmp_path / "videos",
+            client=MagicMock(),
+        )
+    )
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run for an invalid clip aspect ratio")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a"}, {"prompt": "b"}],
+            aspect_ratio="1:1",
+        )
+    )
+    assert "error" in result
+    assert "aspect_ratio" in result["error"]
+    assert result.get("kind") != "clip"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_fetch_unsupported_scheme_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unsupported URI scheme reports the scheme, not a directory error.
+
+    Regression: ftp://, s3://, data: fell into local-path validation and were
+    misreported as 'outside the allowed directory'.
+    """
+    import logging
+
+    with caplog.at_level(logging.ERROR):
+        result = await fetch("ftp://host/pic.png", allowed_dir=tmp_path)
+    assert result is None
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "Unsupported URI scheme" in joined
+    assert "outside the allowed directory" not in joined
+
+
+# ============================================================================
+# Round: GCS gating across transition/bridge/clip, clip client routing,
+# base64 wrap/pad cap, up-front aspect validation, warnings propagation.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_transition_explicit_gcs_on_gemini_api_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit output_gcs_uri on a Gemini-API-routed transition is a clear
+    top-level error, not a silent drop by the impl."""
+    from src.__main__ import generate_transition
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    (tmp_path / "videos").mkdir()
+    frame_a = images_dir / "a.png"
+    frame_b = images_dir / "b.png"
+    frame_a.write_bytes(_create_test_image())
+    frame_b.write_bytes(_create_test_image())
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when explicit GCS is rejected")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = json.loads(
+        await generate_transition(
+            ctx=ctx,
+            first_frame_uri=f"file://{frame_a}",
+            last_frame_uri=f"file://{frame_b}",
+            output_gcs_uri="gs://bucket/out.mp4",
+        )
+    )
+    assert "error" in result
+    assert "Vertex AI" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_transition_env_gcs_default_dropped_on_gemini_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A VIDEO_GCS_BUCKET default is silently dropped (not raised) for a
+    Gemini-API transition, and the call succeeds inline."""
+    from src.__main__ import generate_transition
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    frame_a = images_dir / "a.png"
+    frame_b = images_dir / "b.png"
+    frame_a.write_bytes(_create_test_image())
+    frame_b.write_bytes(_create_test_image())
+    ctx = _ctx_wrapping(
+        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
+        out = videos_dir / "out.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": "first_last_frame",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_transition(
+            ctx=ctx,
+            first_frame_uri=f"file://{frame_a}",
+            last_frame_uri=f"file://{frame_b}",
+        )
+    )
+    assert result["message"] == "Video generated successfully"
+    assert captured["output_gcs_uri"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_generate_bridge_explicit_gcs_on_gemini_api_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit output_gcs_uri on a Gemini-API-routed bridge errors."""
+    from src.__main__ import generate_bridge
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    clip_a = videos_dir / "a.mp4"
+    clip_b = videos_dir / "b.mp4"
+    clip_a.write_bytes(_make_fake_mp4())
+    clip_b.write_bytes(_make_fake_mp4())
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when explicit GCS is rejected")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = json.loads(
+        await generate_bridge(
+            ctx=ctx,
+            from_clip_uri=f"file://{clip_a}",
+            to_clip_uri=f"file://{clip_b}",
+            output_gcs_uri="gs://bucket/out.mp4",
+        )
+    )
+    assert "error" in result
+    assert "Vertex AI" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_generate_bridge_env_gcs_default_dropped_on_gemini_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A VIDEO_GCS_BUCKET default is dropped (not raised) for a Gemini-API
+    bridge, and the call succeeds inline."""
+    from src.__main__ import generate_bridge
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    clip_a = videos_dir / "a.mp4"
+    clip_b = videos_dir / "b.mp4"
+    clip_a.write_bytes(_make_fake_mp4())
+    clip_b.write_bytes(_make_fake_mp4())
+    ctx = _ctx_wrapping(
+        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
+        out = videos_dir / "bridge.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": "first_last_frame",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_bridge(
+            ctx=ctx,
+            from_clip_uri=f"file://{clip_a}",
+            to_clip_uri=f"file://{clip_b}",
+        )
+    )
+    assert result["message"] == "Video generated successfully"
+    assert captured["output_gcs_uri"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_explicit_gcs_on_gemini_api_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit output_gcs_uri on a Gemini-API-routed clip errors top-level
+    before any beat runs."""
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when explicit GCS is rejected")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a"}, {"prompt": "b"}],
+            output_gcs_uri="gs://bucket/out.mp4",
+        )
+    )
+    assert "error" in result
+    assert "Vertex AI" in result["error"]
+    assert result.get("kind") != "clip"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_generate_clip_env_gcs_default_dropped_on_gemini_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A VIDEO_GCS_BUCKET default is dropped (not raised) for a Gemini-API
+    clip, and beats succeed inline."""
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    ctx = _ctx_wrapping(
+        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
+        out = videos_dir / "beat.mp4"
+        out.write_bytes(_make_fake_mp4())
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model", ""),
+            "audio_enabled": kwargs.get("include_audio", False),
+            "generation_mode": "text_to_video",
+            "duration_seconds": kwargs.get("duration_seconds"),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a", "duration_seconds": 4}],
+            add_bridges=False,
+        )
+    )
+    assert result["kind"] == "clip"
+    assert len(result["segments"]) == 1
+    assert captured["output_gcs_uri"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_lite_without_api_client_top_level_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Lite model that can't route (Vertex primary, no gemini_api_client)
+    fails top-level, not as an empty-segments success manifest.
+
+    Regression: the client was resolved inside the per-beat try/except, so the
+    RuntimeError was recorded once per beat and the clip returned zero
+    segments while looking successful.
+    """
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    vertex_client = MagicMock()
+    vertex_client._api_client.vertexai = True
+    app_ctx = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=vertex_client,
+        gemini_api_client=None,
+    )
+    ctx = _ctx_wrapping(app_ctx)
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run when the model can't be routed")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a"}, {"prompt": "b"}],
+            model="veo-3.1-lite-generate-preview",
+        )
+    )
+    assert "error" in result
+    assert "Gemini API" in result["error"]
+    assert result.get("kind") != "clip"
+    assert "segments" not in result
+
+
+def test_decode_base64_capped_accepts_wrapped_under_cap() -> None:
+    """A 76-column MIME-wrapped payload whose true decoded size is under the
+    cap must NOT be rejected (whitespace is stripped before the estimate)."""
+    from src.__main__ import _decode_base64_capped
+
+    raw = b"y" * 1024
+    # encodebytes wraps at 76 columns and adds newlines — the pre-decode
+    # estimate must ignore this whitespace.
+    encoded = base64.encodebytes(raw).decode()
+    assert "\n" in encoded
+    assert _decode_base64_capped(encoded, max_bytes=1030) == raw
+
+
+def test_decode_base64_capped_accepts_exactly_cap() -> None:
+    """A payload decoding to exactly max_bytes must NOT be pre-rejected.
+
+    Regression: the old `len(data) // 4 * 3` estimate overshot on padded
+    input and falsely rejected an at-cap payload.
+    """
+    from src.__main__ import _decode_base64_capped
+
+    raw = b"z" * 1024
+    encoded = base64.b64encode(raw).decode()
+    assert _decode_base64_capped(encoded, max_bytes=1024) == raw
+
+
+def test_decode_base64_capped_rejects_oversize_before_decoding() -> None:
+    """A clearly-oversize payload is rejected BEFORE base64.b64decode runs."""
+    import src.__main__ as main_mod
+    from src.__main__ import _decode_base64_capped
+
+    encoded = base64.encodebytes(b"x" * (64 * 1024)).decode()
+
+    called = False
+    orig_decode = base64.b64decode
+
+    def _tracking_decode(*args: Any, **kwargs: Any) -> bytes:
+        nonlocal called
+        called = True
+        return orig_decode(*args, **kwargs)
+
+    main_mod.base64.b64decode = _tracking_decode  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(ValueError, match="exceeds"):
+            _decode_base64_capped(encoded, max_bytes=1024)
+    finally:
+        main_mod.base64.b64decode = orig_decode  # type: ignore[attr-defined]
+
+    assert not called, "oversize input must be rejected before decoding"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_tools_reject_bad_aspect_ratio_before_impl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_video / _transition / _bridge reject an unsupported aspect
+    ratio up front, before the impl (and before any fetch)."""
+    from src.__main__ import generate_bridge, generate_transition, generate_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run for an invalid aspect ratio")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
+
+    v = json.loads(
+        await generate_video(
+            ctx=_video_ctx(tmp_path),
+            prompt="p",
+            model="veo-3.1-generate-001",
+            aspect_ratio="4:3",
+        )
+    )
+    assert "error" in v
+    assert "aspect_ratio" in v["error"]
+
+    t = json.loads(
+        await generate_transition(
+            ctx=_video_ctx(tmp_path),
+            first_frame_uri=f"file://{tmp_path / 'a.png'}",
+            last_frame_uri=f"file://{tmp_path / 'b.png'}",
+            aspect_ratio="4:3",
+        )
+    )
+    assert "error" in t
+    assert "aspect_ratio" in t["error"]
+
+    b = json.loads(
+        await generate_bridge(
+            ctx=_video_ctx(tmp_path),
+            from_clip_uri=f"file://{tmp_path / 'a.mp4'}",
+            to_clip_uri=f"file://{tmp_path / 'b.mp4'}",
+            aspect_ratio="4:3",
+        )
+    )
+    assert "error" in b
+    assert "aspect_ratio" in b["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_propagates_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warnings from the impl surface in both the response and the manifest."""
+    from src.__main__ import generate_video
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    (tmp_path / "images").mkdir()
+    warning = "include_audio=False ignored on the Gemini API path"
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "v.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs["model"],
+            "audio_enabled": False,
+            "warnings": [warning],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_video(
+            ctx=_video_ctx(tmp_path), prompt="p", model="veo-3.1-generate-001"
+        )
+    )
+    assert result["warnings"] == [warning]
+    sidecar = Path(result["sidecar_url"][7:])
+    manifest = json.loads(sidecar.read_text())
+    assert manifest["warnings"] == [warning]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_generate_clip_propagates_beat_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-beat impl warnings appear in the beat manifest and aggregate into a
+    clip-level warnings list."""
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    ctx = _ctx_wrapping(
+        AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=videos_dir,
+            client=MagicMock(),
+        )
+    )
+    warning = "include_audio ignored on the Gemini API path"
+    call_index = {"n": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        call_index["n"] += 1
+        out = videos_dir / f"beat{call_index['n']}.mp4"
+        out.write_bytes(_make_fake_mp4())
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": "text_to_video",
+            "duration_seconds": kwargs.get("duration_seconds"),
+            "warnings": [warning],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a", "duration_seconds": 4}],
+            add_bridges=False,
+        )
+    )
+    assert result["segments"][0]["warnings"] == [warning]
+    assert result["warnings"] == [warning]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_dedupes_repeated_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identical warnings from many beats collapse to one at the clip level.
+
+    Regression: the same 'audio not honored' warning was appended per beat and
+    per bridge, flooding the clip manifest with byte-identical copies.
+    """
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    ctx = _ctx_wrapping(
+        AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=videos_dir,
+            client=MagicMock(),
+        )
+    )
+    warning = "include_audio=False was not honored: ..."
+    call_index = {"n": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        call_index["n"] += 1
+        out = videos_dir / f"seg{call_index['n']}.mp4"
+        out.write_bytes(_make_fake_mp4())
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model", ""),
+            "audio_enabled": False,
+            "generation_mode": "text_to_video",
+            "duration_seconds": kwargs.get("duration_seconds"),
+            "warnings": [warning],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a"}, {"prompt": "b"}, {"prompt": "c"}],
+            add_bridges=False,
+        )
+    )
+    # Three beats each emit the identical warning; the clip carries it once.
+    assert result["warnings"] == [warning]
+    # But each beat manifest still records its own warning.
+    beat_segs = [s for s in result["segments"] if s.get("kind") == "beat"]
+    assert len(beat_segs) == 3
+    assert all(s["warnings"] == [warning] for s in beat_segs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_image_malformed_thought_signature_url_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-file:// thought_signature_url errors instead of being silently
+    dropped (which would turn an edit into an unrelated fresh generation)."""
+    from src.__main__ import generate_image
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(
+        AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=tmp_path / "videos",
+            client=MagicMock(),
+        )
+    )
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("impl must not run with a malformed signature URL")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_image(
+        ctx=ctx,
+        prompt="make it orange",
+        model="gemini-3-pro-image",
+        thought_signature_url="/data/images/x_thought.txt",
+    )
+    payload = json.loads(result[0].text)
+    assert "error" in payload
+    assert "file://" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_bare_env_bucket_dropped_on_gemini_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed (bare, non-gs://) VIDEO_GCS_BUCKET env default must not
+    fail calls on the Gemini API path, where it would be dropped anyway."""
+    from src.__main__ import generate_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path, video_gcs_bucket="my-bucket"))
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{tmp_path}/videos/out.mp4",
+            "model": kwargs.get("model", ""),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_video(ctx=ctx, prompt="x", model="veo-3.1-generate-001")
+    )
+    assert result["message"] == "Video generated successfully"
+    assert captured["output_gcs_uri"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_gcs_output_includes_inline_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When output lands in GCS (no local sidecar possible), the manifest is
+    included inline in the response so generation params aren't lost."""
+    from src.__main__ import generate_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    client = MagicMock()
+    client._api_client.vertexai = True
+    ctx = _ctx_wrapping(
+        AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=tmp_path / "videos",
+            client=client,
+        )
+    )
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "Video generated successfully",
+            "video_url": "gs://bucket/out.mp4",
+            "model": kwargs.get("model", ""),
+            "duration_seconds": 8,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    result = json.loads(
+        await generate_video(
+            ctx=ctx,
+            prompt="x",
+            model="veo-3.1-generate-001",
+            seed=42,
+            resolution="1080p",
+            output_gcs_uri="gs://bucket/out/",
+        )
+    )
+    assert "sidecar_url" not in result
+    manifest = result["manifest"]
+    assert manifest["seed"] == 42
+    assert manifest["resolution"] == "1080p"

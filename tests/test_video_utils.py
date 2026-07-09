@@ -12,9 +12,7 @@ from src.video_utils import extract_frame_png
 
 def _make_video(frames: list[tuple[int, int, int]]) -> bytes:
     """Encode a tiny MP4 with the given per-frame RGB colors."""
-    arrays = [
-        np.full((64, 64, 3), color, dtype=np.uint8) for color in frames
-    ]
+    arrays = [np.full((64, 64, 3), color, dtype=np.uint8) for color in frames]
     buf = BytesIO()
     iio.imwrite(
         buf,
