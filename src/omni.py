@@ -8,21 +8,31 @@ render, ``client.interactions.get(...)`` is polled until the interaction
 completes, and multi-turn conversational editing is done by threading a
 ``previous_interaction_id`` (the server holds the prior video context).
 
-Request/response shapes follow the Interactions API reference
-(ai.google.dev/api/interactions-api) and were cross-checked against a
-live-verified implementation (2026-07):
+Request/response shapes follow the Vertex AI "Use Gemini Omni Flash …to
+generate videos" REST reference and the Interactions API docs:
   * media rides INSIDE ``input`` as flattened parts
     ({type: 'text'|'image'|'video', text|data|uri, mime_type}) — there are no
     separate image/video kwargs;
-  * ``response_format={'type': 'video', 'aspect_ratio': ...}`` is a TOP-LEVEL
-    field and is the only surface where aspect ratio is controllable;
+  * ``response_format`` is a LIST of one object
+    ``[{'type': 'video', 'aspect_ratio': ..., 'duration': 'Ns',
+    'delivery': 'uri', 'gcs_uri': ...}]``. aspect_ratio ("16:9"/"9:16") and
+    duration ("3s".."10s") live here; ``delivery='uri'`` + ``gcs_uri`` sends
+    output to Cloud Storage, otherwise the video bytes come back inline;
   * ``generation_config={'video_config': {'task': ...}}`` carries the task
     type (text_to_video / image_to_video / reference_to_video / edit);
-  * duration is NOT a documented request field on any Omni surface — the
-    model chooses the clip length, so no duration is ever sent;
-  * a finished interaction carries the clip in ``steps[].content[]`` video
-    parts (inline base64 ``data`` or a hosted ``uri``); newer SDKs also
-    expose a convenience ``output_video``.
+  * ``background=True`` runs the (minute-plus) render asynchronously; the
+    interaction id is polled until ``status == 'completed'``;
+  * a finished interaction carries the clip in a ``model_output`` step's
+    ``content[]`` video part (inline base64 ``data`` or a hosted ``uri``);
+    ``thought`` and ``user_input`` steps are skipped; newer SDKs also expose
+    a convenience ``output_video``.
+
+On Vertex the interactions collection is location ``global``
+(…/locations/global/interactions) — the caller must supply a global-location
+client. NOTE: the Vertex REST example places ``background`` inside the first
+``input`` part; that reads as a doc artifact (it is a request-level flag), so
+it is sent top-level here, matching the Interactions API convention. If a
+live call rejects it, move it into the input part.
 """
 
 import asyncio
@@ -41,6 +51,10 @@ OMNI_MODEL = "gemini-omni-flash-preview"
 
 # Output spec limits documented for gemini-omni-flash-preview.
 _SUPPORTED_ASPECT_RATIOS = ("16:9", "9:16")
+
+# Documented output duration bounds (sent as "Ns" in response_format).
+_MIN_DURATION = 3
+_MAX_DURATION = 10
 
 # Interval (seconds) between polls of an in-flight background interaction.
 _POLL_INTERVAL = 5
@@ -188,13 +202,14 @@ async def generate_video_omni(
     previous_interaction_id: str | None = None,
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
+    output_gcs_uri: str | None = None,
     timeout_seconds: int = 600,
     log_callback: LogCallback | None = None,
 ) -> dict[str, Any]:
     """Generate (or conversationally edit) a video with ``gemini-omni-flash-preview``.
 
     Args:
-        client: Google GenAI client.
+        client: Google GenAI client (for Vertex, a global-location client).
         prompt: Text description of the video to generate or the edit to apply.
         videos_dir: Directory to save the generated video.
         image_bytes_list: Optional input images (raw bytes). One image is
@@ -205,18 +220,20 @@ async def generate_video_omni(
         previous_interaction_id: Optional id of a prior interaction to continue
             a multi-turn conversational edit (server holds the video context).
         aspect_ratio: "16:9" (default) or "9:16". Output is always 720p, 24fps.
-        duration_seconds: Advisory only — Omni does not accept a duration on
-            any documented surface; the model chooses the clip length. The
-            requested value is echoed in the result for planning, with a
-            warning noting it was not enforced.
+        duration_seconds: Desired clip length; clamped to the supported [3, 10]
+            seconds and sent as "Ns" in response_format.
+        output_gcs_uri: Optional gs:// destination. When set, the video is
+            delivered to Cloud Storage (delivery='uri') and video_url is the
+            gs:// URI; otherwise the bytes come back inline and are written
+            locally as a file:// URL.
         timeout_seconds: Overall deadline covering the create call and the
             background polling loop.
         log_callback: Async callback for progress logging.
 
     Returns:
-        Dict with message, video_url (file://), interaction_id, model,
-        duration_seconds (the requested value; advisory), aspect_ratio, and
-        warnings (only when non-empty).
+        Dict with message, video_url (file:// or gs://), interaction_id, model,
+        duration_seconds (clamped int), aspect_ratio, and warnings (only when
+        non-empty).
     """
     # Non-fatal warnings surfaced back to the caller.
     warnings: list[str] = []
@@ -229,14 +246,20 @@ async def generate_video_omni(
             "Supported values are '16:9' and '9:16'."
         )
 
-    # Duration is not a controllable field on Omni; report it back for
-    # planning but warn that the model picks the actual length.
-    reported_duration = round(duration_seconds)
-    warnings.append(
-        "duration_seconds is not controllable on gemini-omni-flash; the model "
-        "chooses the clip length (typically 3-10s). The requested value is "
-        "echoed for planning only."
-    )
+    # Clamp duration into the documented [3, 10]s range and send it as "Ns".
+    clamped_duration = round(duration_seconds)
+    if clamped_duration < _MIN_DURATION:
+        clamped_duration = _MIN_DURATION
+        warnings.append(
+            f"duration_seconds={duration_seconds} below the {_MIN_DURATION}s "
+            f"minimum; clamped to {_MIN_DURATION}s."
+        )
+    elif clamped_duration > _MAX_DURATION:
+        clamped_duration = _MAX_DURATION
+        warnings.append(
+            f"duration_seconds={duration_seconds} above the {_MAX_DURATION}s "
+            f"maximum; clamped to {_MAX_DURATION}s."
+        )
 
     input_parts = _build_input_parts(prompt, image_bytes_list, input_video_bytes)
     task_type = _select_task_type(
@@ -245,16 +268,23 @@ async def generate_video_omni(
         image_count=len(image_bytes_list or []),
     )
 
-    # Interactions API request shapes (see module docstring): media rides in
-    # `input`; response_format (top-level) is the ONLY place aspect ratio is
-    # controllable; generation_config.video_config carries only the task; no
-    # duration field exists. background=True so the long render is polled
-    # rather than blocking one HTTP call.
+    # response_format is a LIST of one object carrying aspect ratio, duration,
+    # and (optionally) GCS delivery. See the module docstring for the full
+    # request shape and the note on `background` placement.
+    response_format_item: dict[str, Any] = {
+        "type": "video",
+        "aspect_ratio": aspect_ratio,
+        "duration": f"{clamped_duration}s",
+    }
+    if output_gcs_uri:
+        response_format_item["delivery"] = "uri"
+        response_format_item["gcs_uri"] = output_gcs_uri
+
     create_kwargs: dict[str, Any] = {
         "model": OMNI_MODEL,
         "input": input_parts,
         "background": True,
-        "response_format": {"type": "video", "aspect_ratio": aspect_ratio},
+        "response_format": [response_format_item],
         "generation_config": {"video_config": {"task": task_type}},
     }
     if previous_interaction_id is not None:
@@ -322,19 +352,24 @@ async def generate_video_omni(
         await log_callback("Interaction complete; resolving video output")
 
     inline_data, uri = _extract_video_payload(interaction)
-    video_bytes = await _resolve_video_bytes(client, inline_data, uri, log_callback)
 
-    filename = f"{uuid.uuid4()}.mp4"
-    filepath = videos_dir / filename
-    filepath.write_bytes(video_bytes)
-    video_url = f"file://{filepath}"
+    if uri and uri.startswith("gs://"):
+        # GCS-delivered output: pass the gs:// URI through unchanged (no
+        # download, no local write), mirroring the Veo gs:// output path.
+        video_url = uri
+    else:
+        video_bytes = await _resolve_video_bytes(client, inline_data, uri, log_callback)
+        filename = f"{uuid.uuid4()}.mp4"
+        filepath = videos_dir / filename
+        filepath.write_bytes(video_bytes)
+        video_url = f"file://{filepath}"
 
     result: dict[str, Any] = {
         "message": "Video generated successfully",
         "video_url": video_url,
         "interaction_id": interaction_id,
         "model": OMNI_MODEL,
-        "duration_seconds": reported_duration,
+        "duration_seconds": clamped_duration,
         "aspect_ratio": aspect_ratio,
     }
 

@@ -150,9 +150,11 @@ async def test_inline_video_written_and_request_shape(tmp_path: Path) -> None:
     assert kwargs is not None
     assert kwargs["model"] == OMNI_MODEL
     assert kwargs["background"] is True
-    # response_format is TOP-LEVEL and carries the aspect ratio.
-    assert kwargs["response_format"] == {"type": "video", "aspect_ratio": "9:16"}
-    # generation_config carries ONLY the task; no duration anywhere.
+    # response_format is a LIST of one object carrying aspect ratio + duration.
+    assert kwargs["response_format"] == [
+        {"type": "video", "aspect_ratio": "9:16", "duration": "6s"}
+    ]
+    # generation_config carries only the task.
     assert kwargs["generation_config"] == {"video_config": {"task": "text_to_video"}}
     # input is flattened parts, prompt first.
     assert kwargs["input"][0] == {"type": "text", "text": "a marble rolling"}
@@ -429,9 +431,8 @@ async def test_invalid_aspect_ratio_raises(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_duration_is_advisory_and_never_sent(tmp_path: Path) -> None:
-    """Duration is echoed for planning with a warning, and never appears in
-    the request (no documented field exists on any Omni surface)."""
+async def test_duration_sent_as_seconds_string(tmp_path: Path) -> None:
+    """Duration is sent as 'Ns' inside response_format (Vertex supports it)."""
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
     interactions = FakeInteractions(create_result=_inline_video_interaction())
@@ -444,8 +445,63 @@ async def test_duration_is_advisory_and_never_sent(tmp_path: Path) -> None:
         duration_seconds=8.0,
     )
     assert result["duration_seconds"] == 8
-    assert any("not controllable" in w for w in result["warnings"])
     kwargs = interactions.create_kwargs
     assert kwargs is not None
-    assert "duration" not in str(kwargs["generation_config"])
-    assert "duration" not in str(kwargs["response_format"])
+    assert kwargs["response_format"][0]["duration"] == "8s"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_duration_clamped_with_warning(tmp_path: Path) -> None:
+    """Out-of-range durations clamp to [3, 10] with a warning."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    interactions = FakeInteractions(create_result=_inline_video_interaction())
+    client = FakeGenaiClient(interactions=interactions)
+
+    result = await generate_video_omni(
+        client=client,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+        duration_seconds=15.0,
+    )
+    assert result["duration_seconds"] == 10
+    assert interactions.create_kwargs["response_format"][0]["duration"] == "10s"
+    assert any("clamped to 10s" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_gcs_delivery_sets_format_and_passes_uri_through(tmp_path: Path) -> None:
+    """output_gcs_uri sets delivery='uri'+gcs_uri; a gs:// result is passed
+    through as video_url without a local write."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    interaction = FakeInteraction(
+        id="int-7",
+        status="completed",
+        steps=[
+            FakeStep(
+                content=[
+                    FakePart(
+                        type="video", uri="gs://out/clip.mp4", mime_type="video/mp4"
+                    )
+                ]
+            )
+        ],
+    )
+    interactions = FakeInteractions(create_result=interaction)
+    client = FakeGenaiClient(interactions=interactions)
+
+    result = await generate_video_omni(
+        client=client,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+        output_gcs_uri="gs://out/",
+    )
+    fmt = interactions.create_kwargs["response_format"][0]
+    assert fmt["delivery"] == "uri"
+    assert fmt["gcs_uri"] == "gs://out/"
+    # gs:// output is passed through; nothing written locally.
+    assert result["video_url"] == "gs://out/clip.mp4"
+    assert not list(videos_dir.iterdir())

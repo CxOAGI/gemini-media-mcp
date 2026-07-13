@@ -3724,26 +3724,34 @@ async def test_loop_extend_passes_audio_and_propagates_warnings(
     assert result["warnings"] == ["same warning each step"]
 
 
-def test_client_for_omni_prefers_gemini_api_then_falls_back_to_vertex(
-    tmp_path: Path,
+def test_client_for_omni_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Omni routing: prefer a dedicated Gemini API client (Interactions is GA
-    there); otherwise use the primary client even in Vertex mode (omni is
-    documented on Vertex too) rather than refusing."""
+    """Omni routing: prefer a dedicated Gemini API client (Interactions GA
+    there); on a Vertex primary use a memoized global-location client (omni's
+    interactions collection is location `global`); on a Gemini-API primary use
+    it as-is. Previously a Vertex-only deployment raised."""
+    import src.__main__ as main_mod
     from src.__main__ import _client_for_omni
 
+    # Reset the module-level memo and stub the global-client constructor so no
+    # real credentials/network are needed.
+    monkeypatch.setattr(main_mod, "_omni_vertex_global_client", None)
+    global_client = MagicMock(name="omni-global")
+    monkeypatch.setattr(main_mod.genai, "Client", lambda **kwargs: global_client)
+
+    # Vertex primary, no dedicated Gemini API client → memoized global client.
     vertex_primary = MagicMock()
     vertex_primary._api_client.vertexai = True
-
-    # No dedicated Gemini API client → fall back to the Vertex primary
-    # (previously this raised).
     ctx_vertex = AppContext(
         data_folder=tmp_path,
         images_dir=tmp_path / "images",
         videos_dir=tmp_path / "videos",
         client=vertex_primary,
     )
-    assert _client_for_omni(ctx_vertex) is vertex_primary
+    assert _client_for_omni(ctx_vertex) is global_client
+    # Second call reuses the memo (constructor not called again).
+    assert _client_for_omni(ctx_vertex) is global_client
 
     # Dedicated Gemini API client present → prefer it.
     gemini_client = MagicMock()
@@ -3755,3 +3763,14 @@ def test_client_for_omni_prefers_gemini_api_then_falls_back_to_vertex(
         gemini_api_client=gemini_client,
     )
     assert _client_for_omni(ctx_both) is gemini_client
+
+    # Gemini-API primary (non-Vertex), no dedicated client → use it as-is.
+    gemini_primary = MagicMock()
+    gemini_primary._api_client.vertexai = False
+    ctx_dev = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=gemini_primary,
+    )
+    assert _client_for_omni(ctx_dev) is gemini_primary

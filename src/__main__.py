@@ -230,6 +230,20 @@ def _client_for_video_model(app_ctx: AppContext, model: str) -> genai.Client:
     return app_ctx.client
 
 
+# Memoized global-location Vertex client for omni. On Vertex the omni
+# interactions collection lives at .../locations/global/interactions, so a
+# regional primary client won't reach it.
+_omni_vertex_global_client: genai.Client | None = None
+
+
+def _get_omni_vertex_global_client() -> genai.Client:
+    """Return a memoized Vertex client pinned to the global location."""
+    global _omni_vertex_global_client
+    if _omni_vertex_global_client is None:
+        _omni_vertex_global_client = genai.Client(vertexai=True, location="global")
+    return _omni_vertex_global_client
+
+
 def _client_for_omni(app_ctx: AppContext) -> genai.Client:
     """Pick the genai.Client for gemini-omni-flash (Interactions API).
 
@@ -237,12 +251,14 @@ def _client_for_omni(app_ctx: AppContext) -> genai.Client:
     Developer API (where Interactions is GA) and Vertex AI / Gemini Enterprise
     Agent Platform (preview; may require allowlisting). Prefer the dedicated
     Gemini API client when one is configured — Interactions is GA there, the
-    safest path — otherwise use the primary client as-is, whether it is in
-    Gemini API or Vertex mode. On Vertex the Interactions transport is
-    preview and worth a smoke test before relying on conversational editing.
+    safest path. Otherwise, on a Vertex primary client, use a global-location
+    client (omni's interactions collection is location `global` on Vertex);
+    on a Gemini-API primary client, use it as-is.
     """
     if app_ctx.gemini_api_client is not None:
         return app_ctx.gemini_api_client
+    if getattr(app_ctx.client._api_client, "vertexai", False):
+        return _get_omni_vertex_global_client()
     return app_ctx.client
 
 
@@ -256,6 +272,7 @@ async def _omni_generate_and_manifest(
     previous_interaction_id: str | None = None,
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
+    output_gcs_uri: str | None = None,
     manifest_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the omni impl and attach a sidecar manifest, returning the result.
@@ -263,8 +280,22 @@ async def _omni_generate_and_manifest(
     Shared by generate_video_omni, edit_video, the generate_video draft path,
     and generate_clip's animatic mode so they all produce consistent output.
     """
+    client = _client_for_omni(app_ctx)
+
+    # GCS delivery only works on Vertex; on the Gemini API omni returns bytes
+    # inline. Drop an explicit output_gcs_uri on a non-Vertex omni client with
+    # a warning rather than sending an unsupported field.
+    effective_gcs = output_gcs_uri
+    gcs_warning: str | None = None
+    if output_gcs_uri and not getattr(client._api_client, "vertexai", False):
+        effective_gcs = None
+        gcs_warning = (
+            "output_gcs_uri is ignored: omni on the Gemini API returns video "
+            "inline (GCS delivery requires Vertex AI mode)."
+        )
+
     result = await generate_video_omni_impl(
-        client=_client_for_omni(app_ctx),
+        client=client,
         prompt=prompt,
         videos_dir=app_ctx.videos_dir,
         image_bytes_list=image_bytes_list or None,
@@ -272,8 +303,11 @@ async def _omni_generate_and_manifest(
         previous_interaction_id=previous_interaction_id,
         aspect_ratio=aspect_ratio,
         duration_seconds=duration_seconds,
+        output_gcs_uri=effective_gcs,
         log_callback=ctx.info,
     )
+    if gcs_warning:
+        result.setdefault("warnings", []).append(gcs_warning)
     manifest: dict[str, Any] = {
         "kind": "omni_video",
         "prompt": prompt,
@@ -282,6 +316,7 @@ async def _omni_generate_and_manifest(
         "duration_seconds": result.get("duration_seconds", duration_seconds),
         "interaction_id": result.get("interaction_id"),
         "previous_interaction_id": previous_interaction_id,
+        "output_gcs_uri": effective_gcs,
         "video_url": result.get("video_url"),
     }
     if manifest_extra:
@@ -1650,6 +1685,7 @@ async def generate_video_omni(
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
     previous_interaction_id: str | None = None,
+    output_gcs_uri: str | None = None,
 ) -> str:
     """Generate a video fast with gemini-omni-flash (Interactions API).
 
@@ -1667,6 +1703,9 @@ async def generate_video_omni(
         duration_seconds: Desired duration, clamped to 3-10s (default 6)
         previous_interaction_id: Continue a prior omni interaction to edit its
             video conversationally (see also the edit_video tool)
+        output_gcs_uri: Optional gs:// destination for the video (Vertex only;
+            ignored with a warning on the Gemini API, which returns bytes
+            inline). Must be in the configured bucket allowlist.
 
     Returns:
         JSON with video_url, interaction_id (pass to edit_video / this tool to
@@ -1675,6 +1714,14 @@ async def generate_video_omni(
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
+
+        if output_gcs_uri:
+            bucket = _parse_gcs_bucket(output_gcs_uri)
+            if bucket is None:
+                raise ValueError(
+                    f"output_gcs_uri must start with gs://: {output_gcs_uri}"
+                )
+            _assert_gcs_bucket_allowed(bucket, app_ctx.allowed_gcs_buckets)
 
         image_bytes_list: list[bytes] = []
         if image_uris:
@@ -1715,6 +1762,7 @@ async def generate_video_omni(
             previous_interaction_id=previous_interaction_id,
             aspect_ratio=aspect_ratio,
             duration_seconds=duration_seconds,
+            output_gcs_uri=output_gcs_uri,
             manifest_extra={
                 "image_uris": image_uris,
                 "input_video_uri": input_video_uri,
