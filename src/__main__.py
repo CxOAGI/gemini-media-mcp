@@ -244,20 +244,28 @@ def _get_omni_vertex_global_client() -> genai.Client:
     return _omni_vertex_global_client
 
 
-def _client_for_omni(app_ctx: AppContext) -> genai.Client:
+def _client_for_omni(app_ctx: AppContext, *, need_gcs: bool = False) -> genai.Client:
     """Pick the genai.Client for gemini-omni-flash (Interactions API).
 
     Omni + the Interactions API are documented on BOTH backends: the Gemini
     Developer API (where Interactions is GA) and Vertex AI / Gemini Enterprise
-    Agent Platform (preview; may require allowlisting). Prefer the dedicated
-    Gemini API client when one is configured — Interactions is GA there, the
-    safest path. Otherwise, on a Vertex primary client, use a global-location
-    client (omni's interactions collection is location `global` on Vertex);
-    on a Gemini-API primary client, use it as-is.
+    Agent Platform (preview; may require allowlisting).
+
+    GCS output delivery only works on Vertex, so when the caller needs it
+    (`need_gcs`) and the primary client is Vertex-capable, prefer the
+    global-location Vertex client even if a Gemini API key is also configured
+    — otherwise the explicit output_gcs_uri would be silently dropped. When
+    GCS is not needed, prefer the dedicated Gemini API client (Interactions is
+    GA there, the safest path). Falls back to a global-location Vertex client
+    for a Vertex primary (omni's interactions collection is location `global`),
+    or the primary client as-is on the Gemini API.
     """
+    primary_is_vertex = getattr(app_ctx.client._api_client, "vertexai", False)
+    if need_gcs and primary_is_vertex:
+        return _get_omni_vertex_global_client()
     if app_ctx.gemini_api_client is not None:
         return app_ctx.gemini_api_client
-    if getattr(app_ctx.client._api_client, "vertexai", False):
+    if primary_is_vertex:
         return _get_omni_vertex_global_client()
     return app_ctx.client
 
@@ -280,7 +288,9 @@ async def _omni_generate_and_manifest(
     Shared by generate_video_omni, edit_video, the generate_video draft path,
     and generate_clip's animatic mode so they all produce consistent output.
     """
-    client = _client_for_omni(app_ctx)
+    # Route to the Vertex client when GCS output is requested (delivery only
+    # works there), otherwise prefer the Gemini API client.
+    client = _client_for_omni(app_ctx, need_gcs=bool(output_gcs_uri))
 
     # GCS delivery only works on Vertex; on the Gemini API omni returns bytes
     # inline. Drop an explicit output_gcs_uri on a non-Vertex omni client with

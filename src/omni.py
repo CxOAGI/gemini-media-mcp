@@ -65,17 +65,75 @@ _POLL_INTERVAL = 5
 _IN_FLIGHT_STATUSES = ("in_progress", "queued")
 
 
-def _sniff_image_mime(data: bytes) -> str:
-    """Best-effort mime detection for input images (PNG/JPEG/WebP/GIF)."""
-    if data.startswith(b"\x89PNG"):
+def _ftyp_brand(data: bytes) -> str | None:
+    """Return the ISO-BMFF major brand (the token after the `ftyp` box) or None.
+
+    PNG/JPEG/WebP don't use ftyp; MP4/MOV/HEIC/HEIF all do, distinguished by
+    this brand.
+    """
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return data[8:12].decode("ascii", "ignore").strip().lower()
+    return None
+
+
+# HEIF-family ftyp brands → still images (HEIC/HEIF).
+_HEIF_BRANDS = {"heic", "heix", "heim", "heis", "hevc", "hevx"}
+_HEIF_SEQUENCE_BRANDS = {"mif1", "msf1"}
+
+
+def _detect_image_mime(data: bytes) -> str:
+    """Return the exact image MIME type from magic bytes, or raise.
+
+    Detects the formats omni accepts as image input. Rejects unknown bytes
+    rather than mislabeling them (e.g. defaulting HEIC to image/png) — an
+    accurate label lets the API accept supported formats and reject the rest
+    with a clear error, instead of us silently sending the wrong type.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
-    if data.startswith(b"\xff\xd8"):
+    if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
-    if data.startswith((b"GIF87a", b"GIF89a")):
+    if data[:6] in (b"GIF87a", b"GIF89a"):
         return "image/gif"
-    return "image/png"
+    brand = _ftyp_brand(data)
+    if brand in _HEIF_BRANDS:
+        return "image/heic"
+    if brand in _HEIF_SEQUENCE_BRANDS:
+        return "image/heif"
+    raise ValueError(
+        "Unrecognized image input format; could not detect a supported image "
+        "MIME type from the data. Supported: PNG, JPEG, WebP, HEIC/HEIF, GIF."
+    )
+
+
+def _detect_video_mime(data: bytes) -> str:
+    """Return the exact video MIME type from magic bytes, or raise.
+
+    Distinguishes MP4 vs QuickTime/MOV via the ftyp brand and recognizes
+    WebM/Matroska, MPEG program/video streams, and AVI, rather than labeling
+    every input video as MP4.
+    """
+    brand = _ftyp_brand(data)
+    if brand is not None:
+        if brand.startswith("qt"):
+            return "video/quicktime"
+        if brand in _HEIF_BRANDS or brand in _HEIF_SEQUENCE_BRANDS:
+            raise ValueError(
+                "Input labeled as video but the data is a HEIC/HEIF image."
+            )
+        return "video/mp4"
+    if data[:4] == b"\x1a\x45\xdf\xa3":
+        return "video/webm"
+    if data[:3] == b"\x00\x00\x01" and data[3:4] in (b"\xba", b"\xb3"):
+        return "video/mpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "video/x-msvideo"
+    raise ValueError(
+        "Unrecognized video input format; could not detect a supported video "
+        "MIME type from the data. Supported: MP4, QuickTime/MOV, WebM, MPEG, AVI."
+    )
 
 
 def _build_input_parts(
@@ -86,7 +144,8 @@ def _build_input_parts(
     """Assemble the flattened ``input`` parts for interactions.create.
 
     The Interactions API takes flattened media parts ({type, data, mime_type})
-    rather than generateContent's inlineData/fileData nesting.
+    rather than generateContent's inlineData/fileData nesting. Each part's
+    mime_type is detected from its bytes and unknown formats are rejected.
     """
     parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for img in image_bytes_list or []:
@@ -94,7 +153,7 @@ def _build_input_parts(
             {
                 "type": "image",
                 "data": base64.b64encode(img).decode("ascii"),
-                "mime_type": _sniff_image_mime(img),
+                "mime_type": _detect_image_mime(img),
             }
         )
     if input_video_bytes is not None:
@@ -102,7 +161,7 @@ def _build_input_parts(
             {
                 "type": "video",
                 "data": base64.b64encode(input_video_bytes).decode("ascii"),
-                "mime_type": "video/mp4",
+                "mime_type": _detect_video_mime(input_video_bytes),
             }
         )
     return parts
@@ -334,9 +393,10 @@ async def generate_video_omni(
         if log_callback:
             await log_callback(f"Interaction {interaction_id}: {status}")
         await asyncio.sleep(_POLL_INTERVAL)
-        # ASSUMED SDK SHAPE: interactions.get retrieves an interaction by id.
+        # google-genai's interactions.get takes the id as `id` (positional-or-
+        # keyword), NOT `interaction_id`.
         interaction = await _run_within_deadline(
-            client.interactions.get, interaction_id=interaction_id
+            client.interactions.get, id=interaction_id
         )
         status = _field(interaction, "status") or _field(interaction, "state")
 

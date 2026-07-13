@@ -3774,3 +3774,33 @@ def test_client_for_omni_routing(
         client=gemini_primary,
     )
     assert _client_for_omni(ctx_dev) is gemini_primary
+
+
+def test_client_for_omni_prefers_vertex_when_gcs_needed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When GCS output is requested and the primary is Vertex-capable, route to
+    the global Vertex client even if a Gemini API client exists — otherwise the
+    explicit output_gcs_uri would be silently dropped."""
+    import src.__main__ as main_mod
+    from src.__main__ import _client_for_omni
+
+    monkeypatch.setattr(main_mod, "_omni_vertex_global_client", None)
+    global_client = MagicMock(name="omni-global")
+    monkeypatch.setattr(main_mod.genai, "Client", lambda **kwargs: global_client)
+
+    vertex_primary = MagicMock()
+    vertex_primary._api_client.vertexai = True
+    gemini_client = MagicMock()
+    ctx = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=vertex_primary,
+        gemini_api_client=gemini_client,
+    )
+
+    # Default (no GCS) prefers the Gemini API client.
+    assert _client_for_omni(ctx) is gemini_client
+    # GCS requested → the Vertex global client wins so delivery works.
+    assert _client_for_omni(ctx, need_gcs=True) is global_client

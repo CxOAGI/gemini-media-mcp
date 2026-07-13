@@ -78,8 +78,11 @@ class FakeInteractions:
         self.create_kwargs = kwargs
         return self._create_result
 
-    def get(self, **kwargs: Any) -> FakeInteraction:
-        self.get_calls.append(kwargs)
+    def get(self, id: str, **kwargs: Any) -> FakeInteraction:
+        # Mirror google-genai's real signature: the interaction id is the
+        # `id` parameter (NOT `interaction_id`), so a wrong kwarg name raises
+        # TypeError here instead of being silently swallowed.
+        self.get_calls.append({"id": id, **kwargs})
         if self._get_results:
             return self._get_results.pop(0)
         raise AssertionError("unexpected interactions.get call")
@@ -210,11 +213,12 @@ async def test_input_video_inlined_and_edit_task(tmp_path: Path) -> None:
     interactions = FakeInteractions(create_result=_inline_video_interaction())
     client = FakeGenaiClient(interactions=interactions)
 
+    mp4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
     await generate_video_omni(
         client=client,  # type: ignore[arg-type]
         prompt="edit this",
         videos_dir=videos_dir,
-        input_video_bytes=b"SRC",
+        input_video_bytes=mp4,
     )
     kwargs = interactions.create_kwargs
     assert kwargs is not None
@@ -222,7 +226,7 @@ async def test_input_video_inlined_and_edit_task(tmp_path: Path) -> None:
     vid_part = kwargs["input"][1]
     assert vid_part["type"] == "video"
     assert vid_part["mime_type"] == "video/mp4"
-    assert base64.b64decode(vid_part["data"]) == b"SRC"
+    assert base64.b64decode(vid_part["data"]) == mp4
 
 
 @pytest.mark.asyncio
@@ -283,7 +287,7 @@ async def test_background_polling_until_completed(
     )
     assert Path(result["video_url"][7:]).read_bytes() == b"DONE"
     assert len(interactions.get_calls) == 2
-    assert interactions.get_calls[0] == {"interaction_id": "int-9"}
+    assert interactions.get_calls[0] == {"id": "int-9"}
 
 
 @pytest.mark.asyncio
@@ -505,3 +509,86 @@ async def test_gcs_delivery_sets_format_and_passes_uri_through(tmp_path: Path) -
     # gs:// output is passed through; nothing written locally.
     assert result["video_url"] == "gs://out/clip.mp4"
     assert not list(videos_dir.iterdir())
+
+
+# ============================================================================
+# MIME detection (accurate labels; reject unknown)
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        pytest.param(b"\x89PNG\r\n\x1a\nrest", "image/png", id="png"),
+        pytest.param(b"\xff\xd8\xff\xe0rest", "image/jpeg", id="jpeg"),
+        pytest.param(b"RIFF\x00\x00\x00\x00WEBPVP8 ", "image/webp", id="webp"),
+        pytest.param(b"GIF89a....", "image/gif", id="gif"),
+        pytest.param(
+            b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00", "image/heic", id="heic"
+        ),
+        pytest.param(
+            b"\x00\x00\x00\x18ftypmif1\x00\x00\x00\x00", "image/heif", id="heif"
+        ),
+    ],
+)
+def test_detect_image_mime(data: bytes, expected: str) -> None:
+    from src.omni import _detect_image_mime
+
+    assert _detect_image_mime(data) == expected
+
+
+def test_detect_image_mime_rejects_unknown_and_video() -> None:
+    from src.omni import _detect_image_mime
+
+    with pytest.raises(ValueError, match="Unrecognized image"):
+        _detect_image_mime(b"not-an-image-at-all")
+    # An MP4 (ftyp mp42) is not an image → rejected, not mislabeled as PNG.
+    with pytest.raises(ValueError, match="Unrecognized image"):
+        _detect_image_mime(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00")
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        pytest.param(
+            b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00", "video/mp4", id="mp4"
+        ),
+        pytest.param(
+            b"\x00\x00\x00\x18ftypqt  \x00\x00\x00\x00", "video/quicktime", id="mov"
+        ),
+        pytest.param(b"\x1a\x45\xdf\xa3rest", "video/webm", id="webm"),
+        pytest.param(b"\x00\x00\x01\xbarest", "video/mpeg", id="mpeg"),
+        pytest.param(b"RIFF\x00\x00\x00\x00AVI LIST", "video/x-msvideo", id="avi"),
+    ],
+)
+def test_detect_video_mime(data: bytes, expected: str) -> None:
+    from src.omni import _detect_video_mime
+
+    assert _detect_video_mime(data) == expected
+
+
+def test_detect_video_mime_rejects_unknown() -> None:
+    from src.omni import _detect_video_mime
+
+    with pytest.raises(ValueError, match="Unrecognized video"):
+        _detect_video_mime(b"SRC")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_unknown_image_input_raises_in_generate(tmp_path: Path) -> None:
+    """An undetectable image input surfaces a clear error rather than being
+    sent with a wrong (default) MIME type."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    client = FakeGenaiClient(
+        FakeInteractions(create_result=_inline_video_interaction())
+    )
+
+    with pytest.raises(ValueError, match="Unrecognized image"):
+        await generate_video_omni(
+            client=client,  # type: ignore[arg-type]
+            prompt="p",
+            videos_dir=videos_dir,
+            image_bytes_list=[b"bogus-bytes"],
+        )
