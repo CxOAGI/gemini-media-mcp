@@ -187,6 +187,51 @@ def _select_task_type(
     return "text_to_video"
 
 
+def _build_create_kwargs(
+    *,
+    prompt: str,
+    image_bytes_list: list[bytes] | None,
+    input_video_bytes: bytes | None,
+    previous_interaction_id: str | None,
+    aspect_ratio: str,
+    duration_seconds_int: int,
+    output_gcs_uri: str | None,
+) -> dict[str, Any]:
+    """Assemble the ``interactions.create`` request body.
+
+    Pure and side-effect-free so it can be validated against the SDK's own
+    request normalizer in tests. ``response_format`` is a LIST of one object
+    carrying aspect ratio, duration ("Ns"), and optional GCS delivery;
+    ``background`` is top-level (the Vertex REST example nests it in input[0],
+    which is a doc artifact — the SDK's create schema has it top-level).
+    """
+    response_format_item: dict[str, Any] = {
+        "type": "video",
+        "aspect_ratio": aspect_ratio,
+        "duration": f"{duration_seconds_int}s",
+    }
+    if output_gcs_uri:
+        response_format_item["delivery"] = "uri"
+        response_format_item["gcs_uri"] = output_gcs_uri
+
+    task_type = _select_task_type(
+        previous_interaction_id=previous_interaction_id,
+        input_video_bytes=input_video_bytes,
+        image_count=len(image_bytes_list or []),
+    )
+
+    create_kwargs: dict[str, Any] = {
+        "model": OMNI_MODEL,
+        "input": _build_input_parts(prompt, image_bytes_list, input_video_bytes),
+        "background": True,
+        "response_format": [response_format_item],
+        "generation_config": {"video_config": {"task": task_type}},
+    }
+    if previous_interaction_id is not None:
+        create_kwargs["previous_interaction_id"] = previous_interaction_id
+    return create_kwargs
+
+
 def _field(obj: Any, name: str) -> Any:
     """Read a field from an SDK object or a plain dict interchangeably."""
     if isinstance(obj, dict):
@@ -320,34 +365,16 @@ async def generate_video_omni(
             f"maximum; clamped to {_MAX_DURATION}s."
         )
 
-    input_parts = _build_input_parts(prompt, image_bytes_list, input_video_bytes)
-    task_type = _select_task_type(
-        previous_interaction_id=previous_interaction_id,
+    create_kwargs = _build_create_kwargs(
+        prompt=prompt,
+        image_bytes_list=image_bytes_list,
         input_video_bytes=input_video_bytes,
-        image_count=len(image_bytes_list or []),
+        previous_interaction_id=previous_interaction_id,
+        aspect_ratio=aspect_ratio,
+        duration_seconds_int=clamped_duration,
+        output_gcs_uri=output_gcs_uri,
     )
-
-    # response_format is a LIST of one object carrying aspect ratio, duration,
-    # and (optionally) GCS delivery. See the module docstring for the full
-    # request shape and the note on `background` placement.
-    response_format_item: dict[str, Any] = {
-        "type": "video",
-        "aspect_ratio": aspect_ratio,
-        "duration": f"{clamped_duration}s",
-    }
-    if output_gcs_uri:
-        response_format_item["delivery"] = "uri"
-        response_format_item["gcs_uri"] = output_gcs_uri
-
-    create_kwargs: dict[str, Any] = {
-        "model": OMNI_MODEL,
-        "input": input_parts,
-        "background": True,
-        "response_format": [response_format_item],
-        "generation_config": {"video_config": {"task": task_type}},
-    }
-    if previous_interaction_id is not None:
-        create_kwargs["previous_interaction_id"] = previous_interaction_id
+    task_type = create_kwargs["generation_config"]["video_config"]["task"]
 
     if log_callback:
         mode = "editing" if previous_interaction_id else "generating"

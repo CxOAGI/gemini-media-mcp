@@ -592,3 +592,51 @@ async def test_unknown_image_input_raises_in_generate(tmp_path: Path) -> None:
             videos_dir=videos_dir,
             image_bytes_list=[b"bogus-bytes"],
         )
+
+
+# ============================================================================
+# Contract test against the REAL google-genai request normalizer
+# ============================================================================
+
+
+def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
+    """Our create body must pass google-genai's own _normalize_create_body:
+    all keys recognized (it raises TypeError on unknown keys) and the flat
+    content list correctly wrapped into a user_input step. This validates the
+    request shape against the actual SDK, not just our fakes — the layer that
+    masked the earlier interactions.get(id=) bug.
+    """
+    try:
+        from google.genai._gaos.google_genai import (
+            _CREATE_BODY_KEYS,
+            _normalize_create_body,
+        )
+    except Exception:  # pragma: no cover - SDK internals moved
+        pytest.skip("google-genai request normalizer not importable at this path")
+
+    from src.omni import _build_create_kwargs
+
+    body = _build_create_kwargs(
+        prompt="a marble rolling",
+        image_bytes_list=[b"\x89PNG\r\n\x1a\nrest"],
+        input_video_bytes=None,
+        previous_interaction_id="int-1",
+        aspect_ratio="9:16",
+        duration_seconds_int=6,
+        output_gcs_uri="gs://bucket/out/",
+    )
+
+    # Every key we send is a recognized create-body field (else create() 400s
+    # locally with TypeError before any request).
+    assert set(body) <= _CREATE_BODY_KEYS
+
+    out = _normalize_create_body(dict(body))
+    # background stays top-level; response_format stays a list.
+    assert out["background"] is True
+    assert isinstance(out["response_format"], list)
+    assert out["response_format"][0]["duration"] == "6s"
+    assert out["response_format"][0]["gcs_uri"] == "gs://bucket/out/"
+    # The flat content list is wrapped into a single user_input step.
+    assert out["input"][0]["type"] == "user_input"
+    kinds = [p["type"] for p in out["input"][0]["content"]]
+    assert kinds == ["text", "image"]
