@@ -3335,3 +3335,237 @@ async def test_generate_video_gcs_output_includes_inline_manifest(
     manifest = result["manifest"]
     assert manifest["seed"] == 42
     assert manifest["resolution"] == "1080p"
+
+
+# ============================================================================
+# Omni / draft / animatic / loop_extend tools
+# ============================================================================
+
+
+def _omni_result(video_url: str, interaction_id: str = "int-1") -> dict[str, Any]:
+    return {
+        "message": "Video generated successfully",
+        "video_url": video_url,
+        "interaction_id": interaction_id,
+        "model": "gemini-omni-flash-preview",
+        "duration_seconds": 6,
+        "aspect_ratio": "16:9",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_omni_returns_interaction_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.__main__ import generate_video_omni
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    out = tmp_path / "videos" / "o.mp4"
+    out.write_bytes(b"mp4")
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return _omni_result(f"file://{out}")
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+
+    result = json.loads(await generate_video_omni(ctx=ctx, prompt="a marble rolling"))
+    assert result["interaction_id"] == "int-1"
+    assert result["video_url"] == f"file://{out}"
+    assert result["sidecar_url"].endswith(".json")
+    assert captured["prompt"] == "a marble rolling"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_edit_video_forwards_previous_interaction_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.__main__ import edit_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    out = tmp_path / "videos" / "e.mp4"
+    out.write_bytes(b"mp4")
+
+    captured: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return _omni_result(f"file://{out}", interaction_id="int-2")
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+
+    result = json.loads(
+        await edit_video(
+            ctx=ctx,
+            previous_interaction_id="int-1",
+            prompt="make the sky stormy",
+        )
+    )
+    assert captured["previous_interaction_id"] == "int-1"
+    assert result["interaction_id"] == "int-2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_draft_routes_to_omni(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.__main__ import generate_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    out = tmp_path / "videos" / "d.mp4"
+    out.write_bytes(b"mp4")
+
+    omni_called = {"n": 0}
+
+    async def mock_omni(**kwargs: Any) -> dict[str, Any]:
+        omni_called["n"] += 1
+        return _omni_result(f"file://{out}")
+
+    async def veo_should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("draft mode must not call the Veo impl")
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_omni)
+    monkeypatch.setattr("src.__main__.generate_video_impl", veo_should_not_run)
+
+    result = json.loads(
+        await generate_video(
+            ctx=ctx,
+            prompt="draft this",
+            model="veo-3.1-generate-001",
+            draft=True,
+            seed=42,
+            negative_prompt="blurry",
+        )
+    )
+    assert omni_called["n"] == 1
+    assert result["interaction_id"] == "int-1"
+    # Veo-only params that were passed are reported as ignored.
+    joined = " ".join(result.get("warnings", []))
+    assert "seed" in joined and "negative_prompt" in joined
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_animatic_uses_omni_and_skips_bridges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    n = {"i": 0}
+
+    async def mock_omni(**kwargs: Any) -> dict[str, Any]:
+        n["i"] += 1
+        out = videos_dir / f"a{n['i']}.mp4"
+        out.write_bytes(b"mp4")
+        return _omni_result(f"file://{out}", interaction_id=f"int-{n['i']}")
+
+    async def veo_should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("animatic mode must not call the Veo impl")
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_omni)
+    monkeypatch.setattr("src.__main__.generate_video_impl", veo_should_not_run)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a"}, {"prompt": "b"}],
+            animatic=True,
+            add_bridges=True,
+        )
+    )
+    assert result["animatic"] is True
+    assert result["model"] == "gemini-omni-flash-preview"
+    beat_segs = [s for s in result["segments"] if s.get("kind") == "beat"]
+    assert len(beat_segs) == 2
+    assert all(s["generation_mode"] == "animatic" for s in beat_segs)
+    # No bridge segments; add_bridges was ignored with a warning.
+    assert not any(s.get("kind") == "bridge" for s in result["segments"])
+    assert any("add_bridges is ignored" in w for w in result.get("warnings", []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_loop_extend_chains_extensions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.__main__ import loop_extend
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    extend_uris: list[str] = []
+    n = {"i": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        n["i"] += 1
+        extend_uris.append(kwargs.get("extend_video_uri"))
+        out = videos_dir / f"ext{n['i']}.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model"),
+            "generation_mode": "extend_video",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    start = videos_dir / "start.mp4"
+    start.write_bytes(b"mp4")
+    result = json.loads(
+        await loop_extend(
+            ctx=ctx,
+            video_uri=f"file://{start}",
+            times=3,
+            model="veo-3.1-generate-001",
+        )
+    )
+    assert n["i"] == 3
+    # First extension uses the source; each subsequent uses the prior output.
+    assert extend_uris[0] == f"file://{start}"
+    assert extend_uris[1] == f"file://{videos_dir}/ext1.mp4"
+    assert extend_uris[2] == f"file://{videos_dir}/ext2.mp4"
+    assert result["video_url"] == f"file://{videos_dir}/ext3.mp4"
+    assert len(result["extension_steps"]) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_loop_extend_rejects_lite_and_bad_times(
+    tmp_path: Path,
+) -> None:
+    from src.__main__ import loop_extend
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    lite = json.loads(
+        await loop_extend(
+            ctx=ctx,
+            video_uri="file:///x.mp4",
+            model="veo-3.1-lite-generate-preview",
+        )
+    )
+    assert "error" in lite and "Lite" in lite["error"]
+
+    bad = json.loads(await loop_extend(ctx=ctx, video_uri="file:///x.mp4", times=99))
+    assert "error" in bad and "between 1 and 20" in bad["error"]

@@ -12,12 +12,15 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 | **Author** | [CxOAGI](https://github.com/CxOAGI) |
 | **Repository** | [https://github.com/CxOAGI/gemini-media-mcp](https://github.com/CxOAGI/gemini-media-mcp) |
 
-## Available Tools (2)
+## Available Tools (5)
 
 | Tools provided by this Server | Short Description |
 |-------------------------------|-------------------|
 | `generate_image` | Generate images using Gemini or Imagen models |
-| `generate_video` | Generate videos using VEO models |
+| `generate_video` | Generate videos using VEO models (with optional fast `draft` mode) |
+| `generate_video_omni` | Fast conversational video via `gemini-omni-flash-preview` (Interactions API) |
+| `edit_video` | Conversationally edit a previously omni-generated video |
+| `loop_extend` | Extend a Veo video multiple times in one call |
 
 ---
 
@@ -67,6 +70,7 @@ Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the p
 | `negative_prompt` | string *optional* | Things to avoid in the video |
 | `seed` | integer *optional* | Random seed for reproducibility |
 | `image_uri` | string *optional* | Input image URI for image-to-video generation |
+| `draft` | boolean *optional* | When `true`, routes to `gemini-omni-flash-preview` for a fast 720p draft instead of Veo (default `false`) |
 
 **Available Models:**
 - `veo-3.1-generate-001` - VEO 3.1 (4/6/8 seconds with audio support)
@@ -83,6 +87,81 @@ Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the p
 *This tool may perform destructive updates.*
 
 *This tool interacts with external entities.*
+
+---
+
+### Tool: **`generate_video_omni`**
+
+Fast conversational video generation via Google's `gemini-omni-flash-preview` (Interactions API). This is the fast/cheap path for drafts and iteration; the Veo tools remain the high-fidelity path (1080p/4K, seeds, first/last frame). See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `prompt` | string | Text description of the video to generate |
+| `image_uris` | array *optional* | List of image URIs to condition on |
+| `input_video_uri` | string *optional* | A video to edit |
+| `aspect_ratio` | string *optional* | `16:9` (default) or `9:16` |
+| `duration_seconds` | integer *optional* | Video duration, 3–10 (default 6) |
+| `previous_interaction_id` | string *optional* | Continue editing a prior omni result |
+
+**Notes:**
+- 720p only, 24fps
+- No `seed` or `negative_prompt` support
+- Response includes an `interaction_id` for multi-turn editing
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`edit_video`**
+
+Conversational edit of a previously omni-generated video. Omni holds the video context server-side (~55 days on the paid tier), so you describe only the change.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `previous_interaction_id` | string | The `interaction_id` from a prior `generate_video_omni` response |
+| `prompt` | string | The edit instruction (e.g. `make the sky stormy`) |
+| `aspect_ratio` | string *optional* | `16:9` (default) or `9:16` |
+| `duration_seconds` | integer *optional* | Video duration, 3–10 (default 6) |
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`loop_extend`**
+
+Convenience wrapper that extends a Veo-generated video multiple times in one call. Each Veo extension adds ~7s, up to 20 times.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `video_uri` | string | The Veo-generated video to extend |
+| `prompt` | string | What the video continues with |
+| `times` | integer | Number of ~7s extensions to apply |
+| `output_gcs_uri` | string *optional* | GCS URI for output |
+
+**Notes:**
+- Veo 3.1 / Veo 3.1 Fast only (not Lite)
+- 720p
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+## Fast drafts vs. high-fidelity
+
+Two video paths, chosen by where you are in the workflow:
+
+- **`gemini-omni-flash-preview` (fast/cheap)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, negative prompts, or first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
+- **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds, first/last-frame control, reference images, extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
+
+Typical workflows:
+- **draft → finalize**: run `generate_video` with `draft=true` to preview quickly on omni, then re-run the same prompt with `draft=false` to render the final on Veo.
+- **animatic → final**: run `generate_clip` with `animatic=true` (default `false`) to render each beat through `gemini-omni-flash-preview` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` to commit to full Veo renders.
 
 ---
 

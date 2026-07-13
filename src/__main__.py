@@ -26,6 +26,8 @@ from PIL import Image as PILImage
 
 from .image import ImageModel, ImageSize, MediaResolution
 from .image import generate_image as generate_image_impl
+from .omni import OMNI_MODEL
+from .omni import generate_video_omni as generate_video_omni_impl
 from .video import _VEO_LITE_MODELS, VideoModel
 from .video import generate_video as generate_video_impl
 from .video_utils import extract_frame_png
@@ -226,6 +228,73 @@ def _client_for_video_model(app_ctx: AppContext, model: str) -> genai.Client:
             )
         return app_ctx.gemini_api_client
     return app_ctx.client
+
+
+def _client_for_omni(app_ctx: AppContext) -> genai.Client:
+    """Pick the genai.Client for gemini-omni-flash (Interactions API).
+
+    Omni is served via the Gemini API / AI Studio. Prefer the dedicated
+    Gemini API client; fall back to the primary client when it is already in
+    Gemini API mode. If the primary client is in Vertex mode and no Gemini API
+    client is configured, omni is unavailable.
+    """
+    if app_ctx.gemini_api_client is not None:
+        return app_ctx.gemini_api_client
+    if not getattr(app_ctx.client._api_client, "vertexai", False):
+        return app_ctx.client
+    raise RuntimeError(
+        "gemini-omni-flash requires the Gemini API. Set GEMINI_API_KEY so omni "
+        "can be served via AI Studio (the primary client is in Vertex mode)."
+    )
+
+
+async def _omni_generate_and_manifest(
+    app_ctx: AppContext,
+    ctx: Context[ServerSession, AppContext],
+    *,
+    prompt: str,
+    image_bytes_list: list[bytes] | None = None,
+    input_video_bytes: bytes | None = None,
+    previous_interaction_id: str | None = None,
+    aspect_ratio: str = "16:9",
+    duration_seconds: float = 6.0,
+    manifest_extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the omni impl and attach a sidecar manifest, returning the result.
+
+    Shared by generate_video_omni, edit_video, the generate_video draft path,
+    and generate_clip's animatic mode so they all produce consistent output.
+    """
+    result = await generate_video_omni_impl(
+        client=_client_for_omni(app_ctx),
+        prompt=prompt,
+        videos_dir=app_ctx.videos_dir,
+        image_bytes_list=image_bytes_list or None,
+        input_video_bytes=input_video_bytes,
+        previous_interaction_id=previous_interaction_id,
+        aspect_ratio=aspect_ratio,
+        duration_seconds=duration_seconds,
+        log_callback=ctx.info,
+    )
+    manifest: dict[str, Any] = {
+        "kind": "omni_video",
+        "prompt": prompt,
+        "model": result.get("model"),
+        "aspect_ratio": aspect_ratio,
+        "duration_seconds": result.get("duration_seconds", duration_seconds),
+        "interaction_id": result.get("interaction_id"),
+        "previous_interaction_id": previous_interaction_id,
+        "video_url": result.get("video_url"),
+    }
+    if manifest_extra:
+        manifest.update(manifest_extra)
+    warnings = result.get("warnings")
+    if warnings:
+        manifest["warnings"] = warnings
+    sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
+    if sidecar_url:
+        result["sidecar_url"] = sidecar_url
+    return result
 
 
 def _validate_aspect_ratio(aspect_ratio: str) -> None:
@@ -714,6 +783,7 @@ async def generate_video(
     reference_image_uris: list[str] | None = None,
     extend_video_uri: str | None = None,
     output_gcs_uri: str | None = None,
+    draft: bool = False,
 ) -> str:
     """Generate a video using Google VEO models.
 
@@ -759,6 +829,11 @@ async def generate_video(
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
             Vertex AI only — on the Gemini API, output is always returned inline
             and an explicit output_gcs_uri is rejected.
+        draft: When True, route to gemini-omni-flash for a fast 720p draft
+            instead of Veo. Iterate cheaply, then re-run with draft=False to
+            finalize on Veo. Omni ignores Veo-only controls (seed,
+            negative_prompt, resolution, last frame, reference images,
+            extension); any that were passed are noted in the response.
 
     Returns:
         JSON with video_url and generation details including generation_mode
@@ -769,6 +844,57 @@ async def generate_video(
 
         # Fail fast on an unsupported aspect ratio before any fetch work.
         _validate_aspect_ratio(aspect_ratio)
+
+        # Draft mode: hand off to the fast omni path. Omni supports only a
+        # text prompt + optional input image(s), so Veo-only controls are
+        # ignored — surface which ones so the caller isn't surprised.
+        if draft:
+            ignored = [
+                name
+                for name, val in (
+                    ("seed", seed),
+                    ("negative_prompt", negative_prompt),
+                    ("resolution", resolution),
+                    ("person_generation", person_generation),
+                    ("last_frame_uri", last_frame_uri or last_frame_base64),
+                    ("reference_image_uris", reference_image_uris),
+                    ("extend_video_uri", extend_video_uri),
+                    ("output_gcs_uri", output_gcs_uri),
+                )
+                if val
+            ]
+            draft_image_bytes: list[bytes] | None = None
+            if image_uri:
+                b = await fetch(
+                    image_uri,
+                    allowed_dir=data_dir,
+                    allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                )
+                if b is None:
+                    raise ValueError(f"Could not fetch image_uri: {image_uri}")
+                draft_image_bytes = [b]
+            elif image_base64:
+                draft_image_bytes = [_decode_base64_capped(image_base64)]
+
+            extra: dict[str, Any] = {"draft": True}
+            if ignored:
+                extra["ignored_veo_params"] = ignored
+            await ctx.info("Generating draft with gemini-omni-flash")
+            result = await _omni_generate_and_manifest(
+                app_ctx,
+                ctx,
+                prompt=prompt,
+                image_bytes_list=draft_image_bytes,
+                aspect_ratio=aspect_ratio,
+                duration_seconds=duration_seconds,
+                manifest_extra=extra,
+            )
+            if ignored:
+                result.setdefault("warnings", []).append(
+                    "draft mode (gemini-omni-flash) ignored Veo-only params: "
+                    + ", ".join(ignored)
+                )
+            return json.dumps(result, indent=2)
 
         # Fetch first frame image
         image_bytes = None
@@ -1185,6 +1311,7 @@ async def generate_clip(
     include_audio: bool = True,
     add_bridges: bool = False,
     output_gcs_uri: str | None = None,
+    animatic: bool = False,
 ) -> str:
     """Generate a multi-beat short clip — the building block for a reel / short.
 
@@ -1216,6 +1343,11 @@ async def generate_clip(
             Bridges require local (file://) beat outputs; skipped when
             beats land in GCS.
         output_gcs_uri: GCS URI for all outputs (optional).
+        animatic: When True, render every beat with gemini-omni-flash (fast,
+            cheap 720p) instead of Veo, for a quick storyboard preview of the
+            whole reel before committing to full Veo renders. Bridges are not
+            available in animatic mode (add_bridges is ignored), and Veo-only
+            per-beat controls (seed, negative_prompt) are ignored.
 
     Returns:
         JSON clip manifest:
@@ -1241,25 +1373,39 @@ async def generate_clip(
         _validate_aspect_ratio(aspect_ratio)
 
         # Resolve the client ONCE, before the beat loop. If the model can't be
-        # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY), let the
-        # RuntimeError propagate to the outer handler so the tool returns a
-        # top-level {"error": ...} rather than failing every beat individually
-        # and returning a success-shaped clip with empty segments.
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
-
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
+        # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY, or omni
+        # with no Gemini API access), let the RuntimeError propagate to the
+        # outer handler so the tool returns a top-level {"error": ...} rather
+        # than failing every beat individually and returning a success-shaped
+        # clip with empty segments.
+        clip_warnings: list[str] = []
+        if animatic:
+            # Fast omni preview path: no Veo GCS, no bridges. video_client is a
+            # harmless placeholder (never used — beats route to omni below).
+            _client_for_omni(app_ctx)  # fail fast if omni is unavailable
+            video_client = app_ctx.client
+            gcs_uri = None
+            if add_bridges:
+                add_bridges = False
+                clip_warnings.append(
+                    "add_bridges is ignored in animatic mode "
+                    "(bridges are a Veo first/last-frame feature)."
+                )
+        else:
+            video_client = _client_for_video_model(app_ctx, model)
+            is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+            gcs_uri = _resolve_video_gcs(
+                output_gcs_uri,
+                app_ctx.video_gcs_bucket,
+                app_ctx.allowed_gcs_buckets,
+                is_vertex_client,
+            )
 
         segments: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        clip_warnings: list[str] = []
         total_duration = 0.0
         prev_video_bytes: bytes | None = None
+        beat_model = OMNI_MODEL if animatic else model
 
         for idx, beat in enumerate(beats):
             try:
@@ -1285,22 +1431,34 @@ async def generate_clip(
                         )
 
                 await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
-                beat_result = await generate_video_impl(
-                    client=video_client,
-                    prompt=prompt,
-                    videos_dir=app_ctx.videos_dir,
-                    model=model,
-                    image_bytes=image_bytes,
-                    allowed_dir=data_dir,
-                    aspect_ratio=aspect_ratio,
-                    duration_seconds=duration,
-                    include_audio=include_audio,
-                    audio_prompt=beat.get("audio_prompt"),
-                    negative_prompt=beat.get("negative_prompt"),
-                    seed=seed,
-                    log_callback=ctx.info,
-                    output_gcs_uri=gcs_uri,
-                )
+                if animatic:
+                    # Fast omni preview: text prompt + optional first frame.
+                    beat_result = await generate_video_omni_impl(
+                        client=_client_for_omni(app_ctx),
+                        prompt=prompt,
+                        videos_dir=app_ctx.videos_dir,
+                        image_bytes_list=[image_bytes] if image_bytes else None,
+                        aspect_ratio=aspect_ratio,
+                        duration_seconds=duration,
+                        log_callback=ctx.info,
+                    )
+                else:
+                    beat_result = await generate_video_impl(
+                        client=video_client,
+                        prompt=prompt,
+                        videos_dir=app_ctx.videos_dir,
+                        model=model,
+                        image_bytes=image_bytes,
+                        allowed_dir=data_dir,
+                        aspect_ratio=aspect_ratio,
+                        duration_seconds=duration,
+                        include_audio=include_audio,
+                        audio_prompt=beat.get("audio_prompt"),
+                        negative_prompt=beat.get("negative_prompt"),
+                        seed=seed,
+                        log_callback=ctx.info,
+                        output_gcs_uri=gcs_uri,
+                    )
             except Exception as beat_err:
                 await ctx.error(f"Beat {idx} failed: {beat_err}")
                 logger.exception("Beat %d failed", idx)
@@ -1314,12 +1472,15 @@ async def generate_clip(
                 "kind": "beat",
                 "index": idx,
                 "prompt": prompt,
-                "model": model,
+                "model": beat_model,
                 "aspect_ratio": aspect_ratio,
                 "duration_seconds": beat_result.get("duration_seconds", duration),
-                "seed": seed,
+                "seed": None if animatic else seed,
                 "video_url": beat_result.get("video_url"),
-                "generation_mode": beat_result.get("generation_mode"),
+                "generation_mode": "animatic"
+                if animatic
+                else beat_result.get("generation_mode"),
+                "interaction_id": beat_result.get("interaction_id"),
             }
             # Surface any warnings the impl emitted for this beat (e.g.
             # include_audio ignored on the Gemini API path) in the beat
@@ -1420,7 +1581,8 @@ async def generate_clip(
         clip_manifest: dict[str, Any] = {
             "kind": "clip",
             "aspect_ratio": aspect_ratio,
-            "model": model,
+            "model": beat_model,
+            "animatic": animatic,
             "segments": segments,
             "total_duration_seconds": total_duration,
             "beat_count": len(beats),
@@ -1436,6 +1598,241 @@ async def generate_clip(
         return json.dumps(clip_manifest, indent=2)
     except Exception as e:
         await ctx.error(f"Clip generation failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def generate_video_omni(
+    ctx: Context[ServerSession, AppContext],
+    prompt: str,
+    image_uris: list[str] | None = None,
+    input_video_uri: str | None = None,
+    aspect_ratio: str = "16:9",
+    duration_seconds: float = 6.0,
+    previous_interaction_id: str | None = None,
+) -> str:
+    """Generate a video fast with gemini-omni-flash (Interactions API).
+
+    Omni is the fast/cheap path (720p, 24fps): good for drafts and quick
+    iteration. The Veo tools remain the high-fidelity path (1080p/4K, seeds,
+    first/last-frame control). Omni does not support seeds or negative prompts.
+
+    Args:
+        ctx: MCP context with application state
+        prompt: Text description of the video to generate
+        image_uris: Optional input image URIs to condition on (gs://, http(s)://,
+            file:// within DATA_FOLDER)
+        input_video_uri: Optional video to edit (uploaded via the Files API)
+        aspect_ratio: "16:9" (default) or "9:16". Output is always 720p.
+        duration_seconds: Desired duration, clamped to 3-10s (default 6)
+        previous_interaction_id: Continue a prior omni interaction to edit its
+            video conversationally (see also the edit_video tool)
+
+    Returns:
+        JSON with video_url, interaction_id (pass to edit_video / this tool to
+        keep editing), and generation details.
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        data_dir = app_ctx.data_folder
+
+        image_bytes_list: list[bytes] = []
+        if image_uris:
+            for uri in image_uris:
+                b = await fetch(
+                    uri,
+                    allowed_dir=data_dir,
+                    allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                )
+                if b is None:
+                    raise ValueError(f"Could not fetch image_uri: {uri}")
+                image_bytes_list.append(b)
+
+        input_video_bytes = None
+        if input_video_uri:
+            input_video_bytes = await fetch(
+                input_video_uri,
+                allowed_dir=data_dir,
+                allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+            )
+            if input_video_bytes is None:
+                raise ValueError(f"Could not fetch input_video_uri: {input_video_uri}")
+
+        await ctx.info("Generating video with gemini-omni-flash")
+        result = await _omni_generate_and_manifest(
+            app_ctx,
+            ctx,
+            prompt=prompt,
+            image_bytes_list=image_bytes_list or None,
+            input_video_bytes=input_video_bytes,
+            previous_interaction_id=previous_interaction_id,
+            aspect_ratio=aspect_ratio,
+            duration_seconds=duration_seconds,
+            manifest_extra={
+                "image_uris": image_uris,
+                "input_video_uri": input_video_uri,
+            },
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        await ctx.error(f"Omni video generation failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def edit_video(
+    ctx: Context[ServerSession, AppContext],
+    previous_interaction_id: str,
+    prompt: str,
+    aspect_ratio: str = "16:9",
+    duration_seconds: float = 6.0,
+) -> str:
+    """Conversationally edit a video generated by gemini-omni-flash.
+
+    Pass the `interaction_id` returned by a prior generate_video_omni (or
+    edit_video) call plus an instruction describing only the change (e.g.
+    "make the sky stormy", "remove the person on the left"). Omni holds the
+    video context server-side, so unmentioned elements are preserved.
+
+    Args:
+        ctx: MCP context with application state
+        previous_interaction_id: interaction_id from a prior omni result
+        prompt: The edit instruction (describe only what should change)
+        aspect_ratio: "16:9" (default) or "9:16"
+        duration_seconds: Desired duration, clamped to 3-10s (default 6)
+
+    Returns:
+        JSON with the edited video_url and a new interaction_id for further edits.
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+
+        await ctx.info(f"Editing video (interaction {previous_interaction_id})")
+        result = await _omni_generate_and_manifest(
+            app_ctx,
+            ctx,
+            prompt=prompt,
+            previous_interaction_id=previous_interaction_id,
+            aspect_ratio=aspect_ratio,
+            duration_seconds=duration_seconds,
+            manifest_extra={"kind": "omni_edit"},
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        await ctx.error(f"Video edit failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def loop_extend(
+    ctx: Context[ServerSession, AppContext],
+    video_uri: str,
+    prompt: str = "continue the action",
+    times: int = 1,
+    model: VideoModel = "veo-3.1-generate-001",
+    aspect_ratio: str = "16:9",
+    output_gcs_uri: str | None = None,
+) -> str:
+    """Extend a Veo-generated video multiple times in one call.
+
+    Each Veo extension continues the video by ~7 seconds; this chains them,
+    feeding each extended result back in as the source for the next. Veo
+    supports up to 20 extensions. Output is 720p. Not supported on Veo 3.1
+    Lite. On Vertex AI, extension requires a GCS output target.
+
+    Args:
+        ctx: MCP context with application state
+        video_uri: URI of the existing Veo video to extend (gs://, file://)
+        prompt: What the continuation should depict
+        times: Number of ~7s extensions to chain (1-20)
+        model: Veo model (not the Lite model)
+        aspect_ratio: Must match the source video (16:9 or 9:16)
+        output_gcs_uri: GCS output URI (required on Vertex for extensions)
+
+    Returns:
+        JSON with the final video_url and the ordered list of intermediate
+        extension URLs.
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        data_dir = app_ctx.data_folder
+
+        if times < 1 or times > 20:
+            raise ValueError("times must be between 1 and 20.")
+        if model in _VEO_LITE_MODELS:
+            raise ValueError("Veo 3.1 Lite does not support video extension.")
+        _validate_aspect_ratio(aspect_ratio)
+
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+        if is_vertex_client and not gcs_uri:
+            raise ValueError(
+                "Video extension on Vertex AI requires output_gcs_uri (or a "
+                "configured VIDEO_GCS_BUCKET)."
+            )
+
+        # Validate the initial gs:// source against the allowlist (intermediate
+        # outputs land in the already-validated gcs_uri bucket).
+        if video_uri.startswith("gs://"):
+            src_bucket = _parse_gcs_bucket(video_uri)
+            if src_bucket is None:
+                raise ValueError(f"Invalid video_uri: {video_uri}")
+            _assert_gcs_bucket_allowed(src_bucket, app_ctx.allowed_gcs_buckets)
+
+        current = video_uri
+        steps: list[str] = []
+        for i in range(times):
+            await ctx.info(f"Extension {i + 1}/{times}")
+            ext_result = await generate_video_impl(
+                client=video_client,
+                prompt=prompt,
+                videos_dir=app_ctx.videos_dir,
+                model=model,
+                extend_video_uri=current,
+                allowed_dir=data_dir,
+                aspect_ratio=aspect_ratio,
+                log_callback=ctx.info,
+                output_gcs_uri=gcs_uri,
+            )
+            current = ext_result.get("video_url", "")
+            if not current:
+                raise ValueError(f"Extension {i + 1} produced no video URL.")
+            steps.append(current)
+
+        manifest: dict[str, Any] = {
+            "kind": "loop_extend",
+            "source_video_uri": video_uri,
+            "prompt": prompt,
+            "model": model,
+            "aspect_ratio": aspect_ratio,
+            "times": times,
+            "final_video_url": current,
+            "extension_steps": steps,
+        }
+        result: dict[str, Any] = {
+            "message": f"Extended video {times} time(s)",
+            "video_url": current,
+            "model": model,
+            "times": times,
+            "extension_steps": steps,
+        }
+        sidecar_url = _write_sidecar(current, manifest)
+        if sidecar_url:
+            result["sidecar_url"] = sidecar_url
+        else:
+            result["manifest"] = manifest
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        await ctx.error(f"Loop extend failed: {e}")
         logger.exception("Tool error")
         return json.dumps({"error": str(e)})
 

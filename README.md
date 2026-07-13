@@ -160,6 +160,7 @@ Generate videos using VEO models. Video works on **both** credential modes: Veo 
 - `negative_prompt`: Things to avoid in the video
 - `seed`: Random seed for reproducibility
 - `image_uri`: First frame image URI for image-to-video generation
+- `draft` (default `false`): When `true`, routes the request to `gemini-omni-flash-preview` for a fast 720p draft instead of Veo. Iterate cheaply, then re-run with `draft=false` to finalize on Veo. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
 
 **Additional Parameters:**
 - `last_frame_uri`: Last frame image URI for first+last frame control
@@ -179,6 +180,60 @@ Generate videos using VEO models. Video works on **both** credential modes: Veo 
 - `first_last_frame`: First and last frame control
 - `reference_to_video`: Reference images for subject preservation (8s only)
 - `extend_video`: Extend existing video
+
+### generate_video_omni
+
+Fast conversational video generation via Google's `gemini-omni-flash-preview` (Interactions API). This is the **fast/cheap path** — ideal for drafts and rapid iteration. The high-fidelity Veo tools remain the path for final renders (1080p/4K, seeds, first/last frame). See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
+
+**Parameters:**
+- `prompt` (required): Text description of the video
+- `image_uris`: List of image URIs to condition on (optional)
+- `input_video_uri`: A video to edit (optional)
+- `aspect_ratio`: `16:9` (default) or `9:16`
+- `duration_seconds`: Video duration, 3–10 (default 6)
+- `previous_interaction_id`: Continue editing a prior omni result (optional)
+
+**Notes:**
+- 720p only, 24fps
+- No `seed` or `negative_prompt` support
+- The response includes an `interaction_id` for multi-turn editing (pass it to `edit_video` or back into `previous_interaction_id`)
+
+### edit_video
+
+Conversational edit of a previously omni-generated video. Because omni holds the video context server-side (~55 days on the paid tier), you describe **only the change** — no need to re-supply the source video.
+
+**Parameters:**
+- `previous_interaction_id` (required): The `interaction_id` from a prior `generate_video_omni` response
+- `prompt` (required): The edit instruction (e.g. `"make the sky stormy"`)
+- `aspect_ratio`: `16:9` (default) or `9:16`
+- `duration_seconds`: Video duration, 3–10 (default 6)
+
+### loop_extend
+
+Convenience wrapper that extends a Veo-generated video multiple times in one call. Each Veo extension adds ~7s, and can be chained up to 20 times.
+
+**Parameters:**
+- `video_uri` (required): The Veo-generated video to extend
+- `prompt` (required): What the video continues with
+- `times` (required): Number of ~7s extensions to apply
+- `output_gcs_uri`: GCS URI for output (optional)
+
+**Notes:**
+- Veo 3.1 / Veo 3.1 Fast only (not Lite)
+- 720p
+
+### Fast drafts vs. high-fidelity
+
+There are two video paths, and you choose based on where you are in the workflow:
+
+- **`gemini-omni-flash-preview` (fast/cheap)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, no negative prompts, no first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video(draft=true)`, and `generate_clip(animatic=true)`.
+- **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds for reproducibility, first/last-frame control, reference images, and extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
+
+Typical workflows:
+- **draft → finalize**: run `generate_video(draft=true)` to preview quickly on omni, then re-run the same prompt with `draft=false` to render the final on Veo.
+- **animatic → final**: run `generate_clip(animatic=true)` to render each beat via `gemini-omni-flash-preview` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` (the default) to commit to full Veo renders.
+
+> **Note:** `generate_clip`'s new `animatic` parameter (default `false`) renders each beat through `gemini-omni-flash-preview` instead of Veo, so you can preview an entire reel cheaply before committing to full Veo renders.
 
 ## Google Vertex AI and Gemini Access
 
