@@ -233,19 +233,17 @@ def _client_for_video_model(app_ctx: AppContext, model: str) -> genai.Client:
 def _client_for_omni(app_ctx: AppContext) -> genai.Client:
     """Pick the genai.Client for gemini-omni-flash (Interactions API).
 
-    Omni is served via the Gemini API / AI Studio. Prefer the dedicated
-    Gemini API client; fall back to the primary client when it is already in
-    Gemini API mode. If the primary client is in Vertex mode and no Gemini API
-    client is configured, omni is unavailable.
+    Omni + the Interactions API are documented on BOTH backends: the Gemini
+    Developer API (where Interactions is GA) and Vertex AI / Gemini Enterprise
+    Agent Platform (preview; may require allowlisting). Prefer the dedicated
+    Gemini API client when one is configured — Interactions is GA there, the
+    safest path — otherwise use the primary client as-is, whether it is in
+    Gemini API or Vertex mode. On Vertex the Interactions transport is
+    preview and worth a smoke test before relying on conversational editing.
     """
     if app_ctx.gemini_api_client is not None:
         return app_ctx.gemini_api_client
-    if not getattr(app_ctx.client._api_client, "vertexai", False):
-        return app_ctx.client
-    raise RuntimeError(
-        "gemini-omni-flash requires the Gemini API. Set GEMINI_API_KEY so omni "
-        "can be served via AI Studio (the primary client is in Vertex mode)."
-    )
+    return app_ctx.client
 
 
 async def _omni_generate_and_manifest(

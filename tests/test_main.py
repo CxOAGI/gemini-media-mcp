@@ -3722,3 +3722,36 @@ async def test_loop_extend_passes_audio_and_propagates_warnings(
     )
     assert audio_flags == [True, True]
     assert result["warnings"] == ["same warning each step"]
+
+
+def test_client_for_omni_prefers_gemini_api_then_falls_back_to_vertex(
+    tmp_path: Path,
+) -> None:
+    """Omni routing: prefer a dedicated Gemini API client (Interactions is GA
+    there); otherwise use the primary client even in Vertex mode (omni is
+    documented on Vertex too) rather than refusing."""
+    from src.__main__ import _client_for_omni
+
+    vertex_primary = MagicMock()
+    vertex_primary._api_client.vertexai = True
+
+    # No dedicated Gemini API client → fall back to the Vertex primary
+    # (previously this raised).
+    ctx_vertex = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=vertex_primary,
+    )
+    assert _client_for_omni(ctx_vertex) is vertex_primary
+
+    # Dedicated Gemini API client present → prefer it.
+    gemini_client = MagicMock()
+    ctx_both = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=vertex_primary,
+        gemini_api_client=gemini_client,
+    )
+    assert _client_for_omni(ctx_both) is gemini_client
