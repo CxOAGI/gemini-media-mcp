@@ -3569,3 +3569,156 @@ async def test_loop_extend_rejects_lite_and_bad_times(
 
     bad = json.loads(await loop_extend(ctx=ctx, video_uri="file:///x.mp4", times=99))
     assert "error" in bad and "between 1 and 20" in bad["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_omni_caps_image_uris(tmp_path: Path) -> None:
+    """More than 8 image URIs is rejected before any fetch."""
+    from src.__main__ import generate_video_omni
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    result = json.loads(
+        await generate_video_omni(
+            ctx=ctx,
+            prompt="p",
+            image_uris=[f"file:///img{i}.png" for i in range(9)],
+        )
+    )
+    assert "error" in result and "at most 8" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_draft_reports_seed_zero_and_inlines_audio_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """seed=0 is reported as ignored (no truthiness bug) and audio_prompt is
+    inlined into the omni prompt rather than dropped."""
+    from src.__main__ import generate_video
+
+    (tmp_path / "images").mkdir()
+    (tmp_path / "videos").mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    out = tmp_path / "videos" / "d.mp4"
+    out.write_bytes(b"mp4")
+
+    captured: dict[str, Any] = {}
+
+    async def mock_omni(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return _omni_result(f"file://{out}")
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_omni)
+
+    result = json.loads(
+        await generate_video(
+            ctx=ctx,
+            prompt="scene",
+            model="veo-3.1-generate-001",
+            draft=True,
+            seed=0,
+            audio_prompt="soft piano",
+            include_audio=True,
+        )
+    )
+    joined = " ".join(result.get("warnings", []))
+    assert "seed" in joined
+    assert "include_audio" in joined
+    # audio_prompt was honored via inlining, so it is NOT in the ignored list.
+    assert "audio_prompt" not in joined
+    assert captured["prompt"] == "scene\nAudio: soft piano"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_animatic_warns_on_dropped_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Animatic mode surfaces dropped per-beat controls and ignored
+    output_gcs_uri/include_audio instead of silently discarding them."""
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    n = {"i": 0}
+    captured_prompts: list[str] = []
+
+    async def mock_omni(**kwargs: Any) -> dict[str, Any]:
+        n["i"] += 1
+        captured_prompts.append(kwargs["prompt"])
+        out = videos_dir / f"a{n['i']}.mp4"
+        out.write_bytes(b"mp4")
+        return _omni_result(f"file://{out}", interaction_id=f"int-{n['i']}")
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_omni)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[
+                {"prompt": "a", "seed": 7, "negative_prompt": "text overlays"},
+                {"prompt": "b", "audio_prompt": "rain"},
+            ],
+            animatic=True,
+            include_audio=True,
+            output_gcs_uri="gs://bucket/x/",
+        )
+    )
+    joined = " ".join(result.get("warnings", []))
+    assert "output_gcs_uri is ignored" in joined
+    assert "include_audio is ignored" in joined
+    assert "negative_prompt" in joined and "seed" in joined
+    # audio_prompt inlined, not dropped.
+    assert captured_prompts[1] == "b\nAudio: rain"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_loop_extend_passes_audio_and_propagates_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """include_audio reaches each extension step and per-step impl warnings
+    surface (deduped) in the loop_extend result."""
+    from src.__main__ import loop_extend
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+
+    audio_flags: list[bool] = []
+    n = {"i": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        n["i"] += 1
+        audio_flags.append(kwargs.get("include_audio"))
+        out = videos_dir / f"e{n['i']}.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model"),
+            "warnings": ["same warning each step"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+
+    start = videos_dir / "s.mp4"
+    start.write_bytes(b"mp4")
+    result = json.loads(
+        await loop_extend(
+            ctx=ctx,
+            video_uri=f"file://{start}",
+            times=2,
+            include_audio=True,
+        )
+    )
+    assert audio_flags == [True, True]
+    assert result["warnings"] == ["same warning each step"]

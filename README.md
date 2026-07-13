@@ -214,9 +214,12 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 
 **Parameters:**
 - `video_uri` (required): The Veo-generated video to extend
-- `prompt` (required): What the video continues with
-- `times` (required): Number of ~7s extensions to apply
-- `output_gcs_uri`: GCS URI for output (optional)
+- `prompt`: What the video continues with (default: "continue the action")
+- `times`: Number of ~7s extensions to apply, 1-20 (default: 1)
+- `model`: Veo model to use (default `veo-3.1-generate-001`; Lite is not supported)
+- `aspect_ratio`: `16:9` (default) or `9:16` — must match the source video
+- `include_audio`: Generate audio on the extended sections (default `true`; Vertex only)
+- `output_gcs_uri`: GCS URI for output (optional; required on Vertex)
 
 **Notes:**
 - Veo 3.1 / Veo 3.1 Fast only (not Lite)

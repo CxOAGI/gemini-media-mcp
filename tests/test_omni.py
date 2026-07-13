@@ -1,4 +1,4 @@
-"""Tests for omni.py (gemini-omni-flash-preview / Interactions API)."""
+"""Tests for src/omni.py (gemini-omni-flash via the Interactions API)."""
 
 import asyncio
 import base64
@@ -15,12 +15,6 @@ from src.omni import OMNI_MODEL, generate_video_omni
 
 
 class FakeOutputVideo:
-    """Test double for interaction.output_video.
-
-    Exposes ``data`` for inline base64 delivery, or ``uri`` for Files API
-    (URI) delivery.
-    """
-
     def __init__(
         self,
         data: str | None = None,
@@ -30,392 +24,428 @@ class FakeOutputVideo:
         self.uri = uri
 
 
-class FakeInteraction:
-    """Test double for a finished interaction."""
-
+class FakePart:
     def __init__(
         self,
-        interaction_id: str = "interaction-123",
-        output_video: FakeOutputVideo | None = None,
+        type: str | None = None,
+        data: str | None = None,
+        uri: str | None = None,
+        mime_type: str | None = None,
+        text: str | None = None,
     ) -> None:
-        self.id = interaction_id
+        self.type = type
+        self.data = data
+        self.uri = uri
+        self.mime_type = mime_type
+        self.text = text
+
+
+class FakeStep:
+    def __init__(self, content: list[FakePart] | None = None) -> None:
+        self.content = content or []
+
+
+class FakeInteraction:
+    def __init__(
+        self,
+        id: str = "int-1",
+        status: str = "completed",
+        output_video: FakeOutputVideo | None = None,
+        steps: list[FakeStep] | None = None,
+        error: Any = None,
+    ) -> None:
+        self.id = id
+        self.status = status
         self.output_video = output_video
+        self.steps = steps or []
+        self.error = error
 
 
 class FakeInteractions:
-    """Test double for the interactions client."""
+    """Test double for client.interactions."""
 
     def __init__(
         self,
-        interaction: FakeInteraction | None = None,
-        raise_error: Exception | None = None,
+        create_result: FakeInteraction | None = None,
+        get_results: list[FakeInteraction] | None = None,
     ) -> None:
-        self._interaction = interaction
-        self._raise_error = raise_error
+        self._create_result = create_result or FakeInteraction()
+        self._get_results = list(get_results or [])
         self.create_kwargs: dict[str, Any] | None = None
+        self.get_calls: list[dict[str, Any]] = []
 
     def create(self, **kwargs: Any) -> FakeInteraction:
         self.create_kwargs = kwargs
-        if self._raise_error:
-            raise self._raise_error
-        return self._interaction or FakeInteraction()
+        return self._create_result
 
-
-class FakeFileResource:
-    """Test double for a Files API resource."""
-
-    def __init__(self, state: str = "ACTIVE") -> None:
-        self.state = state
+    def get(self, **kwargs: Any) -> FakeInteraction:
+        self.get_calls.append(kwargs)
+        if self._get_results:
+            return self._get_results.pop(0)
+        raise AssertionError("unexpected interactions.get call")
 
 
 class FakeFiles:
-    """Test double for the files client."""
-
-    def __init__(
-        self,
-        download_bytes: bytes = b"fake video content",
-        file_resource: FakeFileResource | None = None,
-    ) -> None:
+    def __init__(self, download_bytes: bytes = b"mp4-bytes") -> None:
         self._download_bytes = download_bytes
-        self._file_resource = file_resource or FakeFileResource()
-        self.uploaded: Any = None
+        self.get_calls: list[dict[str, Any]] = []
 
-    def upload(self, **kwargs: Any) -> str:
-        self.uploaded = kwargs
-        return "uploaded-file-handle"
+    def get(self, **kwargs: Any) -> Any:
+        self.get_calls.append(kwargs)
+        return object()
 
-    def get(self, name: str) -> FakeFileResource:
-        return self._file_resource
-
-    def download(self, file: Any) -> bytes:
+    def download(self, **kwargs: Any) -> bytes:
         return self._download_bytes
 
 
 class FakeGenaiClient:
-    """Test double for the Google GenAI client."""
-
     def __init__(
         self,
-        interaction: FakeInteraction | None = None,
-        raise_error: Exception | None = None,
-        download_bytes: bytes = b"fake video content",
-        file_resource: FakeFileResource | None = None,
+        interactions: FakeInteractions | None = None,
+        files: FakeFiles | None = None,
     ) -> None:
-        self.interactions = FakeInteractions(interaction, raise_error)
-        self.files = FakeFiles(download_bytes, file_resource)
+        self.interactions = interactions or FakeInteractions()
+        self.files = files or FakeFiles()
 
 
-def _inline_interaction(
-    content: bytes = b"fake video content",
-    interaction_id: str = "interaction-123",
+def _inline_video_interaction(
+    id: str = "int-1", payload: bytes = b"mp4-bytes"
 ) -> FakeInteraction:
-    """Build an interaction whose video is delivered inline as base64."""
-    encoded = base64.b64encode(content).decode("ascii")
     return FakeInteraction(
-        interaction_id=interaction_id,
-        output_video=FakeOutputVideo(data=encoded),
+        id=id,
+        status="completed",
+        output_video=FakeOutputVideo(data=base64.b64encode(payload).decode()),
     )
 
 
 # ============================================================================
-# Inline base64 happy path
+# Happy path + request shape
 # ============================================================================
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_omni_inline_happy_path(tmp_path: Path) -> None:
-    """Inline base64 delivery writes a file and returns interaction metadata."""
+async def test_inline_video_written_and_request_shape(tmp_path: Path) -> None:
+    """Happy path: inline base64 output is written; the create request uses
+    the documented Interactions API shapes."""
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
-
-    content = b"real mp4 bytes here"
-    client = FakeGenaiClient(interaction=_inline_interaction(content, "abc-1"))
+    interactions = FakeInteractions(
+        create_result=_inline_video_interaction(payload=b"VIDEO")
+    )
+    client = FakeGenaiClient(interactions=interactions)
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
-        prompt="A cat surfing",
+        prompt="a marble rolling",
         videos_dir=videos_dir,
+        aspect_ratio="9:16",
     )
 
-    assert result["message"] == "Video generated successfully"
+    assert result["interaction_id"] == "int-1"
     assert result["model"] == OMNI_MODEL
-    assert result["interaction_id"] == "abc-1"
-    assert result["aspect_ratio"] == "16:9"
-    assert result["duration_seconds"] == 6
-    assert "warnings" not in result
+    assert Path(result["video_url"][7:]).read_bytes() == b"VIDEO"
 
-    video_url = result["video_url"]
-    assert video_url.startswith("file://")
-    file_path = Path(video_url[7:])
-    assert file_path.exists()
-    assert file_path.suffix == ".mp4"
-    assert file_path.read_bytes() == content
-
-
-# ============================================================================
-# previous_interaction_id forwarding (multi-turn edit)
-# ============================================================================
+    kwargs = interactions.create_kwargs
+    assert kwargs is not None
+    assert kwargs["model"] == OMNI_MODEL
+    assert kwargs["background"] is True
+    # response_format is TOP-LEVEL and carries the aspect ratio.
+    assert kwargs["response_format"] == {"type": "video", "aspect_ratio": "9:16"}
+    # generation_config carries ONLY the task; no duration anywhere.
+    assert kwargs["generation_config"] == {"video_config": {"task": "text_to_video"}}
+    # input is flattened parts, prompt first.
+    assert kwargs["input"][0] == {"type": "text", "text": "a marble rolling"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_omni_forwards_previous_interaction_id(
-    tmp_path: Path,
-) -> None:
-    """previous_interaction_id is threaded into interactions.create()."""
+async def test_images_become_input_parts_and_task_types(tmp_path: Path) -> None:
+    """Images ride inside `input` as flattened parts; 1 image => image_to_video,
+    several => reference_to_video."""
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
+    png = b"\x89PNG\r\n\x1a\nrest"
+    jpg = b"\xff\xd8\xffrest"
 
-    client = FakeGenaiClient(interaction=_inline_interaction())
+    interactions = FakeInteractions(create_result=_inline_video_interaction())
+    client = FakeGenaiClient(interactions=interactions)
+    await generate_video_omni(
+        client=client,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+        image_bytes_list=[png],
+    )
+    kwargs = interactions.create_kwargs
+    assert kwargs is not None
+    assert kwargs["generation_config"]["video_config"]["task"] == "image_to_video"
+    img_part = kwargs["input"][1]
+    assert img_part["type"] == "image"
+    assert img_part["mime_type"] == "image/png"
+    assert base64.b64decode(img_part["data"]) == png
+
+    interactions2 = FakeInteractions(create_result=_inline_video_interaction())
+    client2 = FakeGenaiClient(interactions=interactions2)
+    await generate_video_omni(
+        client=client2,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+        image_bytes_list=[png, jpg],
+    )
+    kwargs2 = interactions2.create_kwargs
+    assert kwargs2 is not None
+    assert kwargs2["generation_config"]["video_config"]["task"] == "reference_to_video"
+    assert kwargs2["input"][2]["mime_type"] == "image/jpeg"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_input_video_inlined_and_edit_task(tmp_path: Path) -> None:
+    """An input video is inlined as a video part (no files.upload) and forces
+    the edit task type."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    interactions = FakeInteractions(create_result=_inline_video_interaction())
+    client = FakeGenaiClient(interactions=interactions)
 
     await generate_video_omni(
         client=client,  # type: ignore[arg-type]
-        prompt="Make it night time",
+        prompt="edit this",
         videos_dir=videos_dir,
-        previous_interaction_id="prev-999",
+        input_video_bytes=b"SRC",
     )
-
-    create_kwargs = client.interactions.create_kwargs
-    assert create_kwargs is not None
-    assert create_kwargs["previous_interaction_id"] == "prev-999"
-    assert create_kwargs["input"] == "Make it night time"
-    assert create_kwargs["model"] == OMNI_MODEL
+    kwargs = interactions.create_kwargs
+    assert kwargs is not None
+    assert kwargs["generation_config"]["video_config"]["task"] == "edit"
+    vid_part = kwargs["input"][1]
+    assert vid_part["type"] == "video"
+    assert vid_part["mime_type"] == "video/mp4"
+    assert base64.b64decode(vid_part["data"]) == b"SRC"
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_omni_omits_previous_interaction_id_when_absent(
-    tmp_path: Path,
-) -> None:
-    """When not editing, previous_interaction_id is not sent at all."""
+async def test_previous_interaction_id_forwarded(tmp_path: Path) -> None:
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
-
-    client = FakeGenaiClient(interaction=_inline_interaction())
-
-    await generate_video_omni(
-        client=client,  # type: ignore[arg-type]
-        prompt="Fresh generation",
-        videos_dir=videos_dir,
-    )
-
-    create_kwargs = client.interactions.create_kwargs
-    assert create_kwargs is not None
-    assert "previous_interaction_id" not in create_kwargs
-
-
-# ============================================================================
-# Input attachments (images + input video)
-# ============================================================================
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_omni_attaches_images(tmp_path: Path) -> None:
-    """Input images are forwarded to create()."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    client = FakeGenaiClient(interaction=_inline_interaction())
-    images = [b"img-one", b"img-two"]
-
-    await generate_video_omni(
-        client=client,  # type: ignore[arg-type]
-        prompt="Use these",
-        videos_dir=videos_dir,
-        image_bytes_list=images,
-    )
-
-    create_kwargs = client.interactions.create_kwargs
-    assert create_kwargs is not None
-    assert create_kwargs["images"] == images
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_omni_uploads_input_video(tmp_path: Path) -> None:
-    """An input video is uploaded via files.upload and attached to create()."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    client = FakeGenaiClient(interaction=_inline_interaction())
-
-    await generate_video_omni(
-        client=client,  # type: ignore[arg-type]
-        prompt="Edit this clip",
-        videos_dir=videos_dir,
-        input_video_bytes=b"input-video-bytes",
-    )
-
-    assert client.files.uploaded is not None
-    create_kwargs = client.interactions.create_kwargs
-    assert create_kwargs is not None
-    assert create_kwargs["video"] == "uploaded-file-handle"
-
-
-# ============================================================================
-# URI (Files API) delivery
-# ============================================================================
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_omni_uri_delivery(tmp_path: Path) -> None:
-    """URI delivery polls the Files API (already ACTIVE) and downloads bytes."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    downloaded = b"downloaded mp4 content"
-    interaction = FakeInteraction(
-        interaction_id="uri-1",
-        output_video=FakeOutputVideo(uri="files/generated-video"),
-    )
-    client = FakeGenaiClient(
-        interaction=interaction,
-        download_bytes=downloaded,
-        file_resource=FakeFileResource(state="ACTIVE"),
-    )
+    interactions = FakeInteractions(create_result=_inline_video_interaction(id="int-2"))
+    client = FakeGenaiClient(interactions=interactions)
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
-        prompt="Big output",
+        prompt="make it stormy",
         videos_dir=videos_dir,
+        previous_interaction_id="int-1",
     )
-
-    file_path = Path(result["video_url"][7:])
-    assert file_path.read_bytes() == downloaded
-    assert result["interaction_id"] == "uri-1"
+    kwargs = interactions.create_kwargs
+    assert kwargs is not None
+    assert kwargs["previous_interaction_id"] == "int-1"
+    assert kwargs["generation_config"]["video_config"]["task"] == "edit"
+    assert result["interaction_id"] == "int-2"
 
 
 # ============================================================================
-# Validation
+# Background polling & terminal statuses
 # ============================================================================
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_omni_invalid_aspect_ratio_raises(
-    tmp_path: Path,
+@pytest.mark.timeout(3.0)
+async def test_background_polling_until_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Unsupported aspect ratios raise instead of being coerced."""
+    """create returns in_progress; the loop polls interactions.get until
+    completed, then extracts the video."""
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    client = FakeGenaiClient(interaction=_inline_interaction())
+    pending = FakeInteraction(id="int-9", status="in_progress")
+    done = _inline_video_interaction(id="int-9", payload=b"DONE")
+    interactions = FakeInteractions(
+        create_result=pending,
+        get_results=[FakeInteraction(id="int-9", status="queued"), done],
+    )
+    client = FakeGenaiClient(interactions=interactions)
 
-    with pytest.raises(ValueError, match="Unsupported aspect_ratio"):
+    real_sleep = asyncio.sleep
+
+    async def instant_sleep(_secs: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("src.omni.asyncio.sleep", instant_sleep)
+
+    result = await generate_video_omni(
+        client=client,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+    )
+    assert Path(result["video_url"][7:]).read_bytes() == b"DONE"
+    assert len(interactions.get_calls) == 2
+    assert interactions.get_calls[0] == {"interaction_id": "int-9"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_terminal_status_raises(tmp_path: Path) -> None:
+    """Any non-completed terminal status fails fast with the raw status."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    interactions = FakeInteractions(
+        create_result=FakeInteraction(id="int-3", status="failed")
+    )
+    client = FakeGenaiClient(interactions=interactions)
+
+    with pytest.raises(ValueError, match="status 'failed'"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
-            prompt="Bad aspect",
+            prompt="p",
             videos_dir=videos_dir,
-            aspect_ratio="4:3",
         )
 
 
-# ============================================================================
-# Duration clamping
-# ============================================================================
-
-
-@pytest.mark.parametrize(
-    ("requested", "expected", "expect_warning"),
-    [
-        (15.0, 10, True),
-        (1.0, 3, True),
-        (6.0, 6, False),
-        (3.0, 3, False),
-        (10.0, 10, False),
-        (6.7, 7, False),
-    ],
-)
 @pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_omni_duration_clamping(
-    requested: float,
-    expected: int,
-    expect_warning: bool,
-    tmp_path: Path,
+@pytest.mark.timeout(3.0)
+async def test_polling_timeout_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Duration is clamped to [3, 10] (rounded), with a warning when clamped."""
+    """An interaction that never completes hits the overall deadline."""
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    client = FakeGenaiClient(interaction=_inline_interaction())
-
-    result = await generate_video_omni(
-        client=client,  # type: ignore[arg-type]
-        prompt="Duration test",
-        videos_dir=videos_dir,
-        duration_seconds=requested,
+    forever = [FakeInteraction(status="in_progress") for _ in range(1000)]
+    interactions = FakeInteractions(
+        create_result=FakeInteraction(status="in_progress"),
+        get_results=forever,
     )
+    client = FakeGenaiClient(interactions=interactions)
 
-    assert result["duration_seconds"] == expected
+    real_sleep = asyncio.sleep
 
-    # The clamped duration is also forwarded to the API config.
-    create_kwargs = client.interactions.create_kwargs
-    assert create_kwargs is not None
-    assert create_kwargs["config"]["duration_seconds"] == expected
+    async def instant_sleep(_secs: float) -> None:
+        await real_sleep(0)
 
-    if expect_warning:
-        assert "warnings" in result
-        assert any("clamped" in w for w in result["warnings"])
-    else:
-        assert "warnings" not in result
-
-
-# ============================================================================
-# Timeout
-# ============================================================================
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_omni_timeout_raises(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A create() call that exceeds the timeout raises TimeoutError."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    client = FakeGenaiClient(interaction=_inline_interaction())
-
-    async def fake_wait_for(awaitable: Any, timeout: float) -> Any:
-        # Close the underlying coroutine to avoid "never awaited" warnings.
-        if hasattr(awaitable, "close"):
-            awaitable.close()
-        raise asyncio.TimeoutError()
-
-    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr("src.omni.asyncio.sleep", instant_sleep)
 
     with pytest.raises(TimeoutError, match="timed out"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
-            prompt="Slow",
+            prompt="p",
             videos_dir=videos_dir,
-            timeout_seconds=1,
+            timeout_seconds=0,
         )
 
 
 # ============================================================================
-# Missing output handling
+# Output extraction fallbacks
 # ============================================================================
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_omni_no_output_video_raises(tmp_path: Path) -> None:
-    """An interaction with no output_video raises a clear error."""
+async def test_steps_fallback_when_no_output_video(tmp_path: Path) -> None:
+    """Video is found in steps[].content[] when output_video is absent."""
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
+    step = FakeStep(
+        content=[
+            FakePart(type="text", text="rendering notes"),
+            FakePart(
+                type="video",
+                data=base64.b64encode(b"STEPVID").decode(),
+                mime_type="video/mp4",
+            ),
+        ]
+    )
+    interaction = FakeInteraction(id="int-4", status="completed", steps=[step])
+    client = FakeGenaiClient(FakeInteractions(create_result=interaction))
 
-    interaction = FakeInteraction(output_video=None)
-    client = FakeGenaiClient(interaction=interaction)
+    result = await generate_video_omni(
+        client=client,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+    )
+    assert Path(result["video_url"][7:]).read_bytes() == b"STEPVID"
 
-    with pytest.raises(ValueError, match="no output_video"):
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_uri_delivery_downloads_via_files(tmp_path: Path) -> None:
+    """URI delivery resolves through files.get + files.download."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    interaction = FakeInteraction(
+        id="int-5",
+        status="completed",
+        output_video=FakeOutputVideo(uri="files/abc123"),
+    )
+    files = FakeFiles(download_bytes=b"URIVID")
+    client = FakeGenaiClient(FakeInteractions(create_result=interaction), files)
+
+    result = await generate_video_omni(
+        client=client,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+    )
+    assert Path(result["video_url"][7:]).read_bytes() == b"URIVID"
+    assert files.get_calls == [{"name": "files/abc123"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_no_video_anywhere_raises(tmp_path: Path) -> None:
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    interaction = FakeInteraction(id="int-6", status="completed")
+    client = FakeGenaiClient(FakeInteractions(create_result=interaction))
+
+    with pytest.raises(ValueError, match="no inline video data and no file URI"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
-            prompt="No output",
+            prompt="p",
             videos_dir=videos_dir,
         )
+
+
+# ============================================================================
+# Validation & advisory duration
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_invalid_aspect_ratio_raises(tmp_path: Path) -> None:
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    client = FakeGenaiClient()
+
+    with pytest.raises(ValueError, match="Unsupported aspect_ratio"):
+        await generate_video_omni(
+            client=client,  # type: ignore[arg-type]
+            prompt="p",
+            videos_dir=videos_dir,
+            aspect_ratio="1:1",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_duration_is_advisory_and_never_sent(tmp_path: Path) -> None:
+    """Duration is echoed for planning with a warning, and never appears in
+    the request (no documented field exists on any Omni surface)."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    interactions = FakeInteractions(create_result=_inline_video_interaction())
+    client = FakeGenaiClient(interactions=interactions)
+
+    result = await generate_video_omni(
+        client=client,  # type: ignore[arg-type]
+        prompt="p",
+        videos_dir=videos_dir,
+        duration_seconds=8.0,
+    )
+    assert result["duration_seconds"] == 8
+    assert any("not controllable" in w for w in result["warnings"])
+    kwargs = interactions.create_kwargs
+    assert kwargs is not None
+    assert "duration" not in str(kwargs["generation_config"])
+    assert "duration" not in str(kwargs["response_format"])

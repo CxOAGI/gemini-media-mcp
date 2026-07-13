@@ -294,6 +294,11 @@ async def _omni_generate_and_manifest(
     sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
     if sidecar_url:
         result["sidecar_url"] = sidecar_url
+    else:
+        # No sidecar written (remote URL or write failure) — include the
+        # manifest inline so interaction lineage (previous_interaction_id,
+        # ignored params) isn't lost. Matches the Veo tools' fallback.
+        result["manifest"] = manifest
     return result
 
 
@@ -849,6 +854,9 @@ async def generate_video(
         # text prompt + optional input image(s), so Veo-only controls are
         # ignored — surface which ones so the caller isn't surprised.
         if draft:
+            # `is not None` (not truthiness): seed=0 is a valid Veo seed and
+            # must be reported as ignored too. include_audio is only notable
+            # when explicitly enabled (omni has no audio control).
             ignored = [
                 name
                 for name, val in (
@@ -861,8 +869,15 @@ async def generate_video(
                     ("extend_video_uri", extend_video_uri),
                     ("output_gcs_uri", output_gcs_uri),
                 )
-                if val
+                if val is not None and val != []
             ]
+            if include_audio:
+                ignored.append("include_audio")
+            # audio_prompt CAN be honored best-effort: inline it into the
+            # prompt text, exactly like the Veo path does.
+            draft_prompt = prompt
+            if audio_prompt:
+                draft_prompt = f"{prompt}\nAudio: {audio_prompt}"
             draft_image_bytes: list[bytes] | None = None
             if image_uri:
                 b = await fetch(
@@ -883,7 +898,7 @@ async def generate_video(
             result = await _omni_generate_and_manifest(
                 app_ctx,
                 ctx,
-                prompt=prompt,
+                prompt=draft_prompt,
                 image_bytes_list=draft_image_bytes,
                 aspect_ratio=aspect_ratio,
                 duration_seconds=duration_seconds,
@@ -1391,6 +1406,16 @@ async def generate_clip(
                     "add_bridges is ignored in animatic mode "
                     "(bridges are a Veo first/last-frame feature)."
                 )
+            if output_gcs_uri:
+                clip_warnings.append(
+                    "output_gcs_uri is ignored in animatic mode; omni previews "
+                    "are always written locally."
+                )
+            if include_audio:
+                clip_warnings.append(
+                    "include_audio is ignored in animatic mode "
+                    "(gemini-omni-flash previews carry no controllable audio)."
+                )
         else:
             video_client = _client_for_video_model(app_ctx, model)
             is_vertex_client = getattr(video_client._api_client, "vertexai", False)
@@ -1433,9 +1458,25 @@ async def generate_clip(
                 await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
                 if animatic:
                     # Fast omni preview: text prompt + optional first frame.
+                    # audio_prompt is inlined into the prompt (best-effort,
+                    # same as the Veo path); Veo-only per-beat controls are
+                    # reported as dropped rather than silently discarded.
+                    beat_prompt = prompt
+                    if beat.get("audio_prompt"):
+                        beat_prompt = f"{prompt}\nAudio: {beat['audio_prompt']}"
+                    dropped = [
+                        name
+                        for name in ("negative_prompt", "seed")
+                        if beat.get(name) is not None
+                    ]
+                    if dropped:
+                        clip_warnings.append(
+                            f"animatic mode ignored Veo-only beat params "
+                            f"({', '.join(dropped)}) on beat {idx}."
+                        )
                     beat_result = await generate_video_omni_impl(
                         client=_client_for_omni(app_ctx),
-                        prompt=prompt,
+                        prompt=beat_prompt,
                         videos_dir=app_ctx.videos_dir,
                         image_bytes_list=[image_bytes] if image_bytes else None,
                         aspect_ratio=aspect_ratio,
@@ -1639,6 +1680,13 @@ async def generate_video_omni(
 
         image_bytes_list: list[bytes] = []
         if image_uris:
+            # Cap the list: every image is buffered in memory (each up to
+            # MAX_FETCH_BYTES), and omni conditions on a small set of images.
+            if len(image_uris) > 8:
+                raise ValueError(
+                    f"Too many image_uris ({len(image_uris)}); "
+                    "gemini-omni-flash accepts at most 8 input images here."
+                )
             for uri in image_uris:
                 b = await fetch(
                     uri,
@@ -1734,6 +1782,7 @@ async def loop_extend(
     times: int = 1,
     model: VideoModel = "veo-3.1-generate-001",
     aspect_ratio: str = "16:9",
+    include_audio: bool = True,
     output_gcs_uri: str | None = None,
 ) -> str:
     """Extend a Veo-generated video multiple times in one call.
@@ -1750,6 +1799,8 @@ async def loop_extend(
         times: Number of ~7s extensions to chain (1-20)
         model: Veo model (not the Lite model)
         aspect_ratio: Must match the source video (16:9 or 9:16)
+        include_audio: Generate audio on the extended sections (default True,
+            so extending an audio video doesn't go silent; Vertex only)
         output_gcs_uri: GCS output URI (required on Vertex for extensions)
 
     Returns:
@@ -1790,6 +1841,7 @@ async def loop_extend(
 
         current = video_uri
         steps: list[str] = []
+        step_warnings: list[str] = []
         for i in range(times):
             await ctx.info(f"Extension {i + 1}/{times}")
             ext_result = await generate_video_impl(
@@ -1800,6 +1852,7 @@ async def loop_extend(
                 extend_video_uri=current,
                 allowed_dir=data_dir,
                 aspect_ratio=aspect_ratio,
+                include_audio=include_audio,
                 log_callback=ctx.info,
                 output_gcs_uri=gcs_uri,
             )
@@ -1807,6 +1860,7 @@ async def loop_extend(
             if not current:
                 raise ValueError(f"Extension {i + 1} produced no video URL.")
             steps.append(current)
+            step_warnings.extend(ext_result.get("warnings") or [])
 
         manifest: dict[str, Any] = {
             "kind": "loop_extend",
@@ -1825,6 +1879,11 @@ async def loop_extend(
             "times": times,
             "extension_steps": steps,
         }
+        if step_warnings:
+            # Same warning repeats per step; dedupe, preserving order.
+            deduped = list(dict.fromkeys(step_warnings))
+            result["warnings"] = deduped
+            manifest["warnings"] = deduped
         sidecar_url = _write_sidecar(current, manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
