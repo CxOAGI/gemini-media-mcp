@@ -141,11 +141,29 @@ async def generate_image(
             ref_image.load()
             pil_images.append(ref_image)
 
+    # Non-fatal warnings surfaced back to the caller (matches video/omni).
+    warnings: list[str] = []
+
     try:
         if model_id.startswith("imagen"):
-            # NOTE: Imagen 4.x is deprecated by Google with shutdown scheduled
-            # for 2026-08-17. The replacement is the Nano Banana / gemini-3.x
-            # image family (gemini-3-pro-image, gemini-3.1-flash-image, etc.).
+            # Imagen 4.x is deprecated by Google with shutdown scheduled for
+            # 2026-08-17; surface that at runtime so users migrate before
+            # their calls start failing.
+            warnings.append(
+                f"Model {model_id} is deprecated: Google shuts down Imagen 4.x "
+                "on 2026-08-17. Migrate to the gemini-3.x image family "
+                "(gemini-3-pro-image, gemini-3.1-flash-image, "
+                "gemini-3.1-flash-lite-image)."
+            )
+            # Imagen's generate_images has no image input — don't silently
+            # drop supplied input/reference images.
+            if image_bytes or reference_images:
+                warnings.append(
+                    "Imagen models do not accept input or reference images; "
+                    "the supplied image(s) were ignored. Use a gemini-3.x "
+                    "image model for image-to-image or reference-guided "
+                    "generation."
+                )
             imagen_config_kwargs: dict[str, Any] = {"number_of_images": 1}
             if aspect_ratio:
                 imagen_config_kwargs["aspect_ratio"] = aspect_ratio
@@ -276,6 +294,8 @@ async def generate_image(
                         sig_path = images_dir / sig_filename
                         sig_path.write_text(response_thought_signature)
                         result["thought_signature_url"] = f"file://{sig_path}"
+                    if warnings:
+                        result["warnings"] = warnings
                     return result
                 raise ValueError("Gemini returned no image")
 
@@ -310,6 +330,10 @@ async def generate_image(
             sig_path = images_dir / sig_filename
             sig_path.write_text(response_thought_signature)
             result["thought_signature_url"] = f"file://{sig_path}"
+
+        # Include warnings only when non-empty, matching video/omni.
+        if warnings:
+            result["warnings"] = warnings
 
         return result
 

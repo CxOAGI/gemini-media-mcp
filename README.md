@@ -200,7 +200,7 @@ Fast conversational video generation via Google's `gemini-omni-flash-preview` (I
 
 ### edit_video
 
-Conversational edit of a previously omni-generated video. Because omni holds the video context server-side (~55 days on the paid tier), you describe **only the change** — no need to re-supply the source video.
+Conversational edit of a previously omni-generated video. Because omni holds the video context server-side (background interactions are retained ~14 days on Vertex AI; longer on the paid Gemini API), you describe **only the change** — no need to re-supply the source video.
 
 **Parameters:**
 - `previous_interaction_id` (required): The `interaction_id` from a prior `generate_video_omni` response

@@ -1453,3 +1453,73 @@ async def test_generate_image_vertex_global_client_reused(
     assert len(created_clients) == 1
     assert created_clients[0]["vertexai"] is True
     assert created_clients[0]["location"] == "global"
+
+
+# ============================================================================
+# Warnings channel (Imagen deprecation / ignored inputs)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_imagen_result_carries_deprecation_warning(tmp_path: Path) -> None:
+    """Imagen results warn about the 2026-08-17 shutdown at runtime."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    imagen_response = FakeImagenResponse(
+        [FakeGeneratedImage(FakeImageObject(_create_test_image()))]
+    )
+    client = FakeGenaiClient(imagen_response=imagen_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a photo",
+        images_dir=images_dir,
+        model="imagen-4.0-generate-001",
+    )
+    assert any("2026-08-17" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_imagen_warns_when_input_images_ignored(tmp_path: Path) -> None:
+    """Supplying input/reference images to Imagen adds an 'ignored' warning
+    instead of silently dropping them."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    imagen_response = FakeImagenResponse(
+        [FakeGeneratedImage(FakeImageObject(_create_test_image()))]
+    )
+    client = FakeGenaiClient(imagen_response=imagen_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a photo",
+        images_dir=images_dir,
+        model="imagen-4.0-generate-001",
+        image_bytes=_create_test_image(),
+    )
+    joined = " ".join(result["warnings"])
+    assert "ignored" in joined and "do not accept" in joined
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_gemini_image_result_has_no_warnings(tmp_path: Path) -> None:
+    """Gemini image results omit the warnings key entirely on a clean run."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a cat",
+        images_dir=images_dir,
+        model="gemini-2.5-flash-image",
+    )
+    assert "warnings" not in result
