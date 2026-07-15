@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from src.video import generate_video
+from src.video import _GEMINI_API_MODEL_IDS, generate_video
 
 # ============================================================================
 # Test Doubles
@@ -256,7 +256,10 @@ async def test_generate_video_veo2(
     )
 
     assert gen_result["message"] == "Video generated successfully"
-    assert gen_result["model"] == input["model"]
+    # Non-Vertex fake client: the impl reports the translated Gemini-API ID.
+    assert gen_result["model"] == _GEMINI_API_MODEL_IDS.get(
+        input["model"], input["model"]
+    )
     assert "video_url" in gen_result
 
 
@@ -366,7 +369,14 @@ async def test_generate_video_veo3(
     )
 
     assert gen_result["message"] == "Video generated successfully"
-    assert gen_result["model"] == input["model"]
+    # The impl reports the backend-appropriate model ID: the Vertex `-001`
+    # name as-is, or the translated `-preview` ID on the Gemini API path.
+    if use_vertexai:
+        assert gen_result["model"] == input["model"]
+    else:
+        assert gen_result["model"] == _GEMINI_API_MODEL_IDS.get(
+            input["model"], input["model"]
+        )
 
     # On Vertex AI audio_enabled == include_audio; on the Gemini API path
     # (non-Vertex) Veo 3.1 always generates audio natively.

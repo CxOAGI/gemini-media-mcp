@@ -223,6 +223,9 @@ async def test_input_video_inlined_and_edit_task(tmp_path: Path) -> None:
     kwargs = interactions.create_kwargs
     assert kwargs is not None
     assert kwargs["generation_config"]["video_config"]["task"] == "edit"
+    # Live-verified: edit tasks reject duration in response_format.
+    assert "duration" not in kwargs["response_format"][0]
+    assert "aspect_ratio" not in kwargs["response_format"][0]
     vid_part = kwargs["input"][1]
     assert vid_part["type"] == "video"
     assert vid_part["mime_type"] == "video/mp4"
@@ -246,7 +249,12 @@ async def test_previous_interaction_id_forwarded(tmp_path: Path) -> None:
     kwargs = interactions.create_kwargs
     assert kwargs is not None
     assert kwargs["previous_interaction_id"] == "int-1"
-    assert kwargs["generation_config"]["video_config"]["task"] == "edit"
+    # Live-verified: previous_interaction_id conflicts with video_config.task,
+    # and edit turns inherit duration/aspect from the source video.
+    assert "generation_config" not in kwargs
+    assert "duration" not in kwargs["response_format"][0]
+    assert "aspect_ratio" not in kwargs["response_format"][0]
+    assert any("inherit" in w for w in result["warnings"])
     assert result["interaction_id"] == "int-2"
 
 
@@ -616,20 +624,19 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
 
     from src.omni import _build_create_kwargs
 
+    # Variant 1: create task (fresh generation with a reference image + GCS).
     body = _build_create_kwargs(
         prompt="a marble rolling",
         image_bytes_list=[b"\x89PNG\r\n\x1a\nrest"],
         input_video_bytes=None,
-        previous_interaction_id="int-1",
+        previous_interaction_id=None,
         aspect_ratio="9:16",
         duration_seconds_int=6,
         output_gcs_uri="gs://bucket/out/",
     )
-
     # Every key we send is a recognized create-body field (else create() 400s
     # locally with TypeError before any request).
     assert set(body) <= _CREATE_BODY_KEYS
-
     out = _normalize_create_body(dict(body))
     # background stays top-level; response_format stays a list.
     assert out["background"] is True
@@ -640,3 +647,20 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     assert out["input"][0]["type"] == "user_input"
     kinds = [p["type"] for p in out["input"][0]["content"]]
     assert kinds == ["text", "image"]
+
+    # Variant 2: conversational edit turn — no generation_config (conflicts
+    # with previous_interaction_id) and no duration/aspect (inherited).
+    edit_body = _build_create_kwargs(
+        prompt="make the sky stormy",
+        image_bytes_list=None,
+        input_video_bytes=None,
+        previous_interaction_id="int-1",
+        aspect_ratio="16:9",
+        duration_seconds_int=6,
+        output_gcs_uri=None,
+    )
+    assert set(edit_body) <= _CREATE_BODY_KEYS
+    edit_out = _normalize_create_body(dict(edit_body))
+    assert "generation_config" not in edit_out
+    assert edit_out["previous_interaction_id"] == "int-1"
+    assert edit_out["response_format"] == [{"type": "video"}]

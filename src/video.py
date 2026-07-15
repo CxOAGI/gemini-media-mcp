@@ -24,6 +24,15 @@ VideoModel = Literal[
 # Veo 3.1 Lite does not support 4K output or video extension.
 _VEO_LITE_MODELS = {"veo-3.1-lite-generate-preview"}
 
+# The Gemini Developer API serves Veo 3.1 under `-preview` IDs, while Vertex
+# AI uses the `-001` IDs (live-verified: a `-001` call on the Gemini API 404s
+# with "not found for API version v1beta"). The public VideoModel values stay
+# the `-001` names; they are translated per backend at call time.
+_GEMINI_API_MODEL_IDS = {
+    "veo-3.1-generate-001": "veo-3.1-generate-preview",
+    "veo-3.1-fast-generate-001": "veo-3.1-fast-generate-preview",
+}
+
 # Generation mode for VEO 3.1
 GenerationMode = Literal[
     "text_to_video",  # Text-only generation
@@ -99,6 +108,12 @@ async def generate_video(
         Dictionary with video_url and generation metadata
     """
     model_id = str(model)
+
+    # Translate model IDs per backend: the Gemini Developer API serves Veo
+    # under `-preview` IDs and 404s on the Vertex `-001` names.
+    is_vertexai = getattr(client._api_client, "vertexai", False)
+    if not is_vertexai:
+        model_id = _GEMINI_API_MODEL_IDS.get(model_id, model_id)
 
     # Non-fatal warnings surfaced back to the caller (e.g. a request that could
     # not be honored but should not abort the whole generation).
@@ -188,7 +203,7 @@ async def generate_video(
     config_kwargs["duration_seconds"] = effective_duration
     # generate_audio is only supported on Vertex AI. Veo 3.1 already applies prompt
     # rewriting automatically, so `enhance_prompt` is Veo-2-only and must not be sent.
-    is_vertexai = getattr(client._api_client, "vertexai", False)
+    # (is_vertexai computed at the top alongside model-ID translation.)
     if is_vertexai:
         # Send the flag explicitly BOTH ways: omitting it lets the API apply
         # its own default (audio on for Veo 3.1), which would silently

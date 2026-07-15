@@ -200,35 +200,47 @@ def _build_create_kwargs(
     """Assemble the ``interactions.create`` request body.
 
     Pure and side-effect-free so it can be validated against the SDK's own
-    request normalizer in tests. ``response_format`` is a LIST of one object
-    carrying aspect ratio, duration ("Ns"), and optional GCS delivery;
+    request normalizer in tests. ``response_format`` is a LIST of one object;
     ``background`` is top-level (the Vertex REST example nests it in input[0],
     which is a doc artifact — the SDK's create schema has it top-level).
-    """
-    response_format_item: dict[str, Any] = {
-        "type": "video",
-        "aspect_ratio": aspect_ratio,
-        "duration": f"{duration_seconds_int}s",
-    }
-    if output_gcs_uri:
-        response_format_item["delivery"] = "uri"
-        response_format_item["gcs_uri"] = output_gcs_uri
 
+    Edit-type requests carry FEWER fields (live-verified against the API,
+    which 400s otherwise):
+      * ``previous_interaction_id`` conflicts with ``video_config.task``
+        ("previous_interaction_id is not allowed when video task is set"),
+        so conversational-edit turns send NO generation_config;
+      * edit tasks reject ``duration`` in response_format ("Duration cannot
+        be set in response format for edit task") — duration and aspect
+        ratio are inherited from the source video, so neither is sent for
+        any edit-type request.
+    """
     task_type = _select_task_type(
         previous_interaction_id=previous_interaction_id,
         input_video_bytes=input_video_bytes,
         image_count=len(image_bytes_list or []),
     )
+    is_edit = task_type == "edit"
+
+    response_format_item: dict[str, Any] = {"type": "video"}
+    if not is_edit:
+        response_format_item["aspect_ratio"] = aspect_ratio
+        response_format_item["duration"] = f"{duration_seconds_int}s"
+    if output_gcs_uri:
+        response_format_item["delivery"] = "uri"
+        response_format_item["gcs_uri"] = output_gcs_uri
 
     create_kwargs: dict[str, Any] = {
         "model": OMNI_MODEL,
         "input": _build_input_parts(prompt, image_bytes_list, input_video_bytes),
         "background": True,
         "response_format": [response_format_item],
-        "generation_config": {"video_config": {"task": task_type}},
     }
     if previous_interaction_id is not None:
+        # Conversational edit: the server holds the video context; sending a
+        # task alongside previous_interaction_id is rejected.
         create_kwargs["previous_interaction_id"] = previous_interaction_id
+    else:
+        create_kwargs["generation_config"] = {"video_config": {"task": task_type}}
     return create_kwargs
 
 
@@ -374,7 +386,19 @@ async def generate_video_omni(
         duration_seconds_int=clamped_duration,
         output_gcs_uri=output_gcs_uri,
     )
-    task_type = create_kwargs["generation_config"]["video_config"]["task"]
+    task_type = _select_task_type(
+        previous_interaction_id=previous_interaction_id,
+        input_video_bytes=input_video_bytes,
+        image_count=len(image_bytes_list or []),
+    )
+    if task_type == "edit":
+        # Edits inherit length and framing from the source video; the API
+        # rejects duration (and task alongside previous_interaction_id), so
+        # the requested values are echoed for planning but not sent.
+        warnings.append(
+            "Edit requests inherit duration and aspect ratio from the source "
+            "video; the requested duration_seconds/aspect_ratio were not sent."
+        )
 
     if log_callback:
         mode = "editing" if previous_interaction_id else "generating"
