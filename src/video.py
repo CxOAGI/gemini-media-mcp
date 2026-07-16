@@ -24,13 +24,22 @@ VideoModel = Literal[
 # Veo 3.1 Lite does not support 4K output or video extension.
 _VEO_LITE_MODELS = {"veo-3.1-lite-generate-preview"}
 
+# The Gemini Developer API serves Veo 3.1 under `-preview` IDs, while Vertex
+# AI uses the `-001` IDs (live-verified: a `-001` call on the Gemini API 404s
+# with "not found for API version v1beta"). The public VideoModel values stay
+# the `-001` names; they are translated per backend at call time.
+_GEMINI_API_MODEL_IDS = {
+    "veo-3.1-generate-001": "veo-3.1-generate-preview",
+    "veo-3.1-fast-generate-001": "veo-3.1-fast-generate-preview",
+}
+
 # Generation mode for VEO 3.1
 GenerationMode = Literal[
-    "text_to_video",           # Text-only generation
-    "image_to_video",          # First frame image input
-    "first_last_frame",        # First and last frame control
-    "reference_to_video",      # Reference images for style/character
-    "extend_video",            # Extend existing video
+    "text_to_video",  # Text-only generation
+    "image_to_video",  # First frame image input
+    "first_last_frame",  # First and last frame control
+    "reference_to_video",  # Reference images for style/character
+    "extend_video",  # Extend existing video
 ]
 
 
@@ -63,6 +72,8 @@ async def generate_video(
     last_frame_bytes: bytes | None = None,
     reference_images: list[bytes] | None = None,
     extend_video_uri: str | None = None,
+    resolution: str | None = None,
+    person_generation: str | None = None,
     output_gcs_uri: str | None = None,
 ) -> dict[str, Any]:
     """Generate a video using VEO models.
@@ -82,22 +93,43 @@ async def generate_video(
         log_callback: Async callback for progress logging
         last_frame_bytes: Last frame image bytes for first+last frame control
         reference_images: List of reference image bytes (up to 3) for style/character
-        extend_video_uri: URI of existing VEO video to extend. REQUIRES output_gcs_uri.
-        output_gcs_uri: GCS URI for output (required for extensions and large videos)
+        extend_video_uri: URI of existing VEO video to extend. On Vertex AI
+            this requires output_gcs_uri; on the Gemini API the extended
+            clip is returned inline and GCS output is not supported.
+        resolution: Output resolution ("720p" or "1080p"; "4K" only for non-Lite
+            models). When None, the API default is used.
+        person_generation: Person generation policy ("allow_adult" or "allow_all").
+            Passed through to the API for validation. When None, the API default
+            is used.
+        output_gcs_uri: GCS URI for output (required for extensions and large
+            videos). Only supported in Vertex AI mode.
 
     Returns:
         Dictionary with video_url and generation metadata
     """
     model_id = str(model)
 
+    # Translate model IDs per backend: the Gemini Developer API serves Veo
+    # under `-preview` IDs and 404s on the Vertex `-001` names.
+    is_vertexai = getattr(client._api_client, "vertexai", False)
+    if not is_vertexai:
+        model_id = _GEMINI_API_MODEL_IDS.get(model_id, model_id)
+
+    # Non-fatal warnings surfaced back to the caller (e.g. a request that could
+    # not be honored but should not abort the whole generation).
+    warnings: list[str] = []
+
+    # A last frame without a first frame would silently classify as
+    # text_to_video and the fetched frame would be discarded — reject it.
+    if last_frame_bytes and not image_bytes:
+        raise ValueError(
+            "A last frame was provided without a first frame. First+last "
+            "frame mode requires both; provide image_uri/image_base64 too."
+        )
+
     # Determine generation mode based on inputs
     generation_mode: str = "text_to_video"
     if extend_video_uri:
-        if model in _VEO_LITE_MODELS:
-            raise ValueError(
-                f"Model {model_id} does not support video extension. "
-                "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
-            )
         generation_mode = "extend_video"
     elif reference_images:
         generation_mode = "reference_to_video"
@@ -105,6 +137,20 @@ async def generate_video(
         generation_mode = "first_last_frame"
     elif image_bytes:
         generation_mode = "image_to_video"
+
+    # Veo 3.1 Lite (served via the Gemini API) does not support video
+    # extension, reference images, or first/last-frame control — fail fast
+    # with a clear message instead of an opaque API error.
+    if model in _VEO_LITE_MODELS and generation_mode in (
+        "extend_video",
+        "reference_to_video",
+        "first_last_frame",
+    ):
+        raise ValueError(
+            f"Model {model_id} does not support {generation_mode}. "
+            "Veo 3.1 Lite supports only text-to-video and image-to-video; "
+            "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+        )
 
     # Prepare image inputs
     first_frame_input: types.Image | None = None
@@ -130,27 +176,50 @@ async def generate_video(
                 )
             )
 
+    # Aspect ratio must match source clips for transitions/bridges, so an
+    # unsupported value is a hard error rather than a silent coercion.
+    if aspect_ratio not in ("16:9", "9:16"):
+        raise ValueError(
+            f"Unsupported aspect_ratio '{aspect_ratio}'. "
+            "Supported values are '16:9' and '9:16'."
+        )
+
     config_kwargs: dict[str, Any] = {
         "number_of_videos": 1,
-        "aspect_ratio": aspect_ratio if aspect_ratio in ("16:9", "9:16") else "16:9",
+        "aspect_ratio": aspect_ratio,
     }
 
-    # Reference-to-video only supports 8 seconds
+    # Compute the effective (snapped/forced) duration so it can be both sent to
+    # the API and reported back to callers.
     if generation_mode == "reference_to_video":
-        config_kwargs["duration_seconds"] = 8
-    # Extend video requires exactly 7 seconds output
+        # Reference-to-video only supports 8 seconds.
+        effective_duration = 8
     elif generation_mode == "extend_video":
-        config_kwargs["duration_seconds"] = 7
+        # Extend video requires exactly 7 seconds output.
+        effective_duration = 7
     else:
         allowed = [4, 6, 8]
-        config_kwargs["duration_seconds"] = min(
-            allowed, key=lambda x: abs(x - duration_seconds)
-        )
+        effective_duration = min(allowed, key=lambda x: abs(x - duration_seconds))
+    config_kwargs["duration_seconds"] = effective_duration
     # generate_audio is only supported on Vertex AI. Veo 3.1 already applies prompt
     # rewriting automatically, so `enhance_prompt` is Veo-2-only and must not be sent.
-    is_vertexai = getattr(client._api_client, 'vertexai', False)
-    if include_audio and is_vertexai:
+    # (is_vertexai computed at the top alongside model-ID translation.)
+    if is_vertexai:
+        # Send the flag explicitly BOTH ways: omitting it lets the API apply
+        # its own default (audio on for Veo 3.1), which would silently
+        # contradict include_audio=False and the reported audio_enabled.
         config_kwargs["generate_audio"] = include_audio
+
+    # On the Gemini API path, generate_audio is never sent and Veo 3.1 always
+    # generates audio natively. A caller who explicitly asked for NO audio
+    # (include_audio=False, the default) cannot have that honored here, so warn
+    # rather than silently returning a clip with baked-in audio. (include_audio=True
+    # is satisfied since audio is produced, so no warning is needed there.)
+    if not is_vertexai and not include_audio:
+        warnings.append(
+            "include_audio=False was not honored: Veo 3.1 on the Gemini API "
+            "always generates audio. Use Vertex AI mode to control audio."
+        )
 
     # Add last frame to config for first+last frame mode
     if last_frame_input:
@@ -164,8 +233,33 @@ async def generate_video(
         config_kwargs["negative_prompt"] = negative_prompt
     if seed is not None and seed >= 0:
         config_kwargs["seed"] = seed
-    if output_gcs_uri:
+
+    # output_gcs_uri is a Vertex-only config field. The Gemini API (e.g. for
+    # Veo Lite) does not support GCS output, so only forward it on Vertex.
+    # Callers may pass a default bucket (VIDEO_GCS_BUCKET) that applies to
+    # Vertex runs; silently ignoring it on the Gemini API path keeps Lite and
+    # plain text-to-video working. The generate_video tool separately rejects
+    # an *explicit* output_gcs_uri on a Gemini-API-routed call.
+    if output_gcs_uri and is_vertexai:
         config_kwargs["output_gcs_uri"] = output_gcs_uri
+
+    if resolution is not None:
+        valid_resolutions = ("720p", "1080p", "4K")
+        if resolution not in valid_resolutions:
+            raise ValueError(
+                f"Unsupported resolution '{resolution}'. "
+                f"Supported values are {', '.join(valid_resolutions)}."
+            )
+        if resolution == "4K" and model in _VEO_LITE_MODELS:
+            raise ValueError(
+                f"Model {model_id} does not support 4K resolution. "
+                "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+            )
+        config_kwargs["resolution"] = resolution
+
+    if person_generation is not None:
+        # Pass through as-is and let the API validate the value.
+        config_kwargs["person_generation"] = person_generation
 
     prompt_for_api = prompt
     if audio_prompt:
@@ -198,7 +292,10 @@ async def generate_video(
             if allowed_dir is not None:
                 resolved = local_path.resolve()
                 allowed = allowed_dir.resolve()
-                if not str(resolved).startswith(str(allowed) + os.sep) and resolved != allowed:
+                if (
+                    not str(resolved).startswith(str(allowed) + os.sep)
+                    and resolved != allowed
+                ):
                     raise ValueError(
                         f"Access denied: '{local_path}' is outside the allowed directory."
                     )
@@ -250,17 +347,27 @@ async def generate_video(
         await asyncio.to_thread(video.save, str(filepath))
         video_url = f"file://{filepath}"
 
+    # Report audio truthfully: on Vertex AI it depends on the generate_audio flag
+    # (== include_audio), but on the Gemini API path Veo 3.1 always generates
+    # audio natively regardless of the include_audio input.
+    audio_enabled = include_audio if is_vertexai else True
+
     result = {
         "message": "Video generated successfully",
         "video_url": video_url,
         "prompt": prompt_for_api,
         "model": model_id,
-        "audio_enabled": include_audio,
+        "audio_enabled": audio_enabled,
+        "duration_seconds": effective_duration,
         "generation_mode": generation_mode,
     }
 
     # For extend_video mode, also return the extended video URI
     if generation_mode == "extend_video" and extend_video_uri:
         result["extended_from"] = extend_video_uri
+
+    # Include warnings only when non-empty, so clean runs keep tidy manifests.
+    if warnings:
+        result["warnings"] = warnings
 
     return result

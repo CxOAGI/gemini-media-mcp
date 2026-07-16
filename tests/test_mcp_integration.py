@@ -90,9 +90,9 @@ class TestMCPIntegration:
                 "generate_bridge",
                 "generate_clip",
             }
-            assert expected_tools.issubset(
-                tool_names
-            ), f"Missing tools: {expected_tools - tool_names}"
+            assert expected_tools.issubset(tool_names), (
+                f"Missing tools: {expected_tools - tool_names}"
+            )
             print(f"✓ Found {len(tool_names)} tools: {tool_names}")
 
     # ==================== Gemini 3 Pro Image Tests ====================
@@ -108,9 +108,7 @@ class TestMCPIntegration:
                     "model": "gemini-3-pro-image-preview",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ Gemini 3 Pro Image: {text[:200]}")
             assert "image_url" in text.lower() or "error" in text.lower()
 
@@ -126,9 +124,7 @@ class TestMCPIntegration:
                     "image_size": "2K",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ Gemini 3 Pro with 2K size: {text[:200]}")
             assert "image_url" in text.lower() or "error" in text.lower()
 
@@ -144,9 +140,7 @@ class TestMCPIntegration:
                     "thinking_level": "high",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ Gemini 3 Pro with high thinking: {text[:200]}")
             if "thought_signature" in text:
                 print("✓ Thought signature returned for multi-turn editing")
@@ -164,9 +158,7 @@ class TestMCPIntegration:
                     "model": "gemini-3.1-flash-image-preview",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ Gemini 3.1 Flash Image: {text[:200]}")
             assert "image_url" in text.lower() or "error" in text.lower()
 
@@ -182,9 +174,7 @@ class TestMCPIntegration:
                     "image_size": "2K",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ Gemini 3.1 Flash with 2K size: {text[:200]}")
             assert "image_url" in text.lower() or "error" in text.lower()
 
@@ -201,9 +191,7 @@ class TestMCPIntegration:
                     "model": "veo-3.1-generate-001",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ VEO 3.1 basic: {text[:300]}")
             assert "video_url" in text.lower() or "error" in text.lower()
 
@@ -219,9 +207,7 @@ class TestMCPIntegration:
                     "duration_seconds": 6,
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ VEO 3.1 with 6s duration: {text[:300]}")
             assert "video_url" in text.lower() or "error" in text.lower()
 
@@ -236,9 +222,7 @@ class TestMCPIntegration:
                     "model": "veo-3.1-fast-generate-001",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ VEO 3.1 fast: {text[:300]}")
             assert "video_url" in text.lower() or "error" in text.lower()
 
@@ -254,9 +238,7 @@ class TestMCPIntegration:
                     "duration_seconds": 4,
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ VEO 3.1 Lite: {text[:300]}")
             assert "video_url" in text.lower() or "error" in text.lower()
 
@@ -273,9 +255,7 @@ class TestMCPIntegration:
                     "extend_video_uri": "gs://example/clip.mp4",
                 },
             )
-            text = next(
-                (c.text for c in result.content if hasattr(c, "text")), ""
-            )
+            text = next((c.text for c in result.content if hasattr(c, "text")), "")
             print(f"✓ VEO 3.1 Lite rejects extend: {text[:200]}")
             assert "error" in text.lower()
             assert "extension" in text.lower() or "does not support" in text.lower()

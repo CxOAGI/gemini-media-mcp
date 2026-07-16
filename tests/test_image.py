@@ -8,7 +8,21 @@ from typing import Any
 import pytest
 from PIL import Image
 
+import src.image
 from src.image import generate_image
+
+
+@pytest.fixture(autouse=True)
+def _reset_vertex_global_client() -> Any:
+    """Reset the module-level memoized Vertex global client around each test.
+
+    The client is cached at module scope for efficiency; resetting keeps each
+    test's client-creation assertions independent.
+    """
+    src.image._vertex_global_client = None
+    yield
+    src.image._vertex_global_client = None
+
 
 # ============================================================================
 # Test Doubles
@@ -30,9 +44,11 @@ class FakePart:
         self,
         text: str | None = None,
         inline_data: FakeInlineData | None = None,
+        thought: bool = False,
     ) -> None:
         self.text = text
         self.inline_data = inline_data
+        self.thought = thought
 
 
 class FakeContent:
@@ -91,13 +107,17 @@ class FakeModels:
         self._gemini_response = gemini_response
         self._imagen_response = imagen_response
         self._raise_error = raise_error
+        self.last_generate_content_kwargs: dict[str, Any] | None = None
+        self.last_generate_images_kwargs: dict[str, Any] | None = None
 
     def generate_content(self, **kwargs: Any) -> FakeGeminiResponse:
+        self.last_generate_content_kwargs = kwargs
         if self._raise_error:
             raise self._raise_error
         return self._gemini_response or FakeGeminiResponse()
 
     def generate_images(self, **kwargs: Any) -> FakeImagenResponse:
+        self.last_generate_images_kwargs = kwargs
         if self._raise_error:
             raise self._raise_error
         return self._imagen_response or FakeImagenResponse()
@@ -303,7 +323,7 @@ async def test_generate_image_gemini(
         pytest.param(
             {
                 "prompt": "A blue circle",
-                "model": "imagen-3.0-generate-002",
+                "model": "imagen-4.0-generate-001",
                 "image_bytes": None,
             },
             {"success": True, "has_image_url": True},
@@ -339,7 +359,7 @@ async def test_generate_image_gemini(
         pytest.param(
             {
                 "prompt": "A" * 10000,
-                "model": "imagen-3.0-generate-002",
+                "model": "imagen-4.0-generate-001",
                 "image_bytes": None,
             },
             {"success": True, "has_image_url": True},
@@ -348,7 +368,7 @@ async def test_generate_image_gemini(
         pytest.param(
             {
                 "prompt": "Unicode: 🎨 日本語",
-                "model": "imagen-3.0-generate-002",
+                "model": "imagen-4.0-generate-001",
                 "image_bytes": None,
             },
             {"success": True, "has_image_url": True},
@@ -357,7 +377,7 @@ async def test_generate_image_gemini(
         pytest.param(
             {
                 "prompt": "No image returned",
-                "model": "imagen-3.0-generate-002",
+                "model": "imagen-4.0-generate-001",
                 "image_bytes": None,
                 "empty_response": True,
             },
@@ -367,7 +387,7 @@ async def test_generate_image_gemini(
         pytest.param(
             {
                 "prompt": "No bytes",
-                "model": "imagen-3.0-generate-002",
+                "model": "imagen-4.0-generate-001",
                 "image_bytes": None,
                 "no_bytes": True,
             },
@@ -1089,6 +1109,7 @@ async def test_generate_image_accepts_thought_signature(
 
     # Pass a thought signature from a previous turn (must be valid base64)
     import base64
+
     prev_sig = base64.b64encode(b"previous_turn_signature").decode()
     result = await generate_image(
         client=client,  # type: ignore[arg-type]
@@ -1173,6 +1194,7 @@ async def test_generate_image_all_gemini3_params(
 
     # thought_signature must be valid base64
     import base64
+
     prev_sig = base64.b64encode(b"previous_signature").decode()
     result = await generate_image(
         client=initial_client,  # type: ignore[arg-type]
@@ -1192,3 +1214,312 @@ async def test_generate_image_all_gemini3_params(
     sig_path = Path(result["thought_signature_url"].replace("file://", ""))
     assert sig_path.exists()
     assert sig_path.read_text() == "new_signature"
+
+
+# ============================================================================
+# generate_image tests - ImageModel catalog
+# ============================================================================
+
+
+def test_image_model_excludes_shutdown_imagen3() -> None:
+    """imagen-3.0-generate-002 was shut down and must no longer be listed."""
+    from typing import get_args
+
+    from src.image import ImageModel
+
+    assert "imagen-3.0-generate-002" not in get_args(ImageModel)
+
+
+def test_image_model_includes_new_ga_ids() -> None:
+    """New GA Gemini 3.x and Imagen 4.x IDs must be present in ImageModel."""
+    from typing import get_args
+
+    from src.image import ImageModel
+
+    models = set(get_args(ImageModel))
+    expected = {
+        "gemini-2.5-flash-image",
+        "gemini-3-pro-image",
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-lite-image",
+        "gemini-3-pro-image-preview",
+        "gemini-3.1-flash-image-preview",
+        "imagen-4.0-generate-001",
+        "imagen-4.0-ultra-generate-001",
+        "imagen-4.0-fast-generate-001",
+    }
+    assert expected <= models
+
+
+# ============================================================================
+# generate_image tests - aspect_ratio and person_generation
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_imagen_aspect_ratio_and_person_generation(
+    tmp_path: Path,
+) -> None:
+    """aspect_ratio and person_generation are forwarded to the Imagen config."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    image_obj = FakeImageObject(test_image_bytes)
+    gen_image = FakeGeneratedImage(image_obj)
+    imagen_response = FakeImagenResponse([gen_image])
+
+    client = FakeGenaiClient(imagen_response=imagen_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="A landscape",
+        images_dir=images_dir,
+        model="imagen-4.0-generate-001",
+        aspect_ratio="16:9",
+        person_generation="allow_adult",
+    )
+
+    assert result["message"] == "Image generated successfully"
+    config = client.models.last_generate_images_kwargs["config"]
+    assert config.aspect_ratio == "16:9"
+    # The SDK coerces the pass-through string into a PersonGeneration enum.
+    assert "allow_adult" in str(config.person_generation).lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_gemini_aspect_ratio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """aspect_ratio is merged into the Gemini ImageConfig alongside image_size."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePart(inline_data=inline_data)
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="A portrait",
+        images_dir=images_dir,
+        model="gemini-3-pro-image",
+        image_size="2K",
+        aspect_ratio="9:16",
+    )
+
+    assert result["message"] == "Image generated successfully"
+    config = client.models.last_generate_content_kwargs["config"]
+    assert config.image_config is not None
+    assert config.image_config.aspect_ratio == "9:16"
+    assert config.image_config.image_size == "2K"
+
+
+# ============================================================================
+# generate_image tests - multi-image response
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_multi_image_keeps_last_non_thought(
+    tmp_path: Path,
+) -> None:
+    """Among real image parts keep the LAST (final render); ignore thought parts.
+
+    Thinking image models can emit interim sketch images (thought=True) before
+    the final image, and may emit more than one real image part; the final
+    non-thought image must win.
+    """
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    sketch_bytes = _create_test_image(color="green")
+    draft_bytes = _create_test_image(color="red")
+    final_bytes = _create_test_image(color="blue")
+    assert len({sketch_bytes, draft_bytes, final_bytes}) == 3
+
+    # Order: interim thought sketch, then a draft, then the final render.
+    thought_part = FakePart(
+        inline_data=FakeInlineData("image/png", sketch_bytes), thought=True
+    )
+    draft_part = FakePart(inline_data=FakeInlineData("image/png", draft_bytes))
+    final_part = FakePart(inline_data=FakeInlineData("image/png", final_bytes))
+    content = FakeContent([thought_part, draft_part, final_part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="Generate",
+        images_dir=images_dir,
+        model="gemini-3-pro-image",
+    )
+
+    file_path = Path(result["image_url"][7:])
+    # Final non-thought image wins; the thought sketch is never selected.
+    assert file_path.read_bytes() == final_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_only_thought_images_falls_back(
+    tmp_path: Path,
+) -> None:
+    """If every image part is a thought part, fall back to it rather than fail.
+
+    A truncated thinking-model response may contain only interim (thought=True)
+    images; returning that image beats discarding the bytes the API produced.
+    """
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    sketch_bytes = _create_test_image(color="green")
+    thought_part = FakePart(
+        inline_data=FakeInlineData("image/png", sketch_bytes), thought=True
+    )
+    content = FakeContent([thought_part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="Generate",
+        images_dir=images_dir,
+        model="gemini-3-pro-image",
+    )
+
+    # An image is returned (the fallback), not a "no image" / text-only result.
+    assert "image_url" in result
+    file_path = Path(result["image_url"][7:])
+    assert file_path.read_bytes() == sketch_bytes
+
+
+# ============================================================================
+# generate_image tests - memoized Vertex global client reuse
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_vertex_global_client_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The memoized Vertex global client is created once and reused across calls."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    test_image_bytes = _create_test_image()
+    inline_data = FakeInlineData("image/png", test_image_bytes)
+    part = FakePart(inline_data=inline_data)
+    content = FakeContent([part])
+    candidate = FakeCandidate(content)
+    gemini_response = FakeGeminiResponse([candidate])
+
+    created_clients: list[dict[str, Any]] = []
+
+    def mock_client(**kwargs: Any) -> FakeGenaiClient:
+        created_clients.append(kwargs)
+        return FakeGenaiClient(gemini_response=gemini_response)
+
+    monkeypatch.setattr("src.image.genai.Client", mock_client)
+
+    # Two separate calls, each supplying a Vertex-mode client that triggers the
+    # global-location swap.
+    for _ in range(2):
+        initial_client = FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
+        result = await generate_image(
+            client=initial_client,  # type: ignore[arg-type]
+            prompt="Test prompt",
+            images_dir=images_dir,
+            model="gemini-3-pro-image",
+        )
+        assert result["message"] == "Image generated successfully"
+
+    # The global client should have been created only once and reused.
+    assert len(created_clients) == 1
+    assert created_clients[0]["vertexai"] is True
+    assert created_clients[0]["location"] == "global"
+
+
+# ============================================================================
+# Warnings channel (Imagen deprecation / ignored inputs)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_imagen_result_carries_deprecation_warning(tmp_path: Path) -> None:
+    """Imagen results warn about the 2026-08-17 shutdown at runtime."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    imagen_response = FakeImagenResponse(
+        [FakeGeneratedImage(FakeImageObject(_create_test_image()))]
+    )
+    client = FakeGenaiClient(imagen_response=imagen_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a photo",
+        images_dir=images_dir,
+        model="imagen-4.0-generate-001",
+    )
+    assert any("2026-08-17" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_imagen_warns_when_input_images_ignored(tmp_path: Path) -> None:
+    """Supplying input/reference images to Imagen adds an 'ignored' warning
+    instead of silently dropping them."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    imagen_response = FakeImagenResponse(
+        [FakeGeneratedImage(FakeImageObject(_create_test_image()))]
+    )
+    client = FakeGenaiClient(imagen_response=imagen_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a photo",
+        images_dir=images_dir,
+        model="imagen-4.0-generate-001",
+        image_bytes=_create_test_image(),
+    )
+    joined = " ".join(result["warnings"])
+    assert "ignored" in joined and "do not accept" in joined
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_gemini_image_result_has_no_warnings(tmp_path: Path) -> None:
+    """Gemini image results omit the warnings key entirely on a clean run."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a cat",
+        images_dir=images_dir,
+        model="gemini-2.5-flash-image",
+    )
+    assert "warnings" not in result

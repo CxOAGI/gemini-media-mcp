@@ -101,10 +101,19 @@ def _read_sa_json(
 
 
 def _validate_client(env: dict[str, str]) -> tuple[bool, str | None]:
-    """Attempt to construct a genai.Client using the collected env.
+    """Validate the collected credentials against the live GenAI backend.
+
+    Constructs a ``genai.Client`` from the collected env, then performs a
+    cheap live call (``client.models.list()``, consuming one item) to prove
+    the credentials actually authenticate. Client construction alone is lazy
+    and would happily accept an invalid API key, so the live call is what
+    makes this validation meaningful.
 
     Returns (ok, error_message). Imports are done lazily so that tests that
-    do not touch validation do not need to stub genai.
+    do not touch validation do not need to stub genai. Any failure -- import,
+    construction, auth/permission error, or being offline -- is reported as
+    (False, message); the wizard treats that as non-fatal and offers to
+    continue anyway.
     """
     try:
         from google import genai  # type: ignore[import-not-found]
@@ -118,15 +127,45 @@ def _validate_client(env: dict[str, str]) -> tuple[bool, str | None]:
         for key, value in env.items():
             saved[key] = os.environ.get(key)
             os.environ[key] = value
+        # Bound the live check so the wizard can't hang forever on a network
+        # that silently drops packets — a timeout falls through to the same
+        # soft-fail / "continue anyway" path as any other validation error.
+        try:
+            from google.genai import types as genai_types
+
+            http_options = genai_types.HttpOptions(timeout=30_000)  # ms
+        except Exception:  # pragma: no cover - very old SDK
+            http_options = None
         try:
             if env.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true":
-                genai.Client(vertexai=True)
+                client = genai.Client(vertexai=True, http_options=http_options)
             elif env.get("GEMINI_API_KEY"):
-                genai.Client(api_key=env["GEMINI_API_KEY"])
+                client = genai.Client(
+                    api_key=env["GEMINI_API_KEY"], http_options=http_options
+                )
             else:
                 return False, "No credentials in env to validate."
         except Exception as exc:
             return False, str(exc)
+
+        # Client construction is lazy and never touches the network, so an
+        # invalid key would pass. Make a cheap live call and consume a single
+        # item to force real authentication.
+        try:
+            for _ in client.models.list():
+                break
+        except Exception as exc:
+            # models.list() can fail for credentials that still work for
+            # generation — e.g. a least-privilege Vertex service account
+            # without model-list permission, or a restricted-egress host that
+            # only reaches the generate endpoints. Flag it as a soft failure
+            # so the wizard's "continue anyway" prompt reads correctly.
+            return False, (
+                f"{exc}\n(Note: this check calls models.list(); some valid "
+                "least-privilege or network-restricted setups fail here but "
+                "can still generate. You may continue if you trust the "
+                "credentials.)"
+            )
         return True, None
     finally:
         for key, prior in saved.items():
@@ -317,7 +356,10 @@ def run_wizard(
             raise ValueError("Non-interactive mode requires 'mode' override.")
         choice = _prompt_choice(
             "Which credential mode?",
-            {"g": "Gemini API (images only)", "v": "Vertex AI (images + video)"},
+            {
+                "g": "Gemini API (images + video)",
+                "v": "Vertex AI (images + video, GCS output)",
+            },
             input_fn=_input,
         )
         mode = "gemini" if choice == "g" else "vertex"

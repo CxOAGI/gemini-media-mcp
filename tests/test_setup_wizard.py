@@ -46,6 +46,18 @@ class FakePrint:
         self.lines.append(" ".join(str(a) for a in args))
 
 
+class FakeModels:
+    """Test double for client.models, exposing a live-call list()."""
+
+    def __init__(self) -> None:
+        self.list_calls = 0
+
+    def list(self) -> list[str]:
+        """Mimic genai's models.list(); return an iterable of fake models."""
+        self.list_calls += 1
+        return ["fake-model-a", "fake-model-b"]
+
+
 class FakeGenaiClient:
     """Test double for google.genai.Client."""
 
@@ -53,6 +65,7 @@ class FakeGenaiClient:
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
+        self.models = FakeModels()
         FakeGenaiClient.instances.append(self)
 
 
@@ -147,7 +160,9 @@ def test_gemini_interactive_path() -> None:
     assert env["DATA_FOLDER"].endswith("gemini-media")
     assert not env["DATA_FOLDER"].startswith("~")
     assert len(FakeGenaiClient.instances) == 1
-    assert FakeGenaiClient.instances[0].kwargs == {"api_key": "my-key"}
+    # http_options carries the validation timeout; its value depends on
+    # whether the (stubbed) SDK exposes HttpOptions, so only pin api_key.
+    assert FakeGenaiClient.instances[0].kwargs["api_key"] == "my-key"
 
 
 # ============================================================================
@@ -385,6 +400,42 @@ def test_validation_failure_can_continue(monkeypatch: pytest.MonkeyPatch) -> Non
         print_fn=fake_print,
     )
     assert config["mcpServers"]["gemini-media"]["env"]["GEMINI_API_KEY"] == "bad"
+
+
+@pytest.mark.timeout(1.0)
+def test_validation_performs_live_models_list() -> None:
+    """Successful validation makes a live models.list() call."""
+    fake_input = FakeInput(answers=["g", "good-key", "", ""])
+    fake_print = FakePrint()
+
+    run_wizard(interactive=True, input_fn=fake_input, print_fn=fake_print)
+
+    assert len(FakeGenaiClient.instances) == 1
+    assert FakeGenaiClient.instances[0].models.list_calls == 1
+    assert any("validated successfully" in line for line in fake_print.lines)
+
+
+@pytest.mark.timeout(1.0)
+def test_validation_fails_when_live_call_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A working construction but failing live call is a validation failure."""
+
+    def bad_list(self: Any) -> list[str]:
+        raise RuntimeError("PERMISSION_DENIED: bad api key")
+
+    monkeypatch.setattr(FakeModels, "list", bad_list)
+
+    with pytest.raises(RuntimeError, match="Setup aborted"):
+        run_wizard(
+            interactive=False,
+            mode="gemini",
+            api_key="bad",
+            data_folder="/d",
+            continue_on_validation_error=False,
+            input_fn=lambda _="": "",
+            print_fn=FakePrint(),
+        )
 
 
 @pytest.mark.timeout(1.0)
