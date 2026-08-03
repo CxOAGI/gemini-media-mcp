@@ -126,7 +126,9 @@ Generate images using Gemini image models.
   - `gemini-3.1-flash-lite-image` — cheapest; the recommended migration target from the legacy model
   - `gemini-2.5-flash-image` (Nano Banana) — default; now considered **legacy** by Google (migrate to `gemini-3.1-flash-lite-image`)
 
-  > **Imagen is gone.** Google discontinues every Imagen image endpoint on **2026-08-17**, after which calls fail with `404 Not Found`. This server no longer calls them: the Imagen IDs below are accepted only as compatibility aliases and are transparently served by their Gemini GA replacement, with the substitution reported in the response's `warnings` field. Request a Gemini model directly.
+  > **Imagen is gone.** Google discontinues every Imagen image endpoint on **2026-08-17**, after which calls fail with `404 Not Found`. This server no longer calls them: the Imagen IDs below are accepted only as compatibility aliases and are transparently served by their Gemini GA replacement. Request a Gemini model directly.
+  >
+  > Every substitution is announced on three channels so it cannot go unnoticed: a `warnings` entry in the response JSON, an MCP `warning`-level log notification to the client, and a `WARNING` record in the server log.
   >
   > | Discontinued ID | Served by |
   > |---|---|

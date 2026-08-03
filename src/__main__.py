@@ -762,6 +762,8 @@ async def generate_image(
         # model responds with text only (e.g. a safety refusal or a clarifying
         # question). Surface that text instead of crashing on a missing key.
         if "image_url" not in result:
+            for warning in result.get("warnings", []):
+                await ctx.warning(warning)
             await ctx.info("Model returned text only")
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -780,9 +782,13 @@ async def generate_image(
             response_data["thought_signature_url"] = result["thought_signature_url"]
 
         # Surface impl warnings (e.g. an Imagen ID rerouted to its GA target).
+        # These go out on the MCP logging channel as well as in the payload, so
+        # a client that only reads the image sees them too.
         impl_warnings = result.get("warnings")
         if impl_warnings:
             response_data["warnings"] = impl_warnings
+            for warning in impl_warnings:
+                await ctx.warning(warning)
 
         # Write sidecar manifest so downstream tools (e.g. vfx-mcp) can read
         # generation parameters without parsing response JSON.

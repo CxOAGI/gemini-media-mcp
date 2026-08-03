@@ -1,6 +1,7 @@
 """Tests for image.py image generation helpers."""
 
 import base64
+import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -342,6 +343,60 @@ async def test_legacy_imagen_reroutes_to_gemini_ga(
     assert legacy_model in joined
     assert expected_target in joined
     assert "2026-08-17" in joined
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_legacy_imagen_reroute_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The reroute is logged at WARNING, so an operator whose caller ignores the
+    returned warnings still learns it is pinned to a discontinued model."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    with caplog.at_level(logging.WARNING, logger="src.image"):
+        await generate_image(
+            client=client,  # type: ignore[arg-type]
+            prompt="a photo",
+            images_dir=images_dir,
+            model="imagen-4.0-generate-001",
+        )
+
+    records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "imagen-4.0-generate-001" in message
+    assert "gemini-3.1-flash-image" in message
+    assert "2026-08-17" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_gemini_image_reroute_is_not_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A normal Gemini request logs nothing — the warning must not be noise."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    with caplog.at_level(logging.WARNING, logger="src.image"):
+        await generate_image(
+            client=client,  # type: ignore[arg-type]
+            prompt="a photo",
+            images_dir=images_dir,
+            model="gemini-3.1-flash-image",
+        )
+
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 @pytest.mark.asyncio

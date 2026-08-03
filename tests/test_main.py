@@ -1035,6 +1035,7 @@ async def test_generate_image(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
 
     mock_app_ctx = AppContext(
         data_folder=tmp_path,
@@ -1184,6 +1185,7 @@ async def test_generate_video(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
 
     mock_app_ctx = AppContext(
         data_folder=tmp_path,
@@ -1286,6 +1288,7 @@ async def test_generate_transition_happy_path(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1343,6 +1346,7 @@ async def test_generate_transition_missing_frame(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1413,6 +1417,7 @@ async def test_generate_bridge_happy_path(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1479,6 +1484,7 @@ async def test_generate_bridge_missing_clip(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1520,6 +1526,7 @@ async def test_generate_clip_three_beats_no_bridges(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1580,6 +1587,7 @@ async def test_generate_clip_with_bridges(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1646,6 +1654,7 @@ async def test_generate_clip_partial_failure(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1711,6 +1720,7 @@ async def test_generate_clip_strict_first_frame(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1754,6 +1764,7 @@ async def test_generate_clip_empty_beats(tmp_path: Path) -> None:
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1798,6 +1809,7 @@ async def test_e2e_image_to_transition(
         ctx = MagicMock()
         ctx.info = AsyncMock()
         ctx.error = AsyncMock()
+        ctx.warning = AsyncMock()
         ctx.request_context.lifespan_context = app_ctx
         return ctx
 
@@ -2146,6 +2158,7 @@ def _image_ctx(tmp_path: Path) -> MagicMock:
     ctx = MagicMock()
     ctx.info = AsyncMock()
     ctx.error = AsyncMock()
+    ctx.warning = AsyncMock()
     ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -2163,6 +2176,7 @@ def _video_ctx(
     ctx = MagicMock()
     ctx.info = AsyncMock()
     ctx.error = AsyncMock()
+    ctx.warning = AsyncMock()
     ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=tmp_path / "images",
@@ -2301,8 +2315,9 @@ async def test_generate_image_reports_legacy_imagen_reroute(
 
     monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
 
+    ctx = _image_ctx(tmp_path)
     result = await generate_image(
-        ctx=_image_ctx(tmp_path),
+        ctx=ctx,
         prompt="a cat",
         model="imagen-4.0-generate-001",
     )
@@ -2313,6 +2328,80 @@ async def test_generate_image_reports_legacy_imagen_reroute(
     manifest = json.loads(Path(data["sidecar_url"][7:]).read_text())
     assert manifest["model"] == "gemini-3.1-flash-image"
     assert any("2026-08-17" in w for w in manifest["warnings"])
+
+    # Also raised on the MCP logging channel, so a client that only renders the
+    # image still sees it.
+    ctx.warning.assert_awaited_once()
+    assert "2026-08-17" in ctx.warning.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_warns_on_text_only_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warnings reach the MCP logging channel on the text-only path too, which
+    returns before the normal response is assembled."""
+    from src.__main__ import generate_image
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "Model returned text only",
+            "generated_text": "I cannot draw that",
+            "model": "gemini-3.1-flash-image",
+            "warnings": [
+                "Model imagen-4.0-generate-001 is discontinued by Google on "
+                "2026-08-17 and was replaced with gemini-3.1-flash-image."
+            ],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    ctx = _image_ctx(tmp_path)
+    result = await generate_image(
+        ctx=ctx,
+        prompt="a cat",
+        model="imagen-4.0-generate-001",
+    )
+    payload = json.loads(result[0].text)
+    assert payload["message"] == "Model returned text only"
+    ctx.warning.assert_awaited_once()
+    assert "2026-08-17" in ctx.warning.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_does_not_warn_without_impl_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean Gemini request raises no MCP warning notification."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "clean.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    ctx = _image_ctx(tmp_path)
+    result = await generate_image(
+        ctx=ctx,
+        prompt="a cat",
+        model="gemini-3.1-flash-image",
+    )
+    assert "warnings" not in json.loads(result[1].text)
+    ctx.warning.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2513,6 +2602,7 @@ def _ctx_wrapping(app_ctx: Any) -> Any:
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = app_ctx
     return mock_ctx
 

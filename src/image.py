@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import logging
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -11,6 +12,8 @@ from google import genai
 from google.auth import exceptions as google_auth_exceptions
 from google.genai import types
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 ImageModel = Literal[
     # Gemini image models (Nano Banana family)
@@ -163,6 +166,14 @@ async def generate_image(
             f"replaced with {target} for this request. Update your "
             f"configuration to request {target} (or "
             "gemini-3.1-flash-lite-image / gemini-3-pro-image) directly."
+        )
+        # Also log it: a caller that never inspects the returned warnings still
+        # needs to find out it is pinned to a model that is going away.
+        logger.warning(
+            "Rerouted discontinued model %s to %s; update the caller's "
+            "configuration before Google's 2026-08-17 shutdown",
+            model_id,
+            target,
         )
         model_id = target
 
