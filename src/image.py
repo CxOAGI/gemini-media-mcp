@@ -28,10 +28,12 @@ ImageModel = Literal[
 ]
 
 # Legacy Imagen IDs. Google discontinues every one of these on 2026-08-17;
-# calls sent afterwards fail with 404 Not Found. They are still accepted by
-# generate_image() as a compatibility shim (see _IMAGEN_MIGRATION) so pinned
-# callers keep working, but they are deliberately absent from ImageModel and
-# from the MCP tool schema so nothing new can select them.
+# calls sent afterwards fail with 404 Not Found. They are deliberately split
+# out of ImageModel — the supported catalog — and accepted by generate_image()
+# only as a compatibility shim that reroutes them (see _IMAGEN_MIGRATION).
+# They MUST stay in the MCP tool annotation, though: pydantic validates the
+# model argument against it, so dropping them from the schema would reject a
+# pinned caller's request with a validation error before the shim could run.
 LegacyImagenModel = Literal[
     "imagen-3.0-capability-001",
     "imagen-3.0-capability-002",
