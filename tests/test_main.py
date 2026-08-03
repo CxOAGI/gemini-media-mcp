@@ -996,13 +996,13 @@ def _create_test_image(width: int = 100, height: int = 100) -> bytes:
         ),
         pytest.param(
             {
-                "prompt": "Test imagen",
+                "prompt": "Test legacy imagen alias",
                 "model": "imagen-4.0-generate-001",
                 "image_uri": None,
                 "image_base64": None,
             },
             {"success": True, "has_image": True},
-            id="imagen_model",
+            id="legacy_imagen_alias_still_accepted",
         ),
         pytest.param(
             {
@@ -2268,6 +2268,51 @@ async def test_generate_image_passes_new_params(
     manifest = json.loads(sidecar.read_text())
     assert manifest["aspect_ratio"] == "16:9"
     assert manifest["person_generation"] == "allow_adult"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_reports_legacy_imagen_reroute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy Imagen request still succeeds, and both the response and the
+    manifest name the Gemini model that actually served it."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "out.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        # Mirror the impl: the served model replaces the discontinued alias.
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-image",
+            "warnings": [
+                "Model imagen-4.0-generate-001 is discontinued by Google on "
+                "2026-08-17 and was replaced with gemini-3.1-flash-image."
+            ],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="imagen-4.0-generate-001",
+    )
+    data = json.loads(result[1].text)
+    assert data["model"] == "gemini-3.1-flash-image"
+    assert any("2026-08-17" in w for w in data["warnings"])
+
+    manifest = json.loads(Path(data["sidecar_url"][7:]).read_text())
+    assert manifest["model"] == "gemini-3.1-flash-image"
+    assert any("2026-08-17" in w for w in manifest["warnings"])
 
 
 @pytest.mark.asyncio

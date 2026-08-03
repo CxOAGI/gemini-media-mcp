@@ -24,7 +24,7 @@ from mcp.server.session import ServerSession
 from mcp.types import TextContent
 from PIL import Image as PILImage
 
-from .image import ImageModel, ImageSize, MediaResolution
+from .image import ImageModel, ImageSize, LegacyImagenModel, MediaResolution
 from .image import generate_image as generate_image_impl
 from .omni import OMNI_MODEL
 from .omni import generate_video_omni as generate_video_omni_impl
@@ -638,7 +638,7 @@ mcp = FastMCP(
 async def generate_image(
     ctx: Context[ServerSession, AppContext],
     prompt: str,
-    model: ImageModel,
+    model: ImageModel | LegacyImagenModel,
     image_uri: str | None = None,
     image_base64: str | None = None,
     reference_image_uris: list[str] | None = None,
@@ -648,7 +648,7 @@ async def generate_image(
     person_generation: str | None = None,
     thought_signature_url: str | None = None,
 ):
-    """Generate an image using Google Gemini or Imagen models.
+    """Generate an image using Google Gemini image models.
 
     Args:
         ctx: MCP context with application state
@@ -662,10 +662,11 @@ async def generate_image(
                - Most capable: reasoning + precise text rendering, 4K,
                  up to 14 reference images:
                  "gemini-3-pro-image" (GA, Nano Banana Pro)
-               Note on Imagen: the Imagen 4.x models are DEPRECATED (Google
-               shutdown scheduled 2026-08-17) and "imagen-3.0-generate-002" is
-               already RETIRED (shut down 2025-11-10). Do not start new work on
-               Imagen; migrate to the gemini-3.x image models above.
+               Never pick an "imagen-*" model: Google discontinues every Imagen
+               image endpoint on 2026-08-17 and they return 404 afterwards. The
+               legacy IDs are still accepted only so pinned configurations keep
+               working — such a request is rerouted to the Gemini GA
+               replacement and the substitution is reported under "warnings".
         image_uri: Input image URI (gs://, http://, file://) for image-to-image
         image_base64: Base64 encoded input image (prefer image_uri)
         reference_image_uris: List of reference image URIs (up to 14 for Gemini 3.x image models).
@@ -680,7 +681,7 @@ async def generate_image(
             - "MEDIA_RESOLUTION_MEDIUM": Balanced
             - "MEDIA_RESOLUTION_HIGH": Best quality, higher token usage
         aspect_ratio: Desired output aspect ratio, e.g. "1:1", "16:9", "9:16",
-            "4:3", "3:4". Applies to both Imagen and gemini-3.x image models.
+            "4:3", "3:4".
         person_generation: Policy for generating people:
             - "dont_allow": Do not generate people
             - "allow_adult": Allow generating adults (default behavior)
@@ -778,7 +779,7 @@ async def generate_image(
         if "thought_signature_url" in result:
             response_data["thought_signature_url"] = result["thought_signature_url"]
 
-        # Surface impl warnings (e.g. Imagen deprecation, ignored inputs).
+        # Surface impl warnings (e.g. an Imagen ID rerouted to its GA target).
         impl_warnings = result.get("warnings")
         if impl_warnings:
             response_data["warnings"] = impl_warnings
@@ -788,7 +789,9 @@ async def generate_image(
         manifest: dict[str, Any] = {
             "kind": "image",
             "prompt": prompt,
-            "model": model,
+            # The model actually served, which differs from `model` when a
+            # legacy Imagen ID was rerouted to its Gemini GA replacement.
+            "model": result["model"],
             "image_url": result["image_url"],
             "image_size": image_size,
             "media_resolution": media_resolution,

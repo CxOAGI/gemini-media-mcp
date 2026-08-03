@@ -16,7 +16,7 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 
 | Tools provided by this Server | Short Description |
 |-------------------------------|-------------------|
-| `generate_image` | Generate images using Gemini or Imagen models |
+| `generate_image` | Generate images using Gemini image models |
 | `generate_video` | Generate videos using VEO models (with optional fast `draft` mode) |
 | `generate_video_omni` | Fast conversational video via `gemini-omni-flash-preview` (Interactions API) |
 | `edit_video` | Conversationally edit a previously omni-generated video |
@@ -28,7 +28,7 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 
 ### Tool: **`generate_image`**
 
-Generate images using Gemini or Imagen models
+Generate images using Gemini image models
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
@@ -45,7 +45,7 @@ Generate images using Gemini or Imagen models
 - `gemini-3.1-flash-lite-image` - cheapest; recommended migration target
 - `gemini-2.5-flash-image` - Nano Banana; now considered legacy (migrate to `gemini-3.1-flash-lite-image`)
 
-> **Note:** `imagen-3.0-generate-002` was shut down on 2025-11-10. The Imagen 4.x models are deprecated with a scheduled shutdown of 2026-08-17; prefer the Gemini image models above.
+> **Imagen is gone.** Google discontinues every Imagen image endpoint on **2026-08-17** (`404 Not Found` afterwards). This server no longer calls them — the legacy `imagen-*` IDs are accepted only as compatibility aliases and are served by `gemini-3.1-flash-image` (or `gemini-3.1-flash-lite-image` for the `fast` tiers), with the substitution reported in the response's `warnings` field. Request a Gemini model directly.
 
 *This tool may perform destructive updates.*
 

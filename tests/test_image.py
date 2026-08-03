@@ -3,13 +3,13 @@
 import base64
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from PIL import Image
 
 import src.image
-from src.image import generate_image
+from src.image import LegacyImagenModel, generate_image
 
 
 @pytest.fixture(autouse=True)
@@ -72,40 +72,15 @@ class FakeGeminiResponse:
         self.candidates = candidates
 
 
-class FakeImageObject:
-    """Test double for Imagen image object."""
-
-    def __init__(self, image_bytes: bytes | None = None) -> None:
-        self.image_bytes = image_bytes
-
-
-class FakeGeneratedImage:
-    """Test double for generated image."""
-
-    def __init__(self, image: FakeImageObject | None = None) -> None:
-        self.image = image
-
-
-class FakeImagenResponse:
-    """Test double for Imagen generate_images response."""
-
-    def __init__(
-        self, generated_images: list[FakeGeneratedImage] | None = None
-    ) -> None:
-        self.generated_images = generated_images
-
-
 class FakeModels:
     """Test double for genai models."""
 
     def __init__(
         self,
         gemini_response: FakeGeminiResponse | None = None,
-        imagen_response: FakeImagenResponse | None = None,
         raise_error: Exception | None = None,
     ) -> None:
         self._gemini_response = gemini_response
-        self._imagen_response = imagen_response
         self._raise_error = raise_error
         self.last_generate_content_kwargs: dict[str, Any] | None = None
         self.last_generate_images_kwargs: dict[str, Any] | None = None
@@ -116,11 +91,13 @@ class FakeModels:
             raise self._raise_error
         return self._gemini_response or FakeGeminiResponse()
 
-    def generate_images(self, **kwargs: Any) -> FakeImagenResponse:
+    def generate_images(self, **kwargs: Any) -> None:
+        """Tripwire: generate_images is the Imagen-only endpoint Google
+        discontinues on 2026-08-17. Nothing may call it any more."""
         self.last_generate_images_kwargs = kwargs
-        if self._raise_error:
-            raise self._raise_error
-        return self._imagen_response or FakeImagenResponse()
+        raise AssertionError(
+            "generate_images (Imagen) was called; it is discontinued on 2026-08-17"
+        )
 
 
 class FakeApiClient:
@@ -136,11 +113,10 @@ class FakeGenaiClient:
     def __init__(
         self,
         gemini_response: FakeGeminiResponse | None = None,
-        imagen_response: FakeImagenResponse | None = None,
         raise_error: Exception | None = None,
         vertexai: bool = False,
     ) -> None:
-        self.models = FakeModels(gemini_response, imagen_response, raise_error)
+        self.models = FakeModels(gemini_response, raise_error)
         self._api_client = FakeApiClient(vertexai=vertexai)
 
 
@@ -313,139 +289,113 @@ async def test_generate_image_gemini(
 
 
 # ============================================================================
-# generate_image tests - Imagen models
+# generate_image tests - legacy Imagen IDs reroute to Gemini GA
 # ============================================================================
 
 
 @pytest.mark.parametrize(
-    ("input", "expected"),
+    ("legacy_model", "expected_target"),
     [
-        pytest.param(
-            {
-                "prompt": "A blue circle",
-                "model": "imagen-4.0-generate-001",
-                "image_bytes": None,
-            },
-            {"success": True, "has_image_url": True},
-            id="imagen3_basic",
-        ),
-        pytest.param(
-            {
-                "prompt": "A green triangle",
-                "model": "imagen-4.0-generate-001",
-                "image_bytes": None,
-            },
-            {"success": True, "has_image_url": True},
-            id="imagen4_standard",
-        ),
-        pytest.param(
-            {
-                "prompt": "Ultra quality image",
-                "model": "imagen-4.0-ultra-generate-001",
-                "image_bytes": None,
-            },
-            {"success": True, "has_image_url": True},
-            id="imagen4_ultra",
-        ),
-        pytest.param(
-            {
-                "prompt": "Fast image",
-                "model": "imagen-4.0-fast-generate-001",
-                "image_bytes": None,
-            },
-            {"success": True, "has_image_url": True},
-            id="imagen4_fast",
-        ),
-        pytest.param(
-            {
-                "prompt": "A" * 10000,
-                "model": "imagen-4.0-generate-001",
-                "image_bytes": None,
-            },
-            {"success": True, "has_image_url": True},
-            id="imagen_large_prompt",
-        ),
-        pytest.param(
-            {
-                "prompt": "Unicode: 🎨 日本語",
-                "model": "imagen-4.0-generate-001",
-                "image_bytes": None,
-            },
-            {"success": True, "has_image_url": True},
-            id="imagen_unicode_prompt",
-        ),
-        pytest.param(
-            {
-                "prompt": "No image returned",
-                "model": "imagen-4.0-generate-001",
-                "image_bytes": None,
-                "empty_response": True,
-            },
-            ValueError,
-            id="imagen_no_images",
-        ),
-        pytest.param(
-            {
-                "prompt": "No bytes",
-                "model": "imagen-4.0-generate-001",
-                "image_bytes": None,
-                "no_bytes": True,
-            },
-            ValueError,
-            id="imagen_no_image_bytes",
-        ),
+        ("imagen-3.0-capability-001", "gemini-3.1-flash-image"),
+        ("imagen-3.0-capability-002", "gemini-3.1-flash-image"),
+        ("imagen-3.0-fast-generate-001", "gemini-3.1-flash-lite-image"),
+        ("imagen-3.0-generate-001", "gemini-3.1-flash-image"),
+        ("imagen-3.0-generate-002", "gemini-3.1-flash-image"),
+        ("imagen-4.0-fast-generate-001", "gemini-3.1-flash-lite-image"),
+        ("imagen-4.0-generate-001", "gemini-3.1-flash-image"),
+        ("imagen-4.0-ultra-generate-001", "gemini-3.1-flash-image"),
     ],
 )
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_image_imagen(
-    input: dict[str, Any],
-    expected: dict[str, Any] | type[Exception],
+async def test_legacy_imagen_reroutes_to_gemini_ga(
+    legacy_model: LegacyImagenModel,
+    expected_target: str,
     tmp_path: Path,
 ) -> None:
-    """Test generate_image with Imagen models."""
+    """A discontinued Imagen ID is served by its Gemini GA replacement via
+    generate_content, never by the retired generate_images endpoint."""
     images_dir = tmp_path / "images"
     images_dir.mkdir()
 
-    test_image_bytes = _create_test_image()
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
 
-    # Build response based on flags
-    if input.get("empty_response"):
-        imagen_response = FakeImagenResponse([])
-    elif input.get("no_bytes"):
-        image_obj = FakeImageObject(None)
-        gen_image = FakeGeneratedImage(image_obj)
-        imagen_response = FakeImagenResponse([gen_image])
-    else:
-        image_obj = FakeImageObject(test_image_bytes)
-        gen_image = FakeGeneratedImage(image_obj)
-        imagen_response = FakeImagenResponse([gen_image])
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="A blue circle",
+        images_dir=images_dir,
+        model=legacy_model,
+    )
 
-    client = FakeGenaiClient(imagen_response=imagen_response)
+    assert client.models.last_generate_content_kwargs is not None
+    assert client.models.last_generate_content_kwargs["model"] == expected_target
+    # The discontinued endpoint must not be called at all.
+    assert client.models.last_generate_images_kwargs is None
+    # The reported model is the one actually served, not the dead alias.
+    assert result["model"] == expected_target
+    assert result["image_url"].startswith("file://")
+    assert result["message"] == "Image generated successfully"
 
-    if isinstance(expected, type) and issubclass(expected, Exception):
-        with pytest.raises(expected):
-            await generate_image(
-                client=client,  # type: ignore[arg-type]
-                prompt=input["prompt"],
-                images_dir=images_dir,
-                model=input["model"],
-                image_bytes=input.get("image_bytes"),
-            )
-    else:
-        result = await generate_image(
-            client=client,  # type: ignore[arg-type]
-            prompt=input["prompt"],
-            images_dir=images_dir,
-            model=input["model"],
-            image_bytes=input.get("image_bytes"),
-        )
+    joined = " ".join(result["warnings"])
+    assert legacy_model in joined
+    assert expected_target in joined
+    assert "2026-08-17" in joined
 
-        assert result["model"] == input["model"]
-        assert "image_url" in result
-        assert result["image_url"].startswith("file://")
-        assert "image_preview" in result
-        assert result["message"] == "Image generated successfully"
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_legacy_imagen_accepts_input_images(tmp_path: Path) -> None:
+    """Input and reference images are no longer dropped for a legacy Imagen
+    request — the Gemini replacement accepts them."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="Edit this",
+        images_dir=images_dir,
+        model="imagen-4.0-generate-001",
+        image_bytes=_create_test_image(),
+        reference_images=[_create_test_image()],
+    )
+
+    assert result["message"] == "Image generated successfully"
+    assert client.models.last_generate_content_kwargs is not None
+    contents = client.models.last_generate_content_kwargs["contents"]
+    # prompt + input image + reference image all reached the model.
+    assert len(contents) == 3
+    joined = " ".join(result["warnings"])
+    assert "ignored" not in joined
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_unknown_imagen_id_falls_back_to_flash_image(tmp_path: Path) -> None:
+    """An Imagen ID missing from the published table still reroutes rather than
+    hitting a discontinued endpoint."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="A blue circle",
+        images_dir=images_dir,
+        # Deliberately off-table: not a LegacyImagenModel member.
+        model=cast(Any, "imagen-9.9-generate-999"),
+    )
+
+    assert result["model"] == "gemini-3.1-flash-image"
+    assert client.models.last_generate_images_kwargs is None
 
 
 # ============================================================================
@@ -1221,17 +1171,18 @@ async def test_generate_image_all_gemini3_params(
 # ============================================================================
 
 
-def test_image_model_excludes_shutdown_imagen3() -> None:
-    """imagen-3.0-generate-002 was shut down and must no longer be listed."""
+def test_image_model_excludes_all_imagen_ids() -> None:
+    """Every Imagen endpoint is discontinued on 2026-08-17, so ImageModel — the
+    catalog offered to callers — must contain no Imagen ID at all."""
     from typing import get_args
 
     from src.image import ImageModel
 
-    assert "imagen-3.0-generate-002" not in get_args(ImageModel)
+    assert not [m for m in get_args(ImageModel) if str(m).startswith("imagen")]
 
 
 def test_image_model_includes_new_ga_ids() -> None:
-    """New GA Gemini 3.x and Imagen 4.x IDs must be present in ImageModel."""
+    """New GA Gemini 3.x IDs must be present in ImageModel."""
     from typing import get_args
 
     from src.image import ImageModel
@@ -1244,11 +1195,34 @@ def test_image_model_includes_new_ga_ids() -> None:
         "gemini-3.1-flash-lite-image",
         "gemini-3-pro-image-preview",
         "gemini-3.1-flash-image-preview",
-        "imagen-4.0-generate-001",
-        "imagen-4.0-ultra-generate-001",
-        "imagen-4.0-fast-generate-001",
     }
     assert expected <= models
+
+
+def test_legacy_imagen_catalog_covers_googles_discontinued_list() -> None:
+    """Every endpoint on Google's discontinuation table is accepted as a legacy
+    alias and has a published migration target."""
+    from typing import get_args
+
+    from src.image import _IMAGEN_MIGRATION, LegacyImagenModel
+
+    discontinued = {
+        "imagen-3.0-capability-001",
+        "imagen-3.0-capability-002",
+        "imagen-3.0-fast-generate-001",
+        "imagen-3.0-generate-001",
+        "imagen-3.0-generate-002",
+        "imagen-4.0-fast-generate-001",
+        "imagen-4.0-generate-001",
+        "imagen-4.0-ultra-generate-001",
+    }
+    assert set(get_args(LegacyImagenModel)) == discontinued
+    assert set(_IMAGEN_MIGRATION) == discontinued
+    # Google's table only permits these two targets.
+    assert set(_IMAGEN_MIGRATION.values()) <= {
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-lite-image",
+    }
 
 
 # ============================================================================
@@ -1258,19 +1232,17 @@ def test_image_model_includes_new_ga_ids() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_image_imagen_aspect_ratio_and_person_generation(
+async def test_legacy_imagen_aspect_ratio_and_person_generation(
     tmp_path: Path,
 ) -> None:
-    """aspect_ratio and person_generation are forwarded to the Imagen config."""
+    """aspect_ratio and person_generation survive the reroute and land on the
+    Gemini ImageConfig."""
     images_dir = tmp_path / "images"
     images_dir.mkdir()
 
-    test_image_bytes = _create_test_image()
-    image_obj = FakeImageObject(test_image_bytes)
-    gen_image = FakeGeneratedImage(image_obj)
-    imagen_response = FakeImagenResponse([gen_image])
-
-    client = FakeGenaiClient(imagen_response=imagen_response)
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
 
     result = await generate_image(
         client=client,  # type: ignore[arg-type]
@@ -1282,10 +1254,11 @@ async def test_generate_image_imagen_aspect_ratio_and_person_generation(
     )
 
     assert result["message"] == "Image generated successfully"
-    config = client.models.last_generate_images_kwargs["config"]
-    assert config.aspect_ratio == "16:9"
+    config = client.models.last_generate_content_kwargs["config"]
+    assert config.image_config is not None
+    assert config.image_config.aspect_ratio == "16:9"
     # The SDK coerces the pass-through string into a PersonGeneration enum.
-    assert "allow_adult" in str(config.person_generation).lower()
+    assert "allow_adult" in str(config.image_config.person_generation).lower()
 
 
 @pytest.mark.asyncio
@@ -1456,21 +1429,22 @@ async def test_generate_image_vertex_global_client_reused(
 
 
 # ============================================================================
-# Warnings channel (Imagen deprecation / ignored inputs)
+# Warnings channel (legacy Imagen reroute)
 # ============================================================================
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_imagen_result_carries_deprecation_warning(tmp_path: Path) -> None:
-    """Imagen results warn about the 2026-08-17 shutdown at runtime."""
+async def test_legacy_imagen_text_only_response_keeps_warning(
+    tmp_path: Path,
+) -> None:
+    """The reroute warning survives the text-only return path too."""
     images_dir = tmp_path / "images"
     images_dir.mkdir()
 
-    imagen_response = FakeImagenResponse(
-        [FakeGeneratedImage(FakeImageObject(_create_test_image()))]
-    )
-    client = FakeGenaiClient(imagen_response=imagen_response)
+    part = FakePart(text="I cannot draw that")
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
 
     result = await generate_image(
         client=client,  # type: ignore[arg-type]
@@ -1478,31 +1452,8 @@ async def test_imagen_result_carries_deprecation_warning(tmp_path: Path) -> None
         images_dir=images_dir,
         model="imagen-4.0-generate-001",
     )
+    assert result["message"] == "Model returned text only"
     assert any("2026-08-17" in w for w in result["warnings"])
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_imagen_warns_when_input_images_ignored(tmp_path: Path) -> None:
-    """Supplying input/reference images to Imagen adds an 'ignored' warning
-    instead of silently dropping them."""
-    images_dir = tmp_path / "images"
-    images_dir.mkdir()
-
-    imagen_response = FakeImagenResponse(
-        [FakeGeneratedImage(FakeImageObject(_create_test_image()))]
-    )
-    client = FakeGenaiClient(imagen_response=imagen_response)
-
-    result = await generate_image(
-        client=client,  # type: ignore[arg-type]
-        prompt="a photo",
-        images_dir=images_dir,
-        model="imagen-4.0-generate-001",
-        image_bytes=_create_test_image(),
-    )
-    joined = " ".join(result["warnings"])
-    assert "ignored" in joined and "do not accept" in joined
 
 
 @pytest.mark.asyncio

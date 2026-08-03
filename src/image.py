@@ -22,14 +22,42 @@ ImageModel = Literal[
     # -preview aliases retained for accounts still pinned to them
     "gemini-3-pro-image-preview",
     "gemini-3.1-flash-image-preview",
-    # Imagen 4.x models (deprecated by Google, shutdown 2026-08-17)
-    "imagen-4.0-generate-001",
-    "imagen-4.0-ultra-generate-001",
-    "imagen-4.0-fast-generate-001",
 ]
 
-# NOTE: imagen-3.0-generate-002 was shut down by Google on 2025-11-10 and has
-# been removed from ImageModel because every call now fails.
+# Legacy Imagen IDs. Google discontinues every one of these on 2026-08-17;
+# calls sent afterwards fail with 404 Not Found. They are still accepted by
+# generate_image() as a compatibility shim (see _IMAGEN_MIGRATION) so pinned
+# callers keep working, but they are deliberately absent from ImageModel and
+# from the MCP tool schema so nothing new can select them.
+LegacyImagenModel = Literal[
+    "imagen-3.0-capability-001",
+    "imagen-3.0-capability-002",
+    "imagen-3.0-fast-generate-001",
+    "imagen-3.0-generate-001",
+    "imagen-3.0-generate-002",
+    "imagen-4.0-fast-generate-001",
+    "imagen-4.0-generate-001",
+    "imagen-4.0-ultra-generate-001",
+]
+
+# Migration map published by Google: every discontinued Imagen endpoint maps to
+# gemini-3.1-flash-image or gemini-3.1-flash-lite-image. The "fast" tiers go to
+# the lite model (closest cost/latency match); everything else, including the
+# ultra and capability/editing tiers, goes to gemini-3.1-flash-image.
+_IMAGEN_MIGRATION: dict[str, str] = {
+    "imagen-3.0-capability-001": "gemini-3.1-flash-image",
+    "imagen-3.0-capability-002": "gemini-3.1-flash-image",
+    "imagen-3.0-fast-generate-001": "gemini-3.1-flash-lite-image",
+    "imagen-3.0-generate-001": "gemini-3.1-flash-image",
+    "imagen-3.0-generate-002": "gemini-3.1-flash-image",
+    "imagen-4.0-fast-generate-001": "gemini-3.1-flash-lite-image",
+    "imagen-4.0-generate-001": "gemini-3.1-flash-image",
+    "imagen-4.0-ultra-generate-001": "gemini-3.1-flash-image",
+}
+
+# Fallback target for an Imagen ID that is not in the published table (e.g. a
+# regional or newly-surfaced variant) — still better than a guaranteed 404.
+_IMAGEN_DEFAULT_TARGET = "gemini-3.1-flash-image"
 
 # Gemini 3.x image models (both GA and -preview) that share enhanced
 # capabilities (image_config, up to 14 reference images, global-location Vertex).
@@ -76,7 +104,7 @@ async def generate_image(
     client: genai.Client,
     prompt: str,
     images_dir: Path,
-    model: ImageModel = "gemini-2.5-flash-image",
+    model: ImageModel | LegacyImagenModel = "gemini-2.5-flash-image",
     image_bytes: bytes | None = None,
     reference_images: list[bytes] | None = None,
     image_size: ImageSize | None = None,
@@ -86,14 +114,18 @@ async def generate_image(
     thought_signature: str | None = None,
     conversation_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Generate an image using Gemini or Imagen models.
+    """Generate an image using Gemini image models.
 
     Supported models (``ImageModel``):
       - gemini-2.5-flash-image
       - gemini-3-pro-image, gemini-3.1-flash-image, gemini-3.1-flash-lite-image
         (GA IDs; -preview aliases also accepted)
-      - imagen-4.0-generate-001, imagen-4.0-ultra-generate-001,
-        imagen-4.0-fast-generate-001 (deprecated, see note below)
+
+    Legacy Imagen IDs (``LegacyImagenModel``) are still accepted, but Google
+    discontinues those endpoints on 2026-08-17. Rather than let such a call
+    404, it is transparently rerouted to the migration target published by
+    Google (``_IMAGEN_MIGRATION``) and the substitution is reported in the
+    returned ``warnings`` list.
 
     Args:
         client: Google GenAI client
@@ -105,11 +137,9 @@ async def generate_image(
         image_size: Output image size (1K, 2K, 4K) - must use uppercase K
         media_resolution: Input image resolution processing (low/medium/high)
         aspect_ratio: Desired output aspect ratio (e.g. "1:1", "16:9", "9:16").
-            Applied to Imagen via GenerateImagesConfig and to Gemini 3.x image
-            models via ImageConfig. Passed through as-is; the API validates it.
+            Applied via ImageConfig. Passed through as-is; the API validates it.
         person_generation: Policy for generating people. Valid values:
-            "dont_allow", "allow_adult", "allow_all". Applied to Imagen via
-            GenerateImagesConfig and to Gemini 3.x image models via ImageConfig.
+            "dont_allow", "allow_adult", "allow_all". Applied via ImageConfig.
             Passed through as-is; the API validates it.
         thought_signature: Thought signature from previous turn for multi-turn editing
         conversation_history: Previous conversation history for multi-turn editing
@@ -119,8 +149,25 @@ async def generate_image(
     """
     model_id = str(model)
 
+    # Non-fatal warnings surfaced back to the caller (matches video/omni).
+    warnings: list[str] = []
+
+    # Reroute discontinued Imagen endpoints to their Gemini GA replacement.
+    # Google disables them on 2026-08-17 (404 Not Found afterwards), so calling
+    # them as-is is never the right behaviour; the substitution is reported so
+    # callers can update their own configuration.
+    if model_id.startswith("imagen"):
+        target = _IMAGEN_MIGRATION.get(model_id, _IMAGEN_DEFAULT_TARGET)
+        warnings.append(
+            f"Model {model_id} is discontinued by Google on 2026-08-17 and was "
+            f"replaced with {target} for this request. Update your "
+            f"configuration to request {target} (or "
+            "gemini-3.1-flash-lite-image / gemini-3-pro-image) directly."
+        )
+        model_id = target
+
     # Gemini 3.x image models require the global location when using Vertex AI.
-    if model in _GEMINI3_IMAGE_MODELS:
+    if model_id in _GEMINI3_IMAGE_MODELS:
         if getattr(client._api_client, "vertexai", False):
             # Reuse a memoized global-location client instead of recreating one
             # on every call.
@@ -135,169 +182,123 @@ async def generate_image(
 
     # Process reference images (up to 14 for Gemini 3.x image models)
     if reference_images:
-        max_refs = 14 if model in _GEMINI3_IMAGE_MODELS else 1
+        max_refs = 14 if model_id in _GEMINI3_IMAGE_MODELS else 1
         for ref_bytes in reference_images[:max_refs]:
             ref_image = Image.open(BytesIO(ref_bytes))
             ref_image.load()
             pil_images.append(ref_image)
 
-    # Non-fatal warnings surfaced back to the caller (matches video/omni).
-    warnings: list[str] = []
-
     try:
-        if model_id.startswith("imagen"):
-            # Imagen 4.x is deprecated by Google with shutdown scheduled for
-            # 2026-08-17; surface that at runtime so users migrate before
-            # their calls start failing.
-            warnings.append(
-                f"Model {model_id} is deprecated: Google shuts down Imagen 4.x "
-                "on 2026-08-17. Migrate to the gemini-3.x image family "
-                "(gemini-3-pro-image, gemini-3.1-flash-image, "
-                "gemini-3.1-flash-lite-image)."
-            )
-            # Imagen's generate_images has no image input — don't silently
-            # drop supplied input/reference images.
-            if image_bytes or reference_images:
-                warnings.append(
-                    "Imagen models do not accept input or reference images; "
-                    "the supplied image(s) were ignored. Use a gemini-3.x "
-                    "image model for image-to-image or reference-guided "
-                    "generation."
-                )
-            imagen_config_kwargs: dict[str, Any] = {"number_of_images": 1}
-            if aspect_ratio:
-                imagen_config_kwargs["aspect_ratio"] = aspect_ratio
-            if person_generation:
-                imagen_config_kwargs["person_generation"] = person_generation
-            config = types.GenerateImagesConfig(**imagen_config_kwargs)
-            response = await asyncio.to_thread(
-                client.models.generate_images,
-                model=model_id,
-                prompt=prompt,
-                config=config,
-            )
-            generated_images = response.generated_images
-            if not generated_images:
-                raise ValueError("Imagen returned no image")
-            image_obj = generated_images[0].image
-            if image_obj is None or image_obj.image_bytes is None:
-                raise ValueError("Imagen returned no image bytes")
-            output_bytes = image_obj.image_bytes
-            response_thought_signature = None
-        else:
-            # Build contents for Gemini models
-            contents: list[Any] = []
+        # Build contents for Gemini models
+        contents: list[Any] = []
 
-            # Handle conversation history for multi-turn editing
-            if conversation_history:
-                contents.extend(conversation_history)
+        # Handle conversation history for multi-turn editing
+        if conversation_history:
+            contents.extend(conversation_history)
 
-            # Add current turn content
-            current_turn: list[Any] = [prompt]
-            for pil_img in pil_images:
-                current_turn.append(pil_img)
-            contents.extend(current_turn)
+        # Add current turn content
+        current_turn: list[Any] = [prompt]
+        for pil_img in pil_images:
+            current_turn.append(pil_img)
+        contents.extend(current_turn)
 
-            # Build config with new Gemini 3 parameters
-            config_kwargs: dict[str, Any] = {
-                "response_modalities": ["TEXT", "IMAGE"],
-            }
+        # Build config with new Gemini 3 parameters
+        config_kwargs: dict[str, Any] = {
+            "response_modalities": ["TEXT", "IMAGE"],
+        }
 
-            # Build ImageConfig for Gemini image models. aspect_ratio and
-            # person_generation are accepted by all of them (including
-            # gemini-2.5-flash-image); image_size (1K/2K/4K) is Gemini
-            # 3.x-only, so it is gated separately.
-            image_config_kwargs: dict[str, Any] = {}
-            if image_size and model in _GEMINI3_IMAGE_MODELS:
-                image_config_kwargs["image_size"] = image_size
-            if aspect_ratio:
-                image_config_kwargs["aspect_ratio"] = aspect_ratio
-            if person_generation:
-                image_config_kwargs["person_generation"] = person_generation
-            if image_config_kwargs:
-                config_kwargs["image_config"] = types.ImageConfig(**image_config_kwargs)
+        # Build ImageConfig for Gemini image models. aspect_ratio and
+        # person_generation are accepted by all of them (including
+        # gemini-2.5-flash-image); image_size (1K/2K/4K) is Gemini
+        # 3.x-only, so it is gated separately.
+        image_config_kwargs: dict[str, Any] = {}
+        if image_size and model_id in _GEMINI3_IMAGE_MODELS:
+            image_config_kwargs["image_size"] = image_size
+        if aspect_ratio:
+            image_config_kwargs["aspect_ratio"] = aspect_ratio
+        if person_generation:
+            image_config_kwargs["person_generation"] = person_generation
+        if image_config_kwargs:
+            config_kwargs["image_config"] = types.ImageConfig(**image_config_kwargs)
 
-            # Add media_resolution for input processing
-            if media_resolution:
-                config_kwargs["media_resolution"] = media_resolution
+        # Add media_resolution for input processing
+        if media_resolution:
+            config_kwargs["media_resolution"] = media_resolution
 
-            # Add thought_signature for multi-turn editing continuity
-            # It's a Part field expecting bytes, decode from base64 string
-            if thought_signature:
-                sig_bytes = base64.b64decode(thought_signature)
-                contents.insert(0, types.Part(thought_signature=sig_bytes))
+        # Add thought_signature for multi-turn editing continuity
+        # It's a Part field expecting bytes, decode from base64 string
+        if thought_signature:
+            sig_bytes = base64.b64decode(thought_signature)
+            contents.insert(0, types.Part(thought_signature=sig_bytes))
 
-            config = types.GenerateContentConfig(**config_kwargs)
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=model_id,
-                contents=contents,
-                config=config,
-            )
+        config = types.GenerateContentConfig(**config_kwargs)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=model_id,
+            contents=contents,
+            config=config,
+        )
 
-            output_bytes = None
-            fallback_image_bytes = None
-            text_parts: list[str] = []
-            response_thought_signature = None
+        output_bytes = None
+        fallback_image_bytes = None
+        text_parts: list[str] = []
+        response_thought_signature = None
 
-            candidates = response.candidates if response else None
-            if candidates:
-                content = candidates[0].content
-                parts = content.parts if content else None
-                if parts:
-                    for part in parts:
-                        if part.text:
-                            text_parts.append(part.text)
-                        elif (
-                            part.inline_data
-                            and part.inline_data.data
-                            and part.inline_data.mime_type
-                            and part.inline_data.mime_type.startswith("image/")
-                        ):
-                            # Prefer the LAST non-thought image part. Thinking
-                            # image models (e.g. gemini-3-pro-image) can emit
-                            # interim sketch images (thought=True) before the
-                            # final render; those must not win when a real
-                            # output part exists. But keep any image as a
-                            # fallback so a response containing only thought
-                            # images (e.g. truncated before the final render)
-                            # still returns the image the API produced rather
-                            # than "no image".
-                            fallback_image_bytes = part.inline_data.data
-                            if not getattr(part, "thought", False):
-                                output_bytes = part.inline_data.data
-                        # Capture thought signature for multi-turn editing
-                        if (
-                            hasattr(part, "thought_signature")
-                            and part.thought_signature
-                        ):
-                            sig = part.thought_signature
-                            # Convert bytes to string if needed for JSON serialization
-                            if isinstance(sig, bytes):
-                                sig = base64.b64encode(sig).decode("utf-8")
-                            response_thought_signature = sig
+        candidates = response.candidates if response else None
+        if candidates:
+            content = candidates[0].content
+            parts = content.parts if content else None
+            if parts:
+                for part in parts:
+                    if part.text:
+                        text_parts.append(part.text)
+                    elif (
+                        part.inline_data
+                        and part.inline_data.data
+                        and part.inline_data.mime_type
+                        and part.inline_data.mime_type.startswith("image/")
+                    ):
+                        # Prefer the LAST non-thought image part. Thinking
+                        # image models (e.g. gemini-3-pro-image) can emit
+                        # interim sketch images (thought=True) before the
+                        # final render; those must not win when a real
+                        # output part exists. But keep any image as a
+                        # fallback so a response containing only thought
+                        # images (e.g. truncated before the final render)
+                        # still returns the image the API produced rather
+                        # than "no image".
+                        fallback_image_bytes = part.inline_data.data
+                        if not getattr(part, "thought", False):
+                            output_bytes = part.inline_data.data
+                    # Capture thought signature for multi-turn editing
+                    if hasattr(part, "thought_signature") and part.thought_signature:
+                        sig = part.thought_signature
+                        # Convert bytes to string if needed for JSON serialization
+                        if isinstance(sig, bytes):
+                            sig = base64.b64encode(sig).decode("utf-8")
+                        response_thought_signature = sig
 
-            # Fall back to a thought/interim image if that was the only image
-            # the model returned — better than discarding real image bytes.
-            if not output_bytes and fallback_image_bytes:
-                output_bytes = fallback_image_bytes
+        # Fall back to a thought/interim image if that was the only image
+        # the model returned — better than discarding real image bytes.
+        if not output_bytes and fallback_image_bytes:
+            output_bytes = fallback_image_bytes
 
-            if not output_bytes:
-                if text_parts:
-                    result: dict[str, Any] = {
-                        "message": "Model returned text only",
-                        "generated_text": " ".join(text_parts),
-                        "model": model_id,
-                    }
-                    if response_thought_signature:
-                        sig_filename = f"{uuid.uuid4()}_thought.txt"
-                        sig_path = images_dir / sig_filename
-                        sig_path.write_text(response_thought_signature)
-                        result["thought_signature_url"] = f"file://{sig_path}"
-                    if warnings:
-                        result["warnings"] = warnings
-                    return result
-                raise ValueError("Gemini returned no image")
+        if not output_bytes:
+            if text_parts:
+                result: dict[str, Any] = {
+                    "message": "Model returned text only",
+                    "generated_text": " ".join(text_parts),
+                    "model": model_id,
+                }
+                if response_thought_signature:
+                    sig_filename = f"{uuid.uuid4()}_thought.txt"
+                    sig_path = images_dir / sig_filename
+                    sig_path.write_text(response_thought_signature)
+                    result["thought_signature_url"] = f"file://{sig_path}"
+                if warnings:
+                    result["warnings"] = warnings
+                return result
+            raise ValueError("Gemini returned no image")
 
         filename = f"{uuid.uuid4()}.png"
         filepath = images_dir / filename

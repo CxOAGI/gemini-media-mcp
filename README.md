@@ -115,7 +115,7 @@ This writes files to your host path and returns paths like `/Users/yourusername/
 
 ### generate_image
 
-Generate images using Gemini or Imagen models.
+Generate images using Gemini image models.
 
 **Parameters:**
 - `prompt` (required): Text description of the image
@@ -126,7 +126,16 @@ Generate images using Gemini or Imagen models.
   - `gemini-3.1-flash-lite-image` — cheapest; the recommended migration target from the legacy model
   - `gemini-2.5-flash-image` (Nano Banana) — default; now considered **legacy** by Google (migrate to `gemini-3.1-flash-lite-image`)
 
-  > **Note:** `imagen-3.0-generate-002` was shut down on 2025-11-10 and is no longer available. The Imagen 4.x models (`imagen-4.0-fast-generate-001`, `imagen-4.0-generate-001`, `imagen-4.0-ultra-generate-001`) are **deprecated** with a scheduled shutdown of 2026-08-17; prefer the Gemini image models above.
+  > **Imagen is gone.** Google discontinues every Imagen image endpoint on **2026-08-17**, after which calls fail with `404 Not Found`. This server no longer calls them: the Imagen IDs below are accepted only as compatibility aliases and are transparently served by their Gemini GA replacement, with the substitution reported in the response's `warnings` field. Request a Gemini model directly.
+  >
+  > | Discontinued ID | Served by |
+  > |---|---|
+  > | `imagen-3.0-capability-001`, `imagen-3.0-capability-002` | `gemini-3.1-flash-image` |
+  > | `imagen-3.0-generate-001`, `imagen-3.0-generate-002` | `gemini-3.1-flash-image` |
+  > | `imagen-4.0-generate-001`, `imagen-4.0-ultra-generate-001` | `gemini-3.1-flash-image` |
+  > | `imagen-3.0-fast-generate-001`, `imagen-4.0-fast-generate-001` | `gemini-3.1-flash-lite-image` |
+  >
+  > If you hold Provisioned Throughput on a discontinued Imagen model, move that order yourself — Google does not stop it automatically at retirement.
 - `image_uri`: Input image URI for image-to-image generation
 - `image_base64`: Base64 encoded input image
 - `aspect_ratio`: Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`)
