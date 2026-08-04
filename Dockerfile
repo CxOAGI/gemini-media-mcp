@@ -32,8 +32,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Runtime stage
 FROM python:3.14-alpine
 
-# Apply security patches to fix known vulnerabilities
-RUN apk upgrade --no-cache
+# Apply security patches to fix known vulnerabilities.
+# font-dejavu backs the storyboard renderer: Alpine ships no system fonts, and
+# Pillow's bundled fallback face has no em-dash, so slug lines like
+# "EXT. ALLEY — NIGHT" render as tofu without it. It installs to
+# /usr/share/fonts/dejavu/, which src/storyboard.py already probes.
+RUN apk upgrade --no-cache && apk add --no-cache font-dejavu
 
 WORKDIR /app
 

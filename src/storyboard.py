@@ -131,14 +131,64 @@ def _ellipsis_for(font: Font) -> str:
     PIL's bitmap fallback has no U+2026 glyph and would silently drop it, so
     that path gets three ASCII dots instead.
     """
-    return "\u2026" if _is_scalable(font) else "..."
+    return "\u2026" if _has_typographic_glyphs(font) else "..."
+
+
+# Typographic characters outside Latin-1, mapped to ASCII lookalikes. Pillow's
+# bundled fallback face covers Latin-1 only, so these render as tofu boxes on a
+# system with no fonts installed. Slug lines use them constantly
+# ("EXT. ALLEY — NIGHT"), so folding beats a row of blank squares.
+_ASCII_FOLD = str.maketrans(
+    {
+        "\u2014": "-",  # em dash
+        "\u2013": "-",  # en dash
+        "\u2012": "-",  # figure dash
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+        "\u2026": "...",  # ellipsis
+        "\u2018": "'",  # left single quote
+        "\u2019": "'",  # right single quote
+        "\u201a": "'",
+        "\u201c": '"',  # left double quote
+        "\u201d": '"',  # right double quote
+        "\u201e": '"',
+        "\u2022": "*",  # bullet
+        "\u2192": "->",  # right arrow
+        "\u2190": "<-",  # left arrow
+        "\u2260": "!=",
+        "\u00a0": " ",  # non-breaking space
+        "\u200b": "",  # zero-width space
+    }
+)
+
+
+def _has_typographic_glyphs(font: Font) -> bool:
+    """Whether ``font`` is a real system face with punctuation beyond Latin-1.
+
+    Pillow's bundled fallback is a FreeTypeFont too, so ``_is_scalable`` does
+    not distinguish it — but it is loaded from an in-memory buffer, whereas a
+    face resolved from ``_REGULAR_FONT_PATHS`` carries a string path. That is
+    the only reliable signal available without a font-introspection library.
+    """
+    return _is_scalable(font) and isinstance(getattr(font, "path", None), str)
+
+
+def _drawable(text: str, font: Font) -> str:
+    """Fold ``text`` to characters ``font`` can actually render."""
+    if not text or _has_typographic_glyphs(font):
+        return text
+    return text.translate(_ASCII_FOLD)
 
 
 def _text_width(font: Font, text: str) -> float:
-    """Measured advance width of ``text`` in pixels for ``font``."""
+    """Measured advance width of ``text`` in pixels for ``font``.
+
+    Measures the folded form, so wrapping and truncation agree with what is
+    actually drawn.
+    """
     if not text:
         return 0.0
-    return font.getlength(text)
+    return font.getlength(_drawable(text, font))
 
 
 def _line_height(font: Font, leading: float = 1.35) -> int:
@@ -551,7 +601,7 @@ def _draw_pill(
     x = xy[0] - width if align_right else xy[0]
     y = xy[1]
     draw.rounded_rectangle((x, y, x + width, y + height), radius=height // 2, fill=fill)
-    draw.text((x + pad_x, y + pad_y), text, font=font, fill=text_color)
+    draw.text((x + pad_x, y + pad_y), _drawable(text, font), font=font, fill=text_color)
     return width, height
 
 
@@ -566,7 +616,7 @@ def _draw_lines(
     """Draw ``lines`` stacked downward and return the y after the last one."""
     x, y = xy
     for line in lines:
-        draw.text((x, y), line, font=font, fill=color)
+        draw.text((x, y), _drawable(line, font), font=font, fill=color)
         y += line_h
     return y
 
@@ -922,11 +972,16 @@ def render_contact_sheet(
             summary += f"  ·  {failed} failed"
 
         # Header: title left, summary right on the same baseline band.
-        draw.text((_OUTER_PAD, _OUTER_PAD), title, font=fonts.title, fill=colors.text)
+        draw.text(
+            (_OUTER_PAD, _OUTER_PAD),
+            _drawable(title, fonts.title),
+            font=fonts.title,
+            fill=colors.text,
+        )
         summary_w = _text_width(fonts.subtitle, summary)
         draw.text(
             (sheet_w - _OUTER_PAD - summary_w, _OUTER_PAD + title_lh - sub_lh - 2),
-            summary,
+            _drawable(summary, fonts.subtitle),
             font=fonts.subtitle,
             fill=colors.muted,
         )
@@ -975,7 +1030,7 @@ def render_contact_sheet(
             footer = f"{summary}  ·  no durations set"
         draw.text(
             (_OUTER_PAD, sheet_h - _OUTER_PAD - footer_h + 6),
-            footer,
+            _drawable(footer, fonts.subtitle),
             font=fonts.subtitle,
             fill=colors.muted,
         )

@@ -687,3 +687,53 @@ def test_write_storyboard_creates_missing_directories(tmp_path: Path) -> None:
     target = tmp_path / "a" / "b" / "c"
     result = write_storyboard(make_frames(1), target)
     assert Path(result["sheet_path"]).parent == target
+
+
+# ============================================================================
+# Glyph coverage: folding for fontless environments
+# ============================================================================
+
+
+def test_typographic_chars_are_folded_for_the_bundled_fallback_font() -> None:
+    """Pillow's bundled face covers Latin-1 only, so an em dash renders as a
+    tofu box. Slug lines use them constantly ("EXT. ALLEY — NIGHT"), so those
+    characters must be folded to ASCII when no system font resolved.
+    """
+    from PIL import ImageFont
+
+    from src.storyboard import _drawable
+
+    bundled = ImageFont.load_default(size=20)
+    text = "EXT. ALLEY — NIGHT … “quoted” • a–b"
+    folded = _drawable(text, bundled)
+    assert "—" not in folded
+    assert "…" not in folded
+    assert "“" not in folded
+    assert "•" not in folded
+    assert "EXT. ALLEY - NIGHT" in folded
+
+
+def test_a_real_system_font_keeps_typographic_characters() -> None:
+    """When a real face is available its punctuation must survive untouched —
+    folding everywhere would degrade output that renders correctly.
+    """
+    from src.storyboard import _drawable, _load_font
+
+    font = _load_font(20)
+    text = "EXT. ALLEY — NIGHT"
+    if isinstance(getattr(font, "path", None), str):
+        assert _drawable(text, font) == text
+    else:  # environment genuinely has no system fonts
+        assert "—" not in _drawable(text, font)
+
+
+def test_folding_keeps_wrapping_consistent_with_drawing() -> None:
+    """Width is measured on the folded form, so wrap decisions match what is
+    actually painted."""
+    from PIL import ImageFont
+
+    from src.storyboard import _drawable, _text_width
+
+    bundled = ImageFont.load_default(size=20)
+    text = "a — b"
+    assert _text_width(bundled, text) == bundled.getlength(_drawable(text, bundled))
