@@ -105,7 +105,7 @@ class TestMCPIntegration:
                 "generate_image",
                 {
                     "prompt": "A red apple on a wooden table",
-                    "model": "gemini-3-pro-image-preview",
+                    "model": "gemini-3-pro-image",
                 },
             )
             text = next((c.text for c in result.content if hasattr(c, "text")), "")
@@ -120,7 +120,7 @@ class TestMCPIntegration:
                 "generate_image",
                 {
                     "prompt": "A blue ocean wave",
-                    "model": "gemini-3-pro-image-preview",
+                    "model": "gemini-3-pro-image",
                     "image_size": "2K",
                 },
             )
@@ -136,7 +136,7 @@ class TestMCPIntegration:
                 "generate_image",
                 {
                     "prompt": "A complex steampunk machine with gears and pipes",
-                    "model": "gemini-3-pro-image-preview",
+                    "model": "gemini-3-pro-image",
                     "thinking_level": "high",
                 },
             )
@@ -155,7 +155,7 @@ class TestMCPIntegration:
                 "generate_image",
                 {
                     "prompt": "A sunset over mountains",
-                    "model": "gemini-3.1-flash-image-preview",
+                    "model": "gemini-3.1-flash-image",
                 },
             )
             text = next((c.text for c in result.content if hasattr(c, "text")), "")
@@ -170,7 +170,7 @@ class TestMCPIntegration:
                 "generate_image",
                 {
                     "prompt": "A city skyline at night",
-                    "model": "gemini-3.1-flash-image-preview",
+                    "model": "gemini-3.1-flash-image",
                     "image_size": "2K",
                 },
             )

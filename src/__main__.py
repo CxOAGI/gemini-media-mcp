@@ -24,7 +24,7 @@ from mcp.server.session import ServerSession
 from mcp.types import TextContent
 from PIL import Image as PILImage
 
-from .image import ImageModel, ImageSize, LegacyImagenModel, MediaResolution
+from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import OMNI_MODEL
 from .omni import generate_video_omni as generate_video_omni_impl
@@ -638,7 +638,7 @@ mcp = FastMCP(
 async def generate_image(
     ctx: Context[ServerSession, AppContext],
     prompt: str,
-    model: ImageModel | LegacyImagenModel,
+    model: ImageModel | RetiredImageModel,
     image_uri: str | None = None,
     image_base64: str | None = None,
     reference_image_uris: list[str] | None = None,
@@ -653,20 +653,24 @@ async def generate_image(
     Args:
         ctx: MCP context with application state
         prompt: Text description of the image to generate
-        model: Which model to call. Prefer the Nano Banana / gemini-3.x GA
-               family — it is the going-forward path. Pick by use case:
-               - Cheapest / fast iteration:
-                 "gemini-3.1-flash-lite-image" (GA, lowest cost)
-               - Default / conversational edits / balanced:
-                 "gemini-3.1-flash-image" (GA)
+        model: Which model to call. Pick by use case:
+               - Default / conversational edits / balanced, up to 4K:
+                 "gemini-3.1-flash-image" (GA, Nano Banana 2)
+               - Cheapest / fast iteration, 1K output only:
+                 "gemini-3.1-flash-lite-image" (GA) — it cannot produce 2K or
+                 4K, so use flash or pro when image_size is 2K/4K
                - Most capable: reasoning + precise text rendering, 4K,
                  up to 14 reference images:
                  "gemini-3-pro-image" (GA, Nano Banana Pro)
-               Never pick an "imagen-*" model: Google discontinues every Imagen
-               image endpoint on 2026-08-17 and they return 404 afterwards. The
-               legacy IDs are still accepted only so pinned configurations keep
-               working — such a request is rerouted to the Gemini GA
-               replacement and the substitution is reported under "warnings".
+               Avoid "gemini-2.5-flash-image": it still works but Google shuts
+               it down on 2026-10-02.
+               Never pick an "imagen-*" or "*-preview" model. Every Imagen
+               image endpoint is discontinued on 2026-08-17, and the
+               "gemini-3-pro-image-preview" / "gemini-3.1-flash-image-preview"
+               aliases were already retired on 2026-06-25. Those IDs are
+               accepted only so pinned configurations keep working — such a
+               request is rerouted to the GA replacement and the substitution
+               is reported under "warnings".
         image_uri: Input image URI (gs://, http://, file://) for image-to-image
         image_base64: Base64 encoded input image (prefer image_uri)
         reference_image_uris: List of reference image URIs (up to 14 for Gemini 3.x image models).
@@ -674,8 +678,8 @@ async def generate_image(
             up to 5 human images for character consistency across scenes.
         image_size: Output image size for Gemini 3.x image models (must use uppercase K):
             - "1K": 1024px
-            - "2K": 2048px
-            - "4K": 4096px
+            - "2K": 2048px — not supported by gemini-3.1-flash-lite-image
+            - "4K": 4096px — not supported by gemini-3.1-flash-lite-image
         media_resolution: Input image processing resolution:
             - "MEDIA_RESOLUTION_LOW": Faster, lower token usage
             - "MEDIA_RESOLUTION_MEDIUM": Balanced

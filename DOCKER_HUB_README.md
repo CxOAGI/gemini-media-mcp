@@ -40,12 +40,12 @@ Generate images using Gemini image models
 | `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
 
 **Available Models (GA):**
-- `gemini-3.1-flash-image` - Nano Banana 2; fast, 4K output, up to 14 reference images
+- `gemini-3.1-flash-image` - Nano Banana 2; **default**; fast, up to 4K output, up to 14 reference images
 - `gemini-3-pro-image` - Nano Banana Pro; 4K, reasoning, multi-turn editing
-- `gemini-3.1-flash-lite-image` - cheapest; recommended migration target
-- `gemini-2.5-flash-image` - Nano Banana; now considered legacy (migrate to `gemini-3.1-flash-lite-image`)
+- `gemini-3.1-flash-lite-image` - cheapest, but **1K output only** (2K/4K unsupported)
+- `gemini-2.5-flash-image` - Nano Banana; still served, shut down **2026-10-02** (migrate to `gemini-3.1-flash-image`)
 
-> **Imagen is gone.** Google discontinues every Imagen image endpoint on **2026-08-17** (`404 Not Found` afterwards). This server no longer calls them — the legacy `imagen-*` IDs are accepted only as compatibility aliases and are served by `gemini-3.1-flash-image` (or `gemini-3.1-flash-lite-image` for the `fast` tiers). Each substitution is announced three ways — a `warnings` entry in the response JSON, an MCP `warning` log notification, and a `WARNING` record in the server log. Request a Gemini model directly.
+> **Retired IDs are rerouted, not failed.** The `gemini-3-pro-image-preview` and `gemini-3.1-flash-image-preview` aliases were retired on 2026-06-25, and every `imagen-*` image endpoint is discontinued on 2026-08-17. Requesting one still returns an image — the server substitutes the GA replacement Google published instead of letting the call 404 — and announces the swap three ways: a `warnings` entry in the response JSON, an MCP `warning` log notification, and a `WARNING` record in the server log. Request a GA model directly.
 
 *This tool may perform destructive updates.*
 

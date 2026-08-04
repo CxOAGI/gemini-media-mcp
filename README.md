@@ -121,21 +121,20 @@ Generate images using Gemini image models.
 - `prompt` (required): Text description of the image
 - `model`: Pick by use case.
   **GA (stable) — preferred in production:**
-  - `gemini-3.1-flash-image` (Nano Banana 2) — fast, 4K output, up to 14 reference images
+  - `gemini-3.1-flash-image` (Nano Banana 2) — **default**; fast, up to 4K output, up to 14 reference images
   - `gemini-3-pro-image` (Nano Banana Pro) — 4K, reasoning, `thought_signature` for multi-turn editing
-  - `gemini-3.1-flash-lite-image` — cheapest; the recommended migration target from the legacy model
-  - `gemini-2.5-flash-image` (Nano Banana) — default; now considered **legacy** by Google (migrate to `gemini-3.1-flash-lite-image`)
+  - `gemini-3.1-flash-lite-image` — cheapest, but **1K output only** (2K/4K are unsupported)
+  - `gemini-2.5-flash-image` (Nano Banana) — still served, but Google shuts it down on **2026-10-02**; migrate to `gemini-3.1-flash-image`
 
-  > **Imagen is gone.** Google discontinues every Imagen image endpoint on **2026-08-17**, after which calls fail with `404 Not Found`. This server no longer calls them: the Imagen IDs below are accepted only as compatibility aliases and are transparently served by their Gemini GA replacement. Request a Gemini model directly.
+  > **Retired IDs are rerouted, not failed.** The models below no longer exist (or are about to). Requesting one still returns an image: the server substitutes the replacement Google published rather than letting the call 404. They are accepted only as compatibility aliases — request a GA model directly.
   >
-  > Every substitution is announced on three channels so it cannot go unnoticed: a `warnings` entry in the response JSON, an MCP `warning`-level log notification to the client, and a `WARNING` record in the server log.
+  > | Retired ID | Gone since | Served by |
+  > |---|---|---|
+  > | `gemini-3-pro-image-preview` | 2026-06-25 | `gemini-3-pro-image` |
+  > | `gemini-3.1-flash-image-preview` | 2026-06-25 | `gemini-3.1-flash-image` |
+  > | all 8 `imagen-3.0-*` / `imagen-4.0-*` image IDs | 2026-08-17 | `gemini-3.1-flash-image` |
   >
-  > | Discontinued ID | Served by |
-  > |---|---|
-  > | `imagen-3.0-capability-001`, `imagen-3.0-capability-002` | `gemini-3.1-flash-image` |
-  > | `imagen-3.0-generate-001`, `imagen-3.0-generate-002` | `gemini-3.1-flash-image` |
-  > | `imagen-4.0-generate-001`, `imagen-4.0-ultra-generate-001` | `gemini-3.1-flash-image` |
-  > | `imagen-3.0-fast-generate-001`, `imagen-4.0-fast-generate-001` | `gemini-3.1-flash-lite-image` |
+  > Every substitution — and every use of a model on a shutdown clock, such as `gemini-2.5-flash-image` — is announced on three channels so it cannot go unnoticed: a `warnings` entry in the response JSON, an MCP `warning`-level log notification to the client, and a `WARNING` record in the server log.
   >
   > If you hold Provisioned Throughput on a discontinued Imagen model, move that order yourself — Google does not stop it automatically at retirement.
 - `image_uri`: Input image URI for image-to-image generation
@@ -143,12 +142,13 @@ Generate images using Gemini image models.
 - `aspect_ratio`: Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`)
 - `person_generation`: Policy for generating people (e.g. `allow_adult`, `dont_allow`)
 
-**Gemini 3.x Image Parameters** (for `gemini-3-pro-image` and `gemini-3.1-flash-image`):
+**Gemini 3.x Image Parameters** (for `gemini-3-pro-image`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`):
 - `reference_image_uris`: List of up to 14 reference image URIs for multi-image composition
   - Up to 6 object images for high-fidelity inclusion
   - Up to 5 human images for character consistency across scenes
-- `image_size`: Output resolution (`1K`, `2K`, `4K`) - must use uppercase K
-- `thinking_level`: Reasoning depth (`low` for fast, `high` for complex generation)
+- `image_size`: Output resolution (`1K`, `2K`, `4K`) - must use uppercase K.
+  `gemini-3.1-flash-lite-image` supports `1K` only; asking it for `2K`/`4K` drops the
+  parameter and returns a warning rather than failing the request.
 - `media_resolution`: Input image processing quality (`MEDIA_RESOLUTION_LOW`, `MEDIA_RESOLUTION_MEDIUM`, `MEDIA_RESOLUTION_HIGH`)
 - `thought_signature`: For multi-turn editing workflows - pass back the signature from previous responses
 

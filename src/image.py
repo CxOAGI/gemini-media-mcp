@@ -16,25 +16,23 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 ImageModel = Literal[
-    # Gemini image models (Nano Banana family)
-    "gemini-2.5-flash-image",
-    # Gemini 3.x image models, now GA under suffix-less IDs
+    # Gemini 3.x image models, GA under suffix-less IDs
     "gemini-3-pro-image",
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-lite-image",
-    # -preview aliases retained for accounts still pinned to them
-    "gemini-3-pro-image-preview",
-    "gemini-3.1-flash-image-preview",
+    # Nano Banana 1. Still served, but Google shuts it down 2026-10-02 — see
+    # _DEPRECATED_MODELS. Kept selectable so existing callers are not broken.
+    "gemini-2.5-flash-image",
 ]
 
-# Legacy Imagen IDs. Google discontinues every one of these on 2026-08-17;
-# calls sent afterwards fail with 404 Not Found. They are deliberately split
-# out of ImageModel — the supported catalog — and accepted by generate_image()
-# only as a compatibility shim that reroutes them (see _IMAGEN_MIGRATION).
-# They MUST stay in the MCP tool annotation, though: pydantic validates the
+# IDs whose endpoints are gone (or imminently going). Calls to these fail with
+# 404, so generate_image() reroutes them rather than letting the request die —
+# see _RETIRED_MODELS. They are deliberately split out of ImageModel, the live
+# catalog, but MUST stay in the MCP tool annotation: pydantic validates the
 # model argument against it, so dropping them from the schema would reject a
 # pinned caller's request with a validation error before the shim could run.
-LegacyImagenModel = Literal[
+RetiredImageModel = Literal[
+    # Imagen — every image endpoint discontinued 2026-08-17
     "imagen-3.0-capability-001",
     "imagen-3.0-capability-002",
     "imagen-3.0-fast-generate-001",
@@ -43,35 +41,63 @@ LegacyImagenModel = Literal[
     "imagen-4.0-fast-generate-001",
     "imagen-4.0-generate-001",
     "imagen-4.0-ultra-generate-001",
+    # Nano Banana 2 / Pro preview aliases — retired 2026-06-25, already dead
+    "gemini-3-pro-image-preview",
+    "gemini-3.1-flash-image-preview",
 ]
 
-# Migration map published by Google: every discontinued Imagen endpoint maps to
-# gemini-3.1-flash-image or gemini-3.1-flash-lite-image. The "fast" tiers go to
-# the lite model (closest cost/latency match); everything else, including the
-# ultra and capability/editing tiers, goes to gemini-3.1-flash-image.
-_IMAGEN_MIGRATION: dict[str, str] = {
-    "imagen-3.0-capability-001": "gemini-3.1-flash-image",
-    "imagen-3.0-capability-002": "gemini-3.1-flash-image",
-    "imagen-3.0-fast-generate-001": "gemini-3.1-flash-lite-image",
-    "imagen-3.0-generate-001": "gemini-3.1-flash-image",
-    "imagen-3.0-generate-002": "gemini-3.1-flash-image",
-    "imagen-4.0-fast-generate-001": "gemini-3.1-flash-lite-image",
-    "imagen-4.0-generate-001": "gemini-3.1-flash-image",
-    "imagen-4.0-ultra-generate-001": "gemini-3.1-flash-image",
+# Retired ID -> (replacement, shutdown date). Sourced from Google's published
+# deprecation table. The Imagen rows all name gemini-3.1-flash-image as the
+# replacement; the preview aliases map to their own GA promotion.
+_RETIRED_MODELS: dict[str, tuple[str, str]] = {
+    "imagen-3.0-capability-001": ("gemini-3.1-flash-image", "2026-08-17"),
+    "imagen-3.0-capability-002": ("gemini-3.1-flash-image", "2026-08-17"),
+    "imagen-3.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+    "imagen-3.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+    "imagen-3.0-generate-002": ("gemini-3.1-flash-image", "2026-08-17"),
+    "imagen-4.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+    "imagen-4.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+    "imagen-4.0-ultra-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+    "gemini-3-pro-image-preview": ("gemini-3-pro-image", "2026-06-25"),
+    "gemini-3.1-flash-image-preview": ("gemini-3.1-flash-image", "2026-06-25"),
 }
 
-# Fallback target for an Imagen ID that is not in the published table (e.g. a
-# regional or newly-surfaced variant) — still better than a guaranteed 404.
-_IMAGEN_DEFAULT_TARGET = "gemini-3.1-flash-image"
+# Fallback for a retired-looking ID that is not in the table (e.g. a regional
+# or newly-surfaced Imagen variant) — still better than a guaranteed 404.
+_RETIRED_DEFAULT_TARGET = "gemini-3.1-flash-image"
 
-# Gemini 3.x image models (both GA and -preview) that share enhanced
-# capabilities (image_config, up to 14 reference images, global-location Vertex).
+# Still served, but on a published shutdown clock. These are warned about and
+# NOT substituted: the model still works, and swapping out a caller's explicit
+# choice while it is still valid would be the bigger surprise.
+_DEPRECATED_MODELS: dict[str, tuple[str, str]] = {
+    "gemini-2.5-flash-image": ("gemini-3.1-flash-image", "2026-10-02"),
+}
+
+# Output sizes a model can actually produce. Only models with a restriction are
+# listed; anything absent accepts the full ImageSize range. gemini-3.1-flash-
+# lite-image is 1K-only — 2K and 4K are documented as unsupported.
+_IMAGE_SIZE_SUPPORT: dict[str, frozenset[str]] = {
+    "gemini-3.1-flash-lite-image": frozenset({"1K"}),
+}
+
+
+def _supports_image_size(model_id: str, image_size: str) -> bool:
+    """Whether ``model_id`` can produce ``image_size``.
+
+    Models absent from ``_IMAGE_SIZE_SUPPORT`` have no documented restriction
+    and are assumed to accept the full range.
+    """
+    supported = _IMAGE_SIZE_SUPPORT.get(model_id)
+    return supported is None or image_size in supported
+
+
+# Gemini 3.x image models that share enhanced capabilities (image_config, up to
+# 14 reference images, global-location Vertex). The retired -preview aliases are
+# absent by design: reroute rewrites them to these GA IDs before any lookup.
 _GEMINI3_IMAGE_MODELS = {
     "gemini-3-pro-image",
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-lite-image",
-    "gemini-3-pro-image-preview",
-    "gemini-3.1-flash-image-preview",
 }
 
 # Lazily-created, module-level cached Vertex AI client pinned to the "global"
@@ -109,7 +135,7 @@ async def generate_image(
     client: genai.Client,
     prompt: str,
     images_dir: Path,
-    model: ImageModel | LegacyImagenModel = "gemini-2.5-flash-image",
+    model: ImageModel | RetiredImageModel = "gemini-3.1-flash-image",
     image_bytes: bytes | None = None,
     reference_images: list[bytes] | None = None,
     image_size: ImageSize | None = None,
@@ -122,15 +148,17 @@ async def generate_image(
     """Generate an image using Gemini image models.
 
     Supported models (``ImageModel``):
-      - gemini-2.5-flash-image
-      - gemini-3-pro-image, gemini-3.1-flash-image, gemini-3.1-flash-lite-image
-        (GA IDs; -preview aliases also accepted)
+      - gemini-3.1-flash-image (default), gemini-3.1-flash-lite-image,
+        gemini-3-pro-image
+      - gemini-2.5-flash-image — still served, shut down 2026-10-02
 
-    Legacy Imagen IDs (``LegacyImagenModel``) are still accepted, but Google
-    discontinues those endpoints on 2026-08-17. Rather than let such a call
-    404, it is transparently rerouted to the migration target published by
-    Google (``_IMAGEN_MIGRATION``) and the substitution is reported in the
-    returned ``warnings`` list.
+    Retired IDs (``RetiredImageModel``) are still accepted so pinned callers
+    keep working: the Imagen family (endpoints gone 2026-08-17) and the
+    -preview image aliases (gone 2026-06-25). Rather than let such a call 404,
+    it is rerouted to the replacement Google published (``_RETIRED_MODELS``).
+
+    Every substitution or pending shutdown is reported in the returned
+    ``warnings`` list and logged at WARNING.
 
     Args:
         client: Google GenAI client
@@ -157,27 +185,44 @@ async def generate_image(
     # Non-fatal warnings surfaced back to the caller (matches video/omni).
     warnings: list[str] = []
 
-    # Reroute discontinued Imagen endpoints to their Gemini GA replacement.
-    # Google disables them on 2026-08-17 (404 Not Found afterwards), so calling
-    # them as-is is never the right behaviour; the substitution is reported so
-    # callers can update their own configuration.
-    if model_id.startswith("imagen"):
-        target = _IMAGEN_MIGRATION.get(model_id, _IMAGEN_DEFAULT_TARGET)
+    # Reroute retired endpoints to their replacement. These IDs 404, so issuing
+    # the call as-is is never the right behaviour; the substitution is reported
+    # so callers can update their own configuration. An unlisted imagen-* ID
+    # falls back to the GA replacement rather than a guaranteed failure.
+    if model_id in _RETIRED_MODELS or model_id.startswith("imagen"):
+        target, shutdown = _RETIRED_MODELS.get(
+            model_id, (_RETIRED_DEFAULT_TARGET, "2026-08-17")
+        )
         warnings.append(
-            f"Model {model_id} is discontinued by Google on 2026-08-17 and was "
-            f"replaced with {target} for this request. Update your "
-            f"configuration to request {target} (or "
-            "gemini-3.1-flash-lite-image / gemini-3-pro-image) directly."
+            f"Model {model_id} was retired by Google on {shutdown} and no "
+            f"longer exists; {target} served this request instead. Update "
+            f"your configuration to request {target} directly."
         )
         # Also log it: a caller that never inspects the returned warnings still
-        # needs to find out it is pinned to a model that is going away.
+        # needs to find out it is pinned to a model that is gone.
         logger.warning(
-            "Rerouted discontinued model %s to %s; update the caller's "
-            "configuration before Google's 2026-08-17 shutdown",
+            "Rerouted retired model %s to %s (retired %s); update the "
+            "caller's configuration",
             model_id,
             target,
+            shutdown,
         )
         model_id = target
+
+    # Still-working models with a published shutdown date: warn, but honour the
+    # caller's choice — substituting a model that still works would be worse.
+    elif model_id in _DEPRECATED_MODELS:
+        replacement, shutdown = _DEPRECATED_MODELS[model_id]
+        warnings.append(
+            f"Model {model_id} is deprecated and Google shuts it down on "
+            f"{shutdown}. Migrate to {replacement} before then."
+        )
+        logger.warning(
+            "Model %s is deprecated; Google shuts it down on %s — migrate to %s",
+            model_id,
+            shutdown,
+            replacement,
+        )
 
     # Gemini 3.x image models require the global location when using Vertex AI.
     if model_id in _GEMINI3_IMAGE_MODELS:
@@ -226,7 +271,20 @@ async def generate_image(
         # 3.x-only, so it is gated separately.
         image_config_kwargs: dict[str, Any] = {}
         if image_size and model_id in _GEMINI3_IMAGE_MODELS:
-            image_config_kwargs["image_size"] = image_size
+            if not _supports_image_size(model_id, image_size):
+                supported_sizes = _IMAGE_SIZE_SUPPORT[model_id]
+                # Don't forward a size the model cannot produce. Warn rather
+                # than fail: the caller picked this model explicitly, so
+                # substituting a different one would be the bigger surprise.
+                warnings.append(
+                    f"{model_id} does not support image_size={image_size} "
+                    f"(supported: {', '.join(sorted(supported_sizes))}); the "
+                    "request was sent at the model's default size. Use "
+                    "gemini-3.1-flash-image or gemini-3-pro-image for "
+                    "higher-resolution output."
+                )
+            else:
+                image_config_kwargs["image_size"] = image_size
         if aspect_ratio:
             image_config_kwargs["aspect_ratio"] = aspect_ratio
         if person_generation:

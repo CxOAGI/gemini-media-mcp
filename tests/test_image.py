@@ -10,7 +10,7 @@ import pytest
 from PIL import Image
 
 import src.image
-from src.image import LegacyImagenModel, generate_image
+from src.image import ImageModel, ImageSize, RetiredImageModel, generate_image
 
 
 @pytest.fixture(autouse=True)
@@ -299,18 +299,21 @@ async def test_generate_image_gemini(
     [
         ("imagen-3.0-capability-001", "gemini-3.1-flash-image"),
         ("imagen-3.0-capability-002", "gemini-3.1-flash-image"),
-        ("imagen-3.0-fast-generate-001", "gemini-3.1-flash-lite-image"),
+        ("imagen-3.0-fast-generate-001", "gemini-3.1-flash-image"),
         ("imagen-3.0-generate-001", "gemini-3.1-flash-image"),
         ("imagen-3.0-generate-002", "gemini-3.1-flash-image"),
-        ("imagen-4.0-fast-generate-001", "gemini-3.1-flash-lite-image"),
+        ("imagen-4.0-fast-generate-001", "gemini-3.1-flash-image"),
         ("imagen-4.0-generate-001", "gemini-3.1-flash-image"),
         ("imagen-4.0-ultra-generate-001", "gemini-3.1-flash-image"),
+        # Preview aliases retired 2026-06-25 — same machinery.
+        ("gemini-3-pro-image-preview", "gemini-3-pro-image"),
+        ("gemini-3.1-flash-image-preview", "gemini-3.1-flash-image"),
     ],
 )
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
 async def test_legacy_imagen_reroutes_to_gemini_ga(
-    legacy_model: LegacyImagenModel,
+    legacy_model: RetiredImageModel,
     expected_target: str,
     tmp_path: Path,
 ) -> None:
@@ -342,7 +345,8 @@ async def test_legacy_imagen_reroutes_to_gemini_ga(
     joined = " ".join(result["warnings"])
     assert legacy_model in joined
     assert expected_target in joined
-    assert "2026-08-17" in joined
+    shutdown = "2026-06-25" if legacy_model.endswith("-preview") else "2026-08-17"
+    assert shutdown in joined
 
 
 @pytest.mark.asyncio
@@ -399,6 +403,92 @@ async def test_gemini_image_reroute_is_not_logged(
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
+@pytest.mark.parametrize("size", ["2K", "4K"])
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_flash_lite_drops_unsupported_image_size(
+    size: ImageSize, tmp_path: Path
+) -> None:
+    """gemini-3.1-flash-lite-image is 1K-only. A directly-requested 2K/4K is not
+    forwarded — the model keeps the caller's chosen model and warns."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a photo",
+        images_dir=images_dir,
+        model="gemini-3.1-flash-lite-image",
+        image_size=size,
+    )
+
+    # Model choice is respected; only the impossible size is dropped.
+    assert result["model"] == "gemini-3.1-flash-lite-image"
+    assert client.models.last_generate_content_kwargs is not None
+    config = client.models.last_generate_content_kwargs["config"]
+    assert config.image_config is None or config.image_config.image_size is None
+    joined = " ".join(result["warnings"])
+    assert f"image_size={size}" in joined
+    assert "gemini-3.1-flash-image" in joined
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_flash_lite_forwards_supported_image_size(tmp_path: Path) -> None:
+    """1K is supported and must still reach the model, with no warning."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a photo",
+        images_dir=images_dir,
+        model="gemini-3.1-flash-lite-image",
+        image_size="1K",
+    )
+
+    assert client.models.last_generate_content_kwargs is not None
+    config = client.models.last_generate_content_kwargs["config"]
+    assert config.image_config.image_size == "1K"
+    assert "warnings" not in result
+
+
+@pytest.mark.parametrize("model", ["gemini-3.1-flash-image", "gemini-3-pro-image"])
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_unrestricted_models_still_get_4k(
+    model: ImageModel, tmp_path: Path
+) -> None:
+    """The size guard must not affect models that genuinely support 4K."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a photo",
+        images_dir=images_dir,
+        model=model,
+        image_size="4K",
+    )
+
+    assert client.models.last_generate_content_kwargs is not None
+    config = client.models.last_generate_content_kwargs["config"]
+    assert config.image_config.image_size == "4K"
+    assert "warnings" not in result
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
 async def test_legacy_imagen_accepts_input_images(tmp_path: Path) -> None:
@@ -445,7 +535,7 @@ async def test_unknown_imagen_id_falls_back_to_flash_image(tmp_path: Path) -> No
         client=client,  # type: ignore[arg-type]
         prompt="A blue circle",
         images_dir=images_dir,
-        # Deliberately off-table: not a LegacyImagenModel member.
+        # Deliberately off-table: not a RetiredImageModel member.
         model=cast(Any, "imagen-9.9-generate-999"),
     )
 
@@ -480,10 +570,10 @@ async def test_generate_image_gemini31_flash(
         client=client,  # type: ignore[arg-type]
         prompt="A red square",
         images_dir=images_dir,
-        model="gemini-3.1-flash-image-preview",
+        model="gemini-3.1-flash-image",
     )
 
-    assert result["model"] == "gemini-3.1-flash-image-preview"
+    assert result["model"] == "gemini-3.1-flash-image"
     assert result["message"] == "Image generated successfully"
     assert "image_url" in result
     assert result["image_url"].startswith("file://")
@@ -515,7 +605,7 @@ async def test_generate_image_gemini31_flash_vertex_global_location(
 
     monkeypatch.setattr("src.image.genai.Client", mock_client)
 
-    # Initial client (will be replaced for gemini-3.1-flash-image-preview)
+    # Initial client (will be replaced for gemini-3.1-flash-image)
     # Must set vertexai=True to trigger global location logic
     initial_client = FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
 
@@ -523,7 +613,7 @@ async def test_generate_image_gemini31_flash_vertex_global_location(
         client=initial_client,  # type: ignore[arg-type]
         prompt="Test prompt",
         images_dir=images_dir,
-        model="gemini-3.1-flash-image-preview",
+        model="gemini-3.1-flash-image",
     )
 
     # Verify a new client was created with global location
@@ -531,7 +621,7 @@ async def test_generate_image_gemini31_flash_vertex_global_location(
     assert created_clients[0]["vertexai"] is True
     assert created_clients[0]["location"] == "global"
 
-    assert result["model"] == "gemini-3.1-flash-image-preview"
+    assert result["model"] == "gemini-3.1-flash-image"
     assert "image_url" in result
 
 
@@ -557,7 +647,7 @@ async def test_generate_image_gemini31_flash_image_size(
         client=client,  # type: ignore[arg-type]
         prompt="Test prompt",
         images_dir=images_dir,
-        model="gemini-3.1-flash-image-preview",
+        model="gemini-3.1-flash-image",
         image_size="4K",
     )
 
@@ -593,7 +683,7 @@ async def test_generate_image_gemini31_flash_reference_images(
         client=client,  # type: ignore[arg-type]
         prompt="Combine these reference images",
         images_dir=images_dir,
-        model="gemini-3.1-flash-image-preview",
+        model="gemini-3.1-flash-image",
         reference_images=reference_images,
     )
 
@@ -632,7 +722,7 @@ async def test_generate_image_gemini3_pro(
 
     monkeypatch.setattr("src.image.genai.Client", mock_client)
 
-    # Initial client (will be replaced for gemini-3-pro-image-preview)
+    # Initial client (will be replaced for gemini-3-pro-image)
     # Must set vertexai=True to trigger global location logic
     initial_client = FakeGenaiClient(gemini_response=gemini_response, vertexai=True)
 
@@ -640,7 +730,7 @@ async def test_generate_image_gemini3_pro(
         client=initial_client,  # type: ignore[arg-type]
         prompt="Test prompt",
         images_dir=images_dir,
-        model="gemini-3-pro-image-preview",
+        model="gemini-3-pro-image",
     )
 
     # Verify a new client was created with global location
@@ -648,7 +738,7 @@ async def test_generate_image_gemini3_pro(
     assert created_clients[0]["vertexai"] is True
     assert created_clients[0]["location"] == "global"
 
-    assert result["model"] == "gemini-3-pro-image-preview"
+    assert result["model"] == "gemini-3-pro-image"
     assert "image_url" in result
 
 
@@ -899,7 +989,7 @@ async def test_generate_image_image_size(
         client=initial_client,  # type: ignore[arg-type]
         prompt="Test prompt",
         images_dir=images_dir,
-        model="gemini-3-pro-image-preview",
+        model="gemini-3-pro-image",
         image_size=input["image_size"],
     )
 
@@ -994,7 +1084,7 @@ async def test_generate_image_multiple_reference_images(
         client=initial_client,  # type: ignore[arg-type]
         prompt="Combine these reference images",
         images_dir=images_dir,
-        model="gemini-3-pro-image-preview",
+        model="gemini-3-pro-image",
         reference_images=reference_images,
     )
 
@@ -1033,7 +1123,7 @@ async def test_generate_image_max_reference_images_limited(
         client=initial_client,  # type: ignore[arg-type]
         prompt="Combine references",
         images_dir=images_dir,
-        model="gemini-3-pro-image-preview",
+        model="gemini-3-pro-image",
         reference_images=reference_images,
     )
 
@@ -1205,7 +1295,7 @@ async def test_generate_image_all_gemini3_params(
         client=initial_client,  # type: ignore[arg-type]
         prompt="Generate high quality 4K image",
         images_dir=images_dir,
-        model="gemini-3-pro-image-preview",
+        model="gemini-3-pro-image",
         image_bytes=test_image_bytes,
         reference_images=reference_images,
         image_size="4K",
@@ -1214,7 +1304,7 @@ async def test_generate_image_all_gemini3_params(
     )
 
     assert result["message"] == "Image generated successfully"
-    assert result["model"] == "gemini-3-pro-image-preview"
+    assert result["model"] == "gemini-3-pro-image"
     assert "thought_signature_url" in result
     sig_path = Path(result["thought_signature_url"].replace("file://", ""))
     assert sig_path.exists()
@@ -1236,48 +1326,75 @@ def test_image_model_excludes_all_imagen_ids() -> None:
     assert not [m for m in get_args(ImageModel) if str(m).startswith("imagen")]
 
 
-def test_image_model_includes_new_ga_ids() -> None:
-    """New GA Gemini 3.x IDs must be present in ImageModel."""
+def test_image_model_is_exactly_the_live_catalog() -> None:
+    """ImageModel lists every model Google still serves, and nothing else."""
     from typing import get_args
 
     from src.image import ImageModel
 
-    models = set(get_args(ImageModel))
-    expected = {
-        "gemini-2.5-flash-image",
-        "gemini-3-pro-image",
+    assert set(get_args(ImageModel)) == {
         "gemini-3.1-flash-image",
         "gemini-3.1-flash-lite-image",
-        "gemini-3-pro-image-preview",
-        "gemini-3.1-flash-image-preview",
+        "gemini-3-pro-image",
+        "gemini-2.5-flash-image",
     }
-    assert expected <= models
 
 
-def test_legacy_imagen_catalog_covers_googles_discontinued_list() -> None:
-    """Every endpoint on Google's discontinuation table is accepted as a legacy
-    alias and has a published migration target."""
+def test_image_model_excludes_retired_preview_aliases() -> None:
+    """The -preview image aliases were retired on 2026-06-25 and now 404. They
+    must not be offered as selectable models."""
     from typing import get_args
 
-    from src.image import _IMAGEN_MIGRATION, LegacyImagenModel
+    from src.image import ImageModel, RetiredImageModel
 
-    discontinued = {
-        "imagen-3.0-capability-001",
-        "imagen-3.0-capability-002",
-        "imagen-3.0-fast-generate-001",
-        "imagen-3.0-generate-001",
-        "imagen-3.0-generate-002",
-        "imagen-4.0-fast-generate-001",
-        "imagen-4.0-generate-001",
-        "imagen-4.0-ultra-generate-001",
+    for retired in ("gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"):
+        assert retired not in get_args(ImageModel)
+        assert retired in get_args(RetiredImageModel)
+
+
+def test_retired_catalog_matches_googles_deprecation_table() -> None:
+    """Every retired ID is accepted as an alias and has a replacement."""
+    from typing import get_args
+
+    from src.image import _RETIRED_MODELS, RetiredImageModel
+
+    retired = {
+        # Imagen — discontinued 2026-08-17
+        "imagen-3.0-capability-001": ("gemini-3.1-flash-image", "2026-08-17"),
+        "imagen-3.0-capability-002": ("gemini-3.1-flash-image", "2026-08-17"),
+        "imagen-3.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+        "imagen-3.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+        "imagen-3.0-generate-002": ("gemini-3.1-flash-image", "2026-08-17"),
+        "imagen-4.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+        "imagen-4.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+        "imagen-4.0-ultra-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+        # Preview aliases — retired 2026-06-25
+        "gemini-3-pro-image-preview": ("gemini-3-pro-image", "2026-06-25"),
+        "gemini-3.1-flash-image-preview": ("gemini-3.1-flash-image", "2026-06-25"),
     }
-    assert set(get_args(LegacyImagenModel)) == discontinued
-    assert set(_IMAGEN_MIGRATION) == discontinued
-    # Google's table only permits these two targets.
-    assert set(_IMAGEN_MIGRATION.values()) <= {
-        "gemini-3.1-flash-image",
-        "gemini-3.1-flash-lite-image",
-    }
+    assert _RETIRED_MODELS == retired
+    assert set(get_args(RetiredImageModel)) == set(retired)
+
+    # Every replacement must itself be a live model, or the reroute just moves
+    # the failure. This is what catches the next round of deprecations.
+    from src.image import ImageModel
+
+    live = set(get_args(ImageModel))
+    assert {target for target, _ in _RETIRED_MODELS.values()} <= live
+
+
+def test_deprecated_models_are_still_live_and_have_replacements() -> None:
+    """A model on a shutdown clock must still be selectable (it works today)
+    and must point at a live replacement."""
+    from typing import get_args
+
+    from src.image import _DEPRECATED_MODELS, _RETIRED_MODELS, ImageModel
+
+    live = set(get_args(ImageModel))
+    for model, (replacement, _shutdown) in _DEPRECATED_MODELS.items():
+        assert model in live
+        assert model not in _RETIRED_MODELS
+        assert replacement in live
 
 
 # ============================================================================
@@ -1309,6 +1426,7 @@ async def test_legacy_imagen_aspect_ratio_and_person_generation(
     )
 
     assert result["message"] == "Image generated successfully"
+    assert client.models.last_generate_content_kwargs is not None
     config = client.models.last_generate_content_kwargs["config"]
     assert config.image_config is not None
     assert config.image_config.aspect_ratio == "16:9"
@@ -1345,6 +1463,7 @@ async def test_generate_image_gemini_aspect_ratio(
     )
 
     assert result["message"] == "Image generated successfully"
+    assert client.models.last_generate_content_kwargs is not None
     config = client.models.last_generate_content_kwargs["config"]
     assert config.image_config is not None
     assert config.image_config.aspect_ratio == "9:16"
@@ -1526,6 +1645,6 @@ async def test_gemini_image_result_has_no_warnings(tmp_path: Path) -> None:
         client=client,  # type: ignore[arg-type]
         prompt="a cat",
         images_dir=images_dir,
-        model="gemini-2.5-flash-image",
+        model="gemini-3.1-flash-image",
     )
     assert "warnings" not in result
