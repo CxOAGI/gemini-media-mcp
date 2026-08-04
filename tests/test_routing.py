@@ -437,11 +437,58 @@ def test_pinned_flash_lite_at_4k_is_a_conflict() -> None:
     assert plan.is_satisfiable
 
 
-def test_pinned_retired_image_model_is_a_conflict() -> None:
+def test_pinned_retired_image_model_plans_against_its_replacement() -> None:
+    """A superseded pin is not unroutable: generate_image reroutes it, so the
+    plan must describe the model that would actually run."""
     plan = plan_generation(
         "a picture of a cat", RoutingConstraints(pinned_model="imagen-4.0-generate-001")
     )
+    assert "pinned_model_not_routable" not in _conflict_codes(plan)
+    assert [route.model for route in plan.routes] == ["gemini-3.1-flash-image"]
+    assert any("superseded" in note for note in plan.notes)
+
+
+def test_pinned_unknown_image_model_is_still_a_conflict() -> None:
+    """An ID that resolves to nothing real remains unroutable."""
+    plan = plan_generation(
+        "a picture of a cat", RoutingConstraints(pinned_model="not-a-real-model")
+    )
     assert "pinned_model_not_routable" in _conflict_codes(plan)
+
+
+def test_a_surviving_pin_is_the_only_route() -> None:
+    """pinned_model is a requirement, not a preference — planning an
+    alternative would answer a question the caller did not ask."""
+    plan = plan_generation(
+        "a picture of a cat", RoutingConstraints(pinned_model="gemini-3-pro-image")
+    )
+    assert [route.model for route in plan.routes] == ["gemini-3-pro-image"]
+    # The alternatives are still listed, with the pin named as the reason.
+    reasons = {r.model: r.reason for r in plan.rejected}
+    assert "gemini-3.1-flash-image" in reasons
+    assert "pinned_model=gemini-3-pro-image" in reasons["gemini-3.1-flash-image"]
+
+
+def test_a_pin_that_trips_a_rule_still_offers_alternatives() -> None:
+    """When the pin cannot work, the conflict explains why and the ranked
+    alternatives remain — a dead end would be less useful than a fix."""
+    plan = plan_generation(
+        "a 4k image",
+        RoutingConstraints(pinned_model="gemini-3.1-flash-lite-image", needs_4k=True),
+    )
+    assert "image_size_unsupported_by_pinned_model" in _conflict_codes(plan)
+    assert [route.model for route in plan.routes] == [
+        "gemini-3.1-flash-image",
+        "gemini-3-pro-image",
+    ]
+
+
+def test_a_surviving_video_pin_is_the_only_route() -> None:
+    plan = plan_generation(
+        "a video of a cat",
+        RoutingConstraints(pinned_model="veo-3.1-generate-001"),
+    )
+    assert [route.model for route in plan.routes] == ["veo-3.1-generate-001"]
 
 
 def test_vertex_backend_surfaces_the_global_location_requirement() -> None:

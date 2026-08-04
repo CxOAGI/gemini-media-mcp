@@ -27,6 +27,7 @@ from PIL import Image as PILImage
 from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import OMNI_MODEL
+from .routing import BudgetPreference, MediaKind
 from .omni import generate_video_omni as generate_video_omni_impl
 from .video import _VEO_LITE_MODELS, VideoModel
 from .video import generate_video as generate_video_impl
@@ -40,6 +41,11 @@ MAX_FETCH_BYTES = 50 * 1024 * 1024
 # Maximum number of HTTP redirects to follow during a fetch. Each hop's
 # target is re-validated against the SSRF guard before it is requested.
 MAX_HTTP_REDIRECTS = 5
+
+# Upper bound on shots in one storyboard. Every shot is a billed image
+# generation, so an unbounded list is an unbounded bill; exceeding this is an
+# error rather than a silent truncation.
+MAX_STORYBOARD_SHOTS = 24
 
 
 def _decode_base64_capped(data: str, max_bytes: int | None = None) -> bytes:
@@ -927,8 +933,8 @@ async def generate_image(
 async def plan_generation(
     ctx: Context[ServerSession, AppContext],
     intent: str,
-    budget: str | None = None,
-    media_kind: str | None = None,
+    budget: BudgetPreference | None = None,
+    media_kind: MediaKind | None = None,
     aspect_ratio: str | None = None,
     image_size: ImageSize | None = None,
     duration_seconds: float | None = None,
@@ -1096,21 +1102,55 @@ async def generate_storyboard(
 
         if not shots:
             raise ValueError("shots list must not be empty")
+        # Each shot is a paid image generation, so an oversized board is a real
+        # bill. Refuse loudly rather than truncating: silently dropping shots
+        # would render a board that looks complete but is not.
+        if len(shots) > MAX_STORYBOARD_SHOTS:
+            raise ValueError(
+                f"shots has {len(shots)} entries; the limit is "
+                f"{MAX_STORYBOARD_SHOTS} because every shot is a billed image "
+                "generation. Split the sequence into several storyboards, or "
+                "call generate_storyboard with dry_run=True first to price it."
+            )
+        # Validate every field BEFORE generating anything. A bad duration or a
+        # non-string caption would otherwise surface while assembling the board
+        # — after every keyframe had already been generated and billed.
         for i, shot in enumerate(shots):
+            if not isinstance(shot, dict):
+                raise ValueError(
+                    f"shots[{i}] must be an object like "
+                    '{"prompt": "...", "caption": "...", "duration_seconds": 4}, '
+                    f"got {type(shot).__name__}"
+                )
             if not str(shot.get("prompt", "")).strip():
                 raise ValueError(f"shots[{i}] is missing a non-empty 'prompt'")
+            for field in ("prompt", "caption", "notes"):
+                value = shot.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(
+                        f"shots[{i}].{field} must be a string, "
+                        f"got {type(value).__name__}"
+                    )
+            duration = shot.get("duration_seconds")
+            if duration is not None:
+                try:
+                    if float(duration) < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"shots[{i}].duration_seconds must be a non-negative "
+                        f"number, got {duration!r}"
+                    ) from None
 
         from .image import resolve_image_model
 
         resolved, plan_warnings, effective_size = resolve_image_model(model, image_size)
 
         if dry_run:
-            per_frame = _image_cost(resolved, effective_size)
-            total = dict(per_frame) if per_frame else None
-            if total is not None:
-                total["usd"] = round(float(per_frame["usd"]) * len(shots), 6)
-                total["detail"] = f"{len(shots)} storyboard keyframes @ {resolved}"
-                total.pop("usd_display", None)
+            # Price the whole board in one call. Multiplying a single-frame
+            # estimate would leave `breakdown` describing one image while the
+            # total described N — an inconsistency a caller could act on.
+            total = _image_cost(resolved, effective_size, n=len(shots))
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",

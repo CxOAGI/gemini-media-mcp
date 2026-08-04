@@ -28,6 +28,7 @@ from .image import (
     _supports_image_size,  # pyright: ignore[reportPrivateUsage]
     ImageModel,
     ImageSize,
+    resolve_image_model,
 )
 from .omni import (
     _MAX_DURATION as OMNI_MAX_DURATION,  # pyright: ignore[reportPrivateUsage]
@@ -1531,23 +1532,34 @@ def _plan_image(
     conflicts: list[RoutingConflict] = []
     notes: list[str] = []
 
-    if (
-        request.pinned_model is not None
-        and request.pinned_model not in LIVE_IMAGE_MODELS
-    ):
-        conflicts.append(
-            RoutingConflict(
-                code="pinned_model_not_routable",
-                detail=(
-                    f"pinned_model={request.pinned_model} is not a live image model "
-                    f"({', '.join(LIVE_IMAGE_MODELS)})."
-                ),
-                resolution=(
-                    "Superseded IDs are still accepted by generate_image and "
-                    f"rerouted, but plan against {DEFAULT_IMAGE_MODEL} instead."
-                ),
+    # A pinned ID may be superseded rather than invalid. generate_image would
+    # reroute it and serve the request, so honour the pin against the model
+    # that would actually run instead of calling the request unroutable.
+    pinned = request.pinned_model
+    if pinned is not None and pinned not in LIVE_IMAGE_MODELS:
+        resolved, resolve_warnings, _ = resolve_image_model(pinned)
+        if resolved in LIVE_IMAGE_MODELS:
+            notes.extend(resolve_warnings)
+            notes.append(
+                f"pinned_model={pinned} is superseded; planned against "
+                f"{resolved}, which is what generate_image would call."
             )
-        )
+            pinned = resolved
+        else:
+            conflicts.append(
+                RoutingConflict(
+                    code="pinned_model_not_routable",
+                    detail=(
+                        f"pinned_model={pinned} is not a live image model "
+                        f"({', '.join(LIVE_IMAGE_MODELS)})."
+                    ),
+                    resolution=(
+                        "Superseded IDs are still accepted by generate_image and "
+                        f"rerouted, but plan against {DEFAULT_IMAGE_MODEL} instead."
+                    ),
+                )
+            )
+            pinned = None
 
     for model in sorted(LIVE_IMAGE_MODELS):
         profile = _IMAGE_PROFILES[model]
@@ -1563,7 +1575,7 @@ def _plan_image(
             rejected.append(
                 RejectedRoute(model=model, reason=reason, tool="generate_image")
             )
-            if request.pinned_model == model:
+            if pinned == model:
                 conflicts.append(
                     RoutingConflict(
                         code="image_size_unsupported_by_pinned_model",
@@ -1660,8 +1672,31 @@ def _plan_image(
             "for multi-turn edits instead of regenerating from scratch."
         )
 
+    ranked = _rank(routes, _IMAGE_PROFILES)
+
+    # A pin is a requirement, not a preference: when the pinned model survived
+    # the rules, it is the only plan. Recommending something else would answer
+    # a question the caller did not ask. If the pin was excluded, the ranked
+    # alternatives stay — the conflict already explains why the pin failed.
+    if pinned is not None:
+        pinned_routes = tuple(r for r in ranked if r.model == pinned)
+        if pinned_routes:
+            for other in ranked:
+                if other.model != pinned:
+                    rejected.append(
+                        RejectedRoute(
+                            model=other.model,
+                            reason=(
+                                f"{other.model} not planned: pinned_model="
+                                f"{pinned} was requested."
+                            ),
+                            tool=other.tool,
+                        )
+                    )
+            ranked = pinned_routes
+
     return (
-        _rank(routes, _IMAGE_PROFILES),
+        ranked,
         tuple(rejected),
         tuple(conflicts),
         tuple(notes),
@@ -2402,8 +2437,28 @@ def _plan_video(
             "is an ordered segment list for a downstream cutting MCP."
         )
 
+    ranked = _rank(routes, _VIDEO_PROFILES)
+
+    # Same rule as the image planner: a surviving pin is the only plan.
+    if request.pinned_model is not None:
+        pinned_routes = tuple(r for r in ranked if r.model == request.pinned_model)
+        if pinned_routes:
+            for other in ranked:
+                if other.model != request.pinned_model:
+                    rejected.append(
+                        RejectedRoute(
+                            model=other.model,
+                            reason=(
+                                f"{other.model} not planned: pinned_model="
+                                f"{request.pinned_model} was requested."
+                            ),
+                            tool=other.tool,
+                        )
+                    )
+            ranked = pinned_routes
+
     return (
-        _rank(routes, _VIDEO_PROFILES),
+        ranked,
         tuple(rejected),
         tuple(conflicts),
         tuple(notes),

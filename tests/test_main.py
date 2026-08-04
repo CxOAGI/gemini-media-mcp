@@ -4217,3 +4217,93 @@ async def test_generate_storyboard_rejects_empty_and_promptless_shots(
         ctx=_image_ctx(tmp_path), shots=[{"caption": "no prompt"}]
     )
     assert "prompt" in json.loads(blank[0].text)["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_storyboard_dry_run_breakdown_matches_the_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cost breakdown must describe the same N shots as the total.
+
+    A single-frame estimate multiplied after the fact left `breakdown` saying
+    one image while `usd` said five — a reader could act on either.
+    """
+    from src.__main__ import generate_storyboard
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[{"prompt": f"shot {i}"} for i in range(5)],
+        dry_run=True,
+    )
+    cost = json.loads(result[0].text)["estimated_cost"]
+    assert cost["breakdown"]["images"] == 5
+    assert cost["breakdown"]["output_image_usd"] == pytest.approx(cost["usd"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_storyboard_refuses_an_oversized_board(tmp_path: Path) -> None:
+    """Every shot is a billed generation, so an oversized board fails loudly
+    rather than silently truncating to a board that looks complete."""
+    from src.__main__ import MAX_STORYBOARD_SHOTS, generate_storyboard
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[{"prompt": f"shot {i}"} for i in range(MAX_STORYBOARD_SHOTS + 1)],
+    )
+    error = json.loads(result[0].text)["error"]
+    assert str(MAX_STORYBOARD_SHOTS) in error
+    assert "dry_run" in error
+
+
+@pytest.mark.parametrize(
+    ("bad_shot", "expected"),
+    [
+        pytest.param("a bare string", "must be an object", id="not_a_dict"),
+        pytest.param(None, "must be an object", id="none"),
+        pytest.param(
+            {"prompt": "x", "duration_seconds": "soon"},
+            "duration_seconds must be a non-negative number",
+            id="non_numeric_duration",
+        ),
+        pytest.param(
+            {"prompt": "x", "duration_seconds": -3},
+            "duration_seconds must be a non-negative number",
+            id="negative_duration",
+        ),
+        pytest.param(
+            {"prompt": "x", "caption": {"nested": 1}},
+            "caption must be a string",
+            id="non_string_caption",
+        ),
+        pytest.param({"prompt": "   "}, "non-empty 'prompt'", id="blank_prompt"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_storyboard_validates_shots_before_spending_anything(
+    bad_shot: Any,
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed shot fields must be rejected up front.
+
+    A bad duration or caption used to pass validation and only fail while
+    assembling the board — after every keyframe had been generated and billed.
+    """
+    from src.__main__ import generate_storyboard
+
+    async def must_not_spend(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("invalid input must not reach the generation impl")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", must_not_spend)
+
+    result = await generate_storyboard(ctx=_image_ctx(tmp_path), shots=[bad_shot])
+    assert expected in json.loads(result[0].text)["error"]
