@@ -806,3 +806,55 @@ def test_module_is_deterministic() -> None:
     first = estimate_image_cost("gemini-3.1-flash-image", "4K", 3)
     second = estimate_image_cost("gemini-3.1-flash-image", "4K", 3)
     assert first == second
+
+
+# ============================================================================
+# Superseded IDs price as the model that actually runs
+# ============================================================================
+
+
+@pytest.mark.parametrize("image_size", ["1K", "2K", "4K"])
+def test_every_superseded_id_prices_as_its_own_replacement(image_size: str) -> None:
+    """Each superseded ID must price as ITS replacement, not a shared default.
+
+    The reroute targets are not uniform: the Imagen family and
+    gemini-2.5-flash-image go to gemini-3.1-flash-image, but
+    gemini-3-pro-image-preview goes to gemini-3-pro-image, which costs
+    substantially more. Collapsing these onto one fallback target would quote
+    roughly half the real price for anything pinned to the pro preview.
+
+    Driven off the reroute tables so a future retirement is covered the moment
+    it is added to src.image.
+    """
+    from src.image import _RETIRED_MODELS, _SUNSET_MODELS
+    from src.pricing import estimate_image_cost
+
+    superseded = {**_RETIRED_MODELS, **_SUNSET_MODELS}
+    assert superseded, "expected at least one superseded model to check"
+
+    for requested, (replacement, _shutdown) in superseded.items():
+        got = estimate_image_cost(requested, image_size, 1)
+        expected = estimate_image_cost(replacement, image_size, 1)
+        assert got is not None, f"{requested} is unpriced"
+        assert expected is not None, f"{replacement} is unpriced"
+        assert got.usd == expected.usd, (
+            f"{requested} priced as ${got.usd} but its replacement "
+            f"{replacement} costs ${expected.usd}"
+        )
+        # The description must name the model that will really run, so a
+        # reader is not told they are buying the alias they asked for.
+        assert replacement in got.detail
+
+
+def test_the_two_preview_aliases_do_not_collapse_onto_one_price() -> None:
+    """A regression guard with teeth: the pro and flash previews must stay
+    distinct. If a refactor routed both through one fallback target this is
+    the assertion that fails."""
+    from src.pricing import estimate_image_cost
+
+    pro = estimate_image_cost("gemini-3-pro-image-preview", "4K", 1)
+    flash = estimate_image_cost("gemini-3.1-flash-image-preview", "4K", 1)
+    assert pro is not None and flash is not None
+    assert pro.usd > flash.usd, "pro preview must not be priced at flash rates"
+    assert pro.usd == estimate_image_cost("gemini-3-pro-image", "4K", 1).usd
+    assert flash.usd == estimate_image_cost("gemini-3.1-flash-image", "4K", 1).usd
