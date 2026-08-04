@@ -1684,3 +1684,19 @@ async def test_gemini_image_result_has_no_warnings(tmp_path: Path) -> None:
         model="gemini-3.1-flash-image",
     )
     assert "warnings" not in result
+
+
+def test_resolve_image_model_does_not_log(caplog: pytest.LogCaptureFixture) -> None:
+    """The resolver is consulted by callers that never issue a request — the
+    dry-run estimate and the intent router. A WARNING saying a model "was
+    rerouted" is untrue when nothing was sent, and turns a read-only planning
+    call into server log noise. Substitutions travel back as warnings instead.
+    """
+    from src.image import resolve_image_model
+
+    with caplog.at_level(logging.WARNING, logger="src.image"):
+        model_id, warnings, _ = resolve_image_model("imagen-4.0-generate-001", "4K")
+
+    assert model_id == "gemini-3.1-flash-image"
+    assert warnings, "the substitution must still be reported to the caller"
+    assert not caplog.records, "resolving a model must not write to the log"

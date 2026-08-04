@@ -164,8 +164,11 @@ def resolve_image_model(
     """Resolve a requested model to the one that will actually be called.
 
     Single source of truth for model substitution, shared by the real
-    generation path and the ``dry_run`` estimate so a quoted price always
-    describes the call that would really be issued.
+    generation path, the ``dry_run`` estimate and the intent router, so a
+    quoted price always describes the call that would really be issued.
+
+    Pure: it reports substitutions through the returned warnings and does not
+    log, because most callers never issue a request.
 
     Args:
         model: The requested model ID, which may be retired or superseded.
@@ -199,14 +202,6 @@ def resolve_image_model(
         warnings.append(
             f"Model {model_id} {state}; {target} served this request instead. "
             f"Update your configuration to request {target} directly."
-        )
-        # Also log it: a caller that never inspects the returned warnings still
-        # needs to find out it is pinned to a model that is going away.
-        logger.warning(
-            "Rerouted model %s to %s (shutdown %s); update the caller's configuration",
-            model_id,
-            target,
-            shutdown,
         )
         model_id = target
 
@@ -278,6 +273,14 @@ async def generate_image(
         Dictionary with image_url, image_preview, and generation metadata
     """
     model_id, warnings, image_size = resolve_image_model(model, image_size)
+
+    # Log here rather than inside the resolver. Dry-run estimates and the
+    # intent router resolve models too, and a WARNING saying a request "was
+    # rerouted" is untrue when nothing was ever sent. A caller that never
+    # inspects the returned warnings still needs to learn it is pinned to a
+    # dying model, so this fires on the path that really issues the call.
+    for warning in warnings:
+        logger.warning("%s", warning)
 
     # Gemini 3.x image models require the global location when using Vertex AI.
     if model_id in _GEMINI3_IMAGE_MODELS:
