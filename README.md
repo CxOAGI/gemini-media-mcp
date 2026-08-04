@@ -124,7 +124,6 @@ Generate images using Gemini image models.
   - `gemini-3.1-flash-image` (Nano Banana 2) — **default**; fast, up to 4K output, up to 14 reference images
   - `gemini-3-pro-image` (Nano Banana Pro) — 4K, reasoning, `thought_signature` for multi-turn editing
   - `gemini-3.1-flash-lite-image` — cheapest, but **1K output only** (2K/4K are unsupported)
-  - `gemini-2.5-flash-image` (Nano Banana) — still served, but Google shuts it down on **2026-10-02**; migrate to `gemini-3.1-flash-image`
 
   > **Retired IDs are rerouted, not failed.** The models below no longer exist (or are about to). Requesting one still returns an image: the server substitutes the replacement Google published rather than letting the call 404. They are accepted only as compatibility aliases — request a GA model directly.
   >
@@ -133,8 +132,9 @@ Generate images using Gemini image models.
   > | `gemini-3-pro-image-preview` | 2026-06-25 | `gemini-3-pro-image` |
   > | `gemini-3.1-flash-image-preview` | 2026-06-25 | `gemini-3.1-flash-image` |
   > | all 8 `imagen-3.0-*` / `imagen-4.0-*` image IDs | 2026-08-17 | `gemini-3.1-flash-image` |
+  > | `gemini-2.5-flash-image` | 2026-10-02 (scheduled) | `gemini-3.1-flash-image` |
   >
-  > Every substitution — and every use of a model on a shutdown clock, such as `gemini-2.5-flash-image` — is announced on three channels so it cannot go unnoticed: a `warnings` entry in the response JSON, an MCP `warning`-level log notification to the client, and a `WARNING` record in the server log.
+  > Every substitution is announced on three channels so it cannot go unnoticed: a `warnings` entry in the response JSON, an MCP `warning`-level log notification to the client, and a `WARNING` record in the server log.
   >
   > If you hold Provisioned Throughput on a discontinued Imagen model, move that order yourself — Google does not stop it automatically at retirement.
 - `image_uri`: Input image URI for image-to-image generation
@@ -235,6 +235,50 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 **Notes:**
 - Veo 3.1 / Veo 3.1 Fast only (not Lite)
 - 720p
+
+### generate_clip
+
+Generate a **multi-beat short clip** — the building block for a reel or short. Each beat is rendered in order, and the tool returns an ordered manifest a cutting MCP (e.g. vfx-mcp) can splice into a finished clip.
+
+This is the highest-leverage tool in the server: one call produces a whole sequence instead of N round-trips.
+
+**Parameters:**
+- `beats` (required): Ordered list of beat specs. Each accepts `{prompt, duration_seconds?, seed?, first_frame_uri?, negative_prompt?, audio_prompt?}`
+- `aspect_ratio`: Default `9:16` for vertical social clips
+- `model`: VEO model applied to every beat (default `veo-3.1-fast-generate-001`)
+- `include_audio`: Audio per beat (Vertex only)
+- `add_bridges`: Generate a transition between consecutive beats using the last frame of beat N and the first frame of beat N+1. Requires local (`file://`) beat outputs
+- `animatic`: Render every beat with `gemini-omni-flash` (fast, cheap 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
+- `output_gcs_uri`: GCS URI for all outputs
+
+**Partial failure is non-fatal.** A failed beat is recorded in the manifest's `errors` list and the run continues; bridges that would have used the failed beat are skipped.
+
+**Returns:** a clip manifest — `{kind, aspect_ratio, segments[], total_duration_seconds, errors[]}`.
+
+**Suggested flow:** run once with `animatic: true` to preview the whole sequence cheaply, then re-run with `animatic: false` once the beats read well.
+
+### generate_transition
+
+Generate a transition video **between two still frames** using Veo 3.1's first+last-frame mode. Pair with a cutting MCP that extracts the last frame of clip A and the first frame of clip B.
+
+**Parameters:**
+- `first_frame_uri` (required): Starting still (`gs://`, `https://`, `file://`)
+- `last_frame_uri` (required): Ending still
+- `prompt`: Transition motion and style (default: `smooth cinematic transition between the two frames`)
+- `model`: Veo model — default `veo-3.1-fast-generate-001`. **Lite does not support first/last-frame mode** and cannot be used
+- `duration_seconds`: 4/6/8s, snapped to nearest
+- `aspect_ratio`, `include_audio`, `audio_prompt`, `negative_prompt`, `seed`, `output_gcs_uri`
+
+### generate_bridge
+
+Same primitive as `generate_transition`, but takes **two clips instead of two stills**: it decodes the last frame of `from_clip_uri` and the first frame of `to_clip_uri` for you, so no frame extraction step is needed.
+
+**Parameters:**
+- `from_clip_uri` (required): Clip whose last frame starts the bridge
+- `to_clip_uri` (required): Clip whose first frame ends the bridge
+- `prompt`, `model`, `duration_seconds`, `aspect_ratio`, `include_audio`, `audio_prompt`, `negative_prompt`, `seed`, `output_gcs_uri` — as above
+
+**Returns:** JSON with `video_url`, `sidecar_url`, and the source clip URIs.
 
 ### Fast drafts vs. high-fidelity
 

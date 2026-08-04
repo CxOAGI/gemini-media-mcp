@@ -142,7 +142,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "A red square",
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": None,
                 "response_type": "image",
             },
@@ -152,7 +152,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "Edit this image",
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": _create_test_image(),
                 "response_type": "image",
             },
@@ -162,7 +162,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "A" * 10000,
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": None,
                 "response_type": "image",
             },
@@ -172,7 +172,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "Unicode: 🎨 日本語 émoji",
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": None,
                 "response_type": "image",
             },
@@ -182,7 +182,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "",
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": None,
                 "response_type": "image",
             },
@@ -192,7 +192,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "Describe this",
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": None,
                 "response_type": "text_only",
             },
@@ -202,7 +202,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "Generate",
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": None,
                 "response_type": "empty",
             },
@@ -212,7 +212,7 @@ def _create_test_image(
         pytest.param(
             {
                 "prompt": "Generate",
-                "model": "gemini-2.5-flash-image",
+                "model": "gemini-3.1-flash-image",
                 "image_bytes": None,
                 "response_type": "no_candidates",
             },
@@ -1327,7 +1327,7 @@ def test_image_model_excludes_all_imagen_ids() -> None:
 
 
 def test_image_model_is_exactly_the_live_catalog() -> None:
-    """ImageModel lists every model Google still serves, and nothing else."""
+    """ImageModel lists the models with a future, and nothing else."""
     from typing import get_args
 
     from src.image import ImageModel
@@ -1336,7 +1336,6 @@ def test_image_model_is_exactly_the_live_catalog() -> None:
         "gemini-3.1-flash-image",
         "gemini-3.1-flash-lite-image",
         "gemini-3-pro-image",
-        "gemini-2.5-flash-image",
     }
 
 
@@ -1373,7 +1372,12 @@ def test_retired_catalog_matches_googles_deprecation_table() -> None:
         "gemini-3.1-flash-image-preview": ("gemini-3.1-flash-image", "2026-06-25"),
     }
     assert _RETIRED_MODELS == retired
-    assert set(get_args(RetiredImageModel)) == set(retired)
+
+    # RetiredImageModel is the full accepted-but-superseded set: everything
+    # retired, plus everything on a scheduled shutdown.
+    from src.image import _SUNSET_MODELS
+
+    assert set(get_args(RetiredImageModel)) == set(retired) | set(_SUNSET_MODELS)
 
     # Every replacement must itself be a live model, or the reroute just moves
     # the failure. This is what catches the next round of deprecations.
@@ -1381,20 +1385,52 @@ def test_retired_catalog_matches_googles_deprecation_table() -> None:
 
     live = set(get_args(ImageModel))
     assert {target for target, _ in _RETIRED_MODELS.values()} <= live
+    assert {target for target, _ in _SUNSET_MODELS.values()} <= live
 
 
-def test_deprecated_models_are_still_live_and_have_replacements() -> None:
-    """A model on a shutdown clock must still be selectable (it works today)
-    and must point at a live replacement."""
+def test_sunset_models_reroute_to_a_live_replacement() -> None:
+    """A model with a scheduled shutdown is rerouted, not offered: it must be
+    out of the live catalog and point at a model that is in it."""
     from typing import get_args
 
-    from src.image import _DEPRECATED_MODELS, _RETIRED_MODELS, ImageModel
+    from src.image import _RETIRED_MODELS, _SUNSET_MODELS, ImageModel, RetiredImageModel
 
     live = set(get_args(ImageModel))
-    for model, (replacement, _shutdown) in _DEPRECATED_MODELS.items():
-        assert model in live
+    assert _SUNSET_MODELS == {
+        "gemini-2.5-flash-image": ("gemini-3.1-flash-image", "2026-10-02"),
+    }
+    for model, (replacement, _shutdown) in _SUNSET_MODELS.items():
+        assert model not in live
         assert model not in _RETIRED_MODELS
+        assert model in get_args(RetiredImageModel)
         assert replacement in live
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_sunset_model_warning_does_not_claim_it_is_already_gone(
+    tmp_path: Path,
+) -> None:
+    """gemini-2.5-flash-image still works until 2026-10-02, so the warning must
+    say "scheduled for shutdown", not "no longer exists"."""
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    gemini_response = FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    client = FakeGenaiClient(gemini_response=gemini_response)
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="a cat",
+        images_dir=images_dir,
+        model="gemini-2.5-flash-image",
+    )
+
+    assert result["model"] == "gemini-3.1-flash-image"
+    joined = " ".join(result["warnings"])
+    assert "scheduled for shutdown on 2026-10-02" in joined
+    assert "no longer exists" not in joined
 
 
 # ============================================================================

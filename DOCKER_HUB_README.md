@@ -12,12 +12,15 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 | **Author** | [CxOAGI](https://github.com/CxOAGI) |
 | **Repository** | [https://github.com/CxOAGI/gemini-media-mcp](https://github.com/CxOAGI/gemini-media-mcp) |
 
-## Available Tools (5)
+## Available Tools (8)
 
 | Tools provided by this Server | Short Description |
 |-------------------------------|-------------------|
 | `generate_image` | Generate images using Gemini image models |
 | `generate_video` | Generate videos using VEO models (with optional fast `draft` mode) |
+| `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a cheap animatic preview |
+| `generate_transition` | Veo first+last-frame transition between two stills |
+| `generate_bridge` | Transition between two existing clips (frames extracted for you) |
 | `generate_video_omni` | Fast conversational video via `gemini-omni-flash-preview` (Interactions API) |
 | `edit_video` | Conversationally edit a previously omni-generated video |
 | `loop_extend` | Extend a Veo video multiple times in one call |
@@ -43,9 +46,8 @@ Generate images using Gemini image models
 - `gemini-3.1-flash-image` - Nano Banana 2; **default**; fast, up to 4K output, up to 14 reference images
 - `gemini-3-pro-image` - Nano Banana Pro; 4K, reasoning, multi-turn editing
 - `gemini-3.1-flash-lite-image` - cheapest, but **1K output only** (2K/4K unsupported)
-- `gemini-2.5-flash-image` - Nano Banana; still served, shut down **2026-10-02** (migrate to `gemini-3.1-flash-image`)
 
-> **Retired IDs are rerouted, not failed.** The `gemini-3-pro-image-preview` and `gemini-3.1-flash-image-preview` aliases were retired on 2026-06-25, and every `imagen-*` image endpoint is discontinued on 2026-08-17. Requesting one still returns an image — the server substitutes the GA replacement Google published instead of letting the call 404 — and announces the swap three ways: a `warnings` entry in the response JSON, an MCP `warning` log notification, and a `WARNING` record in the server log. Request a GA model directly.
+> **Retired IDs are rerouted, not failed.** The `gemini-3-pro-image-preview` and `gemini-3.1-flash-image-preview` aliases were retired on 2026-06-25, every `imagen-*` image endpoint is discontinued on 2026-08-17, and `gemini-2.5-flash-image` is scheduled for shutdown on 2026-10-02. Requesting one still returns an image — the server substitutes the GA replacement Google published instead of letting the call 404 — and announces the swap three ways: a `warnings` entry in the response JSON, an MCP `warning` log notification, and a `WARNING` record in the server log. Request a GA model directly.
 
 *This tool may perform destructive updates.*
 
@@ -83,6 +85,67 @@ Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the p
 
 **Duration Options:**
 - 4, 6, or 8 seconds
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`generate_clip`**
+
+Generate a multi-beat short clip — the building block for a reel. One call renders the whole sequence and returns an ordered manifest for a downstream cutting MCP.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `beats` | array | Ordered beat specs: `{prompt, duration_seconds?, seed?, first_frame_uri?, negative_prompt?, audio_prompt?}` |
+| `aspect_ratio` | string *optional* | `9:16` (default, vertical social) or `16:9` |
+| `model` | string *optional* | Veo model for every beat (default `veo-3.1-fast-generate-001`) |
+| `include_audio` | boolean *optional* | Audio per beat (Vertex only) |
+| `add_bridges` | boolean *optional* | Generate a transition between consecutive beats (requires local beat outputs) |
+| `animatic` | boolean *optional* | Render every beat with `gemini-omni-flash` for a fast, cheap 720p storyboard preview of the whole reel |
+| `output_gcs_uri` | string *optional* | GCS URI for all outputs |
+
+**Notes:**
+- A failed beat is recorded in the manifest's `errors` list; the run continues
+- Returns `{kind, aspect_ratio, segments[], total_duration_seconds, errors[]}`
+- Typical flow: `animatic: true` to preview cheaply, then re-run for full Veo renders
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`generate_transition`**
+
+Veo 3.1 first+last-frame transition between two **still frames**.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `first_frame_uri` | string | Starting still (`gs://`, `https://`, `file://`) |
+| `last_frame_uri` | string | Ending still |
+| `prompt` | string *optional* | Transition motion and style |
+| `model` | string *optional* | Veo model (default fast; **Lite is not supported** — no first/last-frame mode) |
+| `duration_seconds` | number *optional* | 4/6/8s, snapped to nearest |
+| `aspect_ratio` | string *optional* | Must match the surrounding clips |
+| `include_audio` / `audio_prompt` / `negative_prompt` / `seed` / `output_gcs_uri` | *optional* | As for `generate_video` |
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`generate_bridge`**
+
+Same as `generate_transition`, but takes two **clips** — it decodes the last frame of the first and the first frame of the second for you.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `from_clip_uri` | string | Clip whose last frame starts the bridge |
+| `to_clip_uri` | string | Clip whose first frame ends the bridge |
+| `prompt` / `model` / `duration_seconds` / `aspect_ratio` / `include_audio` / `audio_prompt` / `negative_prompt` / `seed` / `output_gcs_uri` | *optional* | As above |
 
 *This tool may perform destructive updates.*
 

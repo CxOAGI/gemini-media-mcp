@@ -662,15 +662,13 @@ async def generate_image(
                - Most capable: reasoning + precise text rendering, 4K,
                  up to 14 reference images:
                  "gemini-3-pro-image" (GA, Nano Banana Pro)
-               Avoid "gemini-2.5-flash-image": it still works but Google shuts
-               it down on 2026-10-02.
-               Never pick an "imagen-*" or "*-preview" model. Every Imagen
-               image endpoint is discontinued on 2026-08-17, and the
-               "gemini-3-pro-image-preview" / "gemini-3.1-flash-image-preview"
-               aliases were already retired on 2026-06-25. Those IDs are
-               accepted only so pinned configurations keep working — such a
-               request is rerouted to the GA replacement and the substitution
-               is reported under "warnings".
+               Pick one of the three above and nothing else. The remaining IDs
+               in the schema are superseded and exist only so pinned
+               configurations keep working: every "imagen-*" image endpoint is
+               discontinued 2026-08-17, the "-preview" image aliases were
+               retired 2026-06-25, and "gemini-2.5-flash-image" is scheduled
+               for shutdown 2026-10-02. Requesting one of those is rerouted to
+               the GA replacement and reported under "warnings".
         image_uri: Input image URI (gs://, http://, file://) for image-to-image
         image_base64: Base64 encoded input image (prefer image_uri)
         reference_image_uris: List of reference image URIs (up to 14 for Gemini 3.x image models).

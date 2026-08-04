@@ -20,9 +20,6 @@ ImageModel = Literal[
     "gemini-3-pro-image",
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-lite-image",
-    # Nano Banana 1. Still served, but Google shuts it down 2026-10-02 — see
-    # _DEPRECATED_MODELS. Kept selectable so existing callers are not broken.
-    "gemini-2.5-flash-image",
 ]
 
 # IDs whose endpoints are gone (or imminently going). Calls to these fail with
@@ -44,6 +41,8 @@ RetiredImageModel = Literal[
     # Nano Banana 2 / Pro preview aliases — retired 2026-06-25, already dead
     "gemini-3-pro-image-preview",
     "gemini-3.1-flash-image-preview",
+    # Nano Banana 1 — still served, shutdown scheduled 2026-10-02
+    "gemini-2.5-flash-image",
 ]
 
 # Retired ID -> (replacement, shutdown date). Sourced from Google's published
@@ -66,10 +65,11 @@ _RETIRED_MODELS: dict[str, tuple[str, str]] = {
 # or newly-surfaced Imagen variant) — still better than a guaranteed 404.
 _RETIRED_DEFAULT_TARGET = "gemini-3.1-flash-image"
 
-# Still served, but on a published shutdown clock. These are warned about and
-# NOT substituted: the model still works, and swapping out a caller's explicit
-# choice while it is still valid would be the bigger surprise.
-_DEPRECATED_MODELS: dict[str, tuple[str, str]] = {
+# Still served, but with a published shutdown date. Rerouted like the retired
+# IDs — a caller left on one of these has a hard deadline and no upside, since
+# the replacement is strictly more capable. Only the wording differs, so the
+# warning does not claim a model is already gone when it is not.
+_SUNSET_MODELS: dict[str, tuple[str, str]] = {
     "gemini-2.5-flash-image": ("gemini-3.1-flash-image", "2026-10-02"),
 }
 
@@ -150,15 +150,16 @@ async def generate_image(
     Supported models (``ImageModel``):
       - gemini-3.1-flash-image (default), gemini-3.1-flash-lite-image,
         gemini-3-pro-image
-      - gemini-2.5-flash-image — still served, shut down 2026-10-02
 
-    Retired IDs (``RetiredImageModel``) are still accepted so pinned callers
-    keep working: the Imagen family (endpoints gone 2026-08-17) and the
-    -preview image aliases (gone 2026-06-25). Rather than let such a call 404,
-    it is rerouted to the replacement Google published (``_RETIRED_MODELS``).
+    Superseded IDs (``RetiredImageModel``) are still accepted so pinned callers
+    keep working, and are rerouted to the replacement Google published:
+      - the Imagen family — endpoints gone 2026-08-17 (``_RETIRED_MODELS``)
+      - the -preview image aliases — gone 2026-06-25 (``_RETIRED_MODELS``)
+      - gemini-2.5-flash-image — still served, shutdown 2026-10-02
+        (``_SUNSET_MODELS``)
 
-    Every substitution or pending shutdown is reported in the returned
-    ``warnings`` list and logged at WARNING.
+    Every substitution is reported in the returned ``warnings`` list and
+    logged at WARNING.
 
     Args:
         client: Google GenAI client
@@ -189,40 +190,32 @@ async def generate_image(
     # the call as-is is never the right behaviour; the substitution is reported
     # so callers can update their own configuration. An unlisted imagen-* ID
     # falls back to the GA replacement rather than a guaranteed failure.
-    if model_id in _RETIRED_MODELS or model_id.startswith("imagen"):
-        target, shutdown = _RETIRED_MODELS.get(
-            model_id, (_RETIRED_DEFAULT_TARGET, "2026-08-17")
-        )
+    if (
+        model_id in _RETIRED_MODELS
+        or model_id in _SUNSET_MODELS
+        or model_id.startswith("imagen")
+    ):
+        if model_id in _SUNSET_MODELS:
+            target, shutdown = _SUNSET_MODELS[model_id]
+            state = f"is scheduled for shutdown on {shutdown}"
+        else:
+            target, shutdown = _RETIRED_MODELS.get(
+                model_id, (_RETIRED_DEFAULT_TARGET, "2026-08-17")
+            )
+            state = f"was retired on {shutdown} and no longer exists"
         warnings.append(
-            f"Model {model_id} was retired by Google on {shutdown} and no "
-            f"longer exists; {target} served this request instead. Update "
-            f"your configuration to request {target} directly."
+            f"Model {model_id} {state}; {target} served this request instead. "
+            f"Update your configuration to request {target} directly."
         )
         # Also log it: a caller that never inspects the returned warnings still
-        # needs to find out it is pinned to a model that is gone.
+        # needs to find out it is pinned to a model that is going away.
         logger.warning(
-            "Rerouted retired model %s to %s (retired %s); update the "
-            "caller's configuration",
+            "Rerouted model %s to %s (shutdown %s); update the caller's configuration",
             model_id,
             target,
             shutdown,
         )
         model_id = target
-
-    # Still-working models with a published shutdown date: warn, but honour the
-    # caller's choice — substituting a model that still works would be worse.
-    elif model_id in _DEPRECATED_MODELS:
-        replacement, shutdown = _DEPRECATED_MODELS[model_id]
-        warnings.append(
-            f"Model {model_id} is deprecated and Google shuts it down on "
-            f"{shutdown}. Migrate to {replacement} before then."
-        )
-        logger.warning(
-            "Model %s is deprecated; Google shuts it down on %s — migrate to %s",
-            model_id,
-            shutdown,
-            replacement,
-        )
 
     # Gemini 3.x image models require the global location when using Vertex AI.
     if model_id in _GEMINI3_IMAGE_MODELS:
