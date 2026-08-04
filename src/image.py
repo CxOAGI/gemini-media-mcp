@@ -81,6 +81,32 @@ _IMAGE_SIZE_SUPPORT: dict[str, frozenset[str]] = {
 }
 
 
+def _usage_dict(response: Any) -> dict[str, int] | None:
+    """Extract token counts from a response's usage_metadata as a plain dict.
+
+    Returned to the caller so cost can be computed from what the API actually
+    metered rather than from a pre-flight estimate. Kept as a plain dict of
+    ints because the result travels through ``json.dumps`` in the MCP layer,
+    which cannot serialize the SDK's usage object.
+    """
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return None
+    fields = (
+        "prompt_token_count",
+        "candidates_token_count",
+        "total_token_count",
+        "thoughts_token_count",
+        "cached_content_token_count",
+    )
+    out: dict[str, int] = {}
+    for field in fields:
+        value = getattr(usage, field, None)
+        if isinstance(value, int):
+            out[field] = value
+    return out or None
+
+
 def _supports_image_size(model_id: str, image_size: str) -> bool:
     """Whether ``model_id`` can produce ``image_size``.
 
@@ -129,6 +155,76 @@ MediaResolution = Literal[
     "MEDIA_RESOLUTION_MEDIUM",
     "MEDIA_RESOLUTION_HIGH",
 ]
+
+
+def resolve_image_model(
+    model: str,
+    image_size: ImageSize | None = None,
+) -> tuple[str, list[str], ImageSize | None]:
+    """Resolve a requested model to the one that will actually be called.
+
+    Single source of truth for model substitution, shared by the real
+    generation path and the ``dry_run`` estimate so a quoted price always
+    describes the call that would really be issued.
+
+    Args:
+        model: The requested model ID, which may be retired or superseded.
+        image_size: Requested output size, if any.
+
+    Returns:
+        ``(model_id, warnings, effective_image_size)``. ``effective_image_size``
+        is None when the requested size cannot be produced by the resolved
+        model, in which case a warning explains the drop.
+    """
+    model_id = str(model)
+    warnings: list[str] = []
+
+    # Reroute retired endpoints to their replacement. These IDs 404, so issuing
+    # the call as-is is never the right behaviour; the substitution is reported
+    # so callers can update their own configuration. An unlisted imagen-* ID
+    # falls back to the GA replacement rather than a guaranteed failure.
+    if (
+        model_id in _RETIRED_MODELS
+        or model_id in _SUNSET_MODELS
+        or model_id.startswith("imagen")
+    ):
+        if model_id in _SUNSET_MODELS:
+            target, shutdown = _SUNSET_MODELS[model_id]
+            state = f"is scheduled for shutdown on {shutdown}"
+        else:
+            target, shutdown = _RETIRED_MODELS.get(
+                model_id, (_RETIRED_DEFAULT_TARGET, "2026-08-17")
+            )
+            state = f"was retired on {shutdown} and no longer exists"
+        warnings.append(
+            f"Model {model_id} {state}; {target} served this request instead. "
+            f"Update your configuration to request {target} directly."
+        )
+        # Also log it: a caller that never inspects the returned warnings still
+        # needs to find out it is pinned to a model that is going away.
+        logger.warning(
+            "Rerouted model %s to %s (shutdown %s); update the caller's configuration",
+            model_id,
+            target,
+            shutdown,
+        )
+        model_id = target
+
+    # Drop an output size the resolved model cannot produce. Warn rather than
+    # fail: the caller picked this model explicitly, so substituting a
+    # different one would be the bigger surprise.
+    if image_size and not _supports_image_size(model_id, image_size):
+        supported_sizes = _IMAGE_SIZE_SUPPORT[model_id]
+        warnings.append(
+            f"{model_id} does not support image_size={image_size} "
+            f"(supported: {', '.join(sorted(supported_sizes))}); the "
+            "request was sent at the model's default size. Use "
+            "gemini-3.1-flash-image or gemini-3-pro-image for "
+            "higher-resolution output."
+        )
+        image_size = None
+
+    return model_id, warnings, image_size
 
 
 async def generate_image(
@@ -181,41 +277,7 @@ async def generate_image(
     Returns:
         Dictionary with image_url, image_preview, and generation metadata
     """
-    model_id = str(model)
-
-    # Non-fatal warnings surfaced back to the caller (matches video/omni).
-    warnings: list[str] = []
-
-    # Reroute retired endpoints to their replacement. These IDs 404, so issuing
-    # the call as-is is never the right behaviour; the substitution is reported
-    # so callers can update their own configuration. An unlisted imagen-* ID
-    # falls back to the GA replacement rather than a guaranteed failure.
-    if (
-        model_id in _RETIRED_MODELS
-        or model_id in _SUNSET_MODELS
-        or model_id.startswith("imagen")
-    ):
-        if model_id in _SUNSET_MODELS:
-            target, shutdown = _SUNSET_MODELS[model_id]
-            state = f"is scheduled for shutdown on {shutdown}"
-        else:
-            target, shutdown = _RETIRED_MODELS.get(
-                model_id, (_RETIRED_DEFAULT_TARGET, "2026-08-17")
-            )
-            state = f"was retired on {shutdown} and no longer exists"
-        warnings.append(
-            f"Model {model_id} {state}; {target} served this request instead. "
-            f"Update your configuration to request {target} directly."
-        )
-        # Also log it: a caller that never inspects the returned warnings still
-        # needs to find out it is pinned to a model that is going away.
-        logger.warning(
-            "Rerouted model %s to %s (shutdown %s); update the caller's configuration",
-            model_id,
-            target,
-            shutdown,
-        )
-        model_id = target
+    model_id, warnings, image_size = resolve_image_model(model, image_size)
 
     # Gemini 3.x image models require the global location when using Vertex AI.
     if model_id in _GEMINI3_IMAGE_MODELS:
@@ -263,21 +325,10 @@ async def generate_image(
         # gemini-2.5-flash-image); image_size (1K/2K/4K) is Gemini
         # 3.x-only, so it is gated separately.
         image_config_kwargs: dict[str, Any] = {}
+        # resolve_image_model() already cleared image_size if the resolved
+        # model cannot produce it, so reaching here means the size is valid.
         if image_size and model_id in _GEMINI3_IMAGE_MODELS:
-            if not _supports_image_size(model_id, image_size):
-                supported_sizes = _IMAGE_SIZE_SUPPORT[model_id]
-                # Don't forward a size the model cannot produce. Warn rather
-                # than fail: the caller picked this model explicitly, so
-                # substituting a different one would be the bigger surprise.
-                warnings.append(
-                    f"{model_id} does not support image_size={image_size} "
-                    f"(supported: {', '.join(sorted(supported_sizes))}); the "
-                    "request was sent at the model's default size. Use "
-                    "gemini-3.1-flash-image or gemini-3-pro-image for "
-                    "higher-resolution output."
-                )
-            else:
-                image_config_kwargs["image_size"] = image_size
+            image_config_kwargs["image_size"] = image_size
         if aspect_ratio:
             image_config_kwargs["aspect_ratio"] = aspect_ratio
         if person_generation:
@@ -307,6 +358,7 @@ async def generate_image(
         fallback_image_bytes = None
         text_parts: list[str] = []
         response_thought_signature = None
+        usage = _usage_dict(response)
 
         candidates = response.candidates if response else None
         if candidates:
@@ -359,6 +411,8 @@ async def generate_image(
                     sig_path = images_dir / sig_filename
                     sig_path.write_text(response_thought_signature)
                     result["thought_signature_url"] = f"file://{sig_path}"
+                if usage:
+                    result["usage"] = usage
                 if warnings:
                     result["warnings"] = warnings
                 return result
@@ -387,6 +441,11 @@ async def generate_image(
             "prompt": prompt,
             "model": model_id,
         }
+
+        # Token counts the API actually metered, so the MCP layer can report
+        # real cost instead of a pre-flight estimate.
+        if usage:
+            result["usage"] = usage
 
         # Save thought signature to file for multi-turn editing workflows
         # (can be 1MB+, too large for MCP response)

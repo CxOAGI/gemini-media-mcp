@@ -12,11 +12,13 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 | **Author** | [CxOAGI](https://github.com/CxOAGI) |
 | **Repository** | [https://github.com/CxOAGI/gemini-media-mcp](https://github.com/CxOAGI/gemini-media-mcp) |
 
-## Available Tools (8)
+## Available Tools (10)
 
 | Tools provided by this Server | Short Description |
 |-------------------------------|-------------------|
+| `plan_generation` | Pick the right tool + model for an intent, with costs and ruled-out options. Generates nothing |
 | `generate_image` | Generate images using Gemini image models |
+| `generate_storyboard` | Render a keyframe per shot and return a real storyboard (inline contact sheet + HTML) |
 | `generate_video` | Generate videos using VEO models (with optional fast `draft` mode) |
 | `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a cheap animatic preview |
 | `generate_transition` | Veo first+last-frame transition between two stills |
@@ -28,6 +30,50 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 ---
 
 ## Tools Details
+
+### Tool: **`plan_generation`**
+
+Decide how to generate something before spending anything. Returns ranked, ready-to-call plans with costs, plus the models it ruled out and why. Pure rule-based routing — no model call, no cost, instant.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `intent` | string | Plain-language description of what you want to make |
+| `budget` | string *optional* | `cheap`, `balanced`, or `best` |
+| `media_kind` / `aspect_ratio` / `image_size` / `duration_seconds` / `num_beats` | *optional* | Force a value instead of inferring it |
+| `needs_text_rendering` / `needs_4k` / `needs_audio` / `needs_extension` / `wants_gcs_output` / `is_draft` | boolean *optional* | Hard requirements |
+| `num_reference_images` | integer *optional* | How many references you'll supply |
+| `pinned_model` | string *optional* | A model you must use; reported as a conflict if it can't satisfy the request |
+
+**Notes:**
+- Catches impossible combinations before you pay for the failure (4K on a 1K-only model, extension on Veo Lite, GCS on the Gemini API)
+- Every rejected model comes with a reason — nothing is dropped silently
+
+*This tool is read-only.*
+
+---
+
+### Tool: **`generate_storyboard`**
+
+Render one keyframe per shot and compose a real, readable storyboard.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `shots` | array | Ordered specs: `{prompt, caption?, duration_seconds?, notes?}` |
+| `title` / `subtitle` | string *optional* | Drawn on the board |
+| `model` / `aspect_ratio` / `image_size` | string *optional* | Keyframe settings (`9:16` → vertical panels) |
+| `theme` | string *optional* | `dark` (default) or `light` |
+| `dry_run` | boolean *optional* | Price the whole board without generating |
+
+**Notes:**
+- Returns a contact-sheet PNG **inline** plus a self-contained HTML page on disk
+- A failed shot renders as a marked error panel and isn't billed — partial boards stay reviewable
+- `shots` feeds straight into `generate_clip` as `beats`
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
 
 ### Tool: **`generate_image`**
 
@@ -41,6 +87,7 @@ Generate images using Gemini image models
 | `image_base64` | string *optional* | Base64 encoded input image for image-to-image generation |
 | `aspect_ratio` | string *optional* | Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`) |
 | `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
+| `dry_run` | boolean *optional* | Return only the cost estimate; generates nothing |
 
 **Available Models (GA):**
 - `gemini-3.1-flash-image` - Nano Banana 2; **default**; fast, up to 4K output, up to 14 reference images
@@ -68,6 +115,7 @@ Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the p
 | `duration_seconds` | integer *optional* | Video duration in seconds (4/6/8s) |
 | `include_audio` | boolean *optional* | Enable audio generation |
 | `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
+| `dry_run` | boolean *optional* | Return only the cost estimate; generates nothing |
 | `audio_prompt` | string *optional* | Audio description |
 | `negative_prompt` | string *optional* | Things to avoid in the video |
 | `seed` | integer *optional* | Random seed for reproducibility |

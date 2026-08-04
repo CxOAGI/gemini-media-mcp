@@ -3939,3 +3939,281 @@ def test_client_for_omni_prefers_vertex_when_gcs_needed(
     assert _client_for_omni(ctx) is gemini_client
     # GCS requested → the Vertex global client wins so delivery works.
     assert _client_for_omni(ctx, need_gcs=True) is global_client
+
+
+# ============================================================================
+# dry_run + cost reporting
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_dry_run_generates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run must never reach the impl, and must quote a cost."""
+    from src.__main__ import generate_image
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not call the generation impl")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="gemini-3-pro-image",
+        image_size="4K",
+        dry_run=True,
+    )
+    payload = json.loads(result[0].text)
+    assert payload["dry_run"] is True
+    assert payload["model"] == "gemini-3-pro-image"
+    assert payload["estimated_cost"]["usd"] > 0
+    assert payload["estimated_cost"]["is_estimate"] is True
+    # No image content is returned for an estimate.
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_dry_run_prices_the_model_that_would_actually_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retired ID must be quoted at its replacement's price, not the alias's,
+    and an impossible size must be dropped before it is priced."""
+    from src.__main__ import generate_image
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not call the generation impl")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    retired = json.loads(
+        (
+            await generate_image(
+                ctx=_image_ctx(tmp_path),
+                prompt="a cat",
+                model="imagen-4.0-generate-001",
+                image_size="4K",
+                dry_run=True,
+            )
+        )[0].text
+    )
+    assert retired["requested_model"] == "imagen-4.0-generate-001"
+    assert retired["model"] == "gemini-3.1-flash-image"
+
+    # flash-lite cannot do 4K, so the estimate must be for its default size.
+    lite = json.loads(
+        (
+            await generate_image(
+                ctx=_image_ctx(tmp_path),
+                prompt="a cat",
+                model="gemini-3.1-flash-lite-image",
+                image_size="4K",
+                dry_run=True,
+            )
+        )[0].text
+    )
+    assert lite["image_size"] is None
+    assert any("does not support image_size=4K" in w for w in lite["warnings"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_reports_actual_cost_from_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real run reports metered usage and the cost derived from it."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "cost.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-image",
+            "usage": {
+                "prompt_token_count": 12,
+                "candidates_token_count": 1120,
+                "total_token_count": 1132,
+            },
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="gemini-3.1-flash-image",
+        image_size="1K",
+    )
+    data = json.loads(result[1].text)
+    assert data["usage"]["total_token_count"] == 1132
+    assert data["cost"]["usd"] > 0
+    # Derived from reported usage, not a pre-flight guess.
+    assert data["cost"]["is_estimate"] is False
+
+    # The sidecar carries the cost too, so downstream tools can total a run.
+    manifest = json.loads(Path(data["sidecar_url"][7:]).read_text())
+    assert manifest["cost"]["usd"] == data["cost"]["usd"]
+
+
+# ============================================================================
+# plan_generation + generate_storyboard
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_ranks_and_explains(tmp_path: Path) -> None:
+    """The router tool returns ranked routes and names what it ruled out."""
+    from src.__main__ import plan_generation
+
+    payload = json.loads(
+        await plan_generation(
+            ctx=_image_ctx(tmp_path),
+            intent="a hi-res 4k product shot for print",
+        )
+    )
+    assert payload["media_kind"] == "image"
+    assert payload["routes"], "expected at least one route"
+    top = payload["routes"][0]
+    assert top["tool"] == "generate_image"
+    assert top["cost"]["usd"] > 0
+    # flash-lite cannot do 4K, so it must be rejected *with a reason*.
+    lite = [
+        r for r in payload["rejected"] if r["model"] == "gemini-3.1-flash-lite-image"
+    ]
+    assert lite and "4K" in lite[0]["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_flags_impossible_requests(tmp_path: Path) -> None:
+    """An unsatisfiable combination is reported as a conflict, not a plan that
+    would fail at call time."""
+    from src.__main__ import plan_generation
+
+    payload = json.loads(
+        await plan_generation(
+            ctx=_image_ctx(tmp_path),
+            intent="extend this video",
+            pinned_model="veo-3.1-lite-generate-preview",
+            needs_extension=True,
+        )
+    )
+    codes = [c["code"] for c in payload["conflicts"]]
+    assert any("extension_unsupported" in c for c in codes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_is_deterministic(tmp_path: Path) -> None:
+    """Routing is rule-based, so the same request must always plan the same."""
+    from src.__main__ import plan_generation
+
+    ctx = _image_ctx(tmp_path)
+    a = await plan_generation(ctx=ctx, intent="a 3 beat vertical reel about coffee")
+    b = await plan_generation(ctx=ctx, intent="a 3 beat vertical reel about coffee")
+    assert a == b
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_generate_storyboard_survives_a_failed_shot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed shot must not abort the board; it renders as an error panel and
+    is excluded from the cost."""
+    from src.__main__ import generate_storyboard
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+    calls = {"n": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ValueError("safety filter blocked the prompt")
+        out = images_dir / f"shot{calls['n']}.png"
+        out.write_bytes(_create_test_image())
+        return {
+            "message": "ok",
+            "image_url": f"file://{out}",
+            "image_preview": "data:image/jpeg;base64,x",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-image",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[
+            {"prompt": "wide shot", "caption": "EXT. ALLEY", "duration_seconds": 6},
+            {"prompt": "blocked", "caption": "INT. DOOR", "duration_seconds": 4},
+            {"prompt": "close up", "caption": "CU HANDOFF", "duration_seconds": 3},
+        ],
+        title="Test Board",
+    )
+
+    from mcp.server.fastmcp import Image as MCPImage
+
+    assert isinstance(result[0], MCPImage)
+    data = json.loads(result[1].text)
+    assert len(data["errors"]) == 1
+    assert data["errors"][0]["shot"] == 2
+    # Both artifacts exist on disk.
+    assert Path(data["storyboard_url"][7:]).exists()
+    assert Path(data["sheet_url"][7:]).exists()
+    # Only the two successful shots are billed.
+    assert data["cost"]["usd"] == pytest.approx(0.0672 * 2, rel=1e-3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_storyboard_dry_run_prices_every_shot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run totals the whole board and generates nothing."""
+    from src.__main__ import generate_storyboard
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[{"prompt": f"shot {i}"} for i in range(4)],
+        dry_run=True,
+    )
+    payload = json.loads(result[0].text)
+    assert payload["dry_run"] is True
+    assert payload["shots"] == 4
+    assert payload["estimated_cost"]["usd"] == pytest.approx(0.0672 * 4, rel=1e-3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_storyboard_rejects_empty_and_promptless_shots(
+    tmp_path: Path,
+) -> None:
+    """Bad input fails up front rather than rendering an empty board."""
+    from src.__main__ import generate_storyboard
+
+    empty = await generate_storyboard(ctx=_image_ctx(tmp_path), shots=[])
+    assert "error" in json.loads(empty[0].text)
+
+    blank = await generate_storyboard(
+        ctx=_image_ctx(tmp_path), shots=[{"caption": "no prompt"}]
+    )
+    assert "prompt" in json.loads(blank[0].text)["error"]

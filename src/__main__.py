@@ -626,6 +626,59 @@ async def fetch(
         return None
 
 
+def _cost_payload(estimate: Any) -> dict[str, Any] | None:
+    """Shape a pricing CostEstimate for the MCP response, or None.
+
+    Pricing is imported lazily and defensively: an unpriced model or a missing
+    pricing table must degrade to "no cost reported" rather than fail a
+    generation the caller already paid for.
+    """
+    if estimate is None:
+        return None
+    try:
+        from .pricing import cost_to_dict
+
+        return cost_to_dict(estimate)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not serialize cost estimate", exc_info=True)
+        return None
+
+
+def _image_cost_estimate(
+    model: str,
+    image_size: str | None,
+    *,
+    usage: dict[str, Any] | None = None,
+    n: int = 1,
+) -> Any:
+    """Raw pricing estimate for an image call, or None if unpriceable.
+
+    Metered from reported usage when available, otherwise a unit estimate.
+    Returns the pricing object (not a dict) so several calls can be summed.
+    """
+    try:
+        from .pricing import actual_image_cost, estimate_image_cost
+
+        size = image_size or "1K"
+        if usage is not None:
+            return actual_image_cost(model, usage, size, n)
+        return estimate_image_cost(model, size, n)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not compute image cost", exc_info=True)
+        return None
+
+
+def _image_cost(
+    model: str,
+    image_size: str | None,
+    *,
+    usage: dict[str, Any] | None = None,
+    n: int = 1,
+) -> dict[str, Any] | None:
+    """Cost for an image call, shaped for the MCP response."""
+    return _cost_payload(_image_cost_estimate(model, image_size, usage=usage, n=n))
+
+
 # Create MCP server with lifespan
 mcp = FastMCP(
     "gemini-media-mcp",
@@ -647,6 +700,7 @@ async def generate_image(
     aspect_ratio: str | None = None,
     person_generation: str | None = None,
     thought_signature_url: str | None = None,
+    dry_run: bool = False,
 ):
     """Generate an image using Google Gemini image models.
 
@@ -693,6 +747,10 @@ async def generate_image(
             from a previous response to continue editing. Example workflow:
             1. First call: generate_image(prompt="Draw a cat") → returns thought_signature_url
             2. Second call: generate_image(prompt="Make it orange", thought_signature_url=<from step 1>)
+        dry_run: When True, generate nothing and return only the cost estimate
+            and the resolved model/parameters. Free and instant — use it to
+            price a call before committing to it. A real run reports the
+            actual cost, derived from the token counts the API metered.
 
     Returns:
         JSON with image_url, image_preview, and model info. For Gemini 3.x image models,
@@ -701,6 +759,29 @@ async def generate_image(
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
+
+        if dry_run:
+            # Resolve the model the same way the impl would, so the estimate
+            # prices what would actually run rather than the requested alias.
+            from .image import resolve_image_model
+
+            resolved, plan_warnings, effective_size = resolve_image_model(
+                model, image_size
+            )
+            payload: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "requested_model": model,
+                "model": resolved,
+                "prompt": prompt,
+                "image_size": effective_size,
+                "estimated_cost": _image_cost(resolved, effective_size),
+            }
+            if plan_warnings:
+                payload["warnings"] = plan_warnings
+                for warning in plan_warnings:
+                    await ctx.warning(warning)
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         image_bytes = None
         if image_uri:
@@ -783,6 +864,15 @@ async def generate_image(
         if "thought_signature_url" in result:
             response_data["thought_signature_url"] = result["thought_signature_url"]
 
+        # What this call actually cost, from the token counts the API metered.
+        # Falls back to unit pricing when the response carried no usage.
+        usage = result.get("usage")
+        cost = _image_cost(result["model"], image_size, usage=usage)
+        if cost:
+            response_data["cost"] = cost
+        if usage:
+            response_data["usage"] = usage
+
         # Surface impl warnings (e.g. an Imagen ID rerouted to its GA target).
         # These go out on the MCP logging channel as well as in the payload, so
         # a client that only reads the image sees them too.
@@ -811,6 +901,8 @@ async def generate_image(
         }
         if impl_warnings:
             manifest["warnings"] = impl_warnings
+        if cost:
+            manifest["cost"] = cost
         sidecar_url = _write_sidecar(result["image_url"], manifest)
         if sidecar_url:
             response_data["sidecar_url"] = sidecar_url
@@ -829,6 +921,333 @@ async def generate_image(
         await ctx.error(f"Image generation failed: {e}")
         logger.exception("Tool error")
         return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+
+@mcp.tool()
+async def plan_generation(
+    ctx: Context[ServerSession, AppContext],
+    intent: str,
+    budget: str | None = None,
+    media_kind: str | None = None,
+    aspect_ratio: str | None = None,
+    image_size: ImageSize | None = None,
+    duration_seconds: float | None = None,
+    num_beats: int | None = None,
+    needs_text_rendering: bool | None = None,
+    needs_4k: bool | None = None,
+    needs_audio: bool | None = None,
+    needs_extension: bool | None = None,
+    num_reference_images: int | None = None,
+    wants_gcs_output: bool | None = None,
+    is_draft: bool | None = None,
+    pinned_model: str | None = None,
+) -> str:
+    """Decide HOW to generate something before spending anything on it.
+
+    Describe what you want in plain language and get back ranked, ready-to-call
+    plans: which tool, which model, which parameters, why that model won, what
+    each option costs, and which models were ruled out and for what reason.
+
+    Call this first when you are unsure which of the generate_* tools to use or
+    which model fits. It generates nothing, costs nothing, and is instant — it
+    is pure rule-based routing over this server's capability tables, not a
+    model call. It never replaces the explicit tools; it tells you how to
+    drive them.
+
+    It also catches requests that cannot work before you pay for the failure —
+    4K on a 1K-only model, extending or first/last-frame on Veo Lite, GCS
+    output on the Gemini API — and reports them as conflicts with a fix.
+
+    Args:
+        ctx: MCP context with application state
+        intent: Plain-language description of what you want to make, e.g.
+            "a 3-beat vertical reel about coffee" or "a poster with the words
+            GRAND OPENING". Signals are inferred from this text.
+        budget: "cheap", "balanced", or "best". Overrides anything inferred.
+        media_kind: Force "image" or "video" instead of inferring it.
+        aspect_ratio: Target aspect ratio, e.g. "16:9", "9:16".
+        image_size: Target output size for images ("1K", "2K", "4K").
+        duration_seconds: Target video runtime.
+        num_beats: Number of shots, for multi-beat clip planning.
+        needs_text_rendering: True when legible text must appear in the image.
+        needs_4k: True when 4K output is required.
+        needs_audio: True when generated audio is required.
+        needs_extension: True when an existing video must be lengthened.
+        num_reference_images: How many reference images you intend to supply.
+        wants_gcs_output: True when output must land in GCS (Vertex only).
+        is_draft: True when this is a rough pass, not a final render.
+        pinned_model: A model you must use. Reported as a conflict if it
+            cannot satisfy the request.
+
+    Returns:
+        JSON plan: ranked `routes` (each with tool, model, ready-to-use
+        `params`, score, rationale, caveats, cost), `rejected` models with
+        reasons, `conflicts`, a suggested multi-step `workflow`, and `notes`.
+    """
+    try:
+        from dataclasses import asdict
+
+        from .routing import RoutingConstraints, plan_generation as plan_impl
+
+        constraints = RoutingConstraints(
+            budget=budget,
+            media_kind=media_kind,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            duration_seconds=duration_seconds,
+            num_beats=num_beats,
+            needs_text_rendering=needs_text_rendering,
+            needs_4k=needs_4k,
+            needs_audio=needs_audio,
+            needs_extension=needs_extension,
+            num_reference_images=num_reference_images,
+            wants_gcs_output=wants_gcs_output,
+            is_draft=is_draft,
+            pinned_model=pinned_model,
+        )
+        plan = plan_impl(intent, constraints)
+
+        def _route(route: Any) -> dict[str, Any]:
+            return {
+                "tool": route.tool,
+                "model": route.model,
+                "params": route.params,
+                "score": route.score,
+                "rationale": route.rationale,
+                "caveats": list(route.caveats),
+                "cost": _cost_payload(route.cost),
+            }
+
+        payload: dict[str, Any] = {
+            "intent": plan.intent,
+            "media_kind": plan.media_kind,
+            "is_satisfiable": plan.is_satisfiable,
+            "routes": [_route(r) for r in plan.routes],
+            "rejected": [asdict(r) for r in plan.rejected],
+            "conflicts": [asdict(c) for c in plan.conflicts],
+            "workflow": [asdict(w) for w in plan.workflow],
+            "notes": list(plan.notes),
+        }
+        await ctx.info(
+            f"Planned {plan.media_kind}: {len(plan.routes)} route(s), "
+            f"{len(plan.conflicts)} conflict(s)"
+        )
+        return json.dumps(payload, indent=2)
+    except Exception as e:
+        await ctx.error(f"Planning failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def generate_storyboard(
+    ctx: Context[ServerSession, AppContext],
+    shots: list[dict[str, Any]],
+    title: str = "Storyboard",
+    subtitle: str | None = None,
+    model: ImageModel | RetiredImageModel = "gemini-3.1-flash-image",
+    aspect_ratio: str = "16:9",
+    image_size: ImageSize | None = None,
+    theme: str = "dark",
+    dry_run: bool = False,
+):
+    """Generate a keyframe per shot and return a real, reviewable storyboard.
+
+    The missing step between an idea and `generate_clip`: render one keyframe
+    for every shot, then compose them into an actual storyboard you can read —
+    numbered panels with slug lines, prompts, camera notes and duration
+    badges — instead of a bare list of image URLs.
+
+    Two artifacts come back, because MCP clients render inline images but do
+    not execute HTML:
+      1. A composited contact-sheet PNG, returned inline. This is the thing
+         you look at.
+      2. A self-contained HTML page written to disk (open the file:// URL in a
+         browser) with full-size frames, complete prompt text and cumulative
+         timecode.
+
+    A shot whose generation fails does not abort the board: it renders as a
+    clearly marked panel showing the error, so a partial storyboard stays
+    reviewable. The shot list is designed to be fed straight into
+    `generate_clip` as `beats` once the board reads well.
+
+    Args:
+        ctx: MCP context with application state
+        shots: Ordered shot specs. Each accepts:
+            {prompt: str, caption?: str, duration_seconds?: float,
+             notes?: str}. `prompt` is required; `caption` is a short slug
+            line, `notes` are camera/lighting notes.
+        title: Board title drawn on the sheet.
+        subtitle: Optional second line under the title.
+        model: Image model for the keyframes.
+        aspect_ratio: Frame aspect, e.g. "16:9" for landscape, "9:16" for a
+            vertical reel. Drives the panel shape on the sheet.
+        image_size: Keyframe resolution. Leave unset for the model default —
+            storyboard frames rarely need to be large.
+        theme: "dark" or "light" board styling.
+        dry_run: Estimate the cost of the whole board and generate nothing.
+
+    Returns:
+        The contact sheet inline, plus JSON with storyboard_url (HTML),
+        sheet_url (PNG), per-shot results, total cost and total runtime.
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+
+        if not shots:
+            raise ValueError("shots list must not be empty")
+        for i, shot in enumerate(shots):
+            if not str(shot.get("prompt", "")).strip():
+                raise ValueError(f"shots[{i}] is missing a non-empty 'prompt'")
+
+        from .image import resolve_image_model
+
+        resolved, plan_warnings, effective_size = resolve_image_model(model, image_size)
+
+        if dry_run:
+            per_frame = _image_cost(resolved, effective_size)
+            total = dict(per_frame) if per_frame else None
+            if total is not None:
+                total["usd"] = round(float(per_frame["usd"]) * len(shots), 6)
+                total["detail"] = f"{len(shots)} storyboard keyframes @ {resolved}"
+                total.pop("usd_display", None)
+            payload: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "shots": len(shots),
+                "requested_model": model,
+                "model": resolved,
+                "image_size": effective_size,
+                "estimated_cost": total,
+            }
+            if plan_warnings:
+                payload["warnings"] = plan_warnings
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        from .storyboard import StoryboardFrame, render_contact_sheet, write_storyboard
+
+        frames: list[StoryboardFrame] = []
+        shot_results: list[dict[str, Any]] = []
+        costs: list[Any] = []
+        warnings_seen: list[str] = list(plan_warnings)
+
+        for i, shot in enumerate(shots, start=1):
+            prompt = str(shot["prompt"])
+            duration = shot.get("duration_seconds")
+            await ctx.info(f"Storyboard shot {i}/{len(shots)}")
+            try:
+                result = await generate_image_impl(
+                    client=app_ctx.client,
+                    prompt=prompt,
+                    images_dir=app_ctx.images_dir,
+                    model=model,
+                    image_size=image_size,
+                    aspect_ratio=aspect_ratio,
+                )
+                image_url = result.get("image_url")
+                frame_bytes: bytes | None = None
+                if image_url:
+                    frame_bytes = Path(image_url[7:]).read_bytes()
+                raw_cost = _image_cost_estimate(
+                    result.get("model", resolved),
+                    effective_size,
+                    usage=result.get("usage"),
+                )
+                cost = _cost_payload(raw_cost)
+                if raw_cost is not None:
+                    costs.append(raw_cost)
+                for warning in result.get("warnings", []):
+                    if warning not in warnings_seen:
+                        warnings_seen.append(warning)
+                if frame_bytes is None:
+                    raise ValueError(
+                        result.get("generated_text")
+                        or "model returned no image for this shot"
+                    )
+                frames.append(
+                    StoryboardFrame(
+                        index=i,
+                        image_bytes=frame_bytes,
+                        prompt=prompt,
+                        caption=shot.get("caption"),
+                        duration_seconds=duration,
+                        notes=shot.get("notes"),
+                        image_url=image_url,
+                    )
+                )
+                shot_results.append({"shot": i, "image_url": image_url, "cost": cost})
+            except Exception as shot_error:  # keep the board reviewable
+                logger.warning("Storyboard shot %d failed: %s", i, shot_error)
+                frames.append(
+                    StoryboardFrame(
+                        index=i,
+                        image_bytes=None,
+                        prompt=prompt,
+                        caption=shot.get("caption"),
+                        duration_seconds=duration,
+                        notes=shot.get("notes"),
+                        error=str(shot_error),
+                    )
+                )
+                shot_results.append({"shot": i, "error": str(shot_error)})
+
+        board_theme = "light" if str(theme).lower() == "light" else "dark"
+        # Rendering a large board is a few hundred ms of CPU; keep the event
+        # loop free while it runs.
+        artifacts = await asyncio.to_thread(
+            write_storyboard,
+            frames,
+            app_ctx.images_dir,
+            title=title,
+            subtitle=subtitle,
+            theme=board_theme,
+        )
+        # A narrower sheet for the inline copy: the full-size board is on disk.
+        inline_png = await asyncio.to_thread(
+            render_contact_sheet,
+            frames,
+            title=title,
+            subtitle=subtitle,
+            theme=board_theme,
+            max_sheet_width=1200,
+        )
+
+        failed = [r for r in shot_results if "error" in r]
+        total_runtime = sum(float(s.get("duration_seconds") or 0) for s in shots)
+        response_data: dict[str, Any] = {
+            "message": f"Storyboard rendered: {len(shots) - len(failed)}/{len(shots)} shots",
+            "storyboard_url": artifacts["html_url"],
+            "sheet_url": artifacts["sheet_url"],
+            "model": resolved,
+            "aspect_ratio": aspect_ratio,
+            "shots": shot_results,
+            "total_duration_seconds": total_runtime,
+        }
+        if failed:
+            response_data["errors"] = failed
+        if warnings_seen:
+            response_data["warnings"] = warnings_seen
+            for warning in warnings_seen:
+                await ctx.warning(warning)
+        if costs:
+            try:
+                from .pricing import sum_costs
+
+                response_data["cost"] = _cost_payload(
+                    sum_costs(costs, label="storyboard")
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Could not total storyboard cost", exc_info=True)
+
+        await ctx.info("Storyboard complete")
+        return [
+            Image(data=inline_png, format="png"),
+            TextContent(type="text", text=json.dumps(response_data, indent=2)),
+        ]
+    except Exception as e:
+        await ctx.error(f"Storyboard failed: {e}")
+        logger.exception("Tool error")
+        return [TextContent(type="text", text=json.dumps({"error": str(e)}, indent=2))]
 
 
 @mcp.tool()

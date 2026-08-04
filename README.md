@@ -113,6 +113,39 @@ This writes files to your host path and returns paths like `/Users/yourusername/
 
 ## Available Tools
 
+### plan_generation
+
+**Start here when you are not sure which tool or model to use.** Describe what you want in plain language and get back ranked, ready-to-call plans — which tool, which model, which parameters, why that model won, what each option costs, and which models were ruled out and for what reason.
+
+It generates nothing, costs nothing, and is instant: pure rule-based routing over this server's capability tables, not a model call. It never replaces the explicit `generate_*` tools — it tells you how to drive them.
+
+**Parameters:**
+- `intent` (required): plain language, e.g. `a 3-beat vertical reel about coffee`, `a poster with the words GRAND OPENING`
+- Optional overrides (these always beat what's inferred from the text): `budget` (`cheap`/`balanced`/`best`), `media_kind`, `aspect_ratio`, `image_size`, `duration_seconds`, `num_beats`, `needs_text_rendering`, `needs_4k`, `needs_audio`, `needs_extension`, `num_reference_images`, `wants_gcs_output`, `is_draft`, `pinned_model`
+
+**Returns:** ranked `routes` (tool, model, ready-to-use `params`, score, rationale, caveats, cost), `rejected` models **with reasons**, `conflicts`, a suggested multi-step `workflow`, and `notes`.
+
+It catches requests that cannot work *before* you pay for the failure — 4K on a 1K-only model, extension or first/last-frame on Veo Lite, GCS output on the Gemini API — and reports each as a conflict with a fix.
+
+> Capability beats budget by design. Ask for legible text on a `cheap` budget and it still recommends `gemini-3-pro-image`: a cheap image that fails the brief isn't cheap.
+
+### generate_storyboard
+
+The missing step between an idea and `generate_clip`. Renders one keyframe per shot, then composes them into a **real, readable storyboard** — numbered panels with slug lines, prompts, camera notes and duration badges — instead of a bare list of image URLs.
+
+Two artifacts come back, because MCP clients render inline images but do not execute HTML:
+1. **A composited contact-sheet PNG, returned inline** — this is the thing you look at in chat.
+2. **A self-contained HTML page written to disk** (`file://` URL) with full-size frames, complete prompt text and cumulative timecode. Fully offline: images embedded as data URIs, no external requests.
+
+**Parameters:**
+- `shots` (required): ordered specs — `{prompt, caption?, duration_seconds?, notes?}`. `caption` is a slug line, `notes` are camera/lighting notes
+- `title`, `subtitle`: drawn on the board
+- `model`, `aspect_ratio`, `image_size`: keyframe generation settings (`9:16` gives vertical panels)
+- `theme`: `dark` (default) or `light`
+- `dry_run`: price the whole board without generating
+
+**A failed shot does not abort the board** — it renders as a clearly marked panel showing the actual error, so a partial storyboard stays reviewable, and it isn't billed. The `shots` list is designed to be fed straight into `generate_clip` as `beats` once the board reads well.
+
 ### generate_image
 
 Generate images using Gemini image models.
@@ -141,6 +174,9 @@ Generate images using Gemini image models.
 - `image_base64`: Base64 encoded input image
 - `aspect_ratio`: Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`)
 - `person_generation`: Policy for generating people (e.g. `allow_adult`, `dont_allow`)
+- `dry_run`: Return only the cost estimate and the resolved model/parameters — generates nothing, free and instant
+
+Every real run reports `usage` (the token counts the API metered) and `cost` derived from them, and writes both into the sidecar manifest. A dry run prices **the call that would actually be issued**: ask for `imagen-4.0-generate-001` at 4K and it quotes `gemini-3.1-flash-image`; ask `gemini-3.1-flash-lite-image` for 4K and it quotes its 1K default and tells you why.
 
 **Gemini 3.x Image Parameters** (for `gemini-3-pro-image`, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`):
 - `reference_image_uris`: List of up to 14 reference image URIs for multi-image composition
