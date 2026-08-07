@@ -4416,3 +4416,111 @@ async def test_plan_generation_returns_the_same_shape_as_every_other_tool(
     assert isinstance(result, list)
     assert isinstance(result[0], TextContent)
     assert json.loads(result[0].text)["media_kind"] == "image"
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        pytest.param(
+            "generate_video",
+            {"prompt": "a cat", "model": "veo-3.1-generate-001"},
+            id="generate_video",
+        ),
+        pytest.param(
+            "generate_transition",
+            {"first_frame_uri": "file:///a.png", "last_frame_uri": "file:///b.png"},
+            id="generate_transition",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {"from_clip_uri": "file:///a.mp4", "to_clip_uri": "file:///b.mp4"},
+            id="generate_bridge",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_tools_reject_a_negative_duration_before_generating(
+    tool: str,
+    kwargs: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative duration snapped to the 4s minimum and was generated and
+    billed, while pricing declined it — the two layers disagreed."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("a negative duration must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+
+    result = await getattr(main_mod, tool)(
+        ctx=_video_ctx(tmp_path), duration_seconds=-5, **kwargs
+    )
+    payload = json.loads(result if isinstance(result, str) else result[0].text)
+    assert "must not be negative" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_validates_every_beat_before_rendering_any(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bad duration in a later beat used to surface only after the earlier
+    beats had been generated and billed."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("an invalid beat must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+
+    result = await main_mod.generate_clip(
+        ctx=_video_ctx(tmp_path),
+        beats=[
+            {"prompt": "fine"},
+            {"prompt": "fine too"},
+            {"prompt": "bad", "duration_seconds": -3},
+        ],
+    )
+    payload = json.loads(result)
+    assert "beats[2].duration_seconds" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_manifest_records_the_model_that_actually_ran(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Veo IDs are translated per backend — the Gemini API serves -preview
+    spellings — so a manifest naming the requested ID misreports what was
+    billed."""
+    import src.__main__ as main_mod
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "v.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs["prompt"],
+            # What the backend actually served.
+            "model": "veo-3.1-generate-preview",
+            "duration_seconds": 8,
+            "audio_enabled": True,
+            "generation_mode": "text_to_video",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", mock_impl)
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path), prompt="a cat", model="veo-3.1-generate-001"
+        )
+    )
+    manifest = json.loads(Path(payload["sidecar_url"][7:]).read_text())
+    assert manifest["model"] == "veo-3.1-generate-preview"

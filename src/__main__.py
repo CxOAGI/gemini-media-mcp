@@ -367,6 +367,33 @@ def _validate_aspect_ratio(aspect_ratio: str) -> None:
         )
 
 
+def _validate_duration_seconds(
+    duration_seconds: float | None,
+    field: str = "duration_seconds",
+) -> None:
+    """Raise ValueError for a duration no model could render.
+
+    The impls snap a requested duration to a length the model supports, and
+    the snap is nearest-match — so a negative value quietly became the 4s
+    minimum and was generated and billed. Pricing declines negatives, so
+    without this the two layers disagreed: a dry run reported the request as
+    unpriceable while the real call charged for it.
+
+    Zero is deliberately allowed: it snaps to the model's minimum in both
+    layers, so they still agree.
+    """
+    if duration_seconds is None:
+        return
+    try:
+        value = float(duration_seconds)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{field} must be a number, got {duration_seconds!r}"
+        ) from None
+    if value < 0:
+        raise ValueError(f"{field} must not be negative, got {value:g}")
+
+
 def _resolve_video_gcs(
     output_gcs_uri: str | None,
     default_bucket: str | None,
@@ -1380,6 +1407,7 @@ async def generate_video(
 
         # Fail fast on an unsupported aspect ratio before any fetch work.
         _validate_aspect_ratio(aspect_ratio)
+        _validate_duration_seconds(duration_seconds)
 
         # Draft mode: hand off to the fast omni path. Omni supports only a
         # text prompt + optional input image(s), so Veo-only controls are
@@ -1549,7 +1577,9 @@ async def generate_video(
             "prompt": prompt,
             "audio_prompt": audio_prompt,
             "negative_prompt": negative_prompt,
-            "model": model,
+            # The model that actually ran: the impl translates Veo IDs
+            # per backend (the Gemini API serves -preview spellings).
+            "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
             "resolution": resolution,
@@ -1629,6 +1659,7 @@ async def generate_transition(
 
         # Fail fast on an unsupported aspect ratio before any fetch work.
         _validate_aspect_ratio(aspect_ratio)
+        _validate_duration_seconds(duration_seconds)
 
         # Resolve the client up front so GCS gating can see which backend is
         # in play (the Gemini API does not support GCS output).
@@ -1683,7 +1714,9 @@ async def generate_transition(
             "prompt": prompt,
             "audio_prompt": audio_prompt,
             "negative_prompt": negative_prompt,
-            "model": model,
+            # The model that actually ran: the impl translates Veo IDs
+            # per backend (the Gemini API serves -preview spellings).
+            "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
             "audio_enabled": result.get("audio_enabled", include_audio),
@@ -1759,6 +1792,7 @@ async def generate_bridge(
 
         # Fail fast on an unsupported aspect ratio before any fetch work.
         _validate_aspect_ratio(aspect_ratio)
+        _validate_duration_seconds(duration_seconds)
 
         # Resolve the client up front so GCS gating can see which backend is
         # in play (the Gemini API does not support GCS output).
@@ -1817,7 +1851,9 @@ async def generate_bridge(
             "prompt": prompt,
             "audio_prompt": audio_prompt,
             "negative_prompt": negative_prompt,
-            "model": model,
+            # The model that actually ran: the impl translates Veo IDs
+            # per backend (the Gemini API serves -preview spellings).
+            "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
             "audio_enabled": result.get("audio_enabled", include_audio),
@@ -1911,6 +1947,20 @@ async def generate_clip(
 
         if not beats:
             raise ValueError("beats list must not be empty")
+
+        # Validate every beat before rendering any of them. A bad duration in
+        # beat 5 would otherwise only surface after beats 1-4 had been
+        # generated and billed.
+        for beat_index, beat_spec in enumerate(beats):
+            if not isinstance(beat_spec, dict):
+                raise ValueError(
+                    f"beats[{beat_index}] must be an object with a 'prompt', "
+                    f"got {type(beat_spec).__name__}"
+                )
+            _validate_duration_seconds(
+                beat_spec.get("duration_seconds"),
+                f"beats[{beat_index}].duration_seconds",
+            )
 
         # Validate the clip-level aspect ratio once, up front. Otherwise the
         # impl's per-value ValueError fires inside every beat's error handler,
@@ -2117,7 +2167,7 @@ async def generate_clip(
                         bridge_manifest = {
                             "kind": "bridge",
                             "between_beats": [idx - 1, idx],
-                            "model": model,
+                            "model": bridge_result.get("model", model),
                             "aspect_ratio": aspect_ratio,
                             "duration_seconds": bridge_result.get(
                                 "duration_seconds", 4.0
@@ -2396,6 +2446,10 @@ async def loop_extend(
         current = video_uri
         steps: list[str] = []
         step_warnings: list[str] = []
+        # The model that actually ran. Seeded with the request so it is bound
+        # even if the loop body never executes, then overwritten with the
+        # backend-translated ID the impl reports.
+        served_model = str(model)
         for i in range(times):
             await ctx.info(f"Extension {i + 1}/{times}")
             ext_result = await generate_video_impl(
@@ -2415,12 +2469,15 @@ async def loop_extend(
                 raise ValueError(f"Extension {i + 1} produced no video URL.")
             steps.append(current)
             step_warnings.extend(ext_result.get("warnings") or [])
+            served_model = ext_result.get("model", model)
 
         manifest: dict[str, Any] = {
             "kind": "loop_extend",
             "source_video_uri": video_uri,
             "prompt": prompt,
-            "model": model,
+            # The model that actually ran: the impl translates Veo IDs
+            # per backend (the Gemini API serves -preview spellings).
+            "model": served_model,
             "aspect_ratio": aspect_ratio,
             "times": times,
             "final_video_url": current,
@@ -2429,7 +2486,7 @@ async def loop_extend(
         result: dict[str, Any] = {
             "message": f"Extended video {times} time(s)",
             "video_url": current,
-            "model": model,
+            "model": served_model,
             "times": times,
             "extension_steps": steps,
         }
