@@ -28,6 +28,7 @@ from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import OMNI_MODEL
 from .routing import BudgetPreference, MediaKind
+from .storyboard import Theme
 from .omni import generate_video_omni as generate_video_omni_impl
 from .video import _VEO_LITE_MODELS, VideoModel
 from .video import generate_video as generate_video_impl
@@ -897,7 +898,9 @@ async def generate_image(
             # legacy Imagen ID was rerouted to its Gemini GA replacement.
             "model": result["model"],
             "image_url": result["image_url"],
-            "image_size": image_size,
+            # The size actually used, which differs from the request when the
+            # resolved model cannot produce it (see warnings).
+            "image_size": result.get("image_size", image_size),
             "media_resolution": media_resolution,
             "aspect_ratio": aspect_ratio,
             "person_generation": person_generation,
@@ -947,7 +950,7 @@ async def plan_generation(
     wants_gcs_output: bool | None = None,
     is_draft: bool | None = None,
     pinned_model: str | None = None,
-) -> str:
+):
     """Decide HOW to generate something before spending anything on it.
 
     Describe what you want in plain language and get back ranked, ready-to-call
@@ -1038,11 +1041,11 @@ async def plan_generation(
             f"Planned {plan.media_kind}: {len(plan.routes)} route(s), "
             f"{len(plan.conflicts)} conflict(s)"
         )
-        return json.dumps(payload, indent=2)
+        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
     except Exception as e:
         await ctx.error(f"Planning failed: {e}")
         logger.exception("Tool error")
-        return json.dumps({"error": str(e)}, indent=2)
+        return [TextContent(type="text", text=json.dumps({"error": str(e)}, indent=2))]
 
 
 @mcp.tool()
@@ -1054,7 +1057,7 @@ async def generate_storyboard(
     model: ImageModel | RetiredImageModel = "gemini-3.1-flash-image",
     aspect_ratio: str = "16:9",
     image_size: ImageSize | None = None,
-    theme: str = "dark",
+    theme: Theme = "dark",
     dry_run: bool = False,
 ):
     """Generate a keyframe per shot and return a real, reviewable storyboard.
@@ -1090,7 +1093,7 @@ async def generate_storyboard(
             vertical reel. Drives the panel shape on the sheet.
         image_size: Keyframe resolution. Leave unset for the model default —
             storyboard frames rarely need to be large.
-        theme: "dark" or "light" board styling.
+        theme: "dark" (default) or "light" board styling.
         dry_run: Estimate the cost of the whole board and generate nothing.
 
     Returns:
@@ -1171,6 +1174,13 @@ async def generate_storyboard(
         costs: list[Any] = []
         warnings_seen: list[str] = list(plan_warnings)
 
+        # Log any substitution once for the whole board. The per-shot calls
+        # below are handed the already-resolved model, so the impl has nothing
+        # left to reroute — otherwise a 24-shot board pinned to a retired ID
+        # would emit 24 identical warnings.
+        for warning in plan_warnings:
+            logger.warning("%s", warning)
+
         for i, shot in enumerate(shots, start=1):
             prompt = str(shot["prompt"])
             duration = shot.get("duration_seconds")
@@ -1180,8 +1190,8 @@ async def generate_storyboard(
                     client=app_ctx.client,
                     prompt=prompt,
                     images_dir=app_ctx.images_dir,
-                    model=model,
-                    image_size=image_size,
+                    model=resolved,
+                    image_size=effective_size,
                     aspect_ratio=aspect_ratio,
                 )
                 image_url = result.get("image_url")
@@ -1231,7 +1241,6 @@ async def generate_storyboard(
                 )
                 shot_results.append({"shot": i, "error": str(shot_error)})
 
-        board_theme = "light" if str(theme).lower() == "light" else "dark"
         # Rendering a large board is a few hundred ms of CPU; keep the event
         # loop free while it runs.
         artifacts = await asyncio.to_thread(
@@ -1240,7 +1249,7 @@ async def generate_storyboard(
             app_ctx.images_dir,
             title=title,
             subtitle=subtitle,
-            theme=board_theme,
+            theme=theme,
         )
         # A narrower sheet for the inline copy: the full-size board is on disk.
         inline_png = await asyncio.to_thread(
@@ -1248,7 +1257,7 @@ async def generate_storyboard(
             frames,
             title=title,
             subtitle=subtitle,
-            theme=board_theme,
+            theme=theme,
             max_sheet_width=1200,
         )
 

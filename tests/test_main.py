@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -4077,12 +4078,11 @@ async def test_plan_generation_ranks_and_explains(tmp_path: Path) -> None:
     """The router tool returns ranked routes and names what it ruled out."""
     from src.__main__ import plan_generation
 
-    payload = json.loads(
-        await plan_generation(
-            ctx=_image_ctx(tmp_path),
-            intent="a hi-res 4k product shot for print",
-        )
+    result = await plan_generation(
+        ctx=_image_ctx(tmp_path),
+        intent="a hi-res 4k product shot for print",
     )
+    payload = json.loads(result[0].text)
     assert payload["media_kind"] == "image"
     assert payload["routes"], "expected at least one route"
     top = payload["routes"][0]
@@ -4102,14 +4102,13 @@ async def test_plan_generation_flags_impossible_requests(tmp_path: Path) -> None
     would fail at call time."""
     from src.__main__ import plan_generation
 
-    payload = json.loads(
-        await plan_generation(
-            ctx=_image_ctx(tmp_path),
-            intent="extend this video",
-            pinned_model="veo-3.1-lite-generate-preview",
-            needs_extension=True,
-        )
+    result = await plan_generation(
+        ctx=_image_ctx(tmp_path),
+        intent="extend this video",
+        pinned_model="veo-3.1-lite-generate-preview",
+        needs_extension=True,
     )
+    payload = json.loads(result[0].text)
     codes = [c["code"] for c in payload["conflicts"]]
     assert any("extension_unsupported" in c for c in codes)
 
@@ -4307,3 +4306,113 @@ async def test_storyboard_validates_shots_before_spending_anything(
 
     result = await generate_storyboard(ctx=_image_ctx(tmp_path), shots=[bad_shot])
     assert expected in json.loads(result[0].text)["error"]
+
+
+# ============================================================================
+# Review follow-ups
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_storyboard_logs_a_substitution_once_not_once_per_shot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A board pinned to a retired ID must log the reroute once.
+
+    Each shot used to be handed the raw model, so the impl re-resolved and
+    re-logged it — a 24-shot board produced 24 identical server warnings.
+    """
+    from src.__main__ import generate_storyboard
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+    seen_models: list[str] = []
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        seen_models.append(kwargs["model"])
+        out = images_dir / f"s{len(seen_models)}.png"
+        out.write_bytes(_create_test_image())
+        return {
+            "message": "ok",
+            "image_url": f"file://{out}",
+            "image_preview": "data:image/jpeg;base64,x",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    with caplog.at_level(logging.WARNING, logger="src.__main__"):
+        result = await generate_storyboard(
+            ctx=_image_ctx(tmp_path),
+            shots=[{"prompt": f"shot {i}"} for i in range(4)],
+            model="imagen-4.0-generate-001",
+        )
+
+    # The impl is handed the resolved model, so it has nothing left to reroute.
+    assert seen_models == ["gemini-3.1-flash-image"] * 4
+    reroutes = [r for r in caplog.records if "2026-08-17" in r.getMessage()]
+    assert len(reroutes) == 1, f"expected one reroute log, got {len(reroutes)}"
+
+    # The caller is still told exactly once, too.
+    data = json.loads(result[1].text)
+    assert len([w for w in data["warnings"] if "2026-08-17" in w]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_image_manifest_records_the_size_actually_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the resolved model cannot produce the requested size, the sidecar
+    must record what was really used rather than the unhonoured request."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "sized.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-lite-image",
+            # The impl reports the effective size: 4K was dropped.
+            "image_size": None,
+            "warnings": ["gemini-3.1-flash-lite-image does not support image_size=4K"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="gemini-3.1-flash-lite-image",
+        image_size="4K",
+    )
+    data = json.loads(result[1].text)
+    manifest = json.loads(Path(data["sidecar_url"][7:]).read_text())
+    assert manifest["image_size"] is None, "manifest must not claim 4K was used"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_returns_the_same_shape_as_every_other_tool(
+    tmp_path: Path,
+) -> None:
+    """It used to return a bare str while every sibling returns content parts."""
+    from mcp.types import TextContent
+
+    from src.__main__ import plan_generation
+
+    result = await plan_generation(ctx=_image_ctx(tmp_path), intent="a photo")
+    assert isinstance(result, list)
+    assert isinstance(result[0], TextContent)
+    assert json.loads(result[0].text)["media_kind"] == "image"

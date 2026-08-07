@@ -542,9 +542,18 @@ def estimate_video_cost(
 
     Returns:
         A ``CostEstimate`` with ``is_estimate=True``, or None when the model
-        is unknown or the model has no published rate for that resolution
-        (e.g. 4K on Veo 3.1 Lite).
+        is unknown, the duration is negative, or the model has no published
+        rate for that resolution (e.g. 4K on Veo 3.1 Lite).
     """
+    # A negative duration is not a short clip, it is a bad call. Snapping it
+    # to the 4s floor would quote a real price for an impossible request, so
+    # decline it the same way an unknown model is declined.
+    try:
+        if float(duration_seconds) < 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+
     model_id = resolve_model_id(model)
     pricing = _VIDEO_PRICING.get(model_id)
     if pricing is None:

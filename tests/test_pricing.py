@@ -858,3 +858,30 @@ def test_the_two_preview_aliases_do_not_collapse_onto_one_price() -> None:
     assert pro.usd > flash.usd, "pro preview must not be priced at flash rates"
     assert pro.usd == estimate_image_cost("gemini-3-pro-image", "4K", 1).usd
     assert flash.usd == estimate_image_cost("gemini-3.1-flash-image", "4K", 1).usd
+
+
+def test_a_negative_duration_is_declined_not_snapped_to_the_floor() -> None:
+    """A negative duration is a bad call, not a short clip.
+
+    Snapping it to Veo's 4s floor quoted a real price for an impossible
+    request — and disagreed with estimate_image_cost, which already declines
+    a negative count.
+    """
+    from src.pricing import estimate_image_cost, estimate_video_cost
+
+    assert estimate_video_cost("veo-3.1-generate-001", -5) is None
+    assert estimate_video_cost("veo-3.1-fast-generate-001", -0.1) is None
+    assert estimate_video_cost("gemini-omni-flash-preview", -1) is None
+    assert estimate_image_cost("gemini-3.1-flash-image", "1K", -1) is None
+
+    # Zero is a genuine request that snaps to the model's minimum, so it keeps
+    # its price; only negatives are refused.
+    zero = estimate_video_cost("veo-3.1-generate-001", 0)
+    assert zero is not None and zero.usd > 0
+
+
+def test_a_non_numeric_duration_is_declined() -> None:
+    """Bad input must not raise out of a pricing lookup."""
+    from src.pricing import estimate_video_cost
+
+    assert estimate_video_cost("veo-3.1-generate-001", "soon") is None  # type: ignore[arg-type]

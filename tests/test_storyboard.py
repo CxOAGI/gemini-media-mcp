@@ -737,3 +737,13 @@ def test_folding_keeps_wrapping_consistent_with_drawing() -> None:
     bundled = ImageFont.load_default(size=20)
     text = "a — b"
     assert _text_width(bundled, text) == bundled.getlength(_drawable(text, bundled))
+
+
+def test_theme_literal_matches_what_render_accepts() -> None:
+    """The MCP tool advertises Theme in its schema, so the alias and the
+    renderer's accepted values must not drift apart."""
+    from typing import get_args
+
+    from src.storyboard import Theme
+
+    assert set(get_args(Theme)) == {"dark", "light"}

@@ -226,7 +226,7 @@ async def generate_image(
     client: genai.Client,
     prompt: str,
     images_dir: Path,
-    model: ImageModel | RetiredImageModel = "gemini-3.1-flash-image",
+    model: ImageModel | RetiredImageModel | str = "gemini-3.1-flash-image",
     image_bytes: bytes | None = None,
     reference_images: list[bytes] | None = None,
     image_size: ImageSize | None = None,
@@ -256,7 +256,10 @@ async def generate_image(
         client: Google GenAI client
         prompt: Text description of the image to generate
         images_dir: Directory to save generated images
-        model: Model to use for generation
+        model: Model to use for generation. Typed to include ``str`` because
+            an unrecognised ``imagen-*`` variant is deliberately rerouted
+            rather than rejected; the MCP tool keeps the strict union so the
+            published schema still advertises only real models.
         image_bytes: Input image bytes for editing
         reference_images: List of reference image bytes (up to 14 for Gemini 3.x image models)
         image_size: Output image size (1K, 2K, 4K) - must use uppercase K
@@ -443,6 +446,9 @@ async def generate_image(
             "image_preview": f"data:image/jpeg;base64,{thumb_base64}",
             "prompt": prompt,
             "model": model_id,
+            # The size actually requested of the API, which is None when the
+            # resolved model could not honour what the caller asked for.
+            "image_size": image_size,
         }
 
         # Token counts the API actually metered, so the MCP layer can report
