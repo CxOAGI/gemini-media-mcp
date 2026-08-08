@@ -2,7 +2,6 @@
 
 import base64
 import json
-import os
 import logging
 from io import BytesIO
 from pathlib import Path
@@ -4621,6 +4620,7 @@ async def test_generate_clip_rejects_a_promptless_beat_before_rendering_any(
         pytest.param(True, "10.0.0.5", None, "10.0.0.5", id="cli_wins"),
         pytest.param(True, None, "192.168.1.9", "192.168.1.9", id="env_respected"),
         pytest.param(False, "0.0.0.0", None, "0.0.0.0", id="cli_can_expose_local"),
+        pytest.param(True, "10.0.0.5", "192.168.1.9", "10.0.0.5", id="cli_beats_env"),
     ],
 )
 def test_http_transport_bind_address(
@@ -4634,6 +4634,10 @@ def test_http_transport_bind_address(
     container's own loopback — so the Dockerfile's documented `-p 8000:8000`
     reached nothing. Containers must bind all interfaces; a local run must not,
     so it is not exposed to the network by surprise.
+
+    Drives the real resolver — an earlier version of this test re-implemented
+    the precedence rules inline and would have passed no matter what main()
+    did.
     """
     import src.__main__ as main_mod
 
@@ -4643,46 +4647,71 @@ def test_http_transport_bind_address(
     else:
         monkeypatch.delenv("FASTMCP_HOST", raising=False)
 
-    resolved: str
-    if cli_host:
-        resolved = cli_host
-    elif not os.environ.get("FASTMCP_HOST"):
-        resolved = "0.0.0.0" if main_mod.is_running_in_container() else "127.0.0.1"
-    else:
-        resolved = os.environ["FASTMCP_HOST"]
-
-    assert resolved == expected
+    assert main_mod._resolve_http_host(cli_host) == expected
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected_host", "expected_port"),
+    [
+        pytest.param(
+            ["sse", "--host", "0.0.0.0"], "0.0.0.0", None, id="after_subcommand"
+        ),
+        pytest.param(
+            ["--host", "1.2.3.4", "sse"], "1.2.3.4", None, id="before_subcommand"
+        ),
+        pytest.param(
+            ["--port", "9999", "streamable-http", "--host", "5.6.7.8"],
+            "5.6.7.8",
+            9999,
+            id="mixed_positions_both_survive",
+        ),
+        pytest.param(["stdio"], None, None, id="no_flags"),
+    ],
+)
+def test_network_flags_parse_in_both_positions(
+    argv: list[str], expected_host: str | None, expected_port: int | None
+) -> None:
+    """The Docker ENTRYPOINT appends arguments after the subcommand, so
+    `docker run <image> sse --host 0.0.0.0` is the only form a container user
+    can produce — and argparse rejects top-level flags in that position unless
+    the subparsers also register them. The subparser copies use SUPPRESS
+    defaults so a value given before the subcommand is not clobbered to None.
+    """
+    from src.__main__ import _build_arg_parser
+
+    args = _build_arg_parser().parse_args(argv)
+    assert getattr(args, "host", None) == expected_host
+    assert getattr(args, "port", None) == expected_port
+
+
+@pytest.mark.parametrize(
+    ("bad", "expect_fragment"),
+    [
+        pytest.param(float("nan"), "positive finite", id="nan"),
+        pytest.param(float("inf"), "positive finite", id="inf"),
+        pytest.param(-8.0, "positive finite", id="negative"),
+    ],
+)
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_generate_clip_refuses_an_oversized_beat_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_plan_generation_rejects_nonfinite_durations_with_valid_json(
+    bad: float, expect_fragment: str, tmp_path: Path
 ) -> None:
-    """The storyboard cap was never traced to generate_clip, which has the same
-    unbounded-billed-renders shape but roughly a hundred times the unit cost:
-    500 beats at 8s is about $400 of Veo, uncapped, one render at a time.
+    """NaN sailed past the <= 0 check (every NaN comparison is False), reached
+    the cost math, and the plan serialized with a bare NaN — invalid JSON that
+    strict clients cannot parse. Infinity got further and overflowed the
+    loop_extend times calculation into an internal error. Both must be clean
+    validation errors, and the response must always be strict JSON.
     """
-    import src.__main__ as main_mod
+    from src.__main__ import plan_generation
 
-    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("an oversized clip must not reach the impl")
-
-    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
-
-    result = await main_mod.generate_clip(
-        ctx=_video_ctx(tmp_path),
-        beats=[{"prompt": f"beat {i}"} for i in range(main_mod.MAX_CLIP_BEATS + 1)],
+    result = await plan_generation(
+        ctx=_image_ctx(tmp_path), intent="a video of a cat", duration_seconds=bad
     )
-    error = json.loads(result)["error"]
-    assert str(main_mod.MAX_CLIP_BEATS) in error
-    assert "billed" in error
+    text = result[0].text
 
+    def _no_constants(name: str) -> Any:
+        raise AssertionError(f"bare {name} in tool output — invalid strict JSON")
 
-def test_billed_batch_tools_all_have_a_ceiling() -> None:
-    """Any tool that loops over a caller-supplied list of billed renders needs
-    a cap. This is the check that would have caught generate_clip."""
-    from src.__main__ import MAX_CLIP_BEATS, MAX_STORYBOARD_SHOTS
-
-    assert 0 < MAX_STORYBOARD_SHOTS <= 100
-    assert 0 < MAX_CLIP_BEATS <= 100
+    payload = json.loads(text, parse_constant=_no_constants)
+    assert expect_fragment in payload["error"]

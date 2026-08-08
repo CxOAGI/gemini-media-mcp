@@ -1,5 +1,6 @@
 """MCP server for Gemini media generation."""
 
+import argparse
 import asyncio
 import base64
 import ipaddress
@@ -2529,10 +2530,8 @@ async def loop_extend(
         return json.dumps({"error": str(e)})
 
 
-def main() -> None:
-    """Entry point."""
-    import argparse
-
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. Split from main() so tests parse the real thing."""
     parser = argparse.ArgumentParser(description="Gemini Media MCP Server")
     parser.add_argument(
         "--mount-path",
@@ -2564,10 +2563,23 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command")
 
     # Transport subcommands preserve the existing positional behavior
-    # (gemini-media-mcp [stdio|sse|streamable-http]).
+    # (gemini-media-mcp [stdio|sse|streamable-http]). The network flags are
+    # registered on the subparsers as well as the top level because argparse
+    # only accepts top-level flags BEFORE the subcommand — and the Docker
+    # ENTRYPOINT appends arguments after it, so `docker run <image> sse
+    # --host 0.0.0.0` is the only form a container user can produce.
+    # default=SUPPRESS so the subparser only writes these when actually
+    # given — a plain default of None would clobber a value supplied before
+    # the subcommand (`--host X sse` would silently lose X).
+    network_flags = argparse.ArgumentParser(add_help=False)
+    network_flags.add_argument("--host", default=argparse.SUPPRESS)
+    network_flags.add_argument("--port", type=int, default=argparse.SUPPRESS)
+    network_flags.add_argument("--mount-path", default=argparse.SUPPRESS)
     for transport in ("stdio", "sse", "streamable-http"):
         subparsers.add_parser(
-            transport, help=f"Run the MCP server with {transport} transport"
+            transport,
+            help=f"Run the MCP server with {transport} transport",
+            parents=[network_flags],
         )
 
     setup_parser = subparsers.add_parser(
@@ -2603,6 +2615,28 @@ def main() -> None:
         "--video-gcs-bucket", help="Optional gs:// URI for large video output."
     )
 
+    return parser
+
+
+def _resolve_http_host(cli_host: str | None) -> str:
+    """Bind address for the sse/streamable-http transports.
+
+    Explicit wins (CLI flag, then FASTMCP_HOST). Otherwise bind all
+    interfaces in a container — 127.0.0.1 there is the container's own
+    loopback, so a published port would reach nothing — and keep loopback
+    on a direct run so it is not exposed to the network by surprise.
+    """
+    if cli_host:
+        return cli_host
+    env_host = os.environ.get("FASTMCP_HOST")
+    if env_host:
+        return env_host
+    return "0.0.0.0" if is_running_in_container() else "127.0.0.1"  # noqa: S104
+
+
+def main() -> None:
+    """Entry point."""
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2651,14 +2685,9 @@ def main() -> None:
         # which made the Dockerfile's own documented `-p 8000:8000` usage
         # impossible. Bind all interfaces there, but keep loopback elsewhere
         # so a local run is not exposed to the network by surprise.
-        if args.host:
-            mcp.settings.host = args.host
-        elif not os.environ.get("FASTMCP_HOST"):
-            mcp.settings.host = (
-                "0.0.0.0" if is_running_in_container() else "127.0.0.1"  # noqa: S104
-            )
-        if args.port:
-            mcp.settings.port = args.port
+        mcp.settings.host = _resolve_http_host(getattr(args, "host", None))
+        if getattr(args, "port", None):
+            mcp.settings.port = args.port  # type: ignore[union-attr]
         logger.info(
             "Serving %s on %s:%s", transport, mcp.settings.host, mcp.settings.port
         )

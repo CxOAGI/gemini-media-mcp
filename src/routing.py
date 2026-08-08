@@ -1081,9 +1081,18 @@ class RoutingConstraints:
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}.")
-        if self.duration_seconds is not None and self.duration_seconds <= 0:
+        if self.duration_seconds is not None and (
+            not math.isfinite(self.duration_seconds) or self.duration_seconds <= 0
+        ):
+            # Non-finite values need an explicit check: every comparison with
+            # NaN is False, so it sailed past `<= 0`, reached the cost math,
+            # and serialized as bare NaN — invalid JSON — in the plan.
+            # Infinity got further still, overflowing the loop_extend
+            # times calculation. Same rule as _validate_duration_seconds in
+            # the generation tools.
             raise ValueError(
-                f"duration_seconds must be > 0, got {self.duration_seconds}."
+                "duration_seconds must be a positive finite number, got "
+                f"{self.duration_seconds!r}."
             )
 
 
