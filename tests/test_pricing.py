@@ -348,11 +348,39 @@ def test_video_estimate_matches_published_per_second_rates() -> None:
 
 
 def test_omni_per_second_derives_from_its_token_rate() -> None:
-    # 5,792 tokens per second of 720p video @ $17.50 per 1M tokens.
+    # 5,792 tokens per second of 720p video @ $17.50 per 1M tokens. The quote
+    # covers one frame of encoder overhang (omni renders a fraction over
+    # nominal), so the total is priced on 6s + one frame while the rate itself
+    # is unchanged.
+    from src.pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
     estimate = estimate_video_cost(OMNI_MODEL, 6)
     assert estimate is not None
-    assert estimate.usd == pytest.approx(6 * 5792 * 17.50 / 1e6)
+    quoted_seconds = 6 + OMNI_ENCODER_ALLOWANCE_SECONDS
+    assert estimate.usd == pytest.approx(quoted_seconds * 5792 * 17.50 / 1e6)
     assert estimate.breakdown["usd_per_second"] == pytest.approx(0.10136)
+
+
+def test_omni_quotes_never_undershoot_the_rendered_cost() -> None:
+    """A pre-flight may over-state but must never under-state — the tools say
+    so explicitly. Omni's container lands a fraction over nominal (3s measured
+    3.01s, a 10s edit measured 10.01s), so every omni quote came in just under
+    the metered cost until an allowance was added. Veo measured exactly on
+    nominal and gets none."""
+    from src.pricing import quote_duration_for
+
+    for nominal, measured in ((3.0, 3.01), (8.0, 8.01), (10.0, 10.01)):
+        quote = estimate_video_cost(OMNI_MODEL, nominal)
+        metered = actual_video_cost(
+            OMNI_MODEL, measured, "720p", True, snap_duration=False
+        )
+        assert quote is not None and metered is not None
+        assert quote.usd >= metered.usd, f"{nominal}s quote undershot {measured}s"
+
+    # Veo is unaffected: no allowance, so a quote matches to the cent.
+    assert quote_duration_for("veo-3.1-fast-generate-001", 4.0) == 4.0
+    veo = estimate_video_cost("veo-3.1-fast-generate-001", 4)
+    assert veo is not None and veo.usd == pytest.approx(4 * 0.10)
 
 
 def test_video_resolution_tiers_increase_with_resolution() -> None:

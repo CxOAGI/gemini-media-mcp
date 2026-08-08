@@ -446,6 +446,35 @@ def _normalize_resolution(resolution: str | None) -> str | None:
     return _RESOLUTION_ALIASES.get(key)
 
 
+# Omni's container duration lands a fraction over the nominal length: a 3s
+# request measured 3.01s and a 10s edit measured 10.01s, so every omni quote
+# came in just under the metered cost. Tiny per call, but the tools state the
+# invariant that a pre-flight may over-state and must never under-state, and a
+# 20-beat animatic accrues the shortfall twenty times. One frame at omni's
+# 24fps is the smallest principled allowance that clears the observed
+# overhang. Veo measured exactly on nominal, so it gets no allowance.
+_OMNI_FPS = 24
+OMNI_ENCODER_ALLOWANCE_SECONDS = 1.0 / _OMNI_FPS
+
+
+def quote_duration_for(model: str, duration_seconds: float) -> float:
+    """Duration to price a quote at, allowing for encoder overhang.
+
+    Estimates only. A metered cost uses the duration actually measured from
+    the rendered file and needs no allowance.
+
+    Args:
+        model: Model the quote is for; only Omni carries an allowance.
+        duration_seconds: Nominal duration being quoted.
+
+    Returns:
+        The duration to price, at or above ``duration_seconds``.
+    """
+    if resolve_model_id(model) == OMNI_MODEL:
+        return duration_seconds + OMNI_ENCODER_ALLOWANCE_SECONDS
+    return duration_seconds
+
+
 def snap_video_duration(
     model: str,
     duration_seconds: float,
@@ -632,7 +661,11 @@ def estimate_video_cost(
         # rejected anyway.
         return None
 
-    seconds = snap_video_duration(model_id, duration_seconds, generation_mode)
+    # Quote at or above what will be billed: omni renders a fraction over
+    # nominal, so a bare snapped duration under-quotes every omni call.
+    seconds = quote_duration_for(
+        model_id, snap_video_duration(model_id, duration_seconds, generation_mode)
+    )
     return _build_video_estimate(
         model_id=model_id,
         pricing=pricing,

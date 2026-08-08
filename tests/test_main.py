@@ -4842,7 +4842,9 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
                 "duration_seconds": 8,
                 "draft": True,
             },
-            0.81088,
+            # Draft renders on omni, which carries one frame of encoder
+            # allowance so the quote is a true ceiling.
+            (8 + 1 / 24) * 0.10136,
             id="draft_prices_omni_not_veo",
         ),
         pytest.param(
@@ -4866,15 +4868,16 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
         pytest.param(
             "generate_video_omni",
             {"prompt": "x", "duration_seconds": 6},
-            0.60816,
+            (6 + 1 / 24) * 0.10136,
             id="omni",
         ),
         pytest.param(
             "edit_video",
             {"previous_interaction_id": "i", "prompt": "x"},
             # An edit's rendered length is chosen by the service, so the quote
-            # is Omni's 10s maximum rather than any requested figure.
-            10 * 0.10136,
+            # is Omni's 10s maximum, plus one frame of encoder overhang so the
+            # bound is a true ceiling.
+            (10 + 1 / 24) * 0.10136,
             id="edit_quotes_the_worst_case",
         ),
     ],
@@ -4946,7 +4949,10 @@ async def test_clip_dry_run_prices_beats_and_bridges(
     # price-PARITY with the fast tier ($0.10/s), not cheaper. The animatic's
     # value against the default model is avoiding a wasted full render, and
     # it IS ~4x cheaper than the standard/1080p tiers.
-    assert animatic["estimated_cost"]["usd"] == pytest.approx(24 * 0.10136)
+    # 3 beats x 8s, each carrying one frame of omni encoder allowance.
+    assert animatic["estimated_cost"]["usd"] == pytest.approx(
+        3 * (8 + 1 / 24) * 0.10136
+    )
 
 
 @pytest.mark.asyncio

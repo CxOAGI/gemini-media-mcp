@@ -924,8 +924,15 @@ def _video_cost_estimate(
 
         res = resolution or "720p"
         if actual or presnapped:
+            seconds = duration_seconds
+            if presnapped and not actual:
+                # A pre-clamped QUOTE still needs the encoder allowance; a
+                # metered cost does not, since it prices a measured length.
+                from .pricing import quote_duration_for
+
+                seconds = quote_duration_for(model, seconds)
             cost = actual_video_cost(
-                model, duration_seconds, res, include_audio, snap_duration=False
+                model, seconds, res, include_audio, snap_duration=False
             )
             if cost is not None and presnapped and not actual:
                 cost = dataclasses.replace(cost, is_estimate=True)
