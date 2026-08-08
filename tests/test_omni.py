@@ -254,7 +254,9 @@ async def test_previous_interaction_id_forwarded(tmp_path: Path) -> None:
     assert "generation_config" not in kwargs
     assert "duration" not in kwargs["response_format"][0]
     assert "aspect_ratio" not in kwargs["response_format"][0]
-    assert any("inherit" in w for w in result["warnings"])
+    # The warning no longer claims inheritance: measurement showed the
+    # rendered length is neither the source's nor the request's.
+    assert any("predictable" in w for w in result["warnings"])
     assert result["interaction_id"] == "int-2"
 
 

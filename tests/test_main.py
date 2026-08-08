@@ -4872,8 +4872,10 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
         pytest.param(
             "edit_video",
             {"previous_interaction_id": "i", "prompt": "x"},
-            0.60816,
-            id="edit",
+            # An edit's rendered length is chosen by the service, so the quote
+            # is Omni's 10s maximum rather than any requested figure.
+            10 * 0.10136,
+            id="edit_quotes_the_worst_case",
         ),
     ],
 )
@@ -5236,49 +5238,54 @@ async def test_generate_video_quote_reports_the_duration_it_prices(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_edit_video_quote_uses_the_source_videos_duration(
+async def test_edit_video_quote_is_an_upper_bound_not_a_guess(
     tmp_path: Path,
 ) -> None:
-    """An edit inherits its duration from the source, so quoting the caller's
-    duration_seconds overstated a 3s edit by 3.3x ($1.0136 for a $0.3041 call).
+    """An edit's rendered length is chosen by the service.
 
-    The omni sidecar already records interaction_id beside duration_seconds,
-    so the real length is recoverable locally — no API call, which keeps a dry
-    run free, instant and offline.
+    Live measurement settled a question two rounds of reasoning got wrong in
+    both directions: a 3s source edited with duration_seconds=4 rendered
+    10.01s — neither the source's length nor the request. Google's Omni
+    documentation does not state the rule, so the quote is Omni's maximum.
+    Quoting the source's length under-quoted that render 3.3x, and
+    under-quoting defeats the purpose of a pre-flight.
     """
-    import src.__main__ as main_mod
+    from src.omni import OMNI_MAX_DURATION_SECONDS
 
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
-    (videos_dir / "prior.json").write_text(
-        json.dumps(
-            {"kind": "omni_video", "interaction_id": "i-42", "duration_seconds": 3}
-        )
+    (videos_dir / "source.json").write_text(
+        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
     )
+
+    import src.__main__ as main_mod
 
     payload = json.loads(
         await main_mod.edit_video(
             ctx=_video_ctx(tmp_path),
-            previous_interaction_id="i-42",
-            prompt="make it stormy",
-            duration_seconds=10,  # ignored: the source is 3s
+            previous_interaction_id="i-3s",
+            prompt="x",
+            duration_seconds=4,
             dry_run=True,
         )
     )
-    assert payload["duration_seconds"] == 3
-    assert "inherited" in payload["duration_source"]
-    assert payload["estimated_cost"]["usd"] == pytest.approx(3 * 0.10136)
+    assert payload["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert "upper bound" in payload["duration_source"]
+    # The source length is still reported as context, just not as the basis.
+    assert payload["source_duration_seconds"] == 3
+    # Covers the render that was actually observed and billed.
+    assert payload["estimated_cost"]["usd"] >= 10 * 0.10136 * 0.999
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_edit_video_quote_says_so_when_the_source_is_unknown(
+async def test_edit_video_quote_is_the_same_bound_without_a_known_source(
     tmp_path: Path,
 ) -> None:
-    """A source this server did not generate has no recoverable duration. The
-    quote must fall back AND admit it, rather than presenting a guess as fact.
-    """
+    """The bound does not depend on knowing the source, so a foreign
+    interaction id quotes the same figure rather than a different guess."""
     import src.__main__ as main_mod
+    from src.omni import OMNI_MAX_DURATION_SECONDS
 
     (tmp_path / "videos").mkdir(exist_ok=True)
     payload = json.loads(
@@ -5290,9 +5297,8 @@ async def test_edit_video_quote_says_so_when_the_source_is_unknown(
             dry_run=True,
         )
     )
-    assert payload["duration_seconds"] == 10
-    assert "unknown" in payload["duration_source"]
-    assert "may differ" in payload["duration_source"]
+    assert payload["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert "source_duration_seconds" not in payload
 
 
 def test_source_duration_lookup_survives_a_junk_sidecar(tmp_path: Path) -> None:
@@ -5383,7 +5389,7 @@ async def test_edit_video_quote_returns_even_when_the_lookup_stalls(
         )
     )
     assert payload["dry_run"] is True
-    assert "unknown" in payload["duration_source"]
+    assert "upper bound" in payload["duration_source"]
 
 
 @pytest.mark.asyncio
@@ -5463,10 +5469,10 @@ async def test_bridge_quote_is_refused_without_ffmpeg(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_edit_video_bills_the_inherited_duration_not_the_request(
+async def test_edit_video_bills_a_measured_or_inherited_duration_not_the_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Quote and bill must agree, and both must describe the render.
+    """The bill must describe the render, and the quote must not undershoot it.
 
     An edit sends no duration — verified on the wire — so the render inherits
     the source's length. But the impl reported the REQUEST anyway, and cost is
@@ -5512,7 +5518,11 @@ async def test_edit_video_bills_the_inherited_duration_not_the_request(
 
     assert billed["duration_seconds"] == 3
     assert billed["cost"]["usd"] == pytest.approx(3 * 0.10136)
-    assert quote["estimated_cost"]["usd"] == pytest.approx(billed["cost"]["usd"])
+    # Quote and bill deliberately differ now: the rendered length is chosen by
+    # the service and is not predictable, so the quote is an upper bound while
+    # the bill is what actually rendered. The invariant that matters is the
+    # direction — a pre-flight may over-state, never under-state.
+    assert quote["estimated_cost"]["usd"] >= billed["cost"]["usd"]
 
 
 @pytest.mark.asyncio

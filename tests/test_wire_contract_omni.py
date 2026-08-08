@@ -377,7 +377,9 @@ def test_an_edit_does_not_report_a_duration_it_never_sent(
     # ...so nothing about duration is claimed on the way back.
     assert result["duration_seconds"] is None
     assert result["requested_duration_seconds"] == 3
-    assert any("not the value requested" in w for w in result["warnings"])
+    # A 3s source edited with duration_seconds=4 measured 10.01s, so the
+    # warning must not promise either the source's length or the request.
+    assert any("predictable" in w for w in result["warnings"])
 
 
 @pytest.mark.timeout(20.0)

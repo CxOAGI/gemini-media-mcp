@@ -56,6 +56,10 @@ _SUPPORTED_ASPECT_RATIOS = ("16:9", "9:16")
 _MIN_DURATION = 3
 _MAX_DURATION = 10
 
+# Public alias: the tool layer quotes this as the worst case for an edit,
+# whose rendered length the service chooses and does not document.
+OMNI_MAX_DURATION_SECONDS = _MAX_DURATION
+
 # Interval (seconds) between polls of an in-flight background interaction.
 _POLL_INTERVAL = 5
 
@@ -396,9 +400,12 @@ async def generate_video_omni(
         # rejects duration (and task alongside previous_interaction_id), so
         # neither is sent.
         warnings.append(
-            "Edit requests inherit duration and aspect ratio from the source "
-            "video; the requested duration_seconds/aspect_ratio were not sent, "
-            "so the rendered length is the source's, not the value requested."
+            "Edit requests do not send duration_seconds or aspect_ratio — the "
+            "API rejects them on an edit task — so the rendered length is "
+            "chosen by the service and is NOT predictable from the request or "
+            "from the source video's length. A measured 3s source edited with "
+            "duration_seconds=4 rendered 10.01s. The response reports the "
+            "duration measured from the rendered file."
         )
 
     if log_callback:
