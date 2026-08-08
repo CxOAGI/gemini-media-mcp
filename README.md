@@ -189,7 +189,7 @@ Every real run reports `usage` (the token counts the API metered) and `cost` der
   `gemini-3.1-flash-lite-image` supports `1K` only; asking it for `2K`/`4K` drops the
   parameter and returns a warning rather than failing the request.
 - `media_resolution`: Input image processing quality (`MEDIA_RESOLUTION_LOW`, `MEDIA_RESOLUTION_MEDIUM`, `MEDIA_RESOLUTION_HIGH`)
-- `thought_signature`: For multi-turn editing workflows - pass back the signature from previous responses
+- `thought_signature_url`: For multi-turn editing workflows — pass back the `thought_signature_url` from a previous response to continue editing the same image. (The parameter is the file URL; passing a `thought_signature` key is silently ignored by MCP.)
 
 ### generate_video
 

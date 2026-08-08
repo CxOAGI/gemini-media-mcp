@@ -115,6 +115,10 @@ async def generate_video(
         log_callback: Async callback for progress logging
         last_frame_bytes: Last frame image bytes for first+last frame control
         reference_images: List of reference image bytes (up to 3) for style/character
+        allowed_dir: Directory that file:// / bare-path extend sources must
+            resolve inside. Security boundary, not a convenience: without it
+            any local path readable by the server could be uploaded to the
+            API as "video to extend".
         extend_video_uri: URI of existing VEO video to extend. On Vertex AI
             this requires output_gcs_uri; on the Gemini API the extended
             clip is returned inline and GCS output is not supported.
