@@ -20,7 +20,7 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 | `generate_image` | Generate images using Gemini image models |
 | `generate_storyboard` | Render a keyframe per shot and return a real storyboard (inline contact sheet + HTML) |
 | `generate_video` | Generate videos using VEO models (with optional fast `draft` mode) |
-| `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a cheap animatic preview |
+| `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a fast animatic preview |
 | `generate_transition` | Veo first+last-frame transition between two stills |
 | `generate_bridge` | Transition between two existing clips (frames extracted for you) |
 | `generate_video_omni` | Fast conversational video via `gemini-omni-flash-preview` (Interactions API) |

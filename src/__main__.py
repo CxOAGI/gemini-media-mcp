@@ -34,7 +34,7 @@ from .storyboard import Theme
 from .omni import generate_video_omni as generate_video_omni_impl
 from .video import _VEO_LITE_MODELS, VideoModel
 from .video import generate_video as generate_video_impl
-from .video_utils import extract_frame_png
+from .video_utils import assert_frame_decoding_available, extract_frame_png
 
 logger = logging.getLogger(__name__)
 
@@ -1411,7 +1411,7 @@ async def generate_video(
     prompt: str,
     model: VideoModel,
     aspect_ratio: str = "16:9",
-    duration_seconds: float = 5.0,
+    duration_seconds: float = 8.0,
     include_audio: bool = False,
     audio_prompt: str | None = None,
     negative_prompt: str | None = None,
@@ -1476,8 +1476,12 @@ async def generate_video(
             estimate for the call that would run (the omni draft price when
             draft=True). Free and instant. A real run reports the actual
             cost, derived from the effective duration the API rendered.
-        draft: When True, route to gemini-omni-flash for a fast 720p draft
-            instead of Veo. Iterate cheaply, then re-run with draft=False to
+        draft: When True, route to gemini-omni-flash for a fast 720p draft.
+               Faster, but NOT cheaper than veo-3.1-fast-generate-001: omni is
+               $0.10136/s against Fast's $0.10/s. The saving is real only
+               against veo-3.1-generate-001 ($0.40/s). Use it for speed and to
+               avoid burning a full-fidelity render on a bad idea.
+            instead of Veo. Iterate fast, then re-run with draft=False to
             finalize on Veo. Omni ignores Veo-only controls (seed,
             negative_prompt, resolution, last frame, reference images,
             extension); any that were passed are noted in the response.
@@ -1495,19 +1499,46 @@ async def generate_video(
 
         if dry_run:
             if not draft:
-                # Same check the impl applies, so a quote can never succeed
-                # for a render the real call would refuse (e.g. 4K on Lite).
+                # Same checks the impl applies, so a quote can never succeed
+                # for a render the real call would refuse. The mode is derived
+                # the way the impl derives it — a Lite quote used to price
+                # extension, reference and first/last-frame calls it cannot
+                # serve, because only the resolution rule was shared.
                 from .video import validate_render_options
 
-                validate_render_options(model, resolution)
+                if extend_video_uri:
+                    quoted_mode = "extend_video"
+                elif reference_image_uris:
+                    quoted_mode = "reference_to_video"
+                elif (image_uri or image_base64) and (
+                    last_frame_uri or last_frame_base64
+                ):
+                    quoted_mode = "first_last_frame"
+                elif image_uri or image_base64:
+                    quoted_mode = "image_to_video"
+                else:
+                    quoted_mode = "text_to_video"
+                validate_render_options(model, resolution, quoted_mode)
             est_model = OMNI_MODEL if draft else model
             est_res = "720p" if draft else (resolution or "720p")
+            # Report the duration that will actually render. Returning the
+            # request beside a price for the snapped value (5s quoted as "4s
+            # of video") made the payload contradict itself.
+            try:
+                from .pricing import snap_video_duration
+
+                quoted_duration: float = snap_video_duration(
+                    est_model, duration_seconds
+                )
+            except Exception:  # pragma: no cover - defensive
+                quoted_duration = duration_seconds
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
                 "model": est_model,
                 "resolution": est_res,
-                "duration_seconds": duration_seconds,
+                "requested_duration_seconds": duration_seconds,
+                "duration_seconds": quoted_duration,
                 "estimated_cost": _video_cost(
                     est_model,
                     duration_seconds,
@@ -1762,7 +1793,8 @@ async def generate_transition(
         prompt: Description of the transition motion and style
         model: VEO model (defaults to fast; Lite does NOT support
             first/last-frame mode and cannot be used here)
-        duration_seconds: Transition length (4/6/8s; snapped to nearest)
+        duration_seconds: Transition length. Veo renders 4, 6 or 8s only;
+            others snap to the nearest, ties down (5 -> 4, 7 -> 6).
         aspect_ratio: 16:9 or 9:16 (must match clip aspect for clean cuts)
         include_audio: Generate transitional audio
         audio_prompt: Audio description
@@ -1786,6 +1818,12 @@ async def generate_transition(
         _validate_duration_seconds(duration_seconds)
 
         if dry_run:
+            # Both tools are first/last-frame renders by definition, which
+            # Veo Lite cannot serve — the docstrings said so but nothing
+            # enforced it on the quote path.
+            from .video import validate_render_options
+
+            validate_render_options(model, generation_mode="first_last_frame")
             return json.dumps(
                 {
                     "dry_run": True,
@@ -1928,7 +1966,8 @@ async def generate_bridge(
         to_clip_uri: URI of the clip whose first frame ends the bridge.
         prompt: Description of the transition motion and style.
         model: VEO model (fast by default).
-        duration_seconds: Bridge length (4/6/8s, snapped).
+        duration_seconds: Bridge length. Veo renders 4, 6 or 8s only;
+            others snap to the nearest, ties down (5 -> 4, 7 -> 6).
         aspect_ratio: Must match source clips for a clean cut.
         include_audio: Generate transitional audio.
         audio_prompt: Audio description.
@@ -1951,7 +1990,19 @@ async def generate_bridge(
         _validate_aspect_ratio(aspect_ratio)
         _validate_duration_seconds(duration_seconds)
 
+        # Bridging decodes frames out of two videos, so it needs ffmpeg. This
+        # is an environment fact rather than a model capability: without the
+        # check the tool quoted a price and then died on an opaque decoder
+        # error. Runs before the quote so both agree.
+        assert_frame_decoding_available()
+
         if dry_run:
+            # Both tools are first/last-frame renders by definition, which
+            # Veo Lite cannot serve — the docstrings said so but nothing
+            # enforced it on the quote path.
+            from .video import validate_render_options
+
+            validate_render_options(model, generation_mode="first_last_frame")
             return json.dumps(
                 {
                     "dry_run": True,
@@ -2165,6 +2216,11 @@ async def generate_clip(
         # producing a success-shaped manifest with zero segments instead of a
         # clear top-level failure.
         _validate_aspect_ratio(aspect_ratio)
+
+        if add_bridges and not animatic:
+            # Bridges decode frames out of the rendered beats; fail before any
+            # beat is billed rather than losing every bridge mid-run.
+            assert_frame_decoding_available()
 
         if dry_run:
             est_model = OMNI_MODEL if animatic else model
@@ -2495,7 +2551,7 @@ async def generate_video_omni(
 ) -> str:
     """Generate a video fast with gemini-omni-flash (Interactions API).
 
-    Omni is the fast/cheap path (720p, 24fps): good for drafts and quick
+    Omni is the fast path (720p, 24fps): good for drafts and quick
     iteration. The Veo tools remain the high-fidelity path (1080p/4K, seeds,
     first/last-frame control). Omni does not support seeds or negative prompts.
 
@@ -2529,6 +2585,14 @@ async def generate_video_omni(
         # into a billed 3s render instead of an error.
         _validate_duration_seconds(duration_seconds)
 
+        if output_gcs_uri:
+            bucket = _parse_gcs_bucket(output_gcs_uri)
+            if bucket is None:
+                raise ValueError(
+                    f"output_gcs_uri must start with gs://: {output_gcs_uri}"
+                )
+            _assert_gcs_bucket_allowed(bucket, app_ctx.allowed_gcs_buckets)
+
         if dry_run:
             # Mirror the impl's clamp so the quote matches the render.
             clamped = min(10, max(3, round(duration_seconds)))
@@ -2549,14 +2613,6 @@ async def generate_video_omni(
                 indent=2,
             )
         data_dir = app_ctx.data_folder
-
-        if output_gcs_uri:
-            bucket = _parse_gcs_bucket(output_gcs_uri)
-            if bucket is None:
-                raise ValueError(
-                    f"output_gcs_uri must start with gs://: {output_gcs_uri}"
-                )
-            _assert_gcs_bucket_allowed(bucket, app_ctx.allowed_gcs_buckets)
 
         image_bytes_list: list[bytes] = []
         if image_uris:
@@ -2639,8 +2695,10 @@ async def edit_video(
         duration_seconds: Desired duration, clamped to 3-10s (default 6)
         timeout_seconds: Overall deadline for the edit render (default 600)
 
-        dry_run: When True, return only the cost estimate for the clamped
-            duration and generate nothing.
+        dry_run: When True, return only the cost estimate and generate
+            nothing. NOTE: an edit inherits duration and aspect ratio from the
+            source video, so the quote is for the source's length, which this
+            tool cannot know in advance — treat it as a lower bound.
 
     Returns:
         JSON with the edited video_url and a new interaction_id for further edits.
@@ -2743,6 +2801,20 @@ async def loop_extend(
                 raise ValueError(f"Invalid video_uri: {video_uri}")
             _assert_gcs_bucket_allowed(src_bucket, app_ctx.allowed_gcs_buckets)
 
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+        if is_vertex_client and not gcs_uri:
+            raise ValueError(
+                "Video extension on Vertex AI requires output_gcs_uri (or a "
+                "configured VIDEO_GCS_BUCKET)."
+            )
+
         if dry_run:
             # Each extension is a ~7s Veo render billed like any other.
             return json.dumps(
@@ -2761,20 +2833,6 @@ async def loop_extend(
                     ),
                 },
                 indent=2,
-            )
-
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
-        if is_vertex_client and not gcs_uri:
-            raise ValueError(
-                "Video extension on Vertex AI requires output_gcs_uri (or a "
-                "configured VIDEO_GCS_BUCKET)."
             )
 
         # Validate the initial gs:// source against the allowlist (intermediate

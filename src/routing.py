@@ -630,7 +630,10 @@ _MULTI_SHOT_TERMS: frozenset[str] = frozenset(
         "reel",
         "sequence",
         "series of",
-        "short",
+        # NB: bare "short" is deliberately absent. It reads as the noun ("a
+        # short") only rarely; "short video" / "short clip" means brief, and
+        # treating it as multi-shot turned a single 4s render into a 3-beat
+        # clip at 3x the price. "shorts" (the format) is unambiguous and stays.
         "shorts",
         "storyboard",
         "tiktok",
@@ -803,13 +806,62 @@ def _term_pattern(term: str) -> re.Pattern[str]:
     return pattern
 
 
+# Words that flip the meaning of a keyword immediately following them.
+# "no audio" must not be read as a request FOR audio.
+_NEGATORS: tuple[str, ...] = (
+    "no",
+    "not",
+    "without",
+    "never",
+    "avoid",
+    "exclude",
+    "silent",
+    "mute",
+    "muted",
+    "sans",
+    "minus",
+    "drop",
+    "remove",
+    "skip",
+)
+
+# How far back to look for a negator. Short on purpose: "no dialogue, but
+# ambient music" should keep the music hit, so only the words immediately
+# before a term can negate it.
+_NEGATION_WINDOW = 3
+
+
+def _is_negated(text: str, term: str) -> bool:
+    """Whether every occurrence of ``term`` in ``text`` sits under a negator.
+
+    Keyword matching alone read "no audio" as an audio request, which flipped
+    both the emitted include_audio and the model ranking. Requiring EVERY
+    occurrence to be negated is the conservative reading: a sentence that
+    mentions the term both ways keeps the positive signal.
+    """
+    pattern = _term_pattern(term)
+    found = False
+    for match in pattern.finditer(text):
+        found = True
+        window = text[: match.start()].split()[-_NEGATION_WINDOW:]
+        if not any(word.strip(",.;:!?-") in _NEGATORS for word in window):
+            return False
+    return found
+
+
 def _matched_terms(text: str, terms: frozenset[str]) -> tuple[str, ...]:
     """Return the sorted subset of ``terms`` present in ``text``.
 
     Sorted so the result is reproducible regardless of set iteration order —
     the whole module's determinism guarantee depends on details like this.
     """
-    return tuple(sorted(term for term in terms if _term_pattern(term).search(text)))
+    return tuple(
+        sorted(
+            term
+            for term in terms
+            if _term_pattern(term).search(text) and not _is_negated(text, term)
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -1264,7 +1316,13 @@ def resolve_request(
 
     num_beats = _first_not_none(given.num_beats, signals.beat_count)
     if num_beats is None:
-        if signals.wants_multi_shot:
+        if total_duration is not None and total_duration <= VEO_MAX_CLIP_SECONDS:
+            # A runtime one render already covers. Splitting it into beats
+            # multiplies the bill and invents placeholder prompts for shots
+            # the caller never described; if they want cuts inside 8s they
+            # can say how many.
+            num_beats = 1
+        elif signals.wants_multi_shot:
             # A multi-shot brief with no stated count: enough beats to cover
             # the requested runtime, or the default storyboard length.
             if total_duration is not None and total_duration > VEO_MAX_CLIP_SECONDS:
@@ -2224,12 +2282,17 @@ def _video_cost(
 
     if tool == "loop_extend":
         times = int(params.get("times", 1))
-        total = float(VEO_MAX_CLIP_SECONDS) + VEO_EXTENSION_SECONDS * times
+        # loop_extend extends a clip the caller already has: it renders the
+        # extensions and nothing else. Billing a base render here quoted
+        # $1.50 for a call the tool itself quotes at $0.70. When the planner
+        # also proposes the seed render (an implied extension), that step
+        # carries its own cost.
+        total = VEO_EXTENSION_SECONDS * times
         return _aggregate_video_cost(
             model,
-            float(VEO_MAX_CLIP_SECONDS),
+            float(VEO_EXTENSION_SECONDS),
             total,
-            times + 1,
+            times,
             # Extended output is 720p regardless of what the base clip asked
             # for (documented on loop_extend).
             OMNI_RESOLUTION if model == OMNI_MODEL else "720p",

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import uuid
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
@@ -24,7 +25,7 @@ ImageModel = Literal[
 
 # IDs whose endpoints are gone (or imminently going). Calls to these fail with
 # 404, so generate_image() reroutes them rather than letting the request die —
-# see _RETIRED_MODELS. They are deliberately split out of ImageModel, the live
+# see _MODEL_SHUTDOWNS. They are deliberately split out of ImageModel, the live
 # catalog, but MUST stay in the MCP tool annotation: pydantic validates the
 # model argument against it, so dropping them from the schema would reject a
 # pinned caller's request with a validation error before the shim could run.
@@ -45,33 +46,53 @@ RetiredImageModel = Literal[
     "gemini-2.5-flash-image",
 ]
 
-# Retired ID -> (replacement, shutdown date). Sourced from Google's published
-# deprecation table. The Imagen rows all name gemini-3.1-flash-image as the
-# replacement; the preview aliases map to their own GA promotion.
-_RETIRED_MODELS: dict[str, tuple[str, str]] = {
+# Superseded ID -> (replacement, shutdown date). One table, because whether a
+# shutdown is past or future is a function of today's date, not a property to
+# hard-code: classifying imagen-4.0-* as "retired" was correct on 2026-08-18
+# and wrong on 2026-08-07, when it still had ten days of service left. Dates
+# come from Google's published deprecation table.
+_MODEL_SHUTDOWNS: dict[str, tuple[str, str]] = {
+    # Imagen — every image endpoint discontinued 2026-08-17...
     "imagen-3.0-capability-001": ("gemini-3.1-flash-image", "2026-08-17"),
     "imagen-3.0-capability-002": ("gemini-3.1-flash-image", "2026-08-17"),
     "imagen-3.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
     "imagen-3.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
-    "imagen-3.0-generate-002": ("gemini-3.1-flash-image", "2026-08-17"),
+    # ...except this one, which Google shut down early.
+    "imagen-3.0-generate-002": ("gemini-3.1-flash-image", "2025-11-10"),
     "imagen-4.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
     "imagen-4.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
-    "imagen-4.0-ultra-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
+    # Ultra is the top Imagen tier, so it maps to the top Gemini image model
+    # rather than dropping to flash — Google's table permits either.
+    "imagen-4.0-ultra-generate-001": ("gemini-3-pro-image", "2026-08-17"),
+    # Nano Banana 2 / Pro preview aliases
     "gemini-3-pro-image-preview": ("gemini-3-pro-image", "2026-06-25"),
     "gemini-3.1-flash-image-preview": ("gemini-3.1-flash-image", "2026-06-25"),
-}
-
-# Fallback for a retired-looking ID that is not in the table (e.g. a regional
-# or newly-surfaced Imagen variant) — still better than a guaranteed 404.
-_RETIRED_DEFAULT_TARGET = "gemini-3.1-flash-image"
-
-# Still served, but with a published shutdown date. Rerouted like the retired
-# IDs — a caller left on one of these has a hard deadline and no upside, since
-# the replacement is strictly more capable. Only the wording differs, so the
-# warning does not claim a model is already gone when it is not.
-_SUNSET_MODELS: dict[str, tuple[str, str]] = {
+    # Nano Banana 1
     "gemini-2.5-flash-image": ("gemini-3.1-flash-image", "2026-10-02"),
 }
+
+# Fallback for a superseded-looking ID absent from the table (e.g. a regional
+# or newly-surfaced Imagen variant) — better than a guaranteed 404.
+_SUPERSEDED_DEFAULT_TARGET = "gemini-3.1-flash-image"
+_SUPERSEDED_DEFAULT_SHUTDOWN = "2026-08-17"
+
+
+def _shutdown_phrase(shutdown: str, today: date | None = None) -> str:
+    """Describe a shutdown in the right tense for today.
+
+    A model with a future shutdown date still serves; saying it "was retired
+    and no longer exists" is wrong, and would tell a Provisioned Throughput
+    holder their model is already dead when they still have time to migrate.
+    """
+    now = today or date.today()
+    try:
+        when = date.fromisoformat(shutdown)
+    except ValueError:  # pragma: no cover - table is hand-maintained
+        return f"is superseded (shutdown {shutdown})"
+    if when <= now:
+        return f"was retired on {shutdown} and no longer exists"
+    return f"is scheduled for shutdown on {shutdown}"
+
 
 # Output sizes a model can actually produce. Only models with a restriction are
 # listed; anything absent accepts the full ImageSize range. gemini-3.1-flash-
@@ -186,19 +207,11 @@ def resolve_image_model(
     # the call as-is is never the right behaviour; the substitution is reported
     # so callers can update their own configuration. An unlisted imagen-* ID
     # falls back to the GA replacement rather than a guaranteed failure.
-    if (
-        model_id in _RETIRED_MODELS
-        or model_id in _SUNSET_MODELS
-        or model_id.startswith("imagen")
-    ):
-        if model_id in _SUNSET_MODELS:
-            target, shutdown = _SUNSET_MODELS[model_id]
-            state = f"is scheduled for shutdown on {shutdown}"
-        else:
-            target, shutdown = _RETIRED_MODELS.get(
-                model_id, (_RETIRED_DEFAULT_TARGET, "2026-08-17")
-            )
-            state = f"was retired on {shutdown} and no longer exists"
+    if model_id in _MODEL_SHUTDOWNS or model_id.startswith("imagen"):
+        target, shutdown = _MODEL_SHUTDOWNS.get(
+            model_id, (_SUPERSEDED_DEFAULT_TARGET, _SUPERSEDED_DEFAULT_SHUTDOWN)
+        )
+        state = _shutdown_phrase(shutdown)
         warnings.append(
             f"Model {model_id} {state}; {target} served this request instead. "
             f"Update your configuration to request {target} directly."
@@ -244,10 +257,10 @@ async def generate_image(
 
     Superseded IDs (``RetiredImageModel``) are still accepted so pinned callers
     keep working, and are rerouted to the replacement Google published:
-      - the Imagen family — endpoints gone 2026-08-17 (``_RETIRED_MODELS``)
-      - the -preview image aliases — gone 2026-06-25 (``_RETIRED_MODELS``)
+      - the Imagen family — endpoints discontinued 2026-08-17
+      - the -preview image aliases — gone 2026-06-25
       - gemini-2.5-flash-image — still served, shutdown 2026-10-02
-        (``_SUNSET_MODELS``)
+        (see ``_MODEL_SHUTDOWNS``)
 
     Every substitution is reported in the returned ``warnings`` list and
     logged at WARNING.

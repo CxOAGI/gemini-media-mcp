@@ -2167,7 +2167,9 @@ def _image_ctx(tmp_path: Path) -> MagicMock:
 
 
 def _video_ctx(
-    tmp_path: Path, allowed_gcs_buckets: frozenset[str] = frozenset()
+    tmp_path: Path,
+    allowed_gcs_buckets: frozenset[str] = frozenset(),
+    vertexai: bool = False,
 ) -> MagicMock:
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
@@ -2175,11 +2177,17 @@ def _video_ctx(
     ctx.info = AsyncMock()
     ctx.error = AsyncMock()
     ctx.warning = AsyncMock()
+    # Shape the client explicitly. A bare MagicMock reads as Vertex (every
+    # attribute is truthy), which silently routes tests down the Vertex
+    # branch — where loop_extend requires a GCS target and Lite is refused
+    # for want of a key. That accident has cost real debugging time twice.
+    client = MagicMock()
+    client._api_client.vertexai = vertexai
     ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=tmp_path / "images",
         videos_dir=videos_dir,
-        client=MagicMock(),
+        client=client,
         allowed_gcs_buckets=allowed_gcs_buckets,
     )
     return ctx
@@ -2536,7 +2544,9 @@ async def test_generate_video_extend_rejects_disallowed_bucket(
     monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
 
     result = await generate_video(
-        ctx=_video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"good"})),
+        ctx=_video_ctx(
+            tmp_path, allowed_gcs_buckets=frozenset({"good"}), vertexai=True
+        ),
         prompt="p",
         model="veo-3.1-generate-001",
         extend_video_uri="gs://evil/clip.mp4",
@@ -2563,7 +2573,8 @@ async def test_generate_video_extend_requires_gcs_output(
 
     # allowlist empty and no output_gcs_uri / VIDEO_GCS_BUCKET.
     result = await generate_video(
-        ctx=_video_ctx(tmp_path),
+        # Vertex explicitly: the GCS requirement is a Vertex-only rule.
+        ctx=_video_ctx(tmp_path, vertexai=True),
         prompt="p",
         model="veo-3.1-generate-001",
         extend_video_uri="gs://anything/clip.mp4",
@@ -5056,3 +5067,167 @@ async def test_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
         )
     )
     assert allowed["estimated_cost"]["usd"] == pytest.approx(2 * 7 * 0.40)
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "fragment"),
+    [
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "extend_video_uri": "gs://b/v.mp4",
+            },
+            "does not support extend_video",
+            id="lite_extend",
+        ),
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "reference_image_uris": ["a"],
+            },
+            "does not support reference_to_video",
+            id="lite_references",
+        ),
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "image_uri": "a",
+                "last_frame_uri": "b",
+            },
+            "does not support first_last_frame",
+            id="lite_first_last",
+        ),
+        pytest.param(
+            "generate_transition",
+            {
+                "first_frame_uri": "a",
+                "last_frame_uri": "b",
+                "model": "veo-3.1-lite-generate-preview",
+            },
+            "does not support first_last_frame",
+            id="lite_transition",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {
+                "from_clip_uri": "a",
+                "to_clip_uri": "b",
+                "model": "veo-3.1-lite-generate-preview",
+            },
+            "does not support first_last_frame",
+            id="lite_bridge",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_dry_run_refuses_every_lite_restriction(
+    tool: str, kwargs: dict[str, Any], fragment: str, tmp_path: Path
+) -> None:
+    """Live testing found the quote pricing five impossible Lite calls at
+    $0.20-$0.40 apiece. Only the resolution rule was shared with the impl;
+    the generation-mode restrictions were enforced per tool, so a dry run
+    happily priced an extension on a model that cannot extend."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+    )
+    assert fragment in payload["error"]
+
+
+@pytest.mark.parametrize(
+    ("model", "kwargs"),
+    [
+        pytest.param("veo-3.1-lite-generate-preview", {}, id="lite_text_to_video"),
+        pytest.param(
+            "veo-3.1-lite-generate-preview",
+            {"image_uri": "a"},
+            id="lite_image_to_video",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_the_lite_guard_does_not_over_reach(
+    model: str, kwargs: dict[str, Any], tmp_path: Path
+) -> None:
+    """Lite genuinely supports text-to-video and image-to-video."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path),
+            prompt="x",
+            model=model,
+            duration_seconds=8,
+            dry_run=True,
+            **kwargs,
+        )
+    )
+    assert payload["estimated_cost"]["usd"] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_omni_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
+    """The omni bucket check sat below the quote, so a dry run priced a
+    delivery to a bucket the real call refuses."""
+    import src.__main__ as main_mod
+
+    ctx = _video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"trusted"}))
+    denied = json.loads(
+        await main_mod.generate_video_omni(
+            ctx=ctx, prompt="x", output_gcs_uri="gs://evil/o.mp4", dry_run=True
+        )
+    )
+    assert "not in the allowlist" in denied["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_loop_extend_dry_run_enforces_the_vertex_gcs_requirement(
+    tmp_path: Path,
+) -> None:
+    """Refused live on Vertex without a GCS target, but priced at $0.70 by the
+    quote — the client and GCS resolution sat below the dry-run branch."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.loop_extend(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            video_uri="file:///x.mp4",
+            times=2,
+            dry_run=True,
+        )
+    )
+    assert "requires output_gcs_uri" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_quote_reports_the_duration_it_prices(
+    tmp_path: Path,
+) -> None:
+    """The payload contradicted itself: duration_seconds: 5.0 beside a cost
+    detail reading "4s of video"."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path),
+            prompt="x",
+            model="veo-3.1-generate-001",
+            duration_seconds=5,
+            dry_run=True,
+        )
+    )
+    assert payload["requested_duration_seconds"] == 5
+    assert payload["duration_seconds"] == 4
+    assert "4s of video" in payload["estimated_cost"]["detail"]

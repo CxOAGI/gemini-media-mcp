@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from src.image import _RETIRED_MODELS, _SUNSET_MODELS
+from src.image import _MODEL_SHUTDOWNS
 from src.omni import OMNI_MODEL
 from src.pricing import (
     _IMAGE_PRICING,
@@ -273,7 +273,7 @@ def test_unknown_image_model_returns_none_and_never_raises() -> None:
 # ============================================================================
 
 
-@pytest.mark.parametrize("retired,replacement", sorted(_RETIRED_MODELS.items()))
+@pytest.mark.parametrize("retired,replacement", sorted(_MODEL_SHUTDOWNS.items()))
 def test_retired_ids_price_as_their_replacement(
     retired: str, replacement: tuple[str, str]
 ) -> None:
@@ -287,7 +287,7 @@ def test_retired_ids_price_as_their_replacement(
     assert target in superseded.detail
 
 
-@pytest.mark.parametrize("sunset,replacement", sorted(_SUNSET_MODELS.items()))
+@pytest.mark.parametrize("sunset,replacement", sorted(_MODEL_SHUTDOWNS.items()))
 def test_sunset_ids_price_as_their_replacement(
     sunset: str, replacement: tuple[str, str]
 ) -> None:
@@ -826,10 +826,10 @@ def test_every_superseded_id_prices_as_its_own_replacement(image_size: str) -> N
     Driven off the reroute tables so a future retirement is covered the moment
     it is added to src.image.
     """
-    from src.image import _RETIRED_MODELS, _SUNSET_MODELS
+    from src.image import _MODEL_SHUTDOWNS
     from src.pricing import estimate_image_cost
 
-    superseded = {**_RETIRED_MODELS, **_SUNSET_MODELS}
+    superseded = _MODEL_SHUTDOWNS
     assert superseded, "expected at least one superseded model to check"
 
     for requested, (replacement, _shutdown) in superseded.items():

@@ -1,12 +1,49 @@
 """Video decoding helpers for building transitions between existing clips."""
 
+import shutil
 from io import BytesIO
+from pathlib import Path
 from typing import Literal
 
 import imageio.v3 as iio
 from PIL import Image
 
 FramePosition = Literal["start", "end"]
+
+
+def assert_frame_decoding_available() -> None:
+    """Raise if no usable ffmpeg binary is present.
+
+    Frame extraction needs an ffmpeg the host can execute. The imageio-ffmpeg
+    dependency bundles one, but it is a glibc build: on musl (Alpine, and so
+    the published image) it is absent or unrunnable, which left generate_bridge
+    and generate_clip(add_bridges=True) dead with an opaque decoder error —
+    after the caller had been quoted a price.
+
+    This is an environment fact, not a model capability, so no table can catch
+    it; the tools call this in their pre-flight so a quote and a run agree.
+    """
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise RuntimeError(
+            "ffmpeg is required to read frames out of a video, and none was "
+            "found. Install ffmpeg (the Docker image ships it; for a local "
+            "install use your package manager) or set IMAGEIO_FFMPEG_EXE to a "
+            f"working binary. Underlying error: {exc}"
+        ) from exc
+    # imageio-ffmpeg returns either an absolute path (its bundled build) or a
+    # bare name it expects to resolve on PATH (a system install, which is what
+    # the Alpine image now provides). Accept both.
+    if exe and (Path(exe).exists() or shutil.which(exe)):
+        return
+    raise RuntimeError(
+        "ffmpeg is required to read frames out of a video. imageio-ffmpeg "
+        f"reported {exe!r}, which is not executable here. Install ffmpeg or "
+        "set IMAGEIO_FFMPEG_EXE to a working binary."
+    )
 
 
 def extract_frame_png(

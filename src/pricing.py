@@ -56,8 +56,8 @@ Superseded model IDs
 --------------------
 ``src.image`` reroutes retired/sunset image IDs to a live replacement before
 calling the API, which means the *replacement* is what actually gets billed.
-This module imports those same tables (``_RETIRED_MODELS``,
-``_SUNSET_MODELS``) instead of duplicating them, so a price quoted for
+This module imports that same table (``_MODEL_SHUTDOWNS``) instead of
+duplicating it, so a price quoted for
 ``imagen-4.0-generate-001`` is the price of the model that really runs. The
 same applies to the Veo ID translation in ``src.video``: the Gemini Developer
 API serves Veo under ``-preview`` IDs, and ``generate_video`` reports the
@@ -70,9 +70,8 @@ from dataclasses import dataclass
 from typing import Any, get_args
 
 from .image import (
-    _RETIRED_DEFAULT_TARGET,
-    _RETIRED_MODELS,
-    _SUNSET_MODELS,
+    _MODEL_SHUTDOWNS,
+    _SUPERSEDED_DEFAULT_TARGET,
     ImageModel,
     RetiredImageModel,
 )
@@ -363,12 +362,10 @@ def resolve_model_id(model: str) -> str:
 
     # Same three-way test src/image.py uses, including the imagen-* catch-all
     # for regional or newly-surfaced variants that never made the table.
-    if model_id in _SUNSET_MODELS:
-        return _SUNSET_MODELS[model_id][0]
-    if model_id in _RETIRED_MODELS:
-        return _RETIRED_MODELS[model_id][0]
+    if model_id in _MODEL_SHUTDOWNS:
+        return _MODEL_SHUTDOWNS[model_id][0]
     if model_id.startswith("imagen"):
-        return _RETIRED_DEFAULT_TARGET
+        return _SUPERSEDED_DEFAULT_TARGET
 
     return _VIDEO_MODEL_ALIASES.get(model_id, model_id)
 
@@ -955,6 +952,11 @@ def actual_video_cost(
 # ---------------------------------------------------------------------------
 
 
+# Breakdown entries that are rates, not quantities: adding them across
+# components produces a number that means nothing.
+_RATE_BREAKDOWN_KEYS = frozenset({"usd_per_second"})
+
+
 def sum_costs(
     estimates: Iterable[CostEstimate | None],
     label: str = "total",
@@ -991,7 +993,23 @@ def sum_costs(
         units.add(estimate.unit)
         any_estimate = any_estimate or estimate.is_estimate
         for key, value in estimate.breakdown.items():
-            breakdown[key] = breakdown.get(key, 0.0) + value
+            if key in _RATE_BREAKDOWN_KEYS:
+                # A rate is not additive. Summing $0.40/s across 39 components
+                # reported usd_per_second: 15.6 — a nonsense figure for any
+                # client that renders it. Carry it through when every
+                # component agrees, and drop it when they differ.
+                if breakdown.get(key, value) != value:
+                    breakdown[key] = float("nan")
+                else:
+                    breakdown[key] = value
+            else:
+                breakdown[key] = breakdown.get(key, 0.0) + value
+
+    # A mixed-rate aggregate has no single rate to report; omit it rather
+    # than emit NaN, which is not valid JSON.
+    for key in _RATE_BREAKDOWN_KEYS:
+        if key in breakdown and breakdown[key] != breakdown[key]:
+            del breakdown[key]
 
     breakdown["components"] = float(counted)
     if unpriced:

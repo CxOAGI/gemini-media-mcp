@@ -55,25 +55,45 @@ def _prepare_image_input(image_bytes: bytes) -> types.Image:
     return types.Image(image_bytes=buf.getvalue(), mime_type=f"image/{fmt.lower()}")
 
 
-def validate_render_options(model: str, resolution: str | None) -> None:
-    """Raise for a model/resolution pairing Veo cannot render.
+# Generation modes Veo 3.1 Lite cannot serve. It handles text-to-video and
+# image-to-video only.
+_LITE_UNSUPPORTED_MODES = ("extend_video", "reference_to_video", "first_last_frame")
+
+
+def validate_render_options(
+    model: str,
+    resolution: str | None = None,
+    generation_mode: str | None = None,
+) -> None:
+    """Raise for a model/resolution/mode combination Veo cannot render.
 
     Shared by the generation path and the tools' dry_run quotes, so a quote
     can never succeed for a call that would be refused — the same
-    single-source rule as resolve_image_model on the image side.
+    single-source rule as resolve_image_model on the image side. Every Lite
+    restriction lives here; enforcing them per tool is what let a dry run
+    price an extension on a model that cannot extend.
     """
-    if resolution is None:
-        return
-    valid_resolutions = ("720p", "1080p", "4K")
-    if resolution not in valid_resolutions:
+    if resolution is not None:
+        valid_resolutions = ("720p", "1080p", "4K")
+        if resolution not in valid_resolutions:
+            raise ValueError(
+                f"Unsupported resolution '{resolution}'. "
+                f"Supported values are {', '.join(valid_resolutions)}."
+            )
+        if resolution == "4K" and model in _VEO_LITE_MODELS:
+            raise ValueError(
+                f"Model {model} does not support 4K resolution. "
+                "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+            )
+    if (
+        generation_mode is not None
+        and model in _VEO_LITE_MODELS
+        and generation_mode in _LITE_UNSUPPORTED_MODES
+    ):
         raise ValueError(
-            f"Unsupported resolution '{resolution}'. "
-            f"Supported values are {', '.join(valid_resolutions)}."
-        )
-    if resolution == "4K" and model in _VEO_LITE_MODELS:
-        raise ValueError(
-            f"Model {model} does not support 4K resolution. "
-            "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+            f"Model {model} does not support {generation_mode}. "
+            "Veo 3.1 Lite supports only text-to-video and image-to-video; "
+            "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
         )
 
 
@@ -166,17 +186,9 @@ async def generate_video(
 
     # Veo 3.1 Lite (served via the Gemini API) does not support video
     # extension, reference images, or first/last-frame control — fail fast
-    # with a clear message instead of an opaque API error.
-    if model in _VEO_LITE_MODELS and generation_mode in (
-        "extend_video",
-        "reference_to_video",
-        "first_last_frame",
-    ):
-        raise ValueError(
-            f"Model {model_id} does not support {generation_mode}. "
-            "Veo 3.1 Lite supports only text-to-video and image-to-video; "
-            "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
-        )
+    # with a clear message instead of an opaque API error. Shared with the
+    # tools' dry_run quotes so both refuse the same combinations.
+    validate_render_options(model, generation_mode=generation_mode)
 
     # Prepare image inputs
     first_frame_input: types.Image | None = None

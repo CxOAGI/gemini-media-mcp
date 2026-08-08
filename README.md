@@ -288,14 +288,14 @@ This is the highest-leverage tool in the server: one call produces a whole seque
 - `include_audio`: Audio per beat (Vertex only)
 - `beats` are capped at 20 per call — each is a billed Veo render, and `add_bridges` nearly doubles that. Split longer sequences into several clips
 - `add_bridges`: Generate a transition between consecutive beats using the last frame of beat N and the first frame of beat N+1. Requires local (`file://`) beat outputs
-- `animatic`: Render every beat with `gemini-omni-flash` (fast, cheap 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
+- `animatic`: Render every beat with `gemini-omni-flash` (fast 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
 - `output_gcs_uri`: GCS URI for all outputs
 
 **Partial failure is non-fatal.** A failed beat is recorded in the manifest's `errors` list and the run continues; bridges that would have used the failed beat are skipped.
 
 **Returns:** a clip manifest — `{kind, aspect_ratio, segments[], total_duration_seconds, errors[]}`.
 
-**Suggested flow:** run once with `animatic: true` to preview the whole sequence cheaply, then re-run with `animatic: false` once the beats read well.
+**Suggested flow:** run once with `animatic: true` to preview the whole sequence fast, then re-run with `animatic: false` once the beats read well.
 
 ### generate_transition
 

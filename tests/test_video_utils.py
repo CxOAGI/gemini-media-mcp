@@ -62,3 +62,36 @@ def test_extract_frame_returns_png() -> None:
     img = Image.open(BytesIO(png))
     assert img.format == "PNG"
     img.close()
+
+
+def test_frame_decoding_preflight_reports_a_usable_ffmpeg() -> None:
+    """generate_bridge and generate_clip(add_bridges=True) decode frames out
+    of videos, which needs an ffmpeg the host can run.
+
+    imageio-ffmpeg bundles a glibc build that cannot execute on musl, so the
+    published Alpine image had the dependency and no working binary — both
+    paths were dead with an opaque decoder error, after the caller had been
+    quoted a price. The check accepts an absolute path (bundled build) or a
+    bare name resolvable on PATH (a system install, which is what the image
+    now ships).
+    """
+    from src.video_utils import assert_frame_decoding_available
+
+    assert_frame_decoding_available()
+
+
+def test_frame_decoding_preflight_raises_an_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host with no ffmpeg must be told what to install, not handed a
+    decoder stack trace."""
+    import imageio_ffmpeg
+
+    from src.video_utils import assert_frame_decoding_available
+
+    def no_ffmpeg() -> str:
+        raise RuntimeError("No ffmpeg exe could be found")
+
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", no_ffmpeg)
+    with pytest.raises(RuntimeError, match="ffmpeg is required"):
+        assert_frame_decoding_available()

@@ -1154,3 +1154,81 @@ def test_an_explicit_extension_gets_no_seed_workflow() -> None:
     assert without_source.workflow == ()
     assert without_source.recommended is not None
     assert any("video_uri" in c for c in without_source.recommended.caveats)
+
+
+# ============================================================================
+# Live-test findings
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("intent", "expect_audio"),
+    [
+        pytest.param("a short video with audio", True, id="plain_request"),
+        pytest.param("a video of steam, no audio", False, id="no_audio"),
+        pytest.param("a clip without dialogue", False, id="without"),
+        pytest.param("silent b-roll of a city", False, id="silent"),
+        pytest.param("no dialogue, but ambient music", True, id="mixed_keeps_positive"),
+    ],
+)
+def test_negated_keywords_are_not_read_as_requests(
+    intent: str, expect_audio: bool
+) -> None:
+    """ "no audio" was keyword-matched as a request FOR audio, which flipped
+    both the emitted include_audio and the model ranking. A term counts only
+    when every occurrence is un-negated, so a sentence mentioning it both ways
+    keeps the positive signal."""
+    assert infer_signals(intent).wants_audio is expect_audio
+
+
+def test_a_brief_single_shot_request_is_not_inflated_into_a_clip() -> None:
+    """ "short video" means brief, not "a short". Reading it as multi-shot
+    turned one 4s render into a 3-beat clip at three times the price, with
+    placeholder prompts for shots the caller never described."""
+    plan = plan_generation(
+        "cheapest possible short video of steam rising from a coffee cup, no audio",
+        RoutingConstraints(budget="cheap", duration_seconds=4),
+    )
+    top = plan.recommended
+    assert top is not None
+    assert top.params.get("beats") is None
+    # The winning route may be omni, which has no audio control at all — the
+    # requirement is that nothing asks FOR audio.
+    assert top.params.get("include_audio") is not True
+    assert plan.request.needs_audio is False
+
+
+@pytest.mark.parametrize(
+    "intent",
+    ["a 3 beat tiktok reel about coffee", "a montage of city shots"],
+)
+def test_genuine_multi_shot_intents_still_plan_a_clip(intent: str) -> None:
+    """The fix must not over-reach: real multi-shot briefs still get clips."""
+    top = plan_generation(intent).recommended
+    assert top is not None
+    assert top.tool == "generate_clip"
+    assert len(top.params["beats"]) > 1
+
+
+def test_planner_and_tool_agree_on_extension_price() -> None:
+    """The planner billed a base render loop_extend never performs: $1.50 for
+    the same call the tool quotes at $0.70. loop_extend extends a clip the
+    caller already has."""
+    from src.pricing import actual_video_cost
+
+    plan = plan_generation(
+        "extend this clip",
+        RoutingConstraints(needs_extension=True, source_video_uri="file:///v.mp4"),
+    )
+    top = plan.recommended
+    assert top is not None and top.cost is not None
+    times = top.params["times"]
+
+    # What loop_extend's own dry_run quotes: times x 7s with no re-snap. The
+    # generic estimator would snap 7s down to 6s (ties go down), which is why
+    # both the tool and the planner bypass it for extension chains.
+    tool_quote = actual_video_cost(
+        top.model, times * 7, "720p", True, snap_duration=False
+    )
+    assert tool_quote is not None
+    assert top.cost.usd == pytest.approx(tool_quote.usd)

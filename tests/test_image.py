@@ -2,6 +2,7 @@
 
 import base64
 import logging
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -304,7 +305,7 @@ async def test_generate_image_gemini(
         ("imagen-3.0-generate-002", "gemini-3.1-flash-image"),
         ("imagen-4.0-fast-generate-001", "gemini-3.1-flash-image"),
         ("imagen-4.0-generate-001", "gemini-3.1-flash-image"),
-        ("imagen-4.0-ultra-generate-001", "gemini-3.1-flash-image"),
+        ("imagen-4.0-ultra-generate-001", "gemini-3-pro-image"),
         # Preview aliases retired 2026-06-25 — same machinery.
         ("gemini-3-pro-image-preview", "gemini-3-pro-image"),
         ("gemini-3.1-flash-image-preview", "gemini-3.1-flash-image"),
@@ -345,8 +346,9 @@ async def test_legacy_imagen_reroutes_to_gemini_ga(
     joined = " ".join(result["warnings"])
     assert legacy_model in joined
     assert expected_target in joined
-    shutdown = "2026-06-25" if legacy_model.endswith("-preview") else "2026-08-17"
-    assert shutdown in joined
+    from src.image import _MODEL_SHUTDOWNS
+
+    assert _MODEL_SHUTDOWNS[legacy_model][1] in joined
 
 
 @pytest.mark.asyncio
@@ -1353,59 +1355,67 @@ def test_image_model_excludes_retired_preview_aliases() -> None:
         assert retired in get_args(RetiredImageModel)
 
 
-def test_retired_catalog_matches_googles_deprecation_table() -> None:
-    """Every retired ID is accepted as an alias and has a replacement."""
+def test_shutdown_catalog_matches_googles_deprecation_table() -> None:
+    """Every superseded ID is accepted as an alias and has a dated replacement."""
     from typing import get_args
 
-    from src.image import _RETIRED_MODELS, RetiredImageModel
+    from src.image import _MODEL_SHUTDOWNS, ImageModel, RetiredImageModel
 
-    retired = {
-        # Imagen — discontinued 2026-08-17
+    assert _MODEL_SHUTDOWNS == {
         "imagen-3.0-capability-001": ("gemini-3.1-flash-image", "2026-08-17"),
         "imagen-3.0-capability-002": ("gemini-3.1-flash-image", "2026-08-17"),
         "imagen-3.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
         "imagen-3.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
-        "imagen-3.0-generate-002": ("gemini-3.1-flash-image", "2026-08-17"),
+        # Shut down early, ahead of the rest of the family.
+        "imagen-3.0-generate-002": ("gemini-3.1-flash-image", "2025-11-10"),
         "imagen-4.0-fast-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
         "imagen-4.0-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
-        "imagen-4.0-ultra-generate-001": ("gemini-3.1-flash-image", "2026-08-17"),
-        # Preview aliases — retired 2026-06-25
+        # Ultra is the top Imagen tier, so it maps to the top Gemini image
+        # model rather than dropping to flash.
+        "imagen-4.0-ultra-generate-001": ("gemini-3-pro-image", "2026-08-17"),
         "gemini-3-pro-image-preview": ("gemini-3-pro-image", "2026-06-25"),
         "gemini-3.1-flash-image-preview": ("gemini-3.1-flash-image", "2026-06-25"),
-    }
-    assert _RETIRED_MODELS == retired
-
-    # RetiredImageModel is the full accepted-but-superseded set: everything
-    # retired, plus everything on a scheduled shutdown.
-    from src.image import _SUNSET_MODELS
-
-    assert set(get_args(RetiredImageModel)) == set(retired) | set(_SUNSET_MODELS)
-
-    # Every replacement must itself be a live model, or the reroute just moves
-    # the failure. This is what catches the next round of deprecations.
-    from src.image import ImageModel
-
-    live = set(get_args(ImageModel))
-    assert {target for target, _ in _RETIRED_MODELS.values()} <= live
-    assert {target for target, _ in _SUNSET_MODELS.values()} <= live
-
-
-def test_sunset_models_reroute_to_a_live_replacement() -> None:
-    """A model with a scheduled shutdown is rerouted, not offered: it must be
-    out of the live catalog and point at a model that is in it."""
-    from typing import get_args
-
-    from src.image import _RETIRED_MODELS, _SUNSET_MODELS, ImageModel, RetiredImageModel
-
-    live = set(get_args(ImageModel))
-    assert _SUNSET_MODELS == {
         "gemini-2.5-flash-image": ("gemini-3.1-flash-image", "2026-10-02"),
     }
-    for model, (replacement, _shutdown) in _SUNSET_MODELS.items():
-        assert model not in live
-        assert model not in _RETIRED_MODELS
-        assert model in get_args(RetiredImageModel)
-        assert replacement in live
+    assert set(get_args(RetiredImageModel)) == set(_MODEL_SHUTDOWNS)
+
+    # Every replacement must itself be live, or the reroute just moves the
+    # failure. This is what catches the next round of deprecations.
+    live = set(get_args(ImageModel))
+    assert {target for target, _ in _MODEL_SHUTDOWNS.values()} <= live
+
+
+@pytest.mark.parametrize(
+    ("shutdown", "today", "expected"),
+    [
+        pytest.param("2026-08-17", date(2026, 8, 7), "scheduled for", id="future"),
+        pytest.param("2026-08-17", date(2026, 8, 17), "was retired", id="on_the_day"),
+        pytest.param("2026-08-17", date(2026, 8, 18), "was retired", id="past"),
+        pytest.param("2025-11-10", date(2026, 8, 7), "was retired", id="long_gone"),
+    ],
+)
+def test_shutdown_wording_follows_the_date_not_a_hard_coded_class(
+    shutdown: str, today: date, expected: str
+) -> None:
+    """Whether a shutdown is past or future is a function of today's date.
+
+    Classifying imagen-4.0-* as "retired" was correct on 2026-08-18 and wrong
+    on 2026-08-07, when it still had ten days of service — and telling a
+    Provisioned Throughput holder their model "no longer exists" while it is
+    still serving is the failure this wording exists to prevent.
+    """
+    from src.image import _shutdown_phrase
+
+    assert expected in _shutdown_phrase(shutdown, today)
+
+
+def test_a_future_shutdown_is_never_described_in_the_past_tense() -> None:
+    """The regression that shipped: past tense about a future date."""
+    from src.image import _shutdown_phrase
+
+    phrase = _shutdown_phrase("2026-08-17", date(2026, 8, 7))
+    assert "no longer exists" not in phrase
+    assert phrase == "is scheduled for shutdown on 2026-08-17"
 
 
 @pytest.mark.asyncio
