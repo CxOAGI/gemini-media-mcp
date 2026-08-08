@@ -1494,6 +1494,12 @@ async def generate_video(
         _validate_duration_seconds(duration_seconds)
 
         if dry_run:
+            if not draft:
+                # Same check the impl applies, so a quote can never succeed
+                # for a render the real call would refuse (e.g. 4K on Lite).
+                from .video import validate_render_options
+
+                validate_render_options(model, resolution)
             est_model = OMNI_MODEL if draft else model
             est_res = "720p" if draft else (resolution or "720p")
             payload: dict[str, Any] = {
@@ -1848,7 +1854,7 @@ async def generate_transition(
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
-            resolution="720p" or "720p",
+            resolution="720p",
             include_audio=result.get("audio_enabled", include_audio),
             actual=True,
         )
@@ -2018,7 +2024,7 @@ async def generate_bridge(
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
-            resolution="720p" or "720p",
+            resolution="720p",
             include_audio=result.get("audio_enabled", include_audio),
             actual=True,
         )
@@ -2727,6 +2733,16 @@ async def loop_extend(
         if times < 1 or times > 20:
             raise ValueError("times must be between 1 and 20.")
 
+        if model in _VEO_LITE_MODELS:
+            raise ValueError("Veo 3.1 Lite does not support video extension.")
+        _validate_aspect_ratio(aspect_ratio)
+
+        if video_uri.startswith("gs://"):
+            src_bucket = _parse_gcs_bucket(video_uri)
+            if src_bucket is None:
+                raise ValueError(f"Invalid video_uri: {video_uri}")
+            _assert_gcs_bucket_allowed(src_bucket, app_ctx.allowed_gcs_buckets)
+
         if dry_run:
             # Each extension is a ~7s Veo render billed like any other.
             return json.dumps(
@@ -2746,9 +2762,6 @@ async def loop_extend(
                 },
                 indent=2,
             )
-        if model in _VEO_LITE_MODELS:
-            raise ValueError("Veo 3.1 Lite does not support video extension.")
-        _validate_aspect_ratio(aspect_ratio)
 
         video_client = _client_for_video_model(app_ctx, model)
         is_vertex_client = getattr(video_client._api_client, "vertexai", False)
@@ -2766,11 +2779,6 @@ async def loop_extend(
 
         # Validate the initial gs:// source against the allowlist (intermediate
         # outputs land in the already-validated gcs_uri bucket).
-        if video_uri.startswith("gs://"):
-            src_bucket = _parse_gcs_bucket(video_uri)
-            if src_bucket is None:
-                raise ValueError(f"Invalid video_uri: {video_uri}")
-            _assert_gcs_bucket_allowed(src_bucket, app_ctx.allowed_gcs_buckets)
 
         current = video_uri
         steps: list[str] = []

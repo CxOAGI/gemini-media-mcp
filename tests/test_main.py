@@ -4976,3 +4976,86 @@ async def test_video_real_run_reports_metered_cost(
     assert payload["cost"]["usd"] == pytest.approx(4 * 0.40)
     manifest = json.loads(Path(payload["sidecar_url"][7:]).read_text())
     assert manifest["cost"]["usd"] == payload["cost"]["usd"]
+
+
+# ============================================================================
+# A quote must never succeed for a call the real run would refuse
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "expected_error"),
+    [
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "resolution": "4K",
+            },
+            "does not support 4K",
+            id="quote_4k_on_lite",
+        ),
+        pytest.param(
+            "generate_video",
+            {"prompt": "x", "model": "veo-3.1-generate-001", "resolution": "8K"},
+            "Unsupported resolution",
+            id="quote_bogus_resolution",
+        ),
+        pytest.param(
+            "loop_extend",
+            {
+                "video_uri": "file:///x.mp4",
+                "model": "veo-3.1-lite-generate-preview",
+                "times": 2,
+            },
+            "does not support video extension",
+            id="quote_extension_on_lite",
+        ),
+        pytest.param(
+            "loop_extend",
+            {"video_uri": "file:///x.mp4", "times": 2, "aspect_ratio": "21:9"},
+            "Unsupported aspect_ratio",
+            id="quote_bad_aspect",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_dry_run_refuses_what_the_real_run_would_refuse(
+    tool: str, kwargs: dict[str, Any], expected_error: str, tmp_path: Path
+) -> None:
+    """A dry run that quotes an impossible call sends the caller to a
+    guaranteed failure with a price in hand. loop_extend's quote used to sit
+    above the Lite, aspect and bucket checks; generate_video's used to return
+    estimated_cost: null for 4K-on-Lite instead of the impl's error.
+    """
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+    )
+    assert expected_error in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
+    """With an allowlist configured, quoting an extension of a video in a
+    disallowed bucket must fail exactly like running it would."""
+    import src.__main__ as main_mod
+
+    ctx = _video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"trusted"}))
+    denied = json.loads(
+        await main_mod.loop_extend(
+            ctx=ctx, video_uri="gs://evil/x.mp4", times=2, dry_run=True
+        )
+    )
+    assert "not in the allowlist" in denied["error"]
+
+    allowed = json.loads(
+        await main_mod.loop_extend(
+            ctx=ctx, video_uri="gs://trusted/x.mp4", times=2, dry_run=True
+        )
+    )
+    assert allowed["estimated_cost"]["usd"] == pytest.approx(2 * 7 * 0.40)

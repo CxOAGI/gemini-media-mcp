@@ -55,6 +55,28 @@ def _prepare_image_input(image_bytes: bytes) -> types.Image:
     return types.Image(image_bytes=buf.getvalue(), mime_type=f"image/{fmt.lower()}")
 
 
+def validate_render_options(model: str, resolution: str | None) -> None:
+    """Raise for a model/resolution pairing Veo cannot render.
+
+    Shared by the generation path and the tools' dry_run quotes, so a quote
+    can never succeed for a call that would be refused — the same
+    single-source rule as resolve_image_model on the image side.
+    """
+    if resolution is None:
+        return
+    valid_resolutions = ("720p", "1080p", "4K")
+    if resolution not in valid_resolutions:
+        raise ValueError(
+            f"Unsupported resolution '{resolution}'. "
+            f"Supported values are {', '.join(valid_resolutions)}."
+        )
+    if resolution == "4K" and model in _VEO_LITE_MODELS:
+        raise ValueError(
+            f"Model {model} does not support 4K resolution. "
+            "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+        )
+
+
 async def generate_video(
     client: genai.Client,
     prompt: str,
@@ -244,17 +266,7 @@ async def generate_video(
         config_kwargs["output_gcs_uri"] = output_gcs_uri
 
     if resolution is not None:
-        valid_resolutions = ("720p", "1080p", "4K")
-        if resolution not in valid_resolutions:
-            raise ValueError(
-                f"Unsupported resolution '{resolution}'. "
-                f"Supported values are {', '.join(valid_resolutions)}."
-            )
-        if resolution == "4K" and model in _VEO_LITE_MODELS:
-            raise ValueError(
-                f"Model {model_id} does not support 4K resolution. "
-                "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
-            )
+        validate_render_options(model, resolution)
         config_kwargs["resolution"] = resolution
 
     if person_generation is not None:
