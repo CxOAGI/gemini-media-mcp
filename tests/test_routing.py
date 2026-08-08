@@ -1086,3 +1086,71 @@ def test_emitted_params_match_the_real_tool_signatures() -> None:
     for tool_name, params in calls:
         for beat in params.get("beats", []):
             assert set(beat) <= beat_keys
+
+
+def test_profile_accessors_cover_the_live_catalogs() -> None:
+    """image_profile/video_profile/video_capabilities are the module's public
+    lookup API and had no direct tests — a rename would only have surfaced
+    through downstream callers."""
+    from typing import get_args
+
+    from src.image import ImageModel
+    from src.routing import image_profile, video_capabilities, video_profile
+    from src.video import VideoModel
+
+    for model in get_args(ImageModel):
+        assert image_profile(model) is not None, model
+    for model in get_args(VideoModel):
+        assert video_profile(model) is not None, model
+        assert video_capabilities(model) is not None, model
+    assert image_profile("not-a-model") is None
+    assert video_profile("not-a-model") is None
+    assert video_capabilities("not-a-model") is None
+
+
+def test_an_implied_extension_plans_the_seed_render_first() -> None:
+    """A fresh 30-second request implies extension (a continuous shot longer
+    than one Veo render can only be made by extending), but the caller has no
+    video yet — so the workflow must lead with the seed render. This used to
+    return loop_extend alone with an empty workflow: a top route whose
+    required video_uri could not exist."""
+    plan = plan_generation("a 30 second product video")
+    top = plan.recommended
+    assert top is not None
+    assert top.tool == "loop_extend"
+
+    assert [(w.order, w.tool) for w in plan.workflow] == [
+        (1, "generate_video"),
+        (2, "loop_extend"),
+    ]
+    seed, extend = plan.workflow
+    assert seed.params["duration_seconds"] == 8.0
+    # 8s seed + 4 extensions of ~7s covers the requested 30s.
+    assert extend.params["times"] == 4
+    assert "step 1" in extend.params["video_uri"]
+
+
+def test_an_explicit_extension_gets_no_seed_workflow() -> None:
+    """A caller who asked to extend has a clip already: with the URI supplied
+    the plan is a single call, and without it the caveat asks for the URI
+    instead of proposing a misleading fresh render."""
+    with_source = plan_generation(
+        "make this longer",
+        RoutingConstraints(
+            needs_extension=True,
+            source_video_uri="file:///v.mp4",
+            duration_seconds=30,
+            media_kind="video",
+        ),
+    )
+    assert with_source.workflow == ()
+
+    without_source = plan_generation(
+        "make this longer",
+        RoutingConstraints(
+            needs_extension=True, duration_seconds=30, media_kind="video"
+        ),
+    )
+    assert without_source.workflow == ()
+    assert without_source.recommended is not None
+    assert any("video_uri" in c for c in without_source.recommended.caveats)

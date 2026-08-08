@@ -289,3 +289,66 @@ def test_an_edit_turn_omits_the_fields_the_api_rejects(
     assert "aspect_ratio" not in response_format
     assert "generation_config" not in created
     assert result["interaction_id"] == "i-1"
+
+
+@pytest.mark.timeout(20.0)
+def test_a_create_response_without_an_id_fails_loud(
+    tmp_path: Path, no_poll_delay: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without an interaction id there is nothing to poll and nothing for a
+    later edit turn to reference — proceeding would hang or edit nothing."""
+    stub = _OmniStub()
+    original = stub.create_response
+
+    def no_id() -> dict[str, Any]:
+        body = original()
+        body.pop("id", None)
+        body.pop("name", None)
+        return body
+
+    monkeypatch.setattr(stub, "create_response", no_id)
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError, match="no interaction id"):
+        _run(stub, videos_dir)
+
+
+@pytest.mark.timeout(20.0)
+def test_an_interaction_that_never_finishes_times_out(
+    tmp_path: Path, no_poll_delay: None
+) -> None:
+    """The deadline covers the whole create-and-poll sequence; without it a
+    stuck render would poll forever inside a tool call."""
+    stub = _OmniStub(in_flight_polls=10_000)
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        _run(stub, videos_dir, timeout_seconds=0)
+
+
+@pytest.mark.timeout(20.0)
+def test_a_completed_interaction_with_no_video_output_fails_loud(
+    tmp_path: Path, no_poll_delay: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """status=completed does not guarantee a video part exists; returning a
+    result without one would hand back a video_url pointing at nothing."""
+    stub = _OmniStub()
+    original = stub.poll_response
+
+    def no_video() -> dict[str, Any]:
+        body = original()
+        body.pop("steps", None)
+        return body
+
+    monkeypatch.setattr(stub, "poll_response", no_video)
+    monkeypatch.setattr(
+        stub, "create_response", lambda: {"id": "i-1", "status": "in_progress"}
+    )
+    stub.in_flight_polls = 1
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError, match="video"):
+        _run(stub, videos_dir)

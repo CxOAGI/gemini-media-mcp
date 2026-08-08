@@ -4715,3 +4715,92 @@ async def test_plan_generation_rejects_nonfinite_durations_with_valid_json(
 
     payload = json.loads(text, parse_constant=_no_constants)
     assert expect_fragment in payload["error"]
+
+
+# ============================================================================
+# Unfetchable inputs on the tools that never had their own tests
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        pytest.param(
+            "generate_video_omni",
+            {"prompt": "x", "image_uris": ["https://example.com/a.png"]},
+            id="omni_image_uris",
+        ),
+        pytest.param(
+            "generate_video_omni",
+            {"prompt": "x", "input_video_uri": "https://example.com/v.mp4"},
+            id="omni_input_video",
+        ),
+        pytest.param(
+            "generate_transition",
+            {
+                "first_frame_uri": "https://example.com/a.png",
+                "last_frame_uri": "https://example.com/b.png",
+            },
+            id="transition_frames",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {
+                "from_clip_uri": "https://example.com/a.mp4",
+                "to_clip_uri": "https://example.com/b.mp4",
+            },
+            id="bridge_clips",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_unfetchable_inputs_fail_loud_not_silent(
+    tool: str, kwargs: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A supplied URI that cannot be fetched must abort the call, never quietly
+    degrade to a generation without that input. Pinned for image/video long
+    ago; these tools shared the shape but never had their own tests."""
+    import src.__main__ as main_mod
+
+    async def fetch_nothing(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def must_not_generate(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("generation must not run after a failed fetch")
+
+    monkeypatch.setattr(main_mod, "fetch", fetch_nothing)
+    for impl in ("generate_video_impl", "generate_video_omni_impl"):
+        monkeypatch.setattr(main_mod, impl, must_not_generate, raising=False)
+
+    result = await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), **kwargs)
+    payload = json.loads(result if isinstance(result, str) else result[0].text)
+    assert "Could not fetch" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per the manifest contract the beat fails (recorded in errors) rather
+    than silently falling back to text-to-video with the frame dropped."""
+    import src.__main__ as main_mod
+
+    async def fetch_nothing(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def must_not_generate(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("the beat must fail before generation")
+
+    monkeypatch.setattr(main_mod, "fetch", fetch_nothing)
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_generate)
+
+    payload = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path),
+            beats=[{"prompt": "x", "first_frame_uri": "https://example.com/f.png"}],
+        )
+    )
+    assert payload["errors"] and "first_frame" in str(payload["errors"][0])
+    assert payload["segments"] == []

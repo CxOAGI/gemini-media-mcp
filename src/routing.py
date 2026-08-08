@@ -1123,6 +1123,11 @@ class ResolvedRequest:
     last_frame_uri: str | None
     source_video_uri: str | None
     needs_extension: bool
+    # True when extension was implied by a long runtime rather than asked
+    # for. An implied extension has no source video yet, so the plan must
+    # lead with a seed render; an explicit one references a clip the
+    # caller already has.
+    extension_implied: bool
     wants_bridge: bool
     wants_transition: bool
     wants_gcs_output: bool
@@ -1319,6 +1324,11 @@ def resolve_request(
         last_frame_uri=given.last_frame_uri,
         source_video_uri=given.source_video_uri,
         needs_extension=bool(needs_extension),
+        extension_implied=bool(
+            needs_extension
+            and implied_extension
+            and not (given.needs_extension or signals.wants_extension)
+        ),
         wants_bridge=signals.wants_bridge,
         wants_transition=signals.wants_transition,
         wants_gcs_output=bool(wants_gcs_output),
@@ -2492,6 +2502,48 @@ def _build_workflow(
     if not routes:
         return ()
     best = routes[0]
+
+    if (
+        best.tool == "loop_extend"
+        and request.extension_implied
+        and request.source_video_uri is None
+    ):
+        # A continuous shot longer than one Veo render can only be made by
+        # generating a seed clip and extending it — a multi-beat clip would
+        # have cuts. The caller has no video yet, so the sequence IS the plan;
+        # without it the top route's required video_uri cannot exist.
+        seed_params: dict[str, Any] = {
+            "prompt": request.intent,
+            "model": best.params.get("model", best.model),
+            "duration_seconds": float(VEO_MAX_CLIP_SECONDS),
+        }
+        if "aspect_ratio" in best.params:
+            seed_params["aspect_ratio"] = best.params["aspect_ratio"]
+        extend_params = dict(best.params)
+        extend_params["video_uri"] = "<video_url from step 1>"
+        return (
+            WorkflowStep(
+                order=1,
+                tool="generate_video",
+                params=seed_params,
+                rationale=(
+                    f"Render the opening {VEO_MAX_CLIP_SECONDS}s seed clip — a "
+                    "continuous shot longer than one Veo render can only be "
+                    "made by extending an existing clip."
+                ),
+            ),
+            WorkflowStep(
+                order=2,
+                tool="loop_extend",
+                params=extend_params,
+                rationale=(
+                    f"Extend the seed clip {extend_params.get('times', 1)} "
+                    "time(s) (~7s each) to reach the requested runtime, using "
+                    "step 1's video_url."
+                ),
+            ),
+        )
+
     if best.tool != "generate_clip":
         return ()
 

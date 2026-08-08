@@ -885,3 +885,44 @@ def test_a_non_numeric_duration_is_declined() -> None:
     from src.pricing import estimate_video_cost
 
     assert estimate_video_cost("veo-3.1-generate-001", "soon") is None  # type: ignore[arg-type]
+
+
+def test_actual_cost_prices_an_unsupported_size_at_the_real_tier() -> None:
+    """flash-lite asked for 4K renders at its 1K default (the size is dropped
+    upstream), so the metered bill must be the 1K figure — quoting the 4K
+    tier would charge for pixels that were never produced."""
+    from src.pricing import actual_image_cost
+
+    usage = {
+        "prompt_token_count": 9,
+        "candidates_token_count": 1120,
+        "total_token_count": 1129,
+    }
+    at_4k = actual_image_cost("gemini-3.1-flash-lite-image", usage, "4K", 1)
+    at_1k = actual_image_cost("gemini-3.1-flash-lite-image", usage, "1K", 1)
+    assert at_4k is not None and at_1k is not None
+    assert at_4k.usd == at_1k.usd
+
+
+def test_actual_cost_splits_text_tokens_out_at_the_text_rate() -> None:
+    """Image models can emit text alongside the image. Those tokens bill at
+    the text rate, not the 20x image rate; over-billing them would overstate
+    every metered cost that includes commentary."""
+    from src.pricing import actual_image_cost
+
+    image_only = actual_image_cost(
+        "gemini-3.1-flash-image",
+        {"prompt_token_count": 0, "candidates_token_count": 1120},
+        "1K",
+        1,
+    )
+    with_text = actual_image_cost(
+        "gemini-3.1-flash-image",
+        {"prompt_token_count": 0, "candidates_token_count": 1120 + 200},
+        "1K",
+        1,
+    )
+    assert image_only is not None and with_text is not None
+    assert with_text.breakdown.get("output_text_tokens") == 200
+    # 200 tokens at $3/1M is $0.0006 — far below the $12/1M image rate.
+    assert with_text.usd - image_only.usd == pytest.approx(200 * 3.00 / 1_000_000)
