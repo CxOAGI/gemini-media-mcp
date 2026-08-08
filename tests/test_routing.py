@@ -1295,11 +1295,18 @@ def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
     Computed from the price book rather than restated, so a test cannot pass
     against a rationale that hard-codes a number the pricing no longer says.
     """
-    from src.pricing import estimate_video_cost
+    from src.pricing import estimate_video_cost, quote_duration_for
 
     probe = estimate_video_cost(OMNI_MODEL, beat_seconds, "720p", False)
     assert probe is not None
-    return probe.breakdown["usd_per_second"] * beats * beat_seconds
+    # Each render carries one frame of encoder allowance (omni lands ~0.01s
+    # over nominal), so the plan's figure is per-render quoted seconds — the
+    # same arithmetic the tool's per-beat dry_run performs.
+    return (
+        probe.breakdown["usd_per_second"]
+        * beats
+        * quote_duration_for(OMNI_MODEL, beat_seconds)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1316,8 +1323,8 @@ def test_the_animatic_claims_a_saving_only_when_it_saves(
     budget: str | None, expected_model: str, animatic_is_cheaper: bool
 ) -> None:
     """The animatic was sold as the cheap preflight for every Veo tier, but
-    omni bills $0.10136/s against Veo Fast's $0.10/s: 3 x 8s beats cost $2.43
-    as an animatic and $2.40 as the real render. The step is still worth
+    omni bills $0.10136/s against Veo Fast's $0.10/s: 3 x 8s beats cost ~$2.45
+    as an animatic (allowance included) and $2.40 as the real render. The step is still worth
     recommending — it catches a bad creative call before the delivery render —
     but it may not claim a saving the numbers contradict."""
     plan = plan_generation(

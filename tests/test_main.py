@@ -5475,36 +5475,46 @@ async def test_bridge_quote_is_refused_without_ffmpeg(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_edit_video_bills_a_measured_or_inherited_duration_not_the_request(
+async def test_edit_video_bills_the_measured_render(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bill must describe the render, and the quote must not undershoot it.
+    """The bill comes from the artifact, not from any inference.
 
-    An edit sends no duration — verified on the wire — so the render inherits
-    the source's length. But the impl reported the REQUEST anyway, and cost is
-    derived from that field, so a 3s source edited with the default 6 quoted
-    $0.3041 and billed $0.6082. Under-quoting defeats the point of a
-    pre-flight, and the bill described a render that never happened.
+    A real 3s file is rendered for the test, so the measurement path runs for
+    real: the bill is the measured length at metered confidence, whatever was
+    requested, and quote >= bill holds (the quote is the 10s upper bound).
     """
+    import subprocess
+
+    import imageio_ffmpeg
+
     import src.__main__ as main_mod
     from src.omni import OMNI_MODEL
 
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
-    (videos_dir / "source.json").write_text(
-        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
+    rendered = videos_dir / "edited.mp4"
+    subprocess.run(
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=3:size=160x90:rate=24",
+            str(rendered),
+        ],
+        capture_output=True,
+        check=True,
     )
 
     async def fake_impl(**kwargs: Any) -> dict[str, Any]:
-        out = videos_dir / "edited.mp4"
-        out.write_bytes(b"mp4")
         return {
             "message": "ok",
-            "video_url": f"file://{out}",
+            "video_url": f"file://{rendered}",
             "interaction_id": "i-new",
             "model": OMNI_MODEL,
-            # What the impl reports for an edit: it never sent a duration.
-            "duration_seconds": None,
+            "duration_seconds": None,  # an edit never sent one
             "requested_duration_seconds": kwargs.get("duration_seconds", 6),
             "aspect_ratio": "16:9",
         }
@@ -5522,34 +5532,43 @@ async def test_edit_video_bills_a_measured_or_inherited_duration_not_the_request
         await main_mod.edit_video(ctx=ctx, previous_interaction_id="i-3s", prompt="x")
     )
 
-    assert billed["duration_seconds"] == 3
-    assert billed["cost"]["usd"] == pytest.approx(3 * 0.10136)
-    # Quote and bill deliberately differ now: the rendered length is chosen by
-    # the service and is not predictable, so the quote is an upper bound while
-    # the bill is what actually rendered. The invariant that matters is the
-    # direction — a pre-flight may over-state, never under-state.
+    assert billed["duration_source"] == "measured from the rendered video"
+    assert billed["duration_seconds"] == pytest.approx(3.0, abs=0.2)
+    assert billed["cost"]["is_estimate"] is False
+    assert billed["cost"]["usd"] == pytest.approx(
+        billed["duration_seconds"] * 0.10136, rel=1e-6
+    )
+    # A pre-flight may over-state, never under-state.
     assert quote["estimated_cost"]["usd"] >= billed["cost"]["usd"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_edit_video_says_so_when_the_billed_length_is_unknown(
+async def test_an_unmeasurable_edit_bills_the_upper_bound_not_the_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A source this server did not generate has no resolvable length, so the
-    reported cost is the requested duration and must be labelled as such."""
+    """When the render cannot be measured (e.g. gs:// delivery), the bill is
+    the service maximum as a labelled estimate.
+
+    The previous fallback billed the SOURCE's sidecar length as though
+    metered — the falsified inherit model resurrected on the one branch
+    measurement cannot reach, under-billing ~3.3x on the two measured data
+    points (3.00s and 3.01s sources both rendered 10.01s).
+    """
     import src.__main__ as main_mod
-    from src.omni import OMNI_MODEL
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
 
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
+    # A source sidecar exists and says 3s — it must NOT become the bill.
+    (videos_dir / "source.json").write_text(
+        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
+    )
 
     async def fake_impl(**kwargs: Any) -> dict[str, Any]:
-        out = videos_dir / "edited.mp4"
-        out.write_bytes(b"mp4")
         return {
             "message": "ok",
-            "video_url": f"file://{out}",
+            "video_url": "gs://bucket/edited.mp4",  # unmeasurable from here
             "interaction_id": "i-new",
             "model": OMNI_MODEL,
             "duration_seconds": None,
@@ -5562,12 +5581,15 @@ async def test_edit_video_says_so_when_the_billed_length_is_unknown(
     billed = json.loads(
         await main_mod.edit_video(
             ctx=_video_ctx(tmp_path, vertexai=True),
-            previous_interaction_id="generated-elsewhere",
+            previous_interaction_id="i-3s",
             prompt="x",
         )
     )
-    assert "unknown" in billed["duration_source"]
-    assert "not the billed one" in billed["cost"]["detail"]
+    assert billed["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert "upper bound" in billed["duration_source"]
+    # A bound is an estimate; presenting it as metered would be a lie.
+    assert billed["cost"]["is_estimate"] is True
+    assert billed["cost"]["usd"] >= OMNI_MAX_DURATION_SECONDS * 0.10136
 
 
 @pytest.mark.asyncio

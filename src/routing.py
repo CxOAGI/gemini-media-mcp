@@ -2352,7 +2352,19 @@ def _aggregate_video_cost(
         from .pricing import CostEstimate
     except ImportError:  # pragma: no cover - probe already proved it imports
         return probe
-    usd = rate * total_seconds
+    # Each omni render carries one frame of encoder overhang (see
+    # pricing.quote_duration_for); a multi-render plan accrues it per render.
+    # quote_duration_for(model, 0.0) is the per-render allowance itself —
+    # zero for Veo, one frame for omni — so this stays a no-op for Veo and
+    # keeps the planner's figure identical to the tool's per-beat quote.
+    try:
+        from .pricing import quote_duration_for
+
+        per_render_allowance = quote_duration_for(model, 0.0)
+    except ImportError:  # pragma: no cover - pricing is a sibling module
+        per_render_allowance = 0.0
+    quoted_seconds = total_seconds + segments * per_render_allowance
+    usd = rate * quoted_seconds
     return CostEstimate(
         usd=usd,
         is_estimate=True,
@@ -2364,12 +2376,12 @@ def _aggregate_video_cost(
         source_note=getattr(probe, "source_note", None),
         detail=(
             f"{segments} render{'s' if segments != 1 else ''} totalling "
-            f"{total_seconds:g}s @ {resolution} on "
+            f"{quoted_seconds:g}s @ {resolution} on "
             f"{model} (${rate:g}/s)"
         ),
         breakdown={
             "renders": float(segments),
-            "seconds": total_seconds,
+            "seconds": quoted_seconds,
             "usd_per_second": rate,
             "video_usd": usd,
         },
