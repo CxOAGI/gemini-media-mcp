@@ -94,6 +94,15 @@ Generate images using Gemini image models
 - `gemini-3-pro-image` - Nano Banana Pro; 4K, reasoning, multi-turn editing
 - `gemini-3.1-flash-lite-image` - cheapest, but **1K output only** (2K/4K unsupported)
 
+### HTTP transports
+
+```bash
+docker run --rm -p 8000:8000 -e GEMINI_API_KEY=... -e DATA_FOLDER=/data \
+  -v /host/path:/data cxoagi/gemini-media-mcp streamable-http   # or: sse
+```
+
+The server binds `0.0.0.0` inside a container so the published port is reachable, and `127.0.0.1` when run directly so a local run is not exposed to the network. Override with `--host` / `--port` or `FASTMCP_HOST`.
+
 > **Retired IDs are rerouted, not failed.** The `gemini-3-pro-image-preview` and `gemini-3.1-flash-image-preview` aliases were retired on 2026-06-25, every `imagen-*` image endpoint is discontinued on 2026-08-17, and `gemini-2.5-flash-image` is scheduled for shutdown on 2026-10-02. Requesting one still returns an image — the server substitutes the GA replacement Google published instead of letting the call 404 — and announces the swap three ways: a `warnings` entry in the response JSON, an MCP `warning` log notification, and a `WARNING` record in the server log. Request a GA model directly.
 
 *This tool may perform destructive updates.*

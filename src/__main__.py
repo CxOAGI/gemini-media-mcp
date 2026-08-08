@@ -2528,6 +2528,21 @@ def main() -> None:
         help="Mount path for SSE/HTTP transport (e.g., /mcp)",
     )
     parser.add_argument(
+        "--host",
+        default=None,
+        help=(
+            "Bind address for the sse/streamable-http transports. Defaults to "
+            "0.0.0.0 in a container (so a published port is reachable) and "
+            "127.0.0.1 otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port for the sse/streamable-http transports (default 8000).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -2617,6 +2632,24 @@ def main() -> None:
             "Run 'gemini-media-mcp setup' for an interactive setup wizard."
         )
         sys.exit(1)
+
+    if transport in ("sse", "streamable-http"):
+        # FastMCP binds 127.0.0.1 by default. Inside a container that is the
+        # container's own loopback, so a published port reaches nothing —
+        # which made the Dockerfile's own documented `-p 8000:8000` usage
+        # impossible. Bind all interfaces there, but keep loopback elsewhere
+        # so a local run is not exposed to the network by surprise.
+        if args.host:
+            mcp.settings.host = args.host
+        elif not os.environ.get("FASTMCP_HOST"):
+            mcp.settings.host = (
+                "0.0.0.0" if is_running_in_container() else "127.0.0.1"  # noqa: S104
+            )
+        if args.port:
+            mcp.settings.port = args.port
+        logger.info(
+            "Serving %s on %s:%s", transport, mcp.settings.host, mcp.settings.port
+        )
 
     mcp.run(transport=transport, mount_path=args.mount_path)
 

@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import logging
 from io import BytesIO
 from pathlib import Path
@@ -4610,3 +4611,44 @@ async def test_generate_clip_rejects_a_promptless_beat_before_rendering_any(
         beats=[{"prompt": "fine"}, {"prompt": "fine"}, {"caption": "no prompt"}],
     )
     assert "beats[2]" in json.loads(result)["error"]
+
+
+@pytest.mark.parametrize(
+    ("in_container", "cli_host", "env_host", "expected"),
+    [
+        pytest.param(True, None, None, "0.0.0.0", id="container_binds_all"),
+        pytest.param(False, None, None, "127.0.0.1", id="local_stays_loopback"),
+        pytest.param(True, "10.0.0.5", None, "10.0.0.5", id="cli_wins"),
+        pytest.param(True, None, "192.168.1.9", "192.168.1.9", id="env_respected"),
+        pytest.param(False, "0.0.0.0", None, "0.0.0.0", id="cli_can_expose_local"),
+    ],
+)
+def test_http_transport_bind_address(
+    in_container: bool,
+    cli_host: str | None,
+    env_host: str | None,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FastMCP binds 127.0.0.1 by default, which inside a container is the
+    container's own loopback — so the Dockerfile's documented `-p 8000:8000`
+    reached nothing. Containers must bind all interfaces; a local run must not,
+    so it is not exposed to the network by surprise.
+    """
+    import src.__main__ as main_mod
+
+    monkeypatch.setattr(main_mod, "is_running_in_container", lambda: in_container)
+    if env_host:
+        monkeypatch.setenv("FASTMCP_HOST", env_host)
+    else:
+        monkeypatch.delenv("FASTMCP_HOST", raising=False)
+
+    resolved: str
+    if cli_host:
+        resolved = cli_host
+    elif not os.environ.get("FASTMCP_HOST"):
+        resolved = "0.0.0.0" if main_mod.is_running_in_container() else "127.0.0.1"
+    else:
+        resolved = os.environ["FASTMCP_HOST"]
+
+    assert resolved == expected
