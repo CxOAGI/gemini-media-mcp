@@ -273,9 +273,6 @@ def test_cleanup_credentials(
             {"GOOGLE_GENAI_USE_VERTEXAI": "true"}, True, id="vertexai_enabled"
         ),
         pytest.param(
-            {"GOOGLE_GENAI_USE_VERTEXAI": "true"}, True, id="vertexai_enabled"
-        ),
-        pytest.param(
             {"GOOGLE_GENAI_USE_VERTEXAI": "TRUE"}, True, id="vertexai_uppercase"
         ),
         pytest.param({"GEMINI_API_KEY": "test-key"}, True, id="api_key_set"),

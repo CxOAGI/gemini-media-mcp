@@ -430,7 +430,9 @@ async def test_flash_lite_drops_unsupported_image_size(
     assert result["model"] == "gemini-3.1-flash-lite-image"
     assert client.models.last_generate_content_kwargs is not None
     config = client.models.last_generate_content_kwargs["config"]
-    assert config.image_config is None or config.image_config.image_size is None
+    # Covers both shapes in one falsifiable expression: no image_config at
+    # all, or one that carries no image_size.
+    assert getattr(config.image_config, "image_size", None) is None
     joined = " ".join(result["warnings"])
     assert f"image_size={size}" in joined
     assert "gemini-3.1-flash-image" in joined

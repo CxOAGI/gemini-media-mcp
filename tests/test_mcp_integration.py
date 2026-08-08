@@ -7,8 +7,11 @@ Run with Vertex AI (full features including Gemini 3 Pro Image):
   GOOGLE_GENAI_USE_VERTEXAI=true uv run pytest tests/test_mcp_integration.py -v -s
 """
 
+import json
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -75,6 +78,43 @@ async def _mcp_session(temp_data_folder):
             yield session
 
 
+def _payload(result: Any) -> dict[str, Any]:
+    """Parse a tool result's JSON text part.
+
+    Fails the test on a non-JSON body rather than falling back to substring
+    matching, which is what let the old assertions accept anything.
+    """
+    text = next((c.text for c in result.content if hasattr(c, "text")), "")
+    assert text, "tool returned no text content"
+    return json.loads(text)
+
+
+def _assert_generated(result: Any, url_key: str) -> dict[str, Any]:
+    """Assert the call actually produced media, and show the API error if not.
+
+    These live tests previously asserted `"image_url" in text or "error" in
+    text`, which is true of EVERY possible response — success and failure
+    alike — so a total API outage passed. This demands the media URL and, on
+    failure, surfaces the server's own error message.
+    """
+    payload = _payload(result)
+    assert "error" not in payload, f"tool returned an error: {payload['error']}"
+    assert payload.get(url_key), f"no {url_key} in response: {payload}"
+    assert str(payload[url_key]).startswith(("file://", "gs://")), payload[url_key]
+    return payload
+
+
+def _assert_refused(result: Any, expected_fragment: str) -> None:
+    """Assert the call was refused for the stated reason.
+
+    A bare `"error" in text` passes on ANY failure — including a network
+    blip or a bad key — so the reason has to be checked too.
+    """
+    payload = _payload(result)
+    assert "error" in payload, f"expected a refusal, got: {payload}"
+    assert expected_fragment.lower() in payload["error"].lower(), payload["error"]
+
+
 class TestMCPIntegration:
     """Test MCP server via stdio client."""
 
@@ -118,9 +158,8 @@ class TestMCPIntegration:
                     "model": "gemini-3-pro-image",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ Gemini 3 Pro Image: {text[:200]}")
-            assert "image_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "image_url")
+            assert payload["model"] == "gemini-3-pro-image"
 
     @requires_api
     async def test_gemini3_pro_image_size(self, temp_data_folder):
@@ -134,26 +173,33 @@ class TestMCPIntegration:
                     "image_size": "2K",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ Gemini 3 Pro with 2K size: {text[:200]}")
-            assert "image_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "image_url")
+            # The manifest records the size actually used, so a silently
+            # dropped 2K would surface here.
+            sidecar = json.loads(Path(payload["sidecar_url"][7:]).read_text())
+            assert sidecar["image_size"] == "2K"
 
     @requires_api
-    async def test_gemini3_pro_thinking_level(self, temp_data_folder):
-        """Test Gemini 3 Pro Image with thinking_level parameter."""
+    async def test_gemini3_pro_returns_a_thought_signature(self, temp_data_folder):
+        """Multi-turn editing depends on the signature being returned.
+
+        This test used to pass `thinking_level: "high"` — not a parameter of
+        generate_image — and assert nothing. MCP leaves additionalProperties
+        unset, so the unknown key was silently dropped and the test could
+        never fail. It now checks the capability that actually exists.
+        """
         async with _mcp_session(temp_data_folder) as session:
             result = await session.call_tool(
                 "generate_image",
                 {
                     "prompt": "A complex steampunk machine with gears and pipes",
                     "model": "gemini-3-pro-image",
-                    "thinking_level": "high",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ Gemini 3 Pro with high thinking: {text[:200]}")
-            if "thought_signature" in text:
-                print("✓ Thought signature returned for multi-turn editing")
+            payload = _assert_generated(result, "image_url")
+            signature_url = payload.get("thought_signature_url")
+            assert signature_url, f"no thought_signature_url: {payload}"
+            assert Path(signature_url[7:]).stat().st_size > 0
 
     # ==================== Gemini 3.1 Flash Image Tests ====================
 
@@ -168,9 +214,8 @@ class TestMCPIntegration:
                     "model": "gemini-3.1-flash-image",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ Gemini 3.1 Flash Image: {text[:200]}")
-            assert "image_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "image_url")
+            assert payload["model"] == "gemini-3.1-flash-image"
 
     @requires_api
     async def test_gemini31_flash_image_size(self, temp_data_folder):
@@ -184,9 +229,8 @@ class TestMCPIntegration:
                     "image_size": "2K",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ Gemini 3.1 Flash with 2K size: {text[:200]}")
-            assert "image_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "image_url")
+            assert payload.get("cost") is not None, "a real run must report cost"
 
     # ==================== VEO 3.1 Tests ====================
 
@@ -201,9 +245,8 @@ class TestMCPIntegration:
                     "model": "veo-3.1-generate-001",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ VEO 3.1 basic: {text[:300]}")
-            assert "video_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "video_url")
+            assert payload.get("cost") is not None, "a real run must report cost"
 
     @requires_api
     async def test_veo31_duration(self, temp_data_folder):
@@ -217,9 +260,8 @@ class TestMCPIntegration:
                     "duration_seconds": 6,
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ VEO 3.1 with 6s duration: {text[:300]}")
-            assert "video_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "video_url")
+            assert payload.get("cost") is not None, "a real run must report cost"
 
     @requires_api
     async def test_veo31_fast(self, temp_data_folder):
@@ -232,9 +274,8 @@ class TestMCPIntegration:
                     "model": "veo-3.1-fast-generate-001",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ VEO 3.1 fast: {text[:300]}")
-            assert "video_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "video_url")
+            assert payload.get("cost") is not None, "a real run must report cost"
 
     @requires_api
     async def test_veo31_lite(self, temp_data_folder):
@@ -248,9 +289,8 @@ class TestMCPIntegration:
                     "duration_seconds": 4,
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ VEO 3.1 Lite: {text[:300]}")
-            assert "video_url" in text.lower() or "error" in text.lower()
+            payload = _assert_generated(result, "video_url")
+            assert payload.get("cost") is not None, "a real run must report cost"
 
     @requires_api
     async def test_veo31_lite_rejects_extend(self, temp_data_folder):
