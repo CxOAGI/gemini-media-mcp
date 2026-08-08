@@ -83,15 +83,25 @@ class TestMCPIntegration:
         async with _mcp_session(temp_data_folder) as session:
             result = await session.list_tools()
             tool_names = {tool.name for tool in result.tools}
+            # Exact roster, not a subset: unit tests import the tool functions
+            # directly, so a deleted @mcp.tool() registration fails nothing
+            # else in the suite. This subset check silently missed five tools
+            # as they were added.
             expected_tools = {
+                "plan_generation",
                 "generate_image",
+                "generate_storyboard",
                 "generate_video",
                 "generate_transition",
                 "generate_bridge",
                 "generate_clip",
+                "generate_video_omni",
+                "edit_video",
+                "loop_extend",
             }
-            assert expected_tools.issubset(tool_names), (
-                f"Missing tools: {expected_tools - tool_names}"
+            assert tool_names == expected_tools, (
+                f"Missing: {expected_tools - tool_names} | "
+                f"Unexpected: {tool_names - expected_tools}"
             )
             print(f"✓ Found {len(tool_names)} tools: {tool_names}")
 
