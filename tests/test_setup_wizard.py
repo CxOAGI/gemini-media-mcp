@@ -473,3 +473,65 @@ def test_macos_config_path_points_to_application_support() -> None:
     assert path.name == "claude_desktop_config.json"
     assert "Application Support" in str(path)
     assert "Claude" in str(path)
+
+
+def test_written_config_is_not_readable_by_other_accounts(tmp_path: Path) -> None:
+    """The wizard writes live credentials, so the file must be owner-only.
+
+    In Vertex mode the block carries GOOGLE_SERVICE_ACCOUNT_JSON — an entire
+    service-account private key. Left to the umask it landed at 0664, readable
+    by every other account on the host.
+    """
+    import stat
+
+    from src.setup_wizard import _merge_and_write, build_claude_config
+
+    config_path = tmp_path / "claude_desktop_config.json"
+    block = build_claude_config({"GEMINI_API_KEY": "AIza-secret"})
+
+    _merge_and_write(config_path, block)
+
+    mode = stat.S_IMODE(config_path.stat().st_mode)
+    assert not mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH)
+    assert "AIza-secret" in config_path.read_text()
+
+
+def test_backup_of_a_wide_open_config_is_narrowed(tmp_path: Path) -> None:
+    """copy2 preserves the source mode, so a pre-existing world-readable
+    config would otherwise be duplicated exactly as permissive."""
+    import stat
+
+    from src.setup_wizard import _merge_and_write, build_claude_config
+
+    config_path = tmp_path / "claude_desktop_config.json"
+    config_path.write_text('{"mcpServers": {"old": {}}}')
+    config_path.chmod(0o644)
+
+    backup = _merge_and_write(
+        config_path, build_claude_config({"GEMINI_API_KEY": "AIza-secret"})
+    )
+
+    assert backup is not None
+    for path in (config_path, backup):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert not mode & (stat.S_IRGRP | stat.S_IROTH), f"{path.name} is {oct(mode)}"
+
+
+def test_an_existing_config_is_narrowed_before_the_secret_is_written(
+    tmp_path: Path,
+) -> None:
+    """O_CREAT does not change an existing file's mode, so a config that was
+    already world-readable would keep those bits while gaining a fresh key."""
+    import stat
+
+    from src.setup_wizard import _merge_and_write, build_claude_config
+
+    config_path = tmp_path / "claude_desktop_config.json"
+    config_path.write_text("{}")
+    config_path.chmod(0o666)
+
+    _merge_and_write(config_path, build_claude_config({"GEMINI_API_KEY": "AIza-new"}))
+
+    mode = stat.S_IMODE(config_path.stat().st_mode)
+    assert not mode & (stat.S_IRGRP | stat.S_IROTH)
+    assert "AIza-new" in config_path.read_text()
