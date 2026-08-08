@@ -5231,3 +5231,82 @@ async def test_generate_video_quote_reports_the_duration_it_prices(
     assert payload["requested_duration_seconds"] == 5
     assert payload["duration_seconds"] == 4
     assert "4s of video" in payload["estimated_cost"]["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_edit_video_quote_uses_the_source_videos_duration(
+    tmp_path: Path,
+) -> None:
+    """An edit inherits its duration from the source, so quoting the caller's
+    duration_seconds overstated a 3s edit by 3.3x ($1.0136 for a $0.3041 call).
+
+    The omni sidecar already records interaction_id beside duration_seconds,
+    so the real length is recoverable locally — no API call, which keeps a dry
+    run free, instant and offline.
+    """
+    import src.__main__ as main_mod
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    (videos_dir / "prior.json").write_text(
+        json.dumps(
+            {"kind": "omni_video", "interaction_id": "i-42", "duration_seconds": 3}
+        )
+    )
+
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="i-42",
+            prompt="make it stormy",
+            duration_seconds=10,  # ignored: the source is 3s
+            dry_run=True,
+        )
+    )
+    assert payload["duration_seconds"] == 3
+    assert "inherited" in payload["duration_source"]
+    assert payload["estimated_cost"]["usd"] == pytest.approx(3 * 0.10136)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_edit_video_quote_says_so_when_the_source_is_unknown(
+    tmp_path: Path,
+) -> None:
+    """A source this server did not generate has no recoverable duration. The
+    quote must fall back AND admit it, rather than presenting a guess as fact.
+    """
+    import src.__main__ as main_mod
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="made-up-elsewhere",
+            prompt="x",
+            duration_seconds=10,
+            dry_run=True,
+        )
+    )
+    assert payload["duration_seconds"] == 10
+    assert "unknown" in payload["duration_source"]
+    assert "may differ" in payload["duration_source"]
+
+
+def test_source_duration_lookup_survives_a_junk_sidecar(tmp_path: Path) -> None:
+    """Media directories accumulate unrelated and half-written files; a bad
+    one must not break the lookup for a good one."""
+    from src.__main__ import _source_duration_for_interaction
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    (videos_dir / "broken.json").write_text("{not json at all")
+    (videos_dir / "unrelated.json").write_text(json.dumps({"kind": "video"}))
+    (videos_dir / "match.json").write_text(
+        json.dumps({"interaction_id": "i-7", "duration_seconds": 6})
+    )
+
+    assert _source_duration_for_interaction(videos_dir, "i-7") == 6.0
+    assert _source_duration_for_interaction(videos_dir, "absent") is None
+    assert _source_duration_for_interaction(tmp_path / "nope", "i-7") is None

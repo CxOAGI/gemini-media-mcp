@@ -738,6 +738,50 @@ def _image_cost(
     return _cost_payload(_image_cost_estimate(model, image_size, usage=usage, n=n))
 
 
+def _source_duration_for_interaction(
+    videos_dir: Path, interaction_id: str
+) -> float | None:
+    """Duration of a prior omni interaction, from the sidecars we wrote.
+
+    An edit inherits its duration from the source video, so quoting the
+    caller's ``duration_seconds`` overstated a 3s edit by 3.3x when they asked
+    for 10s. The omni manifest already records ``interaction_id`` alongside
+    ``duration_seconds``, so the real length is discoverable locally — no API
+    call, which keeps a dry run free, instant and offline.
+
+    Returns None when the source was not produced by this server (or its
+    sidecar is gone), which is the honest "cannot know" answer.
+
+    Args:
+        videos_dir: Directory the video sidecars are written to.
+        interaction_id: The interaction whose duration is wanted.
+
+    Returns:
+        The recorded duration in seconds, or None if it cannot be determined.
+    """
+    try:
+        sidecars = sorted(
+            videos_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:  # pragma: no cover - unreadable media dir
+        return None
+    # Newest first: an interaction id is chained forward by edits, so the most
+    # recent manifest naming it is the closest ancestor of this edit.
+    for sidecar in sidecars[:200]:
+        try:
+            manifest = json.loads(sidecar.read_text())
+        except (OSError, ValueError):
+            continue
+        if manifest.get("interaction_id") != interaction_id:
+            continue
+        duration = manifest.get("duration_seconds")
+        if isinstance(duration, (int, float)) and duration > 0:
+            return float(duration)
+    return None
+
+
 def _video_cost_estimate(
     model: str,
     duration_seconds: float,
@@ -871,6 +915,11 @@ async def generate_image(
             and the resolved model/parameters. Free and instant — use it to
             price a call before committing to it. A real run reports the
             actual cost, derived from the token counts the API metered.
+            Note: a quote covers output tokens only. Input tokens are not
+            knowable before the call, so a multi-turn edit (which resends the
+            conversation via thought_signature_url) costs slightly more than
+            quoted — measured at ~1% on a real edit, 1527 input tokens against
+            14 for a fresh call. The real run reports the metered figure.
 
     Returns:
         JSON with image_url, image_preview, and model info. For Gemini 3.x image models,
@@ -1111,7 +1160,19 @@ async def plan_generation(
 
         from .routing import RoutingConstraints, plan_generation as plan_impl
 
+        # Tell the planner what this deployment can actually reach. Without
+        # it, it recommended Veo Lite — Gemini-API-only — on a Vertex server
+        # with no key, a route the real call refuses with exactly that
+        # message. The server knows; the router is pure and cannot find out.
+        app_ctx = ctx.request_context.lifespan_context
+        primary_is_vertex = bool(
+            getattr(getattr(app_ctx.client, "_api_client", None), "vertexai", False)
+        )
         constraints = RoutingConstraints(
+            backend="vertex" if primary_is_vertex else "gemini_api",
+            gemini_api_key_available=(
+                not primary_is_vertex or app_ctx.gemini_api_client is not None
+            ),
             budget=budget,
             media_kind=media_kind,
             aspect_ratio=aspect_ratio,
@@ -2692,7 +2753,9 @@ async def edit_video(
         previous_interaction_id: interaction_id from a prior omni result
         prompt: The edit instruction (describe only what should change)
         aspect_ratio: "16:9" (default) or "9:16"
-        duration_seconds: Desired duration, clamped to 3-10s (default 6)
+        duration_seconds: IGNORED for edits. An edit inherits the source
+            video's duration; the parameter is accepted only for symmetry with
+            generate_video_omni and is never sent to the API.
         timeout_seconds: Overall deadline for the edit render (default 600)
 
         dry_run: When True, return only the cost estimate and generate
@@ -2711,24 +2774,40 @@ async def edit_video(
         _validate_duration_seconds(duration_seconds)
 
         if dry_run:
-            # Mirror the impl's clamp so the quote matches the render.
-            clamped = min(10, max(3, round(duration_seconds)))
-            return json.dumps(
-                {
-                    "dry_run": True,
-                    "message": "Estimate only — nothing was generated",
-                    "model": OMNI_MODEL,
-                    "duration_seconds": clamped,
-                    "estimated_cost": _video_cost(
-                        OMNI_MODEL,
-                        float(clamped),
-                        resolution="720p",
-                        include_audio=False,
-                        presnapped=True,
-                    ),
-                },
-                indent=2,
+            # An edit inherits its duration from the source video, so the
+            # caller's duration_seconds is not what gets billed — quoting it
+            # overstated a 3s edit by 3.3x. Recover the real length from the
+            # sidecar of the interaction being edited; fall back to the
+            # request only when the source is unknown, and say so.
+            source_duration = _source_duration_for_interaction(
+                app_ctx.videos_dir, previous_interaction_id
             )
+            payload: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "model": OMNI_MODEL,
+                "previous_interaction_id": previous_interaction_id,
+            }
+            if source_duration is not None:
+                quoted = source_duration
+                payload["duration_seconds"] = quoted
+                payload["duration_source"] = "inherited from the source video"
+            else:
+                quoted = float(min(10, max(3, round(duration_seconds))))
+                payload["duration_seconds"] = quoted
+                payload["duration_source"] = (
+                    "estimate: the source video was not generated by this "
+                    "server, so its length is unknown. An edit inherits the "
+                    "source's duration, so the real cost may differ."
+                )
+            payload["estimated_cost"] = _video_cost(
+                OMNI_MODEL,
+                quoted,
+                resolution="720p",
+                include_audio=False,
+                presnapped=True,
+            )
+            return json.dumps(payload, indent=2)
 
         await ctx.info(f"Editing video (interaction {previous_interaction_id})")
         result = await _omni_generate_and_manifest(

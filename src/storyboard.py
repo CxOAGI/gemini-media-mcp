@@ -622,10 +622,15 @@ def _draw_lines(
 
 
 class _SheetFonts(NamedTuple):
-    """Font set for one contact sheet, scaled to the panel width."""
+    """Font set for one contact sheet.
+
+    ``title``, ``subtitle`` and ``alert`` are header faces at fixed sizes; the
+    rest scale with the panel width.
+    """
 
     title: Font
     subtitle: Font
+    alert: Font
     caption: Font
     body: Font
     badge: Font
@@ -635,12 +640,15 @@ def _sheet_fonts(panel_width: int) -> _SheetFonts:
     """Build the sheet's fonts, scaling body text to the panel width.
 
     Narrow panels (many columns) get proportionally smaller text so wrapping
-    still yields readable lines instead of two words per row.
+    still yields readable lines instead of two words per row. The header faces
+    stay fixed: the header is identical on every board, so letting it shrink
+    with the grid would only make wide boards harder to read.
     """
     scale = panel_width / 480
     return _SheetFonts(
         title=_load_font(30, bold=True),
         subtitle=_load_font(15),
+        alert=_load_font(13, bold=True),
         caption=_load_font(max(11, round(15 * scale)), bold=True),
         body=_load_font(max(10, round(13 * scale))),
         badge=_load_font(max(10, round(12 * scale)), bold=True),
@@ -803,7 +811,9 @@ def _render_failed_area(
         label,
         fonts.badge,
         fill=colors.error,
-        text_color="#ffffff",
+        # Knockout in the palette's error surface colour, matching the header's
+        # failure flag: white on the dark theme's light red is a weak contrast.
+        text_color=colors.error_bg,
         pad_x=10,
     )
     _draw_lines(
@@ -826,7 +836,6 @@ class _Layout(NamedTuple):
     cols: int
     rows: int
     header_h: int
-    footer_h: int
     sheet_w: int
     sheet_h: int
 
@@ -856,10 +865,11 @@ def _layout_sheet(
     rows = math.ceil(count / cols)
 
     header_h = _line_height(fonts.title) + _line_height(fonts.subtitle) + 14
-    footer_h = _line_height(fonts.subtitle) + 12
     sheet_w = 2 * _OUTER_PAD + cols * card_w + (cols - 1) * _GUTTER
     grid_h = rows * card_h + (rows - 1) * _GUTTER
-    sheet_h = _OUTER_PAD + header_h + grid_h + footer_h + _OUTER_PAD
+    # No footer band: the header already carries the whole board summary, so a
+    # footer could only repeat it. The grid just ends on the outer padding.
+    sheet_h = _OUTER_PAD + header_h + grid_h + _OUTER_PAD
 
     return _Layout(
         fonts=fonts,
@@ -869,7 +879,6 @@ def _layout_sheet(
         cols=cols,
         rows=rows,
         header_h=header_h,
-        footer_h=footer_h,
         sheet_w=sheet_w,
         sheet_h=sheet_h,
     )
@@ -890,7 +899,8 @@ def render_contact_sheet(
 
     This is the artifact an MCP client can actually show inline, so it carries
     everything needed for a first-pass review: numbered panels, per-shot
-    duration badges, captions, prompts and a runtime footer.
+    duration badges, captions, prompts, and a header that summarises the board
+    and flags any shots that failed to generate.
 
     Args:
         frames: Shots in playback order. Must not be empty.
@@ -953,7 +963,7 @@ def render_contact_sheet(
 
     fonts = layout.fonts
     card_w, card_h, image_h = layout.card_w, layout.card_h, layout.image_h
-    header_h, footer_h = layout.header_h, layout.footer_h
+    header_h = layout.header_h
     sheet_w, sheet_h = layout.sheet_w, layout.sheet_h
 
     title_lh = _line_height(fonts.title)
@@ -966,25 +976,73 @@ def render_contact_sheet(
         total_runtime = sum(f.duration_seconds or 0.0 for f in frames)
         failed = sum(1 for f in frames if f.failed)
         summary = f"{count} shot{'s' if count != 1 else ''}"
-        if total_runtime > 0:
-            summary += f"  ·  {format_timecode(total_runtime)} runtime"
-        if failed:
-            summary += f"  ·  {failed} failed"
-
-        # Header: title left, summary right on the same baseline band.
-        draw.text(
-            (_OUTER_PAD, _OUTER_PAD),
-            _drawable(title, fonts.title),
-            font=fonts.title,
-            fill=colors.text,
+        # Durations drive every timecode downstream, so a board without them
+        # says so rather than quietly dropping the runtime.
+        summary += (
+            f"  ·  {format_timecode(total_runtime)} runtime"
+            if total_runtime > 0
+            else "  ·  no durations set"
         )
+
+        # Header: title left, summary right on the same baseline band. This is
+        # the board's only summary — it used to be repeated in a footer, which
+        # read as a rendering bug on a short board (both copies visible at
+        # once) and spent a row of height saying nothing new.
+        #
+        # Laid out right to left, because the title is the elastic part: the
+        # failure flag and the summary claim their space first and the title
+        # gets what is left, so a long board name can never run under either.
+        summary_y = _OUTER_PAD + title_lh - sub_lh - 2
+        summary_text = _drawable(summary, fonts.subtitle)
         summary_w = _text_width(fonts.subtitle, summary)
+        # Centre of the summary's *ink*, not of its line box: the line box
+        # reserves descender space this text mostly does not use, so centring
+        # the flag on it would hang the flag visibly low.
+        summary_ink = fonts.subtitle.getbbox(summary_text)
+        summary_mid = summary_y + round((summary_ink[1] + summary_ink[3]) / 2)
+        right_edge = sheet_w - _OUTER_PAD
+
+        if failed:
+            # A board with holes in it is a diagnostic artifact, so the failure
+            # count is a filled pill in the error colour instead of one more
+            # muted phrase in the summary run. error_bg is the palette's
+            # counterpart to error, so the label stays legible in both themes.
+            flag = f"{failed} failed"
+            flag_h = _line_height(fonts.alert, leading=1.0) + 8
+            flag_w, _ = _draw_pill(
+                draw,
+                (right_edge, summary_mid - flag_h // 2),
+                flag,
+                fonts.alert,
+                fill=colors.error,
+                text_color=colors.error_bg,
+                pad_x=10,
+                align_right=True,
+            )
+            right_edge -= flag_w + 12
+
+        summary_x = right_edge - summary_w
         draw.text(
-            (sheet_w - _OUTER_PAD - summary_w, _OUTER_PAD + title_lh - sub_lh - 2),
-            _drawable(summary, fonts.subtitle),
+            (summary_x, summary_y),
+            summary_text,
             font=fonts.subtitle,
             fill=colors.muted,
         )
+        # Titles are caller-supplied and unbounded, so ellipsize rather than
+        # let one run under the summary. On a sheet too narrow to hold even the
+        # ellipsis the title is dropped: a smear of glyphs over the summary is
+        # worse than no title, and the summary is the part carrying meaning.
+        title_text = title
+        title_max = summary_x - 16 - _OUTER_PAD
+        if _text_width(fonts.title, title_text) > title_max:
+            title_text = _ellipsize(title_text, fonts.title, title_max)
+        if _text_width(fonts.title, title_text) <= title_max:
+            draw.text(
+                (_OUTER_PAD, _OUTER_PAD),
+                _drawable(title_text, fonts.title),
+                font=fonts.title,
+                fill=colors.text,
+            )
         if subtitle:
             sub_lines = _wrap_text(
                 subtitle, fonts.subtitle, sheet_w - 2 * _OUTER_PAD, 1
@@ -1024,16 +1082,6 @@ def render_contact_sheet(
             finally:
                 mask.close()
                 card.close()
-
-        footer = summary
-        if total_runtime <= 0:
-            footer = f"{summary}  ·  no durations set"
-        draw.text(
-            (_OUTER_PAD, sheet_h - _OUTER_PAD - footer_h + 6),
-            _drawable(footer, fonts.subtitle),
-            font=fonts.subtitle,
-            fill=colors.muted,
-        )
 
         buffer = BytesIO()
         sheet.save(buffer, format="PNG", optimize=True)

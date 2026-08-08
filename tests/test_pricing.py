@@ -926,3 +926,234 @@ def test_actual_cost_splits_text_tokens_out_at_the_text_rate() -> None:
     assert with_text.breakdown.get("output_text_tokens") == 200
     # 200 tokens at $3/1M is $0.0006 — far below the $12/1M image rate.
     assert with_text.usd - image_only.usd == pytest.approx(200 * 3.00 / 1_000_000)
+
+
+# ============================================================================
+# Rate provenance
+# ============================================================================
+#
+# A cost that carries only `pricing_as_of` says when someone checked a number,
+# not what they checked it against — so a caller who doubts a quote has nowhere
+# to go. These tests pin the URL (and the one caveat that URL does not cover)
+# to the payload that actually crosses the MCP boundary.
+
+
+def _image_note() -> str:
+    """The shared image-rate note, read from the table rather than retyped."""
+    note = _IMAGE_PRICING["gemini-3.1-flash-image"].source_note
+    assert note is not None
+    return note
+
+
+def test_cost_to_dict_carries_the_source_url_not_just_a_date() -> None:
+    """The published page behind the figure must reach the caller."""
+    payload = cost_to_dict(estimate_image_cost("gemini-3.1-flash-image", "2K", 2))
+    assert payload is not None
+    assert payload["pricing_source"] == PRICING_SOURCES["gemini_api"]
+    # Unchanged neighbours: this is additive, not a reshuffle.
+    assert payload["pricing_as_of"] == PRICING_AS_OF
+    assert payload["usd"] == pytest.approx(0.2016)
+
+
+def test_an_image_quote_says_the_rate_holds_on_both_backends() -> None:
+    """Image token rates are published on both pages, so the note points at
+    the Vertex page too — a Vertex caller can check the figure where they
+    actually bill."""
+    payload = cost_to_dict(estimate_image_cost("gemini-3-pro-image", "4K"))
+    assert payload is not None
+    note = payload["pricing_source_note"]
+    assert note is not None
+    assert PRICING_SOURCES["vertex_ai"] in note
+
+
+def test_a_veo_quote_flags_that_the_vertex_rate_is_assumed() -> None:
+    """Veo per-second rates could only be confirmed on the Gemini Developer
+    API page. A Vertex caller quoted one is relying on an assumption, and the
+    payload has to say so rather than leaving it in a source-file docstring."""
+    payload = cost_to_dict(estimate_video_cost("veo-3.1-generate-001", 8, "720p"))
+    assert payload is not None
+    assert payload["pricing_source"] == PRICING_SOURCES["gemini_api"]
+    note = payload["pricing_source_note"]
+    assert note is not None
+    assert "assumed" in note
+    assert "Vertex AI" in note
+    # The Veo caveat must not be confused with the image cross-check note.
+    assert note != _image_note()
+
+
+def test_omni_reports_its_source_without_inventing_a_backend_claim() -> None:
+    """Neither page says how Omni's token rates apply on the other backend, so
+    the note stays empty. Provenance is the URL; silence beats a guess."""
+    payload = cost_to_dict(estimate_video_cost(OMNI_MODEL, 5))
+    assert payload is not None
+    assert payload["pricing_source"] == PRICING_SOURCES["gemini_api"]
+    assert payload["pricing_source_note"] is None
+
+
+@pytest.mark.parametrize("model", sorted(_IMAGE_PRICING))
+def test_every_image_estimate_quotes_a_real_source_url(model: str) -> None:
+    estimate = estimate_image_cost(model, "1K")
+    assert estimate is not None
+    assert estimate.source in PRICING_SOURCES.values()
+
+
+@pytest.mark.parametrize("model", sorted(_VIDEO_PRICING))
+def test_every_video_estimate_quotes_a_real_source_url(model: str) -> None:
+    estimate = estimate_video_cost(model, 8, "720p")
+    assert estimate is not None
+    assert estimate.source in PRICING_SOURCES.values()
+
+
+def test_actual_costs_carry_provenance_too() -> None:
+    """Every path that can hand a caller a number: metered image tokens, the
+    no-usage fallback, per-second video, and Omni's token billing."""
+    metered = actual_image_cost(
+        "gemini-3.1-flash-image",
+        {"prompt_token_count": 12, "candidates_token_count": 1120},
+        "1K",
+        1,
+    )
+    fallback = actual_image_cost("gemini-3.1-flash-image", None, "1K", 1)
+    per_second = actual_video_cost("veo-3.1-fast-generate-001", 8, "720p")
+    omni_tokens = actual_video_cost(
+        OMNI_MODEL,
+        usage_metadata=FakeUsageMetadata(
+            prompt_token_count=10,
+            candidates_tokens_details=[
+                FakeModalityTokenCount(FakeMediaModality("VIDEO"), 5792)
+            ],
+        ),
+    )
+    for cost in (metered, fallback, per_second, omni_tokens):
+        assert cost is not None
+        assert cost.source == PRICING_SOURCES["gemini_api"]
+    assert per_second is not None and per_second.source_note is not None
+
+
+def test_superseded_ids_inherit_the_replacement_models_provenance() -> None:
+    """The quote is for the model that really runs, so the URL must be too."""
+    retired = estimate_image_cost("imagen-4.0-generate-001", "1K")
+    replacement = estimate_image_cost("gemini-3.1-flash-image", "1K")
+    assert retired is not None and replacement is not None
+    assert retired.source == replacement.source
+    assert retired.source_note == replacement.source_note
+
+
+def test_sum_costs_keeps_a_source_every_component_shares() -> None:
+    total = sum_costs(
+        [
+            estimate_video_cost("veo-3.1-generate-001", 8),
+            estimate_video_cost("veo-3.1-fast-generate-001", 4),
+        ]
+    )
+    assert total.source == PRICING_SOURCES["gemini_api"]
+    # Both are Veo, so the Vertex caveat survives the aggregation.
+    assert total.source_note is not None
+    assert "assumed" in total.source_note
+
+
+def test_sum_costs_drops_a_source_its_components_do_not_share() -> None:
+    """There is no "mixed" URL. Naming one page for a total that was priced
+    from two would send a caller to a table missing half the money."""
+    elsewhere = CostEstimate(
+        usd=1.0,
+        is_estimate=True,
+        unit="image",
+        detail="priced from the other page",
+        breakdown={"images": 1.0},
+        source=PRICING_SOURCES["vertex_ai"],
+    )
+    total = sum_costs([estimate_video_cost("veo-3.1-generate-001", 8), elsewhere])
+    assert total.usd == pytest.approx(8 * 0.40 + 1.0)
+    assert total.source is None
+    payload = cost_to_dict(total)
+    assert payload is not None
+    assert payload["pricing_source"] is None
+
+
+def test_sum_costs_drops_a_note_the_components_do_not_share() -> None:
+    """Image and Veo rates come off the same page but carry different
+    caveats, so the aggregate keeps the URL and drops the note rather than
+    applying one kind of rate's caveat to the other's."""
+    total = sum_costs(
+        [
+            estimate_image_cost("gemini-3.1-flash-image", "1K"),
+            estimate_video_cost("veo-3.1-generate-001", 8),
+        ]
+    )
+    assert total.unit == "mixed"
+    assert total.source == PRICING_SOURCES["gemini_api"]
+    assert total.source_note is None
+
+
+def test_sum_costs_does_not_lend_provenance_to_a_sourceless_component() -> None:
+    """src.routing assembles plan quotes itself, with no source of its own.
+    Summing one with a priced beat must not stamp this module's URL onto it."""
+    assembled_elsewhere = CostEstimate(
+        usd=2.5,
+        is_estimate=True,
+        unit="second-of-video",
+        detail="plan quote built outside this module",
+        breakdown={"seconds": 6.0},
+    )
+    assert assembled_elsewhere.source is None
+    beat = estimate_video_cost("veo-3.1-generate-001", 8)
+    # Both orderings, so the answer cannot depend on which component happened
+    # to be seen first.
+    for components in ([beat, assembled_elsewhere], [assembled_elsewhere, beat]):
+        total = sum_costs(components)
+        assert total.source is None
+        assert total.source_note is None
+
+
+def test_an_unpriced_component_does_not_erase_the_shared_source() -> None:
+    """An unpriced beat adds no dollars, so it cannot contradict a source; the
+    total is already flagged as a lower bound by unpriced_components."""
+    total = sum_costs(
+        [
+            estimate_video_cost("veo-3.1-generate-001", 8),
+            estimate_video_cost("sora-9", 8),
+        ]
+    )
+    assert total.breakdown["unpriced_components"] == 1.0
+    assert total.source == PRICING_SOURCES["gemini_api"]
+
+
+def test_a_cost_with_no_source_still_reports_the_key() -> None:
+    """The payload shape is stable: provenance is null, never missing, so a
+    client can render "source unknown" instead of crashing on a lookup."""
+    payload = cost_to_dict(
+        CostEstimate(
+            usd=1.0,
+            is_estimate=True,
+            unit="image",
+            detail="no provenance",
+            breakdown={},
+        )
+    )
+    assert payload is not None
+    assert payload["pricing_source"] is None
+    assert payload["pricing_source_note"] is None
+
+
+def test_describe_model_pricing_exposes_the_source_caveat() -> None:
+    video = describe_model_pricing("veo-3.1-generate-001")
+    image = describe_model_pricing("gemini-3.1-flash-image")
+    assert video is not None and image is not None
+    assert "assumed" in video["source_note"]
+    assert PRICING_SOURCES["vertex_ai"] in image["source_note"]
+
+
+def test_source_notes_only_point_at_pages_the_module_actually_used() -> None:
+    """A note is provenance, not prose: any URL inside one must be a page
+    this module records, so nothing invents a per-model link."""
+    notes = [
+        pricing.source_note
+        for pricing in (*_IMAGE_PRICING.values(), *_VIDEO_PRICING.values())
+        if pricing.source_note is not None
+    ]
+    assert notes, "expected at least one sourcing caveat to be surfaced"
+    for note in notes:
+        for word in note.split():
+            if word.startswith("http"):
+                assert word.strip("()., ") in PRICING_SOURCES.values()

@@ -39,6 +39,10 @@ VEO = "veo-3.1-generate-001"
 VEO_FAST = "veo-3.1-fast-generate-001"
 VEO_LITE = "veo-3.1-lite-generate-preview"
 
+# The smallest score gap that counts as "capability genuinely outranked
+# budget" rather than "the tie-break happened to pick the right model".
+CAPABILITY_MARGIN = 0.05
+
 
 def _models(plan: RoutingPlan) -> list[str]:
     """Model IDs of a plan's routes, in ranked order."""
@@ -61,6 +65,16 @@ def _reason_for(plan: RoutingPlan, model: str) -> str:
 def _conflict_codes(plan: RoutingPlan) -> list[str]:
     """Codes of every conflict on a plan."""
     return [conflict.code for conflict in plan.conflicts]
+
+
+def _leads_by_a_margin(plan: RoutingPlan, winner: str, runner_up: str) -> bool:
+    """Whether ``winner`` out-scores ``runner_up`` by at least the margin.
+
+    Compared with a float tolerance because a weight table that produces
+    exactly 0.05 lands on 0.049999999999999996 once the terms are summed.
+    """
+    scores = {route.model: route.score for route in plan.routes}
+    return scores[winner] - scores[runner_up] >= CAPABILITY_MARGIN - 1e-9
 
 
 # ============================================================================
@@ -507,13 +521,20 @@ def test_text_rendering_warns_on_every_route_that_is_not_pro() -> None:
 
 
 def test_capability_outranks_budget_for_a_text_brief() -> None:
-    """'cheap' does not buy a model that cannot render the words legibly."""
+    """'cheap' does not buy a model that cannot render the words legibly.
+
+    Strengthened from "pro ranks first" to "pro ranks first by a margin":
+    ordering alone was satisfied even when the scores tied, in which case the
+    documented guarantee was really being supplied by the fidelity tie-break
+    in ``_rank``.
+    """
     plan = plan_generation(
         "a poster with a headline", RoutingConstraints(budget="cheap", image_size="2K")
     )
     recommended = plan.recommended
     assert recommended is not None
     assert recommended.model == PRO_IMAGE
+    assert _leads_by_a_margin(plan, PRO_IMAGE, FLASH)
 
 
 def test_image_params_are_ready_to_use() -> None:
@@ -1208,6 +1229,201 @@ def test_genuine_multi_shot_intents_still_plan_a_clip(intent: str) -> None:
     assert top is not None
     assert top.tool == "generate_clip"
     assert len(top.params["beats"]) > 1
+
+
+def test_a_capability_demand_outweighs_a_budget_preference_by_construction() -> None:
+    """The weight table has to make the documented promise arithmetically true.
+
+    Two models one tier apart on the cost axis differ by at most half the
+    budget weight, and the cheaper one may also be the documented default and
+    collect default_affinity on top; the model that owns a capability leads
+    the one that merely has some of it by half the capability weight. At
+    0.35/0.25/0.05 that balance was exactly zero — "capability outranks
+    budget" was a tie, resolved by ``_rank``'s fidelity tie-break.
+    """
+    balance = (
+        0.5 * WEIGHTS.capability_fit
+        - 0.5 * WEIGHTS.budget_alignment
+        - WEIGHTS.default_affinity
+    )
+    assert balance >= CAPABILITY_MARGIN - 1e-9
+
+
+def test_a_text_demand_beats_a_cheap_budget_by_a_real_margin() -> None:
+    """The reported reproduction: pro and flash both scored 0.525 here, so the
+    documented winner came out of the tie-break and any change to iteration
+    order would have flipped it silently."""
+    plan = plan_generation(
+        "a poster with the words GRAND OPENING", RoutingConstraints(budget="cheap")
+    )
+    recommended = plan.recommended
+    assert recommended is not None
+    assert recommended.model == PRO_IMAGE
+
+    scores = [route.score for route in plan.routes]
+    # A strict descent: no two candidates may be separated by the tie-break.
+    assert scores == sorted(scores, reverse=True)
+    assert len(set(scores)) == len(scores)
+    assert _leads_by_a_margin(plan, PRO_IMAGE, FLASH)
+
+
+def test_a_size_demand_every_survivor_meets_still_resolves_on_budget() -> None:
+    """The other half of the scoring fix: 4K is a hard rule, and the models
+    that pass it satisfy it equally. Scoring the survivors on fidelity as well
+    double-counted quality_ceiling, so a plain 4K brief at a balanced budget
+    would have drifted off the documented default onto the priciest model."""
+    plan = plan_generation("a 4k picture of a cat")
+    recommended = plan.recommended
+    assert recommended is not None
+    assert recommended.model == DEFAULT_IMAGE_MODEL
+    assert _leads_by_a_margin(plan, FLASH, PRO_IMAGE)
+    # The size is still the reason the plan exists, so it stays in the prose.
+    assert "4K output" in recommended.rationale
+
+
+def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
+    """What an omni animatic of ``beats`` x ``beat_seconds`` really costs.
+
+    Computed from the price book rather than restated, so a test cannot pass
+    against a rationale that hard-codes a number the pricing no longer says.
+    """
+    from src.pricing import estimate_video_cost
+
+    probe = estimate_video_cost(OMNI_MODEL, beat_seconds, "720p", False)
+    assert probe is not None
+    return probe.breakdown["usd_per_second"] * beats * beat_seconds
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected_model", "animatic_is_cheaper"),
+    [
+        # Only the standard tier is dearer than the animatic; against Fast the
+        # preview costs slightly more, and against Lite about double.
+        pytest.param("best", VEO, True, id="standard_tier_saves"),
+        pytest.param(None, VEO_FAST, False, id="fast_tier_costs_more"),
+        pytest.param("cheap", VEO_LITE, False, id="lite_tier_costs_double"),
+    ],
+)
+def test_the_animatic_claims_a_saving_only_when_it_saves(
+    budget: str | None, expected_model: str, animatic_is_cheaper: bool
+) -> None:
+    """The animatic was sold as the cheap preflight for every Veo tier, but
+    omni bills $0.10136/s against Veo Fast's $0.10/s: 3 x 8s beats cost $2.43
+    as an animatic and $2.40 as the real render. The step is still worth
+    recommending — it catches a bad creative call before the delivery render —
+    but it may not claim a saving the numbers contradict."""
+    plan = plan_generation(
+        "a 3 beat reel about coffee",
+        RoutingConstraints(
+            budget=cast(Any, budget),
+            num_beats=3,
+            duration_seconds=8,
+            media_kind="video",
+        ),
+    )
+    top = plan.recommended
+    assert top is not None
+    assert top.model == expected_model
+    assert top.cost is not None
+
+    # The advice survives in both directions: catching the mistake early has
+    # value even when it is not the cheaper path.
+    assert len(plan.workflow) == 2
+    animatic = plan.workflow[0]
+    assert animatic.params["animatic"] is True
+
+    animatic_usd = _omni_animatic_usd(3, 8.0)
+    render_usd = top.cost.usd
+    assert (animatic_usd < render_usd) is animatic_is_cheaper
+
+    rationale = animatic.rationale
+    assert f"${animatic_usd:.2f}" in rationale
+    assert f"${render_usd:.2f}" in rationale
+    if animatic_is_cheaper:
+        assert f"saving ~${render_usd - animatic_usd:.2f}" in rationale
+        assert "does NOT save money" not in rationale
+    else:
+        assert "does NOT save money" in rationale
+        assert "sav" not in rationale.replace("save money", "")
+        assert f"{animatic_usd / render_usd:.2f}x" in rationale
+
+
+def test_the_animatic_makes_no_economic_claim_when_pricing_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no price book there is no honest comparison to make, so the step is
+    recommended on its creative merit and says nothing about money."""
+    monkeypatch.setitem(sys.modules, "src.pricing", None)
+    plan = plan_generation("a 4 shot reel about shoes")
+    assert plan.workflow
+    rationale = plan.workflow[0].rationale
+    assert "$" not in rationale
+    assert "sav" not in rationale
+    assert OMNI_MODEL in rationale
+
+
+@pytest.mark.parametrize("backend", ["vertex", "unknown", "gemini_api"])
+def test_veo_lite_is_rejected_when_the_server_has_no_gemini_api_key(
+    backend: str,
+) -> None:
+    """Lite is Gemini-API-only, so with no key the call fails with exactly that
+    message. The planner knew the rule and recommended Lite anyway because
+    nothing ever told it the credential state."""
+    plan = plan_generation(
+        "a video of a cat",
+        RoutingConstraints(backend=cast(Any, backend), gemini_api_key_available=False),
+    )
+    assert VEO_LITE not in _models(plan)
+    reason = _reason_for(plan, VEO_LITE)
+    assert "GEMINI_API_KEY" in reason
+    # The models the deployment can actually run are still planned.
+    assert plan.is_satisfiable
+
+
+@pytest.mark.parametrize("key_state", [None, True])
+def test_veo_lite_survives_when_a_key_is_available_or_unknown(
+    key_state: bool | None,
+) -> None:
+    """None means "not stated", which must keep today's behaviour."""
+    plan = plan_generation(
+        "a video of a cat",
+        RoutingConstraints(backend="gemini_api", gemini_api_key_available=key_state),
+    )
+    assert VEO_LITE in _models(plan)
+
+
+def test_pinned_veo_lite_without_a_key_is_a_conflict_that_names_the_key() -> None:
+    plan = plan_generation(
+        "a video of a cat",
+        RoutingConstraints(gemini_api_key_available=False, pinned_model=VEO_LITE),
+    )
+    conflicts = {conflict.code: conflict for conflict in plan.conflicts}
+    assert "pinned_model_backend_unsupported" in conflicts
+    conflict = conflicts["pinned_model_backend_unsupported"]
+    assert "GEMINI_API_KEY" in conflict.detail
+    assert "GEMINI_API_KEY" in conflict.resolution
+
+
+def test_gcs_advice_is_never_offered_on_the_gemini_api() -> None:
+    """output_gcs_uri does not exist on the Gemini Developer API, so offering
+    it as an option is advice that cannot be taken."""
+    plan = plan_generation(
+        "a video of a cat",
+        RoutingConstraints(backend="gemini_api", wants_gcs_output=True),
+    )
+    for route in plan.routes:
+        for caveat in route.caveats:
+            assert "Set output_gcs_uri" not in caveat
+        assert any("Vertex-only" in caveat for caveat in route.caveats)
+
+    # ...and it is still offered where the parameter really exists.
+    on_vertex = plan_generation(
+        "a video of a cat",
+        RoutingConstraints(backend="vertex", wants_gcs_output=True),
+    )
+    top = on_vertex.recommended
+    assert top is not None
+    assert any("Set output_gcs_uri" in caveat for caveat in top.caveats)
 
 
 def test_planner_and_tool_agree_on_extension_price() -> None:

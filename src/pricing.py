@@ -15,6 +15,12 @@ recorded on each pricing record's ``source`` field and collected in
 with no confirmed price is simply absent from the tables, and every public
 entry point returns ``None`` for it rather than guessing.
 
+That provenance travels with the money: every ``CostEstimate`` carries the
+``source`` URL it was priced from, plus a ``source_note`` for the rates whose
+sourcing needs a sentence of explanation (see the Vertex assumption below).
+``cost_to_dict`` publishes both, so a caller who is quoted a figure over MCP
+can open the page it came from instead of taking the number on trust.
+
 Documented assumptions (each one is a place where the sources are thinner
 than we would like):
 
@@ -92,6 +98,22 @@ PRICING_SOURCES: dict[str, str] = {
 # page; the image rates were additionally cross-checked against the Vertex AI
 # page (PRICING_SOURCES["vertex_ai"]), which publishes the same numbers.
 _SRC_GEMINI_API = PRICING_SOURCES["gemini_api"]
+_SRC_VERTEX_AI = PRICING_SOURCES["vertex_ai"]
+
+# Per-rate provenance notes. ``source`` answers "where did this number come
+# from?"; these answer the follow-up question a caller on the *other* backend
+# has to ask — "does it hold for me too?" — using only what the pages
+# themselves say. A rate whose source page tells the whole story carries no
+# note, so a note always means "read this before you trust the figure".
+_IMAGE_SOURCE_NOTE = (
+    "The same token rates are published on the Vertex AI pricing page "
+    f"({_SRC_VERTEX_AI}), so this rate applies on either backend."
+)
+_VEO_SOURCE_NOTE = (
+    "Confirmed on the Gemini Developer API pricing page. The Vertex AI page "
+    "renders its Veo section client-side and publishes no retrievable table, "
+    "so the same rate is assumed — not verified — for Veo on Vertex AI."
+)
 
 # Google's Batch tier is half the Standard tier for every model priced here.
 # Exposed for callers that batch on their own; this server does not.
@@ -117,6 +139,15 @@ class CostEstimate:
         breakdown: Component values. Keys ending in ``_usd`` are dollars, keys
             ending in ``_tokens`` are token counts, and ``seconds`` /
             ``images`` are plain quantities. Never rounded.
+        source: URL of the pricing page the rate behind ``usd`` was read from.
+            ``None`` means "no single honest answer": an aggregate whose
+            components were priced from different pages, or a cost assembled
+            outside this module. Never guessed — an unpriced model yields
+            ``None`` for the whole estimate, not a sourceless one.
+        source_note: One-line qualifier a reader needs before checking the
+            figure against ``source`` (e.g. that the other backend's rate is
+            assumed rather than confirmed). ``None`` when the source page
+            stands on its own, or when components disagree.
     """
 
     usd: float
@@ -124,6 +155,11 @@ class CostEstimate:
     unit: str
     detail: str
     breakdown: dict[str, float]
+    # Defaulted so callers that build a CostEstimate positionally or by
+    # keyword (src.routing assembles multi-render plan quotes itself) keep
+    # working; they simply report no provenance rather than a borrowed one.
+    source: str | None = None
+    source_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +180,9 @@ class ImageModelPricing:
         default_size: Size the model falls back to when asked for one it
             cannot produce (``src.image`` warns and sends at the default).
         source: URL the numbers were read from.
+        source_note: Optional one-liner about how far ``source`` can be
+            trusted for a caller on the other backend; travels onto every
+            ``CostEstimate`` priced from this record.
     """
 
     input_usd_per_mtok: float
@@ -153,6 +192,7 @@ class ImageModelPricing:
     output_tokens_by_size: Mapping[str, int]
     default_size: str
     source: str
+    source_note: str | None = None
 
     def usd_per_image(self, image_size: str) -> float | None:
         """Return the output cost of one image at ``image_size``, or None."""
@@ -183,11 +223,15 @@ class VideoModelPricing:
         fixed_resolution: Set when the model only ever emits one resolution,
             so a differing request is priced at what is actually rendered.
         source: URL the numbers were read from.
+        source_note: Optional one-liner about how far ``source`` can be
+            trusted for a caller on the other backend; travels onto every
+            ``CostEstimate`` priced from this record.
     """
 
     usd_per_second_by_resolution: Mapping[str, float]
     audio_included: bool
     source: str
+    source_note: str | None = None
     output_video_usd_per_mtok: float | None = None
     tokens_per_second: int | None = None
     output_text_usd_per_mtok: float | None = None
@@ -217,6 +261,7 @@ _IMAGE_PRICING: dict[str, ImageModelPricing] = {
         output_tokens_by_size={"512": 747, "1K": 1120, "2K": 1680, "4K": 2520},
         default_size="1K",
         source=_SRC_GEMINI_API,
+        source_note=_IMAGE_SOURCE_NOTE,
     ),
     "gemini-3.1-flash-lite-image": ImageModelPricing(
         input_usd_per_mtok=0.25,
@@ -228,6 +273,7 @@ _IMAGE_PRICING: dict[str, ImageModelPricing] = {
         output_tokens_by_size={"1K": 1120},
         default_size="1K",
         source=_SRC_GEMINI_API,
+        source_note=_IMAGE_SOURCE_NOTE,
     ),
     "gemini-3-pro-image": ImageModelPricing(
         input_usd_per_mtok=2.00,
@@ -239,6 +285,7 @@ _IMAGE_PRICING: dict[str, ImageModelPricing] = {
         output_tokens_by_size={"1K": 1120, "2K": 1120, "4K": 2000},
         default_size="1K",
         source=_SRC_GEMINI_API,
+        source_note=_IMAGE_SOURCE_NOTE,
     ),
 }
 
@@ -260,11 +307,13 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
         usd_per_second_by_resolution={"720p": 0.40, "1080p": 0.40, "4K": 0.60},
         audio_included=True,
         source=_SRC_GEMINI_API,
+        source_note=_VEO_SOURCE_NOTE,
     ),
     "veo-3.1-fast-generate-001": VideoModelPricing(
         usd_per_second_by_resolution={"720p": 0.10, "1080p": 0.12, "4K": 0.30},
         audio_included=True,
         source=_SRC_GEMINI_API,
+        source_note=_VEO_SOURCE_NOTE,
     ),
     "veo-3.1-lite-generate-preview": VideoModelPricing(
         # 4K is deliberately absent: Lite cannot render it (src/video.py
@@ -272,6 +321,7 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
         usd_per_second_by_resolution={"720p": 0.05, "1080p": 0.08},
         audio_included=True,
         source=_SRC_GEMINI_API,
+        source_note=_VEO_SOURCE_NOTE,
     ),
     OMNI_MODEL: VideoModelPricing(
         # Omni is billed per output token: "5,792 tokens per second of 720p
@@ -292,6 +342,10 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
         # still billed at the 720p rate.
         fixed_resolution="720p",
         source=_SRC_GEMINI_API,
+        # Deliberately no source_note: the token rates were read from the
+        # source page above, and neither page says anything about how they
+        # apply on the other backend. Silence is the honest answer — a note
+        # here would be inventing a claim, in either direction.
     ),
 }
 
@@ -509,6 +563,8 @@ def estimate_image_cost(
         unit="image",
         detail=detail,
         breakdown=breakdown,
+        source=pricing.source,
+        source_note=pricing.source_note,
     )
 
 
@@ -619,6 +675,8 @@ def _build_video_estimate(
             "usd_per_second": usd_per_second,
             "video_usd": usd,
         },
+        source=pricing.source,
+        source_note=pricing.source_note,
     )
 
 
@@ -835,6 +893,8 @@ def actual_image_cost(
         unit="token" if output_reported else "image",
         detail=detail,
         breakdown=breakdown,
+        source=pricing.source,
+        source_note=pricing.source_note,
     )
 
 
@@ -920,6 +980,8 @@ def actual_video_cost(
                 f"(${pricing.output_video_usd_per_mtok:g}/1M)"
             ),
             breakdown=breakdown,
+            source=pricing.source,
+            source_note=pricing.source_note,
         )
 
     if duration_seconds is None:
@@ -975,11 +1037,14 @@ def sum_costs(
     Returns:
         A ``CostEstimate`` whose ``unit`` is the shared unit of the components
         or "mixed", and whose ``is_estimate`` is True if any component was an
-        estimate or could not be priced.
+        estimate or could not be priced. ``source``/``source_note`` are carried
+        only when every priced component agrees on them.
     """
     total = 0.0
     breakdown: dict[str, float] = {}
     units: set[str] = set()
+    sources: set[str | None] = set()
+    source_notes: set[str | None] = set()
     counted = 0
     unpriced = 0
     any_estimate = False
@@ -991,6 +1056,8 @@ def sum_costs(
         counted += 1
         total += estimate.usd
         units.add(estimate.unit)
+        sources.add(estimate.source)
+        source_notes.add(estimate.source_note)
         any_estimate = any_estimate or estimate.is_estimate
         for key, value in estimate.breakdown.items():
             if key in _RATE_BREAKDOWN_KEYS:
@@ -1016,6 +1083,19 @@ def sum_costs(
         breakdown["unpriced_components"] = float(unpriced)
 
     unit = units.pop() if len(units) == 1 else "mixed"
+
+    # Provenance obeys the same rule as usd_per_second above: an aggregate may
+    # claim only what every one of its components actually shares. Picking one
+    # component's page would point a caller at a table that does not contain
+    # part of the total, and there is no "mixed" URL to fall back on — so the
+    # honest answer for a disagreement is no answer. A component with no
+    # source of its own (one built outside this module) is a disagreement too,
+    # which is why None participates in the set. Unpriced components add no
+    # dollars and so cannot contradict a source; `unpriced_components` already
+    # tells the caller the total is incomplete.
+    source = sources.pop() if len(sources) == 1 else None
+    source_note = source_notes.pop() if len(source_notes) == 1 else None
+
     detail = f"{label}: {counted} priced component{'s' if counted != 1 else ''}"
     if unpriced:
         detail += f", {unpriced} unpriced (total is a lower bound)"
@@ -1026,6 +1106,8 @@ def sum_costs(
         unit=unit,
         detail=detail,
         breakdown=breakdown,
+        source=source,
+        source_note=source_note,
     )
 
 
@@ -1082,7 +1164,18 @@ def format_cost_line(estimate: CostEstimate | None) -> str:
 
 
 def cost_to_dict(estimate: CostEstimate | None) -> dict[str, Any] | None:
-    """Convert a cost to a JSON-safe dict for an MCP tool response."""
+    """Convert a cost to a JSON-safe dict for an MCP tool response.
+
+    Args:
+        estimate: The cost to serialize, or None for an unpriced operation.
+
+    Returns:
+        A dict of JSON primitives, or None when ``estimate`` is None.
+        ``pricing_as_of`` plus ``pricing_source``/``pricing_source_note`` make
+        the figure checkable: a caller can open the page the rate came from
+        rather than trusting a bare number. Both provenance keys are always
+        present, and are ``None`` when the cost has no single honest source.
+    """
     if estimate is None:
         return None
     # The tool response is a presentation boundary: intermediate arithmetic
@@ -1097,6 +1190,12 @@ def cost_to_dict(estimate: CostEstimate | None) -> dict[str, Any] | None:
         "detail": estimate.detail,
         "breakdown": {k: round(v, 6) for k, v in estimate.breakdown.items()},
         "pricing_as_of": PRICING_AS_OF,
+        # The date alone is unfalsifiable: it says when someone checked, not
+        # what they checked against. The URL is what lets a caller who doubts
+        # a quote go and verify it, and the note is what stops them checking
+        # a Veo figure against a Vertex page that never published one.
+        "pricing_source": estimate.source,
+        "pricing_source_note": estimate.source_note,
     }
 
 
@@ -1149,8 +1248,9 @@ def describe_model_pricing(model: str) -> dict[str, Any] | None:
     """Return the embedded pricing record for ``model``, or None.
 
     Useful for a "why does it cost that?" tool response: it exposes the rates,
-    the resolution tiers, the resolved model ID and the source URL, so a user
-    can check the figure against Google's page themselves.
+    the resolution tiers, the resolved model ID, the source URL and any caveat
+    attached to that source, so a user can check the figure against Google's
+    page themselves.
     """
     model_id = resolve_model_id(model)
 
@@ -1162,6 +1262,7 @@ def describe_model_pricing(model: str) -> dict[str, Any] | None:
             "kind": "image",
             "pricing_as_of": PRICING_AS_OF,
             "source": image.source,
+            "source_note": image.source_note,
             "input_usd_per_mtok": image.input_usd_per_mtok,
             "output_text_usd_per_mtok": image.output_text_usd_per_mtok,
             "output_image_usd_per_mtok": image.output_image_usd_per_mtok,
@@ -1180,6 +1281,7 @@ def describe_model_pricing(model: str) -> dict[str, Any] | None:
             "kind": "video",
             "pricing_as_of": PRICING_AS_OF,
             "source": video.source,
+            "source_note": video.source_note,
             "usd_per_second": dict(video.usd_per_second_by_resolution),
             "audio_included_in_price": video.audio_included,
             "output_video_usd_per_mtok": video.output_video_usd_per_mtok,

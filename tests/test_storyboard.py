@@ -2,12 +2,13 @@
 
 import base64
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pytest
-from PIL import Image, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 import src.storyboard
 from src.storyboard import (
@@ -89,6 +90,87 @@ def open_png(data: bytes) -> tuple[int, int]:
         return image.size
 
 
+def sheet_text(
+    monkeypatch: pytest.MonkeyPatch,
+    frames: Sequence[StoryboardFrame],
+    **kwargs: Any,
+) -> list[tuple[float, float, str]]:
+    """Render a board and return every ``(x, y, text)`` drawn on the sheet.
+
+    Panels are composited from their own card images, so keeping only the draws
+    whose target is the full-size canvas leaves exactly the sheet's own chrome:
+    the header. That is what makes "is this string drawn twice?" answerable.
+    """
+    calls: list[tuple[float, float, str, tuple[int, int]]] = []
+    original = ImageDraw.ImageDraw.text
+
+    def spy(
+        self: ImageDraw.ImageDraw,
+        xy: tuple[float, float],
+        text: str,
+        *args: Any,
+        **text_kwargs: Any,
+    ) -> None:
+        calls.append((xy[0], xy[1], text, self.im.size))
+        original(self, xy, text, *args, **text_kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
+    size = open_png(render_contact_sheet(frames, **kwargs))
+    return [(x, y, text) for x, y, text, target in calls if target == size]
+
+
+def header_rule_y(png: bytes) -> int:
+    """Row of the hairline the header draws above the grid.
+
+    Gives the tests a font-independent boundary between header and grid: the
+    rule is painted straight onto the sheet in an exact palette colour.
+    """
+    rule = (0x26, 0x2B, 0x35)  # _PALETTES["dark"].rule
+    with Image.open(BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+    try:
+        for y in range(rgb.height):
+            if rgb.getpixel((_OUTER_PAD + 5, y)) == rule:
+                return y
+    finally:
+        rgb.close()
+    raise AssertionError("no header rule found")
+
+
+def count_color(png: bytes, color: tuple[int, int, int], *, rows: int) -> int:
+    """Count pixels of exactly ``color`` in the top ``rows`` rows of ``png``."""
+    with Image.open(BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+    try:
+        band = rgb.crop((0, 0, rgb.width, rows))
+        try:
+            counts = band.getcolors(maxcolors=1 << 20) or []
+        finally:
+            band.close()
+    finally:
+        rgb.close()
+    return sum(count for count, found in counts if found == color)
+
+
+def last_ink_row(png: bytes) -> int:
+    """Bottom-most row of ``png`` that is not pure background."""
+    with Image.open(BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+    try:
+        background = rgb.getpixel((0, 0))
+        for y in range(rgb.height - 1, -1, -1):
+            row = rgb.crop((0, y, rgb.width, y + 1))
+            try:
+                colors = row.getcolors(maxcolors=1 << 16) or []
+            finally:
+                row.close()
+            if [color for _, color in colors] != [background]:
+                return y
+    finally:
+        rgb.close()
+    raise AssertionError("sheet is entirely background")
+
+
 # ============================================================================
 # Input validation
 # ============================================================================
@@ -132,7 +214,7 @@ def test_single_frame_sheet_is_valid_png_of_expected_width() -> None:
     png = render_contact_sheet(make_frames(1), panel_width=300)
     width, height = open_png(png)
     assert width == 2 * _OUTER_PAD + 300
-    assert height > 300  # image area + text block + header + footer
+    assert height > 300  # image area + text block + header
 
 
 def test_grid_width_matches_column_count() -> None:
@@ -314,6 +396,118 @@ def test_notes_add_a_reserved_text_row() -> None:
     _, plain_h = open_png(render_contact_sheet(make_frames(2)))
     _, noted_h = open_png(render_contact_sheet(make_frames(2, notes=True)))
     assert noted_h > plain_h
+
+
+# ============================================================================
+# Contact-sheet header
+# ============================================================================
+
+
+def test_board_summary_is_drawn_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The summary belongs to the header and nowhere else.
+
+    It used to be repeated in a footer, so a three-shot board said
+    "3 shots · 00:12 runtime" twice — top right and bottom left, both visible
+    at once. That reads as a rendering bug, and the second copy carried no
+    information the first did not.
+    """
+    drawn = sheet_text(monkeypatch, make_frames(3), title="Dupe Check")
+    summaries = [text for _, _, text in drawn if "shots" in text]
+    assert summaries == ["3 shots  ·  00:12 runtime"]
+    # Nothing else on the sheet repeats a string either.
+    texts = [text for _, _, text in drawn]
+    assert len(texts) == len(set(texts))
+
+
+def test_nothing_is_drawn_below_the_grid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The board ends on the grid plus the outer margin — no footer band.
+
+    Checked in pixels as well as draw calls, because the footer also reserved
+    the vertical space it was drawn into.
+    """
+    frames = make_frames(3)
+    png = render_contact_sheet(frames, title="No Footer")
+    _, height = open_png(png)
+    # The last card's border is the last thing on the sheet, and the margin
+    # under it matches the margin either side of the grid.
+    assert last_ink_row(png) == height - _OUTER_PAD - 1
+
+    # Everything the sheet draws for itself sits above the header rule.
+    rule_y = header_rule_y(png)
+    drawn = sheet_text(monkeypatch, frames, title="No Footer")
+    assert drawn
+    assert all(y < rule_y for _, y, _ in drawn)
+
+
+def test_failure_count_is_flagged_in_the_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed shot is called out once, in the header, in the error colour.
+
+    A board with holes is a diagnostic artifact, so the count must not be
+    buried: it is a filled pill rather than a muted phrase in the summary run.
+    """
+    frames = make_frames(4)
+    frames[2] = StoryboardFrame(
+        index=3, image_bytes=None, prompt="p", duration_seconds=4.0, error="blocked"
+    )
+
+    drawn = sheet_text(monkeypatch, frames, title="Partly Failed")
+    flags = [(y, text) for _, y, text in drawn if "failed" in text]
+    assert len(flags) == 1
+    flag_y, flag_text = flags[0]
+    assert flag_text == "1 failed"
+    # The count is its own element, not a tail on the summary run.
+    assert "failed" not in "".join(t for _, _, t in drawn if t != flag_text)
+
+    png = render_contact_sheet(frames, title="Partly Failed")
+    rule_y = header_rule_y(png)
+    assert flag_y < rule_y
+    # Drawn as a filled pill in the dark theme's error colour, so it reads at a
+    # glance: a few hundred pixels of it, not a stray antialiased edge.
+    assert count_color(png, (0xFF, 0x6B, 0x6B), rows=rule_y) > 200
+
+
+def test_header_says_when_no_durations_are_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing durations are stated, not silently dropped.
+
+    Durations drive every timecode downstream, so a board without them says so
+    — this used to appear only in the footer that no longer exists.
+    """
+    frames = [
+        StoryboardFrame(index=i + 1, image_bytes=make_image(), prompt="p")
+        for i in range(2)
+    ]
+    drawn = sheet_text(monkeypatch, frames, title="Timeless")
+    assert [text for _, _, text in drawn if "shots" in text] == [
+        "2 shots  ·  no durations set"
+    ]
+
+
+def test_long_title_is_truncated_clear_of_the_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long board name yields to the summary instead of running under it."""
+    title = "A Very Long Storyboard Title That Simply Refuses To Stop Going On"
+    drawn = sheet_text(monkeypatch, make_frames(2), title=title, panel_width=300)
+
+    titles = [(x, text) for x, _, text in drawn if text.startswith("A Very Long")]
+    assert len(titles) == 1
+    title_x, title_text = titles[0]
+    assert title_text != title
+    assert title_text.endswith(("…", "..."))
+
+    summary_x = min(x for x, _, text in drawn if "shots" in text)
+    font = _load_font(30, bold=True)
+    assert title_x + font.getlength(title_text) < summary_x
+
+
+def test_short_title_is_left_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Titles that fit are never trimmed."""
+    drawn = sheet_text(monkeypatch, make_frames(3), title="Reel 01")
+    assert "Reel 01" in [text for _, _, text in drawn]
 
 
 # ============================================================================

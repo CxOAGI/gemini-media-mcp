@@ -222,26 +222,47 @@ class ScoringWeights:
     does not express an opinion about returns ``NEUTRAL_TERM`` for every
     candidate, so it cancels out instead of distorting the ranking.
 
+    The spread between capability_fit and budget_alignment is the module's
+    headline promise ("a demanded capability outranks a budget habit") and is
+    therefore sized, not guessed. Two models one tier apart on the cost axis
+    differ by at most ``0.5 * budget_alignment``, and the cheaper of them may
+    also be the documented default and collect ``default_affinity`` on top;
+    the capability gap between the model that owns a capability and the one
+    that merely has some of it is ``0.5 * capability_fit``. So the guarantee
+    holds only while::
+
+        0.5 * capability_fit - 0.5 * budget_alignment - default_affinity > 0
+
+    At the previous 0.35/0.25/0.05 that expression was exactly 0.0: a "cheap"
+    poster brief scored gemini-3-pro-image and gemini-3.1-flash-image at an
+    identical 0.525 and the documented winner emerged only from the fidelity
+    tie-break in ``_rank``, i.e. by luck. At 0.45/0.25/0.05 it is 0.05 — a
+    margin that survives a re-ordering of the candidate list.
+
     Attributes:
         capability_fit: Heaviest weight — an explicitly demanded capability
-            (legible text, 4K, character consistency) is the whole reason the
+            (legible text, character consistency) is the whole reason the
             caller asked for advice, so it must outrank cost habits and the
-            default-model nudge.
+            default-model nudge by a visible margin, not a tie-break.
         budget_alignment: How closely the model's price tier matches the
             requested budget. Second-heaviest: cost is the most common reason
             a caller regrets a model choice.
         quality_ceiling: Raw output fidelity, consulted when the request is
-            quality-led (budget="best", 4K, print).
+            quality-led (budget="best", 4K, print). This is where a
+            size/resolution demand is scored — every model still in the race
+            already passed the hard size rule, so re-scoring it as a
+            capability would only tilt a satisfied demand toward the priciest
+            option.
         speed_fit: Turnaround, consulted when the request is draft-led.
         default_affinity: A deliberate thumb on the scale for each tool's
             documented default, so an otherwise-even race resolves to the
             option the rest of the server already assumes.
     """
 
-    capability_fit: float = 0.35
+    capability_fit: float = 0.45
     budget_alignment: float = 0.25
-    quality_ceiling: float = 0.20
-    speed_fit: float = 0.15
+    quality_ceiling: float = 0.15
+    speed_fit: float = 0.10
     default_affinity: float = 0.05
 
 
@@ -1059,6 +1080,13 @@ class RoutingConstraints:
         wants_gcs_output: Output must land in Cloud Storage.
         backend: Which backend the server is running against. Several rules
             are backend-specific (GCS output, Veo Lite availability).
+        gemini_api_key_available: Whether the server holds a GEMINI_API_KEY.
+            None means unknown, so a Gemini-API-only model stays on the table;
+            False is the server stating it has no key, which makes those
+            models unrunnable however the request is phrased. Live testing
+            found the planner recommending Veo 3.1 Lite on a Vertex
+            deployment with no key — the routing rule was already here, only
+            the credential fact was missing.
         num_beats: How many distinct shots the output has.
         is_draft: This render is throwaway.
         is_iterating: The caller is refining an existing result.
@@ -1088,6 +1116,7 @@ class RoutingConstraints:
     needs_extension: bool | None = None
     wants_gcs_output: bool | None = None
     backend: Backend = "unknown"
+    gemini_api_key_available: bool | None = None
     num_beats: int | None = None
     is_draft: bool | None = None
     is_iterating: bool | None = None
@@ -1160,6 +1189,9 @@ class ResolvedRequest:
     media_kind: MediaKind
     budget: BudgetPreference
     backend: Backend
+    # None when the caller did not say, i.e. a Gemini-API-only model might
+    # work; False is a positive statement that it cannot.
+    gemini_api_key_available: bool | None
     needs_text_rendering: bool
     needs_4k: bool
     image_size: str
@@ -1365,6 +1397,7 @@ def resolve_request(
         media_kind=media_kind,
         budget=budget,
         backend=given.backend,
+        gemini_api_key_available=given.gemini_api_key_available,
         needs_text_rendering=bool(needs_text_rendering),
         needs_4k=needs_4k,
         image_size=image_size,
@@ -1680,7 +1713,14 @@ def _plan_image(
             demanded.append(profile.fidelity_index)
             reasons.append(f"{request.num_reference_images} reference images")
         if request.image_size != "1K":
-            demanded.append(profile.fidelity_index)
+            # Named as a reason, but deliberately NOT a capability term: the
+            # hard size rule above already dropped every model that cannot
+            # render this size, so each survivor satisfies the demand in full.
+            # Scoring the survivors on fidelity here double-counted
+            # quality_ceiling (quality_is_demanded switches on for exactly this
+            # case) and handed the priciest model an advantage on a demand both
+            # models meet — which is why raising capability_fit would otherwise
+            # have moved a plain 4K brief off the documented default.
             reasons.append(f"{request.image_size} output")
 
         quality_is_demanded = (
@@ -1951,25 +1991,59 @@ def _duration_rejection(model: str, needs: VideoNeeds) -> str | None:
     return None
 
 
-def _backend_rejection(model: str, request: ResolvedRequest) -> str | None:
-    """Return a reason when the backend cannot serve ``model`` as requested.
+def _backend_rejection(model: str, request: ResolvedRequest) -> tuple[str, str] | None:
+    """Return (reason, resolution) when the backend cannot serve ``model``.
 
-    Two documented facts drive this: Veo 3.1 Lite is published on the Gemini
-    Developer API only, and GCS output is a Vertex-only config field.
+    Three documented facts drive this: Veo 3.1 Lite is published on the Gemini
+    Developer API only, reaching it needs a GEMINI_API_KEY whatever the
+    backend, and GCS output is a Vertex-only config field.
+
+    Args:
+        model: Candidate model ID.
+        request: The resolved request, including the backend and (when the
+            server told us) whether a Gemini API key exists.
+
+    Returns:
+        The rejection reason paired with the concrete fix, or None when the
+        backend can serve the model.
     """
     capabilities = _VIDEO_CAPABILITIES.get(model)
     if capabilities is None:
         return None
-    if capabilities.gemini_api_only and request.backend == "vertex":
+    if capabilities.gemini_api_only and request.gemini_api_key_available is False:
+        # Checked before the backend rules because it is the stronger fact: on
+        # a Vertex deployment the server can still reach a Gemini-API-only
+        # model through a Gemini API client, but not without the key. Live
+        # testing had the planner recommending Lite into exactly this failure,
+        # so the reason is worded as the error the real call raises.
+        return (
+            f"{model} excluded: it is served by the Gemini Developer API only "
+            "and this server has no GEMINI_API_KEY, so the call would fail with "
+            "that error instead of rendering.",
+            "Set GEMINI_API_KEY to reach this model, or pick a Veo tier the "
+            "configured backend publishes.",
+        )
+    if (
+        capabilities.gemini_api_only
+        and request.backend == "vertex"
+        and not request.gemini_api_key_available
+    ):
+        # Only when the key is absent or unknown. The server genuinely routes
+        # these models through a dedicated Gemini API client on a Vertex
+        # deployment (see _client_for_video_model), so once it has told us a
+        # key exists, excluding the model would refuse a call that works —
+        # the mirror of the bug this rejection was added to prevent.
         return (
             f"{model} excluded: served by the Gemini Developer API only — Vertex "
             "AI has not published it. The server can route it through a Gemini "
-            "API client, but only when GEMINI_API_KEY is set."
+            "API client, but only when GEMINI_API_KEY is set.",
+            "Switch backend, or pick a model published on the backend in use.",
         )
     if capabilities.gemini_api_only and request.wants_gcs_output:
         return (
             f"{model} excluded: it runs on the Gemini API, which does not support "
-            "output_gcs_uri (GCS output is Vertex-only)."
+            "output_gcs_uri (GCS output is Vertex-only).",
+            "Switch backend, or pick a model published on the backend in use.",
         )
     return None
 
@@ -2172,7 +2246,11 @@ def _video_params(
                 "output_gcs_uri omitted: GCS output is Vertex-only and the Gemini "
                 "API rejects an explicit one."
             )
-        else:
+        elif request.backend in ("vertex", "unknown"):
+            # Offered only where the parameter can exist. Stated as a positive
+            # backend test rather than an `else`: advising a Vertex-only field
+            # on a Gemini API deployment is advice that cannot be taken, and a
+            # fourth Backend value must not inherit it by accident.
             caveats.append(
                 "Set output_gcs_uri (Vertex AI only) to land the render in Cloud "
                 "Storage."
@@ -2236,6 +2314,11 @@ def _aggregate_video_cost(
         usd=usd,
         is_estimate=True,
         unit=probe.unit,
+        # Carry the probe's provenance: this estimate is the probe's published
+        # rate applied to a longer total, so it came off the same page. Built
+        # by hand here, it would otherwise report no source at all.
+        source=getattr(probe, "source", None),
+        source_note=getattr(probe, "source_note", None),
         detail=(
             f"{segments} renders totalling {total_seconds:g}s @ {resolution} on "
             f"{model} (${rate:g}/s)"
@@ -2431,7 +2514,7 @@ def _plan_video(
 
         capability_hit = _capability_rejection(model, needs)
         duration_reason = _duration_rejection(model, needs)
-        backend_reason = _backend_rejection(model, request)
+        backend_hit = _backend_rejection(model, request)
         reason = None
         code = None
         resolution = None
@@ -2446,12 +2529,9 @@ def _plan_video(
                 f"{'/'.join(str(d) for d in VEO_DURATIONS_SECONDS)}s clips and can "
                 "be extended."
             )
-        elif backend_reason is not None:
-            reason = backend_reason
+        elif backend_hit is not None:
+            reason, resolution = backend_hit
             code = "backend_unsupported"
-            resolution = (
-                "Switch backend, or pick a model published on the backend in use."
-            )
 
         if reason is not None:
             route_tool = _route_tool(tool, model)
@@ -2552,15 +2632,72 @@ def _plan_video(
 # ============================================================================
 
 
+def _animatic_rationale(
+    beats: int,
+    animatic_cost: CostEstimateLike | None,
+    render_cost: CostEstimateLike | None,
+) -> str:
+    """Explain the animatic preflight without claiming a saving that is not there.
+
+    Live testing caught this rationale selling the animatic as the cheap
+    preview of an expensive render, which is only true against the standard
+    Veo tier. Omni bills $0.10136/s and Veo 3.1 Fast $0.10/s, so 3 x 8s beats
+    cost $2.43 as an animatic against $2.40 for the real thing — and $1.20 on
+    Veo 3.1 Lite, which the animatic then costs double. The preview keeps its
+    place (catching a bad creative call before the delivery render is paid for
+    is worth something on its own), but the claim has to match the arithmetic.
+
+    Args:
+        beats: How many beats the animatic renders.
+        animatic_cost: Estimated cost of the omni preview, or None when
+            pricing is unavailable.
+        render_cost: Estimated cost of the delivery render it precedes, or
+            None. This is the route's own quote, itself produced by
+            ``_aggregate_video_cost``, so the workflow can never contradict
+            the cost printed next to the route.
+
+    Returns:
+        The rationale for the animatic step: a saving only when the numbers
+        show one, an explicit "does not save money" when they do not, and no
+        economic claim at all when either side is unpriced.
+    """
+    lead = f"Preview all {beats} beats on {OMNI_MODEL} first"
+    why = (
+        "an animatic surfaces pacing and continuity problems before the "
+        "delivery render is paid for."
+    )
+
+    if animatic_cost is None or render_cost is None or render_cost.usd <= 0:
+        # Nothing to compare, so recommend the step on its creative merit
+        # alone. A guessed saving is exactly the failure being fixed here.
+        return f"{lead}: {why}"
+
+    animatic_usd = animatic_cost.usd
+    render_usd = render_cost.usd
+    if animatic_usd < render_usd:
+        return (
+            f"{lead} (est. ${animatic_usd:.2f} against ${render_usd:.2f} for the "
+            f"full render, saving ~${render_usd - animatic_usd:.2f}): {why}"
+        )
+    return (
+        f"{lead} (est. ${animatic_usd:.2f}, about "
+        f"{animatic_usd / render_usd:.2f}x the ${render_usd:.2f} full render — "
+        "this does NOT save money): run it to catch a bad creative call before "
+        "committing to the delivery render, not as a way to spend less."
+    )
+
+
 def _build_workflow(
     request: ResolvedRequest, routes: tuple[RoutedCall, ...]
 ) -> tuple[WorkflowStep, ...]:
     """Recommend a call sequence when one call is not the whole answer.
 
-    The animatic-first pattern is the important one: an expensive multi-beat
-    clip is exactly the case where discovering a bad creative call after the
-    full Veo render is the costly mistake, and generate_clip(animatic=True)
-    renders every beat on cheap omni for the same review.
+    The animatic-first pattern is the important one: a multi-beat clip is
+    exactly the case where discovering a bad creative call after the delivery
+    render is the costly mistake, and generate_clip(animatic=True) renders
+    every beat on omni for the same review. Whether that preview is also
+    *cheaper* depends on the Veo tier it precedes and is decided per plan by
+    ``_animatic_rationale`` — omni is not categorically the cheap option.
     """
     if not routes:
         return ()
@@ -2631,17 +2768,14 @@ def _build_workflow(
         OMNI_RESOLUTION,
         False,
     )
-    detail = f" (est. {animatic_cost.detail})" if animatic_cost is not None else ""
 
     animatic_step = WorkflowStep(
         order=1,
         tool="generate_clip",
         params=animatic_params,
-        rationale=(
-            f"Preview all {beats} beats on {OMNI_MODEL} first{detail}: an "
-            "animatic surfaces pacing and continuity problems before the full "
-            "Veo render is paid for."
-        ),
+        # Both sides of the comparison come from _aggregate_video_cost:
+        # best.cost is the generate_clip route's own aggregate quote.
+        rationale=_animatic_rationale(beats, animatic_cost, best.cost),
     )
     if request.is_draft:
         # The caller already said this render is throwaway, so the animatic is
