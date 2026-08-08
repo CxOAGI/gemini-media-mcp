@@ -230,7 +230,10 @@ class TestMCPIntegration:
                 },
             )
             payload = _assert_generated(result, "image_url")
-            assert payload.get("cost") is not None, "a real run must report cost"
+            # The sidecar records the size actually used, so a silently
+            # dropped 2K would surface here rather than pass as "generated".
+            sidecar = json.loads(Path(payload["sidecar_url"][7:]).read_text())
+            assert sidecar["image_size"] == "2K"
 
     # ==================== VEO 3.1 Tests ====================
 
@@ -305,10 +308,11 @@ class TestMCPIntegration:
                     "extend_video_uri": "gs://example/clip.mp4",
                 },
             )
-            text = next((c.text for c in result.content if hasattr(c, "text")), "")
-            print(f"✓ VEO 3.1 Lite rejects extend: {text[:200]}")
-            assert "error" in text.lower()
-            assert "extension" in text.lower() or "does not support" in text.lower()
+            # Fragment verified against the impl's actual message ("does not
+            # support extend_video") by driving generate_video through a wire
+            # stub — an earlier fix asserted "video extension" and would have
+            # failed live for the wrong reason.
+            _assert_refused(result, "does not support extend")
 
 
 if __name__ == "__main__":
