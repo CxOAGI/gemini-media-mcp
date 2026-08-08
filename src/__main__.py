@@ -2228,7 +2228,7 @@ async def generate_clip(
             most useful pre-flight in the server: a clip is the most expensive
             call it can make.
         animatic: When True, render every beat with gemini-omni-flash (fast,
-            cheap 720p) instead of Veo, for a quick storyboard preview of the
+            720p) instead of Veo, for a quick storyboard preview of the
             whole reel before committing to full Veo renders. Bridges are not
             available in animatic mode (add_bridges is ignored), and Veo-only
             per-beat controls (seed, negative_prompt) are ignored.

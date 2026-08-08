@@ -1554,7 +1554,7 @@ class RoutingPlan:
         rejected: Every excluded option, with its reason.
         conflicts: Contradictions in the request as stated.
         workflow: Recommended call sequence when one call is not the whole
-            answer (e.g. a cheap animatic before an expensive clip).
+            answer (e.g. a fast animatic pass before an expensive clip).
         notes: Non-blocking observations about the routing itself.
     """
 

@@ -163,13 +163,13 @@ Generate a multi-beat short clip — the building block for a reel. One call ren
 | `model` | string *optional* | Veo model for every beat (default `veo-3.1-fast-generate-001`) |
 | `include_audio` | boolean *optional* | Audio per beat (Vertex only) |
 | `add_bridges` | boolean *optional* | Generate a transition between consecutive beats (requires local beat outputs) |
-| `animatic` | boolean *optional* | Render every beat with `gemini-omni-flash` for a fast, cheap 720p storyboard preview of the whole reel |
+| `animatic` | boolean *optional* | Render every beat with `gemini-omni-flash` for a fast 720p storyboard preview of the whole reel |
 | `output_gcs_uri` | string *optional* | GCS URI for all outputs |
 
 **Notes:**
 - A failed beat is recorded in the manifest's `errors` list; the run continues
 - Returns `{kind, aspect_ratio, segments[], total_duration_seconds, errors[]}`
-- Typical flow: `animatic: true` to preview cheaply, then re-run for full Veo renders
+- Typical flow: `animatic: true` to preview quickly, then re-run for full Veo renders
 
 *This tool may perform destructive updates.*
 
@@ -215,7 +215,7 @@ Same as `generate_transition`, but takes two **clips** — it decodes the last f
 
 ### Tool: **`generate_video_omni`**
 
-Fast conversational video generation via Google's `gemini-omni-flash-preview` (Interactions API). This is the fast/cheap path for drafts and iteration; the Veo tools remain the high-fidelity path (1080p/4K, seeds, first/last frame). See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
+Fast conversational video generation via Google's `gemini-omni-flash-preview` (Interactions API). This is the fast path for drafts and iteration (not cheaper than Veo Fast: $0.10136/s vs $0.10/s); the Veo tools remain the high-fidelity path (1080p/4K, seeds, first/last frame). See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
@@ -282,7 +282,7 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 
 Two video paths, chosen by where you are in the workflow:
 
-- **`gemini-omni-flash-preview` (fast/cheap)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, negative prompts, or first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
+- **`gemini-omni-flash-preview` (fastest turnaround)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, negative prompts, or first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
 - **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds, first/last-frame control, reference images, extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
 
 Typical workflows:
