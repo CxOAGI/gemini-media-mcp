@@ -361,6 +361,7 @@ async def _omni_generate_and_manifest(
             effective_duration = measured
             duration_source = "measured from the rendered video"
 
+    billed_upper_bound = False
     if effective_duration is None and previous_interaction_id:
         # An edit whose render cannot be measured (e.g. gs:// delivery). Two
         # measurements put the render at Omni's maximum regardless of the
@@ -369,11 +370,24 @@ async def _omni_generate_and_manifest(
         # inherit model, resurrected on the one branch measurement cannot
         # reach. Bill the maximum as an upper bound and label it an estimate.
         effective_duration = float(OMNI_MAX_DURATION_SECONDS)
+        billed_upper_bound = True
         duration_source = (
             "upper bound: the render could not be measured, and an edit's "
             f"length is chosen by the service, so this bills Omni's "
             f"{OMNI_MAX_DURATION_SECONDS}s maximum rather than a figure "
             "inherited from the request or the source"
+        )
+    elif duration_source is None:
+        # Delivered somewhere this process cannot open (a gs:// URI), so the
+        # render was never inspected. A FRESH omni request is honoured at its
+        # clamped length, so that figure is the right basis — but it is what
+        # was asked for, not what came back, and omni renders land marginally
+        # over it. Price it as an estimate carrying the encoder allowance,
+        # and say which it is rather than leaving the number unattributed.
+        duration_source = (
+            "the clamped request: the rendered file could not be opened to "
+            "measure it (delivered to a remote URI), so this is the length "
+            "asked for, not the length measured"
         )
 
     duration_is_measured = duration_source == "measured from the rendered video"
@@ -396,11 +410,17 @@ async def _omni_generate_and_manifest(
     )
     if cost:
         if not duration_is_measured:
+            # Two different unmeasured cases, and saying "the service maximum"
+            # for the one that prices the request would overstate the bill by
+            # 3x on the response an operator reconciles against.
             cost = dict(cost)
+            basis = (
+                "bills the service maximum as an upper bound, not the metered length"
+                if billed_upper_bound
+                else "prices the length requested, not a metered length"
+            )
             cost["detail"] = (
-                f"{cost['detail']} — the render could not be measured, so this "
-                "bills the service maximum as an upper bound, not the metered "
-                "length"
+                f"{cost['detail']} — the render could not be measured, so this {basis}"
             )
         result["cost"] = cost
     manifest: dict[str, Any] = {
@@ -414,6 +434,14 @@ async def _omni_generate_and_manifest(
         "output_gcs_uri": effective_gcs,
         "video_url": result.get("video_url"),
     }
+    if duration_source:
+        manifest["duration_source"] = duration_source
+    manifest_cost = result.get("cost")
+    if manifest_cost:
+        # Same as the Veo tools and loop_extend: the sidecar is what an
+        # operator reconciles against later, so it carries the figure and the
+        # provenance, not the figure alone.
+        manifest["cost"] = manifest_cost
     if manifest_extra:
         manifest.update(manifest_extra)
     warnings = result.get("warnings")
@@ -861,6 +889,11 @@ def _source_duration_for_interaction(
             continue
         if manifest.get("interaction_id") != interaction_id:
             continue
+        if str(manifest.get("duration_source", "")).startswith("upper bound"):
+            # That render's length was never established — the manifest holds
+            # the billing ceiling. Reporting it as the source's real length
+            # would launder a bound into a fact one hop later.
+            continue
         duration = manifest.get("duration_seconds")
         if isinstance(duration, (int, float)) and duration > 0:
             return float(duration)
@@ -947,6 +980,20 @@ def _video_cost_estimate(
     except Exception:  # pragma: no cover - defensive
         logger.debug("Could not compute video cost", exc_info=True)
         return None
+
+
+def _segment_is_metered(segment: dict[str, Any]) -> bool:
+    """Whether a clip segment's recorded length is what actually rendered.
+
+    Veo renders exactly the snapped length the impl sent it, so its segments
+    are metered without a probe. Omni renders run marginally over the clamped
+    request, so an omni segment is metered only when the file itself was
+    measured — otherwise it is an estimate and carries the encoder allowance,
+    the same rule every other omni surface follows.
+    """
+    if segment.get("duration_source") == "measured from the rendered video":
+        return True
+    return str(segment.get("model") or "") != OMNI_MODEL
 
 
 def _video_cost(
@@ -2376,7 +2423,12 @@ async def generate_clip(
             720p) instead of Veo, for a quick storyboard preview of the
             whole reel before committing to full Veo renders. Bridges are not
             available in animatic mode (add_bridges is ignored), and Veo-only
-            per-beat controls (seed, negative_prompt) are ignored.
+            per-beat controls (seed, negative_prompt) are ignored. Each beat
+            is measured from the rendered file, so an animatic's reported cost
+            is metered and lands marginally above the quote's nominal seconds
+            (omni overshoots the clamped request by about a frame per beat);
+            beats delivered to GCS cannot be measured, and the total then says
+            so by reporting itself as an estimate.
 
     Returns:
         JSON clip manifest:
@@ -2592,13 +2644,31 @@ async def generate_clip(
                 prev_video_bytes = None
                 continue
 
+            # Omni renders land marginally over the clamped request (3s
+            # requested measured 3.01s), so an animatic beat's length is only
+            # known by opening the file. Veo renders exactly the snapped
+            # length it was sent (4s requested measured 4.0s) and needs no
+            # probe. Without this, a 20-beat animatic reported a cost nobody
+            # measured as though it were metered.
+            beat_duration = float(beat_result.get("duration_seconds") or duration)
+            beat_duration_source: str | None = None
+            if animatic:
+                beat_url_now = beat_result.get("video_url") or ""
+                if isinstance(beat_url_now, str) and beat_url_now.startswith("file://"):
+                    measured_beat = await asyncio.to_thread(
+                        measure_video_duration, Path(beat_url_now[7:])
+                    )
+                    if measured_beat is not None:
+                        beat_duration = measured_beat
+                        beat_duration_source = "measured from the rendered video"
+
             beat_manifest = {
                 "kind": "beat",
                 "index": idx,
                 "prompt": prompt,
                 "model": beat_model,
                 "aspect_ratio": aspect_ratio,
-                "duration_seconds": beat_result.get("duration_seconds", duration),
+                "duration_seconds": beat_duration,
                 "seed": None if animatic else seed,
                 "video_url": beat_result.get("video_url"),
                 "generation_mode": "animatic"
@@ -2606,6 +2676,8 @@ async def generate_clip(
                 else beat_result.get("generation_mode"),
                 "interaction_id": beat_result.get("interaction_id"),
             }
+            if beat_duration_source:
+                beat_manifest["duration_source"] = beat_duration_source
             # Surface any warnings the impl emitted for this beat (e.g.
             # include_audio ignored on the Gemini API path) in the beat
             # manifest and aggregate them into the clip-level warnings.
@@ -2722,7 +2794,8 @@ async def generate_clip(
                     float(seg.get("duration_seconds") or 0),
                     resolution="720p",
                     include_audio=bool(seg.get("audio_enabled", include_audio)),
-                    actual=True,
+                    actual=_segment_is_metered(seg),
+                    presnapped=not _segment_is_metered(seg),
                 )
                 for seg in segments
                 if seg.get("video_url")
@@ -2926,8 +2999,10 @@ async def edit_video(
             is Omni's 10s maximum as an upper bound — a pre-flight may
             over-state but must never under-state. The source's own length is
             reported separately as `source_duration_seconds` for context, and
-            `duration_source` explains the basis. The real run reports the
-            duration measured from the rendered file.
+            `duration_source` explains the basis. The real run measures the
+            rendered file and bills that; when the render is delivered
+            somewhere it cannot be opened (a gs:// URI) it bills the same 10s
+            upper bound, labelled as an estimate rather than as metered.
 
     Returns:
         JSON with the edited video_url and a new interaction_id for further edits.

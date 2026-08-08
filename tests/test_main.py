@@ -5652,3 +5652,213 @@ def test_no_surface_claims_an_edit_inherits_the_source_duration() -> None:
                 offenders.append(f"{path.name}:{node.lineno}: {text[:80]}")
 
     assert not offenders, "stale inherit-duration claim(s):\n" + "\n".join(offenders)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_an_unmeasurable_fresh_omni_render_prices_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh render delivered to GCS prices the clamped request.
+
+    There are three states here, not two: measured, an edit whose length is
+    unknowable (bills the maximum), and a fresh render that was honoured at
+    its clamped length but never opened. Collapsing the last two made a $0.31
+    render report that it "bills the service maximum as an upper bound" —
+    3x above what it charged, on the line an operator reconciles against.
+    """
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/out.mp4",  # cannot be opened from here
+            "interaction_id": "i1",
+            "model": OMNI_MODEL,
+            "duration_seconds": 3,  # fresh requests ARE honoured
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    r = json.loads(
+        await main_mod.generate_video_omni(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            prompt="x",
+            duration_seconds=3,
+            output_gcs_uri="gs://bucket/out.mp4",
+        )
+    )
+    assert r["duration_seconds"] == 3.0
+    assert "not the length measured" in r["duration_source"]
+    # Priced off 3s, so it must not claim to have billed the 10s maximum.
+    assert r["cost"]["usd"] < 0.4
+    assert "service maximum" not in r["cost"]["detail"]
+    assert "prices the length requested" in r["cost"]["detail"]
+    assert r["cost"]["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60.0)
+async def test_an_animatic_bills_measured_beats_not_the_clamped_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_clip is the one render path that never measured anything.
+
+    Every beat's cost came from the impl's clamped request and was summed with
+    actual=True, so the most expensive tool on the server reported a figure
+    nobody measured as metered — the exact defect measurement was added to
+    kill, surviving in the tool too expensive to live-test.
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    videos = tmp_path / "videos"
+    videos.mkdir(exist_ok=True)
+    rendered = 0
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        nonlocal rendered
+        rendered += 1
+        path = videos / f"beat{rendered}.mp4"
+        # Omni overshoots the clamp; that overshoot is the whole point.
+        subprocess.run(
+            [
+                imageio_ffmpeg.get_ffmpeg_exe(),
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=3.01:size=160x90:rate=100",
+                str(path),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        return {
+            "message": "ok",
+            "video_url": f"file://{path}",
+            "interaction_id": f"i{rendered}",
+            "model": OMNI_MODEL,
+            "duration_seconds": 3,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+    ctx = _video_ctx(tmp_path, vertexai=True)
+    beats = [{"prompt": f"beat {i}", "duration_seconds": 3} for i in range(3)]
+
+    quote = json.loads(
+        await main_mod.generate_clip(ctx=ctx, beats=beats, animatic=True, dry_run=True)
+    )
+    clip = json.loads(await main_mod.generate_clip(ctx=ctx, beats=beats, animatic=True))
+    manifest = clip.get("manifest") or clip
+    segments = manifest["segments"]
+
+    assert [s["duration_seconds"] for s in segments] == [
+        pytest.approx(3.01, abs=0.01)
+    ] * 3
+    assert {s["duration_source"] for s in segments} == {
+        "measured from the rendered video"
+    }
+    # Metered because measured — and above the clamped figure it used to bill.
+    assert manifest["cost"]["is_estimate"] is False
+    assert manifest["cost"]["usd"] > 3 * 3 * 0.10136
+    # The invariant, on the tool where it compounds per beat.
+    assert quote["estimated_cost"]["usd"] >= manifest["cost"]["usd"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_an_animatic_it_cannot_measure_is_not_reported_as_metered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Beats delivered to GCS cannot be opened, so the total is an estimate."""
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/beat.mp4",
+            "interaction_id": "i1",
+            "model": OMNI_MODEL,
+            "duration_seconds": 3,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    clip = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=[{"prompt": "b", "duration_seconds": 3}],
+            animatic=True,
+        )
+    )
+    manifest = clip.get("manifest") or clip
+    assert manifest["cost"]["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_billing_upper_bound_is_never_read_back_as_a_source_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound an unmeasurable edit bills must not become a stated fact.
+
+    The omni sidecar is what a later quote reads for source_duration_seconds
+    and what an operator reconciles against, so it carries the cost and the
+    provenance — and a recorded ceiling is refused as a source length rather
+    than laundered into one a hop later.
+    """
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+
+    videos = tmp_path / "videos"
+    videos.mkdir(exist_ok=True)
+    (videos / "source.json").write_text(
+        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
+    )
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/edited.mp4",
+            "interaction_id": "i-bound",
+            "model": OMNI_MODEL,
+            "duration_seconds": None,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    edited = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            previous_interaction_id="i-3s",
+            prompt="x",
+        )
+    )
+    manifest = edited.get("manifest") or {}
+    assert manifest["duration_source"].startswith("upper bound")
+    assert manifest["cost"]["usd"] == edited["cost"]["usd"]
+
+    # Persist that manifest the way a sidecar would, then ask for the source
+    # length of that interaction: a ceiling is not an answer.
+    (videos / "bound.json").write_text(json.dumps(manifest))
+    assert main_mod._source_duration_for_interaction(videos, "i-bound") is None
+    assert manifest["duration_seconds"] == OMNI_MAX_DURATION_SECONDS

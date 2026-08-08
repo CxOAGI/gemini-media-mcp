@@ -408,7 +408,9 @@ async def generate_video_omni(
             "chosen by the service and is NOT predictable from the request or "
             "from the source video's length. A measured 3s source edited with "
             "duration_seconds=4 rendered 10.01s. The response reports the "
-            "duration measured from the rendered file."
+            "duration measured from the rendered file, or that same 10s "
+            "maximum as a labelled upper bound when the render is delivered "
+            "somewhere it cannot be opened to measure (a gs:// URI)."
         )
 
     if log_callback:
