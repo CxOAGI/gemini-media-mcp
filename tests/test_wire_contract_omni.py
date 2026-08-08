@@ -352,3 +352,45 @@ def test_a_completed_interaction_with_no_video_output_fails_loud(
 
     with pytest.raises(ValueError, match="video"):
         _run(stub, videos_dir)
+
+
+@pytest.mark.timeout(20.0)
+def test_an_edit_does_not_report_a_duration_it_never_sent(
+    tmp_path: Path, no_poll_delay: None
+) -> None:
+    """An edit sends no duration, so it must not report one.
+
+    The impl echoed the caller's clamped request into `duration_seconds`, and
+    the tool layer bills from that field — so a 3s source edited with the
+    default 6 billed $0.6082 for a render that was 3s. Reporting the request
+    describes a render that did not happen. None means "inherited, resolve it
+    upstream"; the request is preserved separately.
+    """
+    stub = _OmniStub()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    result = _run(stub, videos_dir, previous_interaction_id="i-0", duration_seconds=3)
+
+    # Nothing about duration reached the API...
+    assert "duration" not in stub.response_format()
+    # ...so nothing about duration is claimed on the way back.
+    assert result["duration_seconds"] is None
+    assert result["requested_duration_seconds"] == 3
+    assert any("not the value requested" in w for w in result["warnings"])
+
+
+@pytest.mark.timeout(20.0)
+def test_a_fresh_render_still_reports_the_duration_it_sent(
+    tmp_path: Path, no_poll_delay: None
+) -> None:
+    """The other side of the same rule: a fresh render DOES send a duration,
+    so it must keep reporting it — the fix must not blank the normal path."""
+    stub = _OmniStub()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    result = _run(stub, videos_dir, duration_seconds=3)
+
+    assert stub.response_format()["duration"] == "3s"
+    assert result["duration_seconds"] == 3

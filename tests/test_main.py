@@ -5459,3 +5459,123 @@ async def test_bridge_quote_is_refused_without_ffmpeg(
     )
     assert "ffmpeg is required" in payload["error"]
     assert "estimated_cost" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_edit_video_bills_the_inherited_duration_not_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quote and bill must agree, and both must describe the render.
+
+    An edit sends no duration — verified on the wire — so the render inherits
+    the source's length. But the impl reported the REQUEST anyway, and cost is
+    derived from that field, so a 3s source edited with the default 6 quoted
+    $0.3041 and billed $0.6082. Under-quoting defeats the point of a
+    pre-flight, and the bill described a render that never happened.
+    """
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    (videos_dir / "source.json").write_text(
+        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
+    )
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "edited.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": "i-new",
+            "model": OMNI_MODEL,
+            # What the impl reports for an edit: it never sent a duration.
+            "duration_seconds": None,
+            "requested_duration_seconds": kwargs.get("duration_seconds", 6),
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+    ctx = _video_ctx(tmp_path, vertexai=True)
+
+    quote = json.loads(
+        await main_mod.edit_video(
+            ctx=ctx, previous_interaction_id="i-3s", prompt="x", dry_run=True
+        )
+    )
+    billed = json.loads(
+        await main_mod.edit_video(ctx=ctx, previous_interaction_id="i-3s", prompt="x")
+    )
+
+    assert billed["duration_seconds"] == 3
+    assert billed["cost"]["usd"] == pytest.approx(3 * 0.10136)
+    assert quote["estimated_cost"]["usd"] == pytest.approx(billed["cost"]["usd"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_edit_video_says_so_when_the_billed_length_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source this server did not generate has no resolvable length, so the
+    reported cost is the requested duration and must be labelled as such."""
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "edited.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": "i-new",
+            "model": OMNI_MODEL,
+            "duration_seconds": None,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    billed = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            previous_interaction_id="generated-elsewhere",
+            prompt="x",
+        )
+    )
+    assert "unknown" in billed["duration_source"]
+    assert "not the billed one" in billed["cost"]["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_clip_quote_reports_the_ffmpeg_check_when_bridging(
+    tmp_path: Path,
+) -> None:
+    """generate_clip prices bridges through the same ffmpeg primitive as
+    generate_bridge — and is where a missing binary costs most, since the
+    bridges are folded into the estimate. The signal landed on the standalone
+    tool first and not on the composite that needed it."""
+    import src.__main__ as main_mod
+
+    beats = [{"prompt": "b", "duration_seconds": 8}] * 3
+    bridged = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+        )
+    )
+    assert any("ffmpeg" in c for c in bridged["preflight_checks"])
+
+    plain = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+        )
+    )
+    assert plain["preflight_checks"] == []

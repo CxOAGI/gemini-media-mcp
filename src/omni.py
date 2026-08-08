@@ -394,10 +394,11 @@ async def generate_video_omni(
     if task_type == "edit":
         # Edits inherit length and framing from the source video; the API
         # rejects duration (and task alongside previous_interaction_id), so
-        # the requested values are echoed for planning but not sent.
+        # neither is sent.
         warnings.append(
             "Edit requests inherit duration and aspect ratio from the source "
-            "video; the requested duration_seconds/aspect_ratio were not sent."
+            "video; the requested duration_seconds/aspect_ratio were not sent, "
+            "so the rendered length is the source's, not the value requested."
         )
 
     if log_callback:
@@ -480,7 +481,12 @@ async def generate_video_omni(
         "video_url": video_url,
         "interaction_id": interaction_id,
         "model": OMNI_MODEL,
-        "duration_seconds": clamped_duration,
+        # For an edit the duration was never sent, so reporting the request
+        # here would describe a render that did not happen — and the caller
+        # bills from this field. None means "inherited, resolve it upstream";
+        # the request is kept separately so nothing is lost.
+        "duration_seconds": None if task_type == "edit" else clamped_duration,
+        "requested_duration_seconds": clamped_duration,
         "aspect_ratio": aspect_ratio,
     }
 
