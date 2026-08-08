@@ -5,6 +5,7 @@ import base64
 import ipaddress
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -390,6 +391,12 @@ def _validate_duration_seconds(
         raise ValueError(
             f"{field} must be a number, got {duration_seconds!r}"
         ) from None
+    # NaN slips through a plain < 0 check (all NaN comparisons are False),
+    # would snap to the model minimum, generate and bill — and then render as
+    # bare NaN in the response JSON, which strict parsers reject. Python's own
+    # json.loads accepts NaN/Infinity, so these values genuinely arrive.
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite, got {value!r}")
     if value < 0:
         raise ValueError(f"{field} must not be negative, got {value:g}")
 
@@ -1161,16 +1168,9 @@ async def generate_storyboard(
                         f"shots[{i}].{field} must be a string, "
                         f"got {type(value).__name__}"
                     )
-            duration = shot.get("duration_seconds")
-            if duration is not None:
-                try:
-                    if float(duration) < 0:
-                        raise ValueError
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        f"shots[{i}].duration_seconds must be a non-negative "
-                        f"number, got {duration!r}"
-                    ) from None
+            _validate_duration_seconds(
+                shot.get("duration_seconds"), f"shots[{i}].duration_seconds"
+            )
 
         from .image import resolve_image_model
 
@@ -1957,6 +1957,8 @@ async def generate_clip(
                     f"beats[{beat_index}] must be an object with a 'prompt', "
                     f"got {type(beat_spec).__name__}"
                 )
+            if not str(beat_spec.get("prompt", "") or "").strip():
+                raise ValueError(f"beats[{beat_index}] is missing a non-empty 'prompt'")
             _validate_duration_seconds(
                 beat_spec.get("duration_seconds"),
                 f"beats[{beat_index}].duration_seconds",
@@ -2264,6 +2266,10 @@ async def generate_video_omni(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        # Fail fast before any fetch or interaction work; the omni impl
+        # clamps to [3, 10]s, which would turn a negative or NaN duration
+        # into a billed 3s render instead of an error.
+        _validate_duration_seconds(duration_seconds)
         data_dir = app_ctx.data_folder
 
         if output_gcs_uri:
@@ -2359,6 +2365,10 @@ async def edit_video(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        # Fail fast before any fetch or interaction work; the omni impl
+        # clamps to [3, 10]s, which would turn a negative or NaN duration
+        # into a billed 3s render instead of an error.
+        _validate_duration_seconds(duration_seconds)
 
         await ctx.info(f"Editing video (interaction {previous_interaction_id})")
         result = await _omni_generate_and_manifest(

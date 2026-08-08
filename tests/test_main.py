@@ -4268,13 +4268,18 @@ async def test_storyboard_refuses_an_oversized_board(tmp_path: Path) -> None:
         pytest.param(None, "must be an object", id="none"),
         pytest.param(
             {"prompt": "x", "duration_seconds": "soon"},
-            "duration_seconds must be a non-negative number",
+            "duration_seconds must be a number",
             id="non_numeric_duration",
         ),
         pytest.param(
             {"prompt": "x", "duration_seconds": -3},
-            "duration_seconds must be a non-negative number",
+            "duration_seconds must not be negative",
             id="negative_duration",
+        ),
+        pytest.param(
+            {"prompt": "x", "duration_seconds": float("nan")},
+            "duration_seconds must be finite",
+            id="nan_duration",
         ),
         pytest.param(
             {"prompt": "x", "caption": {"nested": 1}},
@@ -4524,3 +4529,84 @@ async def test_video_manifest_records_the_model_that_actually_ran(
     )
     manifest = json.loads(Path(payload["sidecar_url"][7:]).read_text())
     assert manifest["model"] == "veo-3.1-generate-preview"
+
+
+@pytest.mark.parametrize("bad", [-5, float("nan"), float("inf")])
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_omni_tools_reject_bad_durations_before_generating(
+    bad: float, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The omni tools clamped instead of validating, so a negative or NaN
+    duration became a billed 3s render. The pattern fix that covered the Veo
+    tools missed them because they had no _validate_aspect_ratio call to
+    anchor the grep."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("a bad duration must not reach the omni impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", must_not_spend)
+    monkeypatch.setattr(main_mod, "edit_video_impl", must_not_spend, raising=False)
+
+    result = await main_mod.generate_video_omni(
+        ctx=_video_ctx(tmp_path), prompt="a cat", duration_seconds=bad
+    )
+    payload = json.loads(result if isinstance(result, str) else result[0].text)
+    assert "duration_seconds" in payload["error"]
+
+    result2 = await main_mod.edit_video(
+        ctx=_video_ctx(tmp_path),
+        previous_interaction_id="abc",
+        prompt="make it stormy",
+        duration_seconds=bad,
+    )
+    payload2 = json.loads(result2 if isinstance(result2, str) else result2[0].text)
+    assert "duration_seconds" in payload2["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_nan_duration_is_rejected_everywhere_a_negative_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NaN passes a bare < 0 check, would be quoted, generated and billed, and
+    then serialized as bare NaN — invalid JSON — in the response. Python's own
+    json.loads accepts NaN, so the value genuinely arrives over MCP."""
+    import src.__main__ as main_mod
+    from src.pricing import estimate_video_cost
+
+    assert estimate_video_cost("veo-3.1-generate-001", float("nan")) is None
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("NaN must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+    result = await main_mod.generate_video(
+        ctx=_video_ctx(tmp_path),
+        prompt="a cat",
+        model="veo-3.1-generate-001",
+        duration_seconds=float("nan"),
+    )
+    assert "must be finite" in json.loads(result)["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_rejects_a_promptless_beat_before_rendering_any(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A beat's prompt is knowable before spending; the check used to live
+    inside the render loop, so beat 3 missing a prompt billed beats 1-2."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("a promptless beat must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+
+    result = await main_mod.generate_clip(
+        ctx=_video_ctx(tmp_path),
+        beats=[{"prompt": "fine"}, {"prompt": "fine"}, {"caption": "no prompt"}],
+    )
+    assert "beats[2]" in json.loads(result)["error"]

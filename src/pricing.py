@@ -549,9 +549,11 @@ def estimate_video_cost(
     # to the 4s floor would quote a real price for an impossible request, so
     # decline it the same way an unknown model is declined.
     try:
-        if float(duration_seconds) < 0:
-            return None
+        value = float(duration_seconds)
     except (TypeError, ValueError):
+        return None
+    # NaN passes a bare < 0 check and would be quoted at the 4s floor.
+    if not math.isfinite(value) or value < 0:
         return None
 
     model_id = resolve_model_id(model)
