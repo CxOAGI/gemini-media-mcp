@@ -1,5 +1,6 @@
 """Tests for video_utils.extract_frame_png."""
 
+from pathlib import Path
 from io import BytesIO
 
 import imageio.v3 as iio
@@ -95,3 +96,47 @@ def test_frame_decoding_preflight_raises_an_actionable_error(
     monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", no_ffmpeg)
     with pytest.raises(RuntimeError, match="ffmpeg is required"):
         assert_frame_decoding_available()
+
+
+def test_measure_video_duration_reads_the_real_length(tmp_path: Path) -> None:
+    """The only duration source that cannot drift.
+
+    Every other figure is the caller's request or something the server wrote
+    down earlier — and an edit's sidecar seeds the next edit's estimate, so a
+    wrong assumption propagates down the chain. Five review rounds argued
+    about inherited-vs-requested duration without anyone measuring a rendered
+    file; this makes every render self-report.
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    from src.video_utils import measure_video_duration
+
+    clip = tmp_path / "three_seconds.mp4"
+    subprocess.run(
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=3:size=160x90:rate=24",
+            str(clip),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    assert measure_video_duration(clip) == pytest.approx(3.0, abs=0.2)
+
+
+@pytest.mark.parametrize("name", ["not_a_video.mp4", "missing.mp4"])
+def test_measure_video_duration_never_raises(name: str, tmp_path: Path) -> None:
+    """A probe failure must not fail a render that already succeeded and was
+    already billed — it falls back to the caller's existing reporting."""
+    from src.video_utils import measure_video_duration
+
+    target = tmp_path / name
+    if "not_a_video" in name:
+        target.write_bytes(b"definitely not an mp4")
+    assert measure_video_duration(target) is None

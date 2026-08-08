@@ -1,5 +1,7 @@
 """Video decoding helpers for building transitions between existing clips."""
 
+import logging
+import math
 import shutil
 from io import BytesIO
 from pathlib import Path
@@ -8,7 +10,42 @@ from typing import Literal
 import imageio.v3 as iio
 from PIL import Image
 
+logger = logging.getLogger(__name__)
+
 FramePosition = Literal["start", "end"]
+
+
+def measure_video_duration(path: Path) -> float | None:
+    """Read a rendered file's real duration in seconds, or None.
+
+    The only duration source that cannot drift. Every other figure in this
+    server is either the caller's request or a value the server previously
+    wrote down, so a wrong assumption propagates: an edit inherits its length
+    from its source, and each edit's sidecar seeds the next one's estimate.
+    Measuring the artifact settles what actually rendered, independent of what
+    was asked for or recorded.
+
+    Never raises: a probe failure falls back to the caller's existing
+    reporting rather than failing a render that already succeeded and was
+    already billed.
+
+    Args:
+        path: A local video file.
+
+    Returns:
+        Duration in seconds, or None when it cannot be determined.
+    """
+    try:
+        import imageio.v3 as iio
+
+        meta = iio.immeta(path, plugin="FFMPEG")
+    except Exception:
+        logger.debug("Could not probe duration of %s", path, exc_info=True)
+        return None
+    duration = meta.get("duration")
+    if isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0:
+        return float(duration)
+    return None
 
 
 def assert_frame_decoding_available() -> None:

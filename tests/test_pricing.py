@@ -981,13 +981,24 @@ def test_a_veo_quote_flags_that_the_vertex_rate_is_assumed() -> None:
     assert note != _image_note()
 
 
-def test_omni_reports_its_source_without_inventing_a_backend_claim() -> None:
-    """Neither page says how Omni's token rates apply on the other backend, so
-    the note stays empty. Provenance is the URL; silence beats a guess."""
+def test_omni_states_that_no_backend_claim_is_made() -> None:
+    """Neither page says how Omni's token rates apply on the other backend.
+
+    This note was originally left empty on the reasoning that silence beats a
+    guess — right about not guessing, wrong about silence: every other rate
+    carries a note, so a null here read as an oversight rather than a
+    decision, and a reviewer flagged it as exactly that. Saying "no
+    cross-backend equivalence is claimed" invents nothing and distinguishes
+    "we looked and there is nothing to say" from "nobody checked".
+    """
     payload = cost_to_dict(estimate_video_cost(OMNI_MODEL, 5))
     assert payload is not None
     assert payload["pricing_source"] == PRICING_SOURCES["gemini_api"]
-    assert payload["pricing_source_note"] is None
+    note = payload["pricing_source_note"]
+    assert note is not None
+    # States the absence of a claim; does not make one.
+    assert "no cross-backend equivalence is claimed" in note
+    assert "same" not in note.lower().split("cross-backend")[0]
 
 
 @pytest.mark.parametrize("model", sorted(_IMAGE_PRICING))

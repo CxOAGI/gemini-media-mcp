@@ -342,10 +342,15 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
         # still billed at the 720p rate.
         fixed_resolution="720p",
         source=_SRC_GEMINI_API,
-        # Deliberately no source_note: the token rates were read from the
-        # source page above, and neither page says anything about how they
-        # apply on the other backend. Silence is the honest answer — a note
-        # here would be inventing a claim, in either direction.
+        # Stated explicitly rather than left null: the other rates carry a
+        # cross-backend note, and a silent gap here reads as an oversight.
+        # Neither pricing page says how omni's token rates apply on the other
+        # backend, so no such claim is made.
+        source_note=(
+            "Rates confirmed on the Gemini Developer API pricing page. Neither "
+            "page states how omni's token rates apply on the other backend, so "
+            "no cross-backend equivalence is claimed."
+        ),
     ),
 }
 
