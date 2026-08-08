@@ -901,10 +901,16 @@ async def test_generate_video_extend(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_mode_priority_extend_wins(
+async def test_generate_video_refuses_extend_combined_with_image_inputs(
     tmp_path: Path,
 ) -> None:
-    """Test that extend_video has highest priority in generation mode."""
+    """Conflicting inputs are refused, not silently resolved by a ladder.
+
+    This test previously asserted the ladder: pass every input at once and
+    extend_video quietly wins. That is what made the defect invisible — the
+    caller paid to fetch a first frame, a last frame and a reference set, all
+    three were dropped without a word, and the response reported success.
+    """
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
@@ -915,27 +921,40 @@ async def test_generate_video_mode_priority_extend_wins(
 
     client = FakeGenaiClient(operation=operation)
 
-    # Provide all inputs - extend_video should win
-    gen_result = await generate_video(
-        client=client,  # type: ignore[arg-type]
-        prompt="Test priority",
-        videos_dir=videos_dir,
-        model="veo-3.1-generate-001",
-        image_bytes=_create_test_image(),
-        last_frame_bytes=_create_test_image(),
-        reference_images=[_create_test_image()],
-        extend_video_uri="gs://bucket/video.mp4",
-    )
+    with pytest.raises(ValueError) as excinfo:
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="Test priority",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+            image_bytes=_create_test_image(),
+            last_frame_bytes=_create_test_image(),
+            reference_images=[_create_test_image()],
+            extend_video_uri="gs://bucket/video.mp4",
+        )
 
-    assert gen_result["generation_mode"] == "extend_video"
+    # The message has to name what was dropped, or the caller cannot tell
+    # which of the three inputs to remove.
+    # The message names every input that would have been dropped, in the
+    # caller's vocabulary (the tool parameters) rather than the impl's.
+    message = str(excinfo.value)
+    assert "extend_video_uri" in message
+    assert "image_uri/image_base64" in message
+    assert "last_frame_uri" in message
+    assert "reference_image_uris" in message
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_mode_priority_reference_over_frames(
+async def test_generate_video_refuses_references_combined_with_frames(
     tmp_path: Path,
 ) -> None:
-    """Test that reference_images wins over first/last frame."""
+    """Reference-to-video silently discarded a paid-for first frame.
+
+    Worse than a dropped parameter: reference mode also forces the render to
+    8 seconds, so a 4-second request was billed double for a render that
+    ignored the frame the caller supplied.
+    """
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
@@ -946,17 +965,61 @@ async def test_generate_video_mode_priority_reference_over_frames(
 
     client = FakeGenaiClient(operation=operation)
 
-    # Provide first frame and reference images - reference should win
-    gen_result = await generate_video(
-        client=client,  # type: ignore[arg-type]
-        prompt="Test priority",
-        videos_dir=videos_dir,
-        model="veo-3.1-generate-001",
-        image_bytes=_create_test_image(),
-        reference_images=[_create_test_image()],
-    )
+    with pytest.raises(ValueError) as excinfo:
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="Test priority",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+            image_bytes=_create_test_image(),
+            reference_images=[_create_test_image()],
+        )
 
-    assert gen_result["generation_mode"] == "reference_to_video"
+    message = str(excinfo.value)
+    assert "reference images" in message
+    assert "image_uri/image_base64" in message
+    # The forced 8s render is why this is a refusal and not a warning.
+    assert "8 seconds" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_still_picks_a_mode_when_inputs_do_not_conflict(
+    tmp_path: Path,
+) -> None:
+    """Refusing conflicts must not break the ordinary single-input paths."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    for kwargs, expected in (
+        ({"extend_video_uri": "gs://bucket/video.mp4"}, "extend_video"),
+        ({"reference_images": [_create_test_image()]}, "reference_to_video"),
+        ({"image_bytes": _create_test_image()}, "image_to_video"),
+        (
+            {
+                "image_bytes": _create_test_image(),
+                "last_frame_bytes": _create_test_image(),
+            },
+            "first_last_frame",
+        ),
+        ({}, "text_to_video"),
+    ):
+        client = FakeGenaiClient(
+            operation=FakeOperation(
+                done=True,
+                result=FakeVideoResult(
+                    [FakeGeneratedVideo(FakeVideoObject(video_bytes=b"video content"))]
+                ),
+            )
+        )
+        gen_result = await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="Test priority",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+            **kwargs,
+        )
+        assert gen_result["generation_mode"] == expected
 
 
 @pytest.mark.asyncio

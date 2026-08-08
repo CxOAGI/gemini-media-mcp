@@ -16,7 +16,9 @@ Why two artifacts?
     2. ``render_html`` emits a fully self-contained HTML document (images as
        ``data:`` URIs, CSS/JS inlined, zero external requests) that the user
        opens in a browser for the richer review pass: full prompts, notes,
-       running timecode, light/dark support.
+       running timecode, light/dark support. Oversized frames are resampled
+       for the embed — the page stays offline-complete, and the originals are
+       linked per shot for anyone who needs the full resolution.
 
     ``write_storyboard`` writes both and returns their URLs.
 
@@ -29,6 +31,7 @@ import html
 import logging
 import math
 import re
+import threading
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -85,8 +88,8 @@ _BOLD_FONT_PATHS: tuple[str, ...] = (
 )
 
 
-@lru_cache(maxsize=64)
-def _load_font(size: int, bold: bool = False) -> Font:
+@lru_cache(maxsize=256)
+def _load_font_for_thread(size: int, bold: bool, thread_id: int) -> Font:
     """Load a TrueType face at ``size``, falling back to PIL's bitmap font.
 
     Tries each candidate path in order and returns the first that opens. If
@@ -95,11 +98,13 @@ def _load_font(size: int, bold: bool = False) -> Font:
     storyboard beats no storyboard.
 
     Results are memoized because a single sheet asks for the same handful of
-    (size, weight) pairs once per panel.
+    (size, weight) pairs once per panel. ``thread_id`` is part of the key, not
+    used in the body: see ``_load_font``.
 
     Args:
         size: Requested point size.
         bold: Whether to prefer a bold face.
+        thread_id: Identity of the calling thread; keeps faces unshared.
 
     Returns:
         A FreeTypeFont when a face resolved, otherwise PIL's default font.
@@ -118,6 +123,37 @@ def _load_font(size: int, bold: bool = False) -> Font:
     except (OSError, TypeError, ValueError):
         logger.debug("No scalable font available; using PIL's bitmap default")
         return ImageFont.load_default()
+
+
+class _FontLoader:
+    """Memoized font loader that never shares a face between threads.
+
+    Pillow documents FreeTypeFont as not thread-safe: a face carries mutable
+    render state, and two ``generate_storyboard`` calls land on different
+    ``asyncio.to_thread`` workers, so a process-wide memo handed the same
+    object to both and let them interleave inside FreeType — corrupt metrics
+    and garbled glyphs at best.
+
+    Per-thread instances rather than a lock: layout calls ``getlength`` and
+    ``getbbox`` hundreds of times per panel and draws per line, so a shared
+    lock would serialize essentially all rendering and undo the reason the work
+    is on a worker thread at all. The price is one extra face load per
+    (size, weight) per worker — microseconds, then memoized — against a bounded
+    pool of workers.
+
+    Presents the ``lru_cache`` surface (call + ``cache_clear``) the module and
+    its tests already use.
+    """
+
+    def __call__(self, size: int, bold: bool = False) -> Font:
+        return _load_font_for_thread(size, bold, threading.get_ident())
+
+    def cache_clear(self) -> None:
+        """Drop every memoized face, for every thread."""
+        _load_font_for_thread.cache_clear()
+
+
+_load_font = _FontLoader()
 
 
 def _is_scalable(font: Font) -> bool:
@@ -335,6 +371,60 @@ def _sniff_mime(data: bytes) -> str:
 def _data_uri(data: bytes) -> str:
     """Encode ``data`` as a ``data:`` URI so the HTML stays self-contained."""
     return f"data:{_sniff_mime(data)};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+# Every embedded frame exists several times over while the page is built: the
+# base64 text in the parts list, the joined document, and the UTF-8 encoding of
+# it on write. Inlining full-size keyframes made a 24-shot 4K board a 673MB
+# .html rendered at 2.5GB of RSS. The page is a review artifact whose widest
+# presentation is the ~1100px zoom, so an embed longer than this on either edge
+# buys nothing a reviewer can see.
+_HTML_EMBED_MAX_EDGE = 1600
+# Only applies to frames that are re-encoded, i.e. ones already being resampled.
+_HTML_EMBED_JPEG_QUALITY = 82
+
+
+def _embed_uri(data: bytes) -> str:
+    """Encode a frame as a ``data:`` URI, shrinking an oversized one first.
+
+    Frames at or under the embed cap are passed through byte-for-byte, so a
+    normally-sized board is unchanged. Anything larger is resampled to the cap
+    and re-encoded — JPEG when it is opaque, PNG when it carries alpha.
+
+    Undecodable bytes fall back to embedding the original: a frame the renderer
+    cannot read is still a frame the browser might.
+    """
+    try:
+        with Image.open(BytesIO(data)) as source:
+            if max(source.size) <= _HTML_EMBED_MAX_EDGE:
+                return _data_uri(data)
+            source.thumbnail(
+                (_HTML_EMBED_MAX_EDGE, _HTML_EMBED_MAX_EDGE), Image.Resampling.LANCZOS
+            )
+            transparent = source.mode in ("RGBA", "LA", "PA") or (
+                source.mode == "P" and "transparency" in source.info
+            )
+            buffer = BytesIO()
+            # Flattening onto a matte here would have to guess a colour the CSS
+            # picks per theme, so alpha is kept instead and the page composites
+            # it the same way it composites a full-size frame.
+            flat = source.convert("RGBA" if transparent else "RGB")
+            try:
+                if transparent:
+                    flat.save(buffer, format="PNG", optimize=True)
+                else:
+                    flat.save(
+                        buffer,
+                        format="JPEG",
+                        quality=_HTML_EMBED_JPEG_QUALITY,
+                        optimize=True,
+                    )
+            finally:
+                flat.close()
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not shrink a frame for embedding (%s)", exc)
+        return _data_uri(data)
+    return _data_uri(buffer.getvalue())
 
 
 # ============================================================================
@@ -1202,6 +1292,31 @@ document.addEventListener('click', function (event) {
 """
 
 
+# Schemes allowed in a rendered href. ``html.escape`` makes an attribute safe
+# to parse but says nothing about what the URL *does*, so it does not stop
+# ``javascript:``. Frames only ever carry a server-generated file:// or gs://
+# URL today, which is exactly why this is worth pinning down: the day a caller
+# gets to set image_url, a storyboard the user opens from disk must not be able
+# to run script with one click.
+_SAFE_URL_SCHEMES = frozenset({"file", "gs", "http", "https"})
+
+
+def _safe_href(url: str) -> str | None:
+    """Return ``url`` when its scheme is one we will put in an ``href``.
+
+    Returns None for anything else, including scheme-relative URLs, which would
+    reach the network and break the page's offline guarantee.
+    """
+    # Browsers ignore ASCII whitespace and control characters when they parse a
+    # scheme, so "java\tscript:..." is a javascript: URL to them; strip those
+    # before looking at it, or the allowlist reads the wrong scheme.
+    cleaned = re.sub(r"[\x00-\x20\x7f]", "", url)
+    scheme, separator, _ = cleaned.partition(":")
+    if not separator or scheme.lower() not in _SAFE_URL_SCHEMES:
+        return None
+    return url
+
+
 def _html_field(label: str, value: str, *, error: bool = False) -> str:
     """Render one escaped ``<dt>/<dd>`` pair."""
     css = ' class="err"' if error else ""
@@ -1219,8 +1334,10 @@ def render_html(
 
     Every image is embedded as a ``data:`` URI and the CSS/JS are inlined, so
     the document renders identically offline and issues zero external
-    requests. All caller-supplied text is escaped — prompts are untrusted
-    input and must never be able to inject markup.
+    requests. Frames larger than the page can display are resampled down for
+    the embed (see ``_embed_uri``); the full-resolution originals stay on disk
+    and are linked per shot. All caller-supplied text is escaped — prompts are
+    untrusted input and must never be able to inject markup.
 
     Args:
         frames: Shots in playback order. Must not be empty.
@@ -1291,7 +1408,7 @@ def render_html(
         else:
             alt = html.escape(frame.caption or f"Shot {frame.index}")
             parts.append(
-                f'<figure><img alt="{alt}" src="{_data_uri(frame.image_bytes)}">'
+                f'<figure><img alt="{alt}" src="{_embed_uri(frame.image_bytes)}">'
                 "</figure>"
             )
 
@@ -1312,10 +1429,15 @@ def render_html(
         if frame.error:
             parts.append(_html_field("Error", frame.error, error=True))
         if frame.image_url:
-            url = html.escape(frame.image_url, quote=True)
+            shown = html.escape(frame.image_url)
+            href = _safe_href(frame.image_url)
+            # A URL we will not link to is still worth showing — the reviewer
+            # can see where the frame claims to come from, just not click it.
             parts.append(
-                f'    <dt>Source</dt><dd><a href="{url}">'
-                f"{html.escape(frame.image_url)}</a></dd>"
+                f'    <dt>Source</dt><dd><a href="'
+                f'{html.escape(href, quote=True)}">{shown}</a></dd>'
+                if href
+                else f"    <dt>Source</dt><dd>{shown}</dd>"
             )
         parts.append("</dl></div></li>")
 

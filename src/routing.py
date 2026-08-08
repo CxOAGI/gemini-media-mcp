@@ -114,6 +114,26 @@ MAX_IMAGE_REFERENCE_IMAGES = 14
 # Veo accepts at most 3 reference images (asset type), per src/video.py.
 MAX_VIDEO_REFERENCE_IMAGES = 3
 
+# generate_clip hard-errors above this beat count. Mirrored from
+# src/__main__.py's MAX_CLIP_BEATS (the source of truth) rather than imported:
+# importing it would pull the whole MCP server — FastMCP construction and all —
+# into a module whose entire promise is that it only computes. Planning more
+# beats than this emitted a fully quoted route the tool refuses outright.
+MAX_CLIP_BEATS = 20
+
+# generate_clip renders every bridge at exactly 4.0s regardless of how long the
+# beats are (the duration_seconds=4.0 bridge render in src/__main__.py), and
+# its own dry_run prices them at 4.0s. Pricing a bridge at the beat length
+# quoted $4.00 for a plan the tool itself quotes at $3.20.
+CLIP_BRIDGE_SECONDS = 4.0
+
+# Tools with no resolution parameter at all: they always render 720p, so a 4K
+# or 1080p ask cannot reach them and must not be priced as if it had. Quoting
+# generate_clip at 4K reported $5.40 against the tool's own $1.80.
+FIXED_720P_TOOLS: frozenset[str] = frozenset(
+    {"generate_clip", "generate_transition", "generate_bridge"}
+)
+
 # Defaults applied when neither the caller nor the intent text says otherwise.
 DEFAULT_VIDEO_DURATION_SECONDS = 6.0
 DEFAULT_BEAT_COUNT = 3
@@ -797,8 +817,10 @@ _HORIZONTAL_TERMS: frozenset[str] = frozenset(
 _SQUARE_TERMS: frozenset[str] = frozenset({"1:1", "square"})
 
 # "8s", "8 sec", "8-second", "30 seconds" — the number of seconds of output.
+# The unit is captured because the single-letter spelling is ambiguous and has
+# to earn its reading (see _duration_value).
 _DURATION_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(?:s\b|sec\b|secs\b|second\b|seconds\b)"
+    r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(s|sec|secs|second|seconds)\b"
 )
 
 # "2 minutes", "90-min" — the same fact in the other unit. Worth parsing
@@ -806,18 +828,131 @@ _DURATION_PATTERN = re.compile(
 # served by one Veo clip, and saying so is more useful than quietly planning 8
 # seconds of video.
 _MINUTES_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(?:m\b|min\b|mins\b|minute\b|minutes\b)"
+    r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(m|min|mins|minute|minutes)\b"
 )
 
 # "by another 30 seconds", "add 20s", "extend by 2 minutes" — an amount to
 # ADD, not a total. Without this, the plain duration pattern takes the first
 # number in the sentence, so "extend my 8 second clip by another 30 seconds"
 # read the SOURCE length and planned one 7s extension instead of five.
+# The leading lookbehind is load-bearing: without it "a lullaby 30 seconds
+# long" matched the "by 30 seconds" buried inside "lullaby" and planned a 30s
+# extension of a clip nobody asked to extend.
 _ADDED_DURATION_PATTERN = re.compile(
-    r"(?:by|add|plus|another)\s+(?:another\s+)?(\d+(?:\.\d+)?)\s*"
+    r"(?<!\w)(?:by|add|plus|another)\s+(?:another\s+)?(\d+(?:\.\d+)?)\s*"
     r"(?:-|\s)?\s*(s\b|sec\b|secs\b|second\b|seconds\b"
     r"|m\b|min\b|mins\b|minute\b|minutes\b)"
 )
+
+# The single-letter units are the ambiguous ones: "8s" is a runtime but "the
+# 1970s", "an 80s diner", "our 100s of customers", "the iPhone 15s" and "a 3 m
+# tall robot" are not, and every one of them was being planned as a duration
+# (1970s quoted a 247-beat clip at $197.60). A bare unit therefore only counts
+# when the surrounding words make it a runtime; the spelled-out units
+# (sec/second/min/minute) are unambiguous and need no such proof.
+_BARE_DURATION_UNITS: frozenset[str] = frozenset({"s", "m"})
+
+# Nouns that can only be describing the thing being timed, so a bare unit in
+# front of one is a runtime: "8s clip", "30s of video".
+_DURATION_CONTEXT_WORDS: frozenset[str] = frozenset(
+    {
+        "ad",
+        "advert",
+        "animatic",
+        "animation",
+        "b-roll",
+        "beat",
+        "beats",
+        "broll",
+        "clip",
+        "clips",
+        "commercial",
+        "cut",
+        "cuts",
+        "film",
+        "footage",
+        "loop",
+        "long",
+        "montage",
+        "movie",
+        "reel",
+        "reels",
+        "render",
+        "scene",
+        "scenes",
+        "segment",
+        "sequence",
+        "shot",
+        "shots",
+        "spot",
+        "take",
+        "trailer",
+        "video",
+        "videos",
+        "vlog",
+    }
+)
+
+# Words that announce a duration is coming, so a bare unit behind one is a
+# runtime even with no noun after it: "for 15s", "make it 8s".
+_DURATION_CUE_WORDS: frozenset[str] = frozenset(
+    {
+        "about",
+        "approximately",
+        "around",
+        "duration",
+        "exactly",
+        "for",
+        "it",
+        "lasting",
+        "length",
+        "over",
+        "roughly",
+        "runtime",
+        "under",
+    }
+)
+
+# A four-digit number carrying a trailing "s" is a decade, never a runtime:
+# "1970s footage" is a look, not 1970 seconds of output.
+_DECADE_PATTERN = re.compile(r"^(?:19|20)\d{2}$")
+
+_WORD_BEFORE_PATTERN = re.compile(r"([\w'-]+)\W*$")
+_WORD_AFTER_PATTERN = re.compile(r"^\W*([\w'-]+)")
+
+
+def _word_before(text: str, index: int) -> str:
+    """The word ending immediately before ``index``, or "" if there is none."""
+    match = _WORD_BEFORE_PATTERN.search(text[:index])
+    return match.group(1) if match else ""
+
+
+def _word_after(text: str, index: int) -> str:
+    """The word starting immediately after ``index``, or "" if there is none."""
+    match = _WORD_AFTER_PATTERN.search(text[index:])
+    return match.group(1) if match else ""
+
+
+def _duration_value(text: str, pattern: re.Pattern[str]) -> float | None:
+    """First number in ``text`` that is really a duration, in its own unit.
+
+    The spelled-out units are taken at face value. A bare "s"/"m" has to be
+    corroborated by the words around it, because the same characters spell
+    decades, product names and plural quantities — and every one of those was
+    being planned as a runtime.
+    """
+    for match in pattern.finditer(text):
+        if match.group(2) in _BARE_DURATION_UNITS:
+            if _DECADE_PATTERN.match(match.group(1)):
+                continue
+            if not (
+                _word_after(text, match.end()) in _DURATION_CONTEXT_WORDS
+                or _word_before(text, match.start()) in _DURATION_CUE_WORDS
+            ):
+                continue
+        return float(match.group(1))
+    return None
+
 
 # "3 beats", "5 shots", "4 scenes" — how many segments the output has.
 _BEAT_PATTERN = re.compile(r"(\d+)\s*(?:beats?|shots?|scenes?|cuts?|segments?)\b")
@@ -852,9 +987,6 @@ _NEGATORS: tuple[str, ...] = (
     "never",
     "avoid",
     "exclude",
-    "silent",
-    "mute",
-    "muted",
     "sans",
     "minus",
     "drop",
@@ -862,10 +994,44 @@ _NEGATORS: tuple[str, ...] = (
     "skip",
 )
 
+# Negators that can only be talking about the soundtrack. "a silent video of
+# rain" is a video request with the sound off, but a negator scoped to nothing
+# read "silent" as cancelling "video" and planned a still image — 5 of 15
+# natural "video without X" phrasings lost their modality this way.
+_AUDIO_NEGATORS: tuple[str, ...] = _NEGATORS + ("silent", "mute", "muted")
+
 # How far back to look for a negator. Short on purpose: "no dialogue, but
 # ambient music" should keep the music hit, so only the words immediately
 # before a term can negate it.
 _NEGATION_WINDOW = 3
+
+# A negator only reaches a term while nothing separates them. Clause and
+# sentence punctuation ends the scan — "no audio, a video of rain" and "avoid
+# text. video montage of ocean waves" are asking FOR video, and reading the
+# negator across the break planned stills for both.
+_CLAUSE_BREAK_PATTERN = re.compile(r"[,.;:!?()\[\]\"]|\s[-–—]+\s")
+
+# Conjunctions start a new clause even without punctuation, so "without music
+# and video of a river" must not lose its video.
+_CLAUSE_BREAK_WORDS: frozenset[str] = frozenset(
+    {"and", "but", "or", "nor", "then", "so", "yet", "while", "plus"}
+)
+
+
+def _negator_precedes(prefix: str, negators: tuple[str, ...]) -> bool:
+    """Whether a negator sits in the words directly before a term.
+
+    ``prefix`` is everything ahead of the term. Only the current clause is
+    read, and only its last ``_NEGATION_WINDOW`` words.
+    """
+    clause = _CLAUSE_BREAK_PATTERN.split(prefix)[-1]
+    for word in reversed(clause.split()[-_NEGATION_WINDOW:]):
+        cleaned = word.strip("-\"'")
+        if cleaned in _CLAUSE_BREAK_WORDS:
+            return False
+        if cleaned in negators:
+            return True
+    return False
 
 
 def _is_negated(text: str, term: str) -> bool:
@@ -876,12 +1042,12 @@ def _is_negated(text: str, term: str) -> bool:
     occurrence to be negated is the conservative reading: a sentence that
     mentions the term both ways keeps the positive signal.
     """
+    negators = _AUDIO_NEGATORS if term in _AUDIO_TERMS else _NEGATORS
     pattern = _term_pattern(term)
     found = False
     for match in pattern.finditer(text):
         found = True
-        window = text[: match.start()].split()[-_NEGATION_WINDOW:]
-        if not any(word.strip(",.;:!?-") in _NEGATORS for word in window):
+        if not _negator_precedes(text[: match.start()], negators):
             return False
     return found
 
@@ -976,8 +1142,8 @@ def infer_signals(intent: str) -> IntentSignals:
     horizontal_hits = _matched_terms(text, _HORIZONTAL_TERMS)
     square_hits = _matched_terms(text, _SQUARE_TERMS)
 
-    duration_match = _DURATION_PATTERN.search(text)
-    minutes_match = _MINUTES_PATTERN.search(text)
+    seconds_value = _duration_value(text, _DURATION_PATTERN)
+    minutes_value = _duration_value(text, _MINUTES_PATTERN)
     added_match = _ADDED_DURATION_PATTERN.search(text)
     added_duration: float | None = None
     if added_match is not None:
@@ -985,10 +1151,10 @@ def infer_signals(intent: str) -> IntentSignals:
         added_duration = (
             added_value * 60.0 if added_match.group(2).startswith("m") else added_value
         )
-    if duration_match is not None:
-        duration = float(duration_match.group(1))
-    elif minutes_match is not None:
-        duration = float(minutes_match.group(1)) * 60.0
+    if seconds_value is not None:
+        duration = seconds_value
+    elif minutes_value is not None:
+        duration = minutes_value * 60.0
     else:
         duration = None
 
@@ -2180,6 +2346,11 @@ def _video_params(
             "service, predictable from neither the request nor the source. "
             "Cost is measured from the rendered file; a quote is an upper bound."
         )
+        caveats.append(
+            f"The quote is Omni's {OMNI_MAX_DURATION:g}s maximum, the same "
+            "upper bound edit_video's own dry_run reports — not the "
+            f"{duration:g}s above, which is never sent."
+        )
     elif tool == "loop_extend":
         times = 1
         if request.added_duration_seconds is not None:
@@ -2248,10 +2419,26 @@ def _video_params(
             "aspect_ratio must match the surrounding clips or the cut will jump."
         )
     elif tool == "generate_clip":
+        # generate_clip refuses more beats than MAX_CLIP_BEATS outright, so a
+        # longer plan was a ready-to-call route that could only ever return an
+        # error ("a 3 minute montage" planned 23). Truncate to what the tool
+        # accepts and say what was lost — a silent truncation would quote a
+        # runtime the caller is not getting.
+        beat_count = request.num_beats
+        if beat_count > MAX_CLIP_BEATS:
+            caveats.append(
+                f"{request.num_beats} beats would be needed but generate_clip "
+                f"rejects more than {MAX_CLIP_BEATS}; planned at "
+                f"{MAX_CLIP_BEATS} beats, which covers "
+                f"{MAX_CLIP_BEATS * duration:g}s of the "
+                f"{request.num_beats * duration:g}s asked for. Split the "
+                "sequence across several clips to cover the rest."
+            )
+            beat_count = MAX_CLIP_BEATS
         params = {
             "beats": [
                 {"prompt": request.intent, "duration_seconds": duration}
-                for _ in range(request.num_beats)
+                for _ in range(beat_count)
             ],
             "aspect_ratio": aspect_ratio,
             "model": model,
@@ -2259,7 +2446,7 @@ def _video_params(
             "add_bridges": request.wants_transition or request.wants_bridge,
         }
         caveats.append(
-            f"Replace each of the {request.num_beats} beat prompts with that "
+            f"Replace each of the {beat_count} beat prompts with that "
             "shot's own description — they are seeded from the intent."
         )
     elif tool == "generate_video_omni":
@@ -2282,6 +2469,18 @@ def _video_params(
         }
         if request.resolution is not None:
             params["resolution"] = request.resolution
+
+    # These tools have no resolution parameter at all, so an HD/4K ask cannot
+    # reach them. It was previously priced as if it had — three times the
+    # tool's own quote — and dropped without a word.
+    requested_resolution = request.resolution or ("4K" if request.needs_4k else None)
+    if tool in FIXED_720P_TOOLS and requested_resolution not in (None, "720p"):
+        caveats.append(
+            f"{tool} takes no resolution parameter and always renders "
+            f"{OMNI_RESOLUTION}; the {requested_resolution} request cannot be "
+            f"honored here and is neither sent nor priced. Render the shots "
+            "individually with generate_video if the resolution matters."
+        )
 
     if request.wants_gcs_output and tool != "edit_video":
         if request.backend == "gemini_api":
@@ -2395,9 +2594,26 @@ def _video_cost(
 
     Single-render routes are priced directly (so the quote reflects the
     duration snap); multi-render routes go through ``_aggregate_video_cost``.
+
+    Every figure here must equal what the tool's own dry_run quotes for the
+    same parameters, and must never under-state — a planner that disagrees
+    with the tool it is recommending is worse than no quote at all.
     """
+    if tool == "edit_video":
+        # An edit's rendered length is chosen by the service: two measurements
+        # showed it rendering at Omni's maximum regardless of the source, and
+        # edit_video's own dry_run quotes that maximum for exactly that reason.
+        # Pricing the request's duration under-quoted a ~6s edit by 40%, which
+        # is the one thing a pre-flight may not do. include_audio mirrors the
+        # tool's own call so the two quotes are identical down to the detail.
+        return _estimate_video_cost(
+            OMNI_MODEL, float(OMNI_MAX_DURATION), OMNI_RESOLUTION, False
+        )
+
     resolution = (
-        OMNI_RESOLUTION if model == OMNI_MODEL else (request.resolution or "720p")
+        OMNI_RESOLUTION
+        if model == OMNI_MODEL or tool in FIXED_720P_TOOLS
+        else (request.resolution or "720p")
     )
     duration = float(params.get("duration_seconds", request.clip_duration_seconds))
 
@@ -2406,15 +2622,15 @@ def _video_cost(
         beat_duration = float(
             params["beats"][0].get("duration_seconds", duration) if beats else duration
         )
-        segments = beats
-        if params.get("add_bridges") and beats > 1:
-            # Each bridge is its own render between consecutive beats.
-            segments += beats - 1
+        bridges = beats - 1 if (params.get("add_bridges") and beats > 1) else 0
+        # A bridge is its own render, but always a 4s one — charging it at the
+        # beat length quoted $4.00 against the tool's $3.20 for identical
+        # params.
         return _aggregate_video_cost(
             model,
             beat_duration,
-            beat_duration * segments,
-            segments,
+            beat_duration * beats + CLIP_BRIDGE_SECONDS * bridges,
+            beats + bridges,
             resolution,
             request.needs_audio,
         )
@@ -2650,8 +2866,11 @@ def _plan_video(
             "Veo-only parameters it ignored."
         )
     if request.num_beats > 1:
+        # Reported at the count the emitted route actually carries, which
+        # generate_clip's beat ceiling may have truncated.
+        planned_beats = min(request.num_beats, MAX_CLIP_BEATS)
         notes.append(
-            f"{request.num_beats} beats render sequentially; the returned manifest "
+            f"{planned_beats} beats render sequentially; the returned manifest "
             "is an ordered segment list for a downstream cutting MCP."
         )
 

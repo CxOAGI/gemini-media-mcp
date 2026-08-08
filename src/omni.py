@@ -37,12 +37,15 @@ live call rejects it, move it into the input part.
 
 import asyncio
 import base64
+import functools
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from google import genai
+
+from .video import run_off_loop
 
 # Type for async log callback from MCP context
 LogCallback = Callable[[str], Awaitable[None]]
@@ -62,6 +65,13 @@ OMNI_MAX_DURATION_SECONDS = _MAX_DURATION
 
 # Interval (seconds) between polls of an in-flight background interaction.
 _POLL_INTERVAL = 5
+
+# How often an unchanged status is worth repeating. Logging every poll turned
+# one routine render into 15 notifications, 13 of them the identical
+# "in_progress" line, and an animatic multiplies that by its beat count.
+# src/video.py polls for up to 1800s and logs twice; this keeps the state
+# changes plus a sparse heartbeat so a long render still shows liveness.
+_POLL_LOG_INTERVAL_SECONDS = 60.0
 
 # Interaction statuses that mean "still rendering — keep polling". Everything
 # else (failed / cancelled / budget_exceeded / incomplete / requires_action /
@@ -291,8 +301,14 @@ async def _resolve_video_bytes(
     inline_data: str | bytes | None,
     uri: str | None,
     log_callback: LogCallback | None,
+    run_within_deadline: Callable[..., Awaitable[Any]],
 ) -> bytes:
-    """Materialize mp4 bytes from an inline payload or a Files API uri."""
+    """Materialize mp4 bytes from an inline payload or a Files API uri.
+
+    The download runs through the caller's deadline runner like every other
+    call in this module: an interaction that completes at t=590s of a 600s
+    budget would otherwise hang here forever on an untimed transfer.
+    """
     if inline_data:
         if isinstance(inline_data, str):
             return base64.b64decode(inline_data)
@@ -306,8 +322,8 @@ async def _resolve_video_bytes(
 
     # ASSUMED SDK SHAPE: files.get resolves the uri/name to a file resource and
     # files.download returns its raw bytes.
-    file_obj = await asyncio.to_thread(client.files.get, name=uri)
-    data = await asyncio.to_thread(client.files.download, file=file_obj)
+    file_obj = await run_within_deadline(client.files.get, name=uri)
+    data = await run_within_deadline(client.files.download, file=file_obj)
     if data is None:
         raise ValueError(f"Downloaded video file was empty: {uri}")
     return bytes(data)
@@ -353,8 +369,10 @@ async def generate_video_omni(
 
     Returns:
         Dict with message, video_url (file:// or gs://), interaction_id, model,
-        duration_seconds (clamped int), aspect_ratio, and warnings (only when
-        non-empty).
+        duration_seconds (clamped int), aspect_ratio, the requested_* originals,
+        and warnings (only when non-empty). duration_seconds and aspect_ratio
+        are both None for an edit — neither was sent, so neither can be
+        reported as fact.
     """
     # Non-fatal warnings surfaced back to the caller.
     warnings: list[str] = []
@@ -422,20 +440,20 @@ async def generate_video_omni(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
 
+    expired = f"Omni video interaction timed out after {timeout_seconds}s."
+
     async def _run_within_deadline(func: Any, /, **kwargs: Any) -> Any:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            raise TimeoutError(
-                f"Omni video interaction timed out after {timeout_seconds}s."
-            )
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(func, **kwargs), timeout=remaining
-            )
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"Omni video interaction timed out after {timeout_seconds}s."
-            ) from exc
+            raise TimeoutError(expired)
+        # run_off_loop, not asyncio.to_thread: a timed-out call cannot be
+        # cancelled, and abandoning it on the loop's shared default executor
+        # burns a worker that every other request also draws from.
+        return await run_off_loop(
+            functools.partial(func, **kwargs),
+            timeout=remaining,
+            message=expired,
+        )
 
     interaction = await _run_within_deadline(
         client.interactions.create, **create_kwargs
@@ -449,13 +467,19 @@ async def generate_video_omni(
     # `completed` proceeds to extraction; any other terminal status fails fast
     # with the raw status and any error message.
     status = _field(interaction, "status") or _field(interaction, "state")
+    # Report state CHANGES and a sparse heartbeat, never one line per poll.
+    logged_status: Any = object()
+    last_logged_at = loop.time()
     while status in _IN_FLIGHT_STATUSES:
         if loop.time() >= deadline:
-            raise TimeoutError(
-                f"Omni video interaction timed out after {timeout_seconds}s."
-            )
-        if log_callback:
+            raise TimeoutError(expired)
+        if log_callback and (
+            status != logged_status
+            or loop.time() - last_logged_at >= _POLL_LOG_INTERVAL_SECONDS
+        ):
             await log_callback(f"Interaction {interaction_id}: {status}")
+            logged_status = status
+            last_logged_at = loop.time()
         await asyncio.sleep(_POLL_INTERVAL)
         # google-genai's interactions.get takes the id as `id` (positional-or-
         # keyword), NOT `interaction_id`.
@@ -482,7 +506,9 @@ async def generate_video_omni(
         # download, no local write), mirroring the Veo gs:// output path.
         video_url = uri
     else:
-        video_bytes = await _resolve_video_bytes(client, inline_data, uri, log_callback)
+        video_bytes = await _resolve_video_bytes(
+            client, inline_data, uri, log_callback, _run_within_deadline
+        )
         filename = f"{uuid.uuid4()}.mp4"
         filepath = videos_dir / filename
         filepath.write_bytes(video_bytes)
@@ -499,7 +525,12 @@ async def generate_video_omni(
         # the request is kept separately so nothing is lost.
         "duration_seconds": None if task_type == "edit" else clamped_duration,
         "requested_duration_seconds": clamped_duration,
-        "aspect_ratio": aspect_ratio,
+        # Same property as duration above: _build_create_kwargs omits
+        # aspect_ratio on an edit, so reporting the request here would state a
+        # ratio the service never received — editing a 9:16 source under the
+        # 16:9 default renders at the source's ratio, not the request's.
+        "aspect_ratio": None if task_type == "edit" else aspect_ratio,
+        "requested_aspect_ratio": aspect_ratio,
     }
 
     # Include warnings only when non-empty, matching src/video.py.

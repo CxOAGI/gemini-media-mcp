@@ -11,7 +11,9 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from aiohttp.abc import AbstractResolver, ResolveResult
 from google import genai
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
@@ -49,6 +52,12 @@ MAX_FETCH_BYTES = 50 * 1024 * 1024
 # Maximum number of HTTP redirects to follow during a fetch. Each hop's
 # target is re-validated against the SSRF guard before it is requested.
 MAX_HTTP_REDIRECTS = 5
+
+# Cap on a thought-signature file read. A signature is an opaque token of at
+# most a few kilobytes, but the path is caller-supplied and the strongest
+# target is a large file the server itself wrote into DATA_FOLDER — an
+# uncapped read_text() of a 157 MB render added ~150 MB RSS in one call.
+MAX_THOUGHT_SIGNATURE_BYTES = 256 * 1024
 
 # Upper bound on shots in one storyboard. Every shot is a billed image
 # generation, so an unbounded list is an unbounded bill; exceeding this is an
@@ -516,6 +525,16 @@ def _resolve_video_gcs(
     gs:// scheme + allowlist. On a non-Vertex client: raises ValueError if
     output_gcs_uri was explicit (GCS unsupported on the Gemini API), else
     drops the env default and returns None.
+
+    The allowlist check runs through `_assert_gcs_bucket_allowed`, the same
+    gate every gs:// *input* passes, so an output destination cannot be the
+    one gs:// entry point that is silently unchecked — a render was previously
+    written into an attacker-named bucket without so much as a log line.
+    Default-deny was considered and rejected: the README documents an unset
+    allowlist as "gs:// fetches log a warning", so denying would break every
+    existing deployment that relies on ambient credentials. Warning uniformly
+    is the change that makes behaviour consistent without breaking the
+    documented contract.
     """
     gcs_uri = output_gcs_uri or default_bucket
     # GCS output only works on Vertex AI. On the Gemini API path, reject an
@@ -541,6 +560,9 @@ def _resolve_video_gcs(
                 f"output_gcs_uri bucket '{bucket}' is not in the allowlist. "
                 f"Configured: {sorted(allowed_buckets)}"
             )
+        # No allowlist configured: warn, exactly as every gs:// input does.
+        # Silence here is what let an unchecked output destination through.
+        _assert_gcs_bucket_allowed(bucket, allowed_buckets)
     return gcs_uri
 
 
@@ -607,40 +629,171 @@ def _validate_local_path(path: Path, allowed_dir: Path) -> Path:
     return resolved
 
 
-def _assert_http_host_public(url: str) -> None:
-    """Reject http(s) URLs whose host resolves to a private or loopback IP.
+def _read_thought_signature(path: Path, allowed_dir: Path) -> str:
+    """Read a thought-signature file with containment and size enforced.
 
-    Mitigates SSRF against cloud metadata (169.254.169.254), localhost, or
-    internal networks. Does not protect against DNS rebinding between this
-    check and the actual request — acceptable for single-shot fetches.
-    Synchronous; use `_assert_http_host_public_async` from async code so
-    the DNS lookup does not block the event loop.
+    The path is caller-supplied, so `_validate_local_path` alone was not
+    enough: containment says the file is inside DATA_FOLDER, not that it is
+    small, and every rendered video and image the server writes is inside
+    DATA_FOLDER. An uncapped read_text() of a 157 MB render cost ~150 MB RSS
+    per call — the one fetch path that ignored MAX_FETCH_BYTES entirely.
+
+    Blocking; call it off the event loop.
+    """
+    validated = _validate_local_path(path, allowed_dir)
+    size = validated.stat().st_size
+    if size > MAX_THOUGHT_SIGNATURE_BYTES:
+        raise ValueError(
+            f"thought_signature_url file is {size} bytes, over the "
+            f"{MAX_THOUGHT_SIGNATURE_BYTES}-byte cap: {path}"
+        )
+    return validated.read_text()
+
+
+async def _read_thought_signature_async(path: Path, allowed_dir: Path) -> str:
+    """Async wrapper so the stat/read never runs on the event loop."""
+    return await asyncio.to_thread(_read_thought_signature, path, allowed_dir)
+
+
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether an address is routable on the public internet.
+
+    Enumerating the ranges to refuse (private / loopback / link-local /
+    multicast / reserved / unspecified) left holes that matter in practice:
+    RFC 6598 carrier-grade NAT space (100.64.0.0/10) matches none of those
+    flags, and it is the standard pod and internal-load-balancer range on EKS
+    and GKE — so `http://100.64.1.1/` was fetched and its content returned to
+    the caller. `is_global` is the allowlist form of the same question and
+    closes the whole class, including ranges IANA has not allocated yet.
+    """
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        # ::ffff:a.b.c.d reaches the same host as a.b.c.d, so it must be
+        # judged as the IPv4 address it wraps rather than as an IPv6 one.
+        ip = mapped
+    if getattr(ip, "is_site_local", False):
+        # Deprecated IPv6 site-local (fec0::/10) is absent from CPython's
+        # private-networks table, so `is_global` reports it as public even on
+        # 3.13 — yet it is exactly the internal addressing this guard exists
+        # to refuse.
+        return False
+    if ip.is_multicast:
+        # Some multicast scopes are is_global=True (ff02::1 among them), and
+        # a multicast destination is never a legitimate fetch target.
+        return False
+    return ip.is_global
+
+
+def _assert_http_host_public(url: str) -> list[str]:
+    """Resolve an http(s) URL's host and reject any non-public answer.
+
+    Mitigates SSRF against cloud metadata (169.254.169.254), localhost, and
+    internal networks. Every address the name resolves to must pass, so a
+    record mixing a public and an internal answer is refused outright.
+
+    Returns the vetted addresses so the caller can connect to exactly what was
+    checked. Discarding them and letting aiohttp resolve the name again left a
+    DNS-rebinding window: a TTL-0 or round-robin record can hand this check a
+    public address and the connector an internal one. See
+    `_VettedAddressResolver` for how the answer is pinned.
+
+    Synchronous; use `_assert_http_host_public_async` from async code so the
+    DNS lookup does not block the event loop.
     """
     parsed = urlparse(url)
     host = parsed.hostname
     if not host:
         raise ValueError(f"URL missing host: {url}")
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except socket.gaierror as e:
         raise ValueError(f"Could not resolve host '{host}': {e}") from e
+    vetted: list[str] = []
     for info in infos:
         addr = info[4][0]
         ip = ipaddress.ip_address(addr)
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
+        if not _is_public_ip(ip):
             raise ValueError(f"Refusing to fetch non-public address: {host} -> {addr}")
+        if addr not in vetted:
+            vetted.append(addr)
+    if not vetted:
+        raise ValueError(f"Could not resolve host '{host}': no addresses returned")
+    return vetted
 
 
-async def _assert_http_host_public_async(url: str) -> None:
+async def _assert_http_host_public_async(url: str) -> list[str]:
     """Async wrapper that runs the DNS lookup off the event loop."""
-    await asyncio.to_thread(_assert_http_host_public, url)
+    return await asyncio.to_thread(_assert_http_host_public, url)
+
+
+def _host_pin_keys(host: str) -> list[str]:
+    """Every spelling of a hostname aiohttp might hand the resolver.
+
+    urlparse lowercases but leaves a unicode host as-is, while yarl gives the
+    connector the IDNA/punycode form. Pinning under both spellings keeps an
+    internationalized domain from missing its pin and failing closed.
+    """
+    keys = [host]
+    try:
+        encoded = host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return keys
+    if encoded not in keys:
+        keys.append(encoded)
+    return keys
+
+
+class _VettedAddressResolver(AbstractResolver):
+    """Resolver that hands aiohttp only addresses the SSRF guard vetted.
+
+    aiohttp's default ThreadedResolver performs its own lookup, so the guard's
+    answers were thrown away and the connection could land on a different
+    address than the one that was checked (DNS rebinding). Pinning closes that
+    window: the socket goes to the vetted IP, while the request URL still
+    carries the hostname, so the Host header and TLS SNI — and therefore
+    certificate validation — are unchanged.
+
+    Pins are replaced before every redirect hop, so each hop connects only to
+    what was vetted for that hop.
+
+    Residual gap, stated honestly: when a name legitimately resolves to
+    several public addresses all of them are pinned and aiohttp may use any,
+    and the guard requires every answer to pass, so this narrows the window to
+    "one of the addresses this process itself resolved and approved" rather
+    than eliminating DNS variance entirely.
+    """
+
+    def __init__(self) -> None:
+        self._pins: dict[str, list[str]] = {}
+
+    def pin(self, host: str, addresses: list[str]) -> None:
+        """Replace the vetted addresses for a host (called once per hop)."""
+        for key in _host_pin_keys(host):
+            self._pins[key] = list(addresses)
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
+        addresses = self._pins.get(host)
+        if not addresses:
+            # Fail closed: an unpinned name is one the guard never approved,
+            # and falling back to a fresh lookup here would reopen the very
+            # rebinding window this resolver exists to close.
+            raise OSError(f"No vetted address for host '{host}'")
+        return [
+            ResolveResult(
+                hostname=host,
+                host=addr,
+                port=port,
+                family=socket.AF_INET6 if ":" in addr else socket.AF_INET,
+                proto=socket.IPPROTO_TCP,
+                flags=0,
+            )
+            for addr in addresses
+        ]
+
+    async def close(self) -> None:
+        self._pins.clear()
 
 
 def _assert_gcs_bucket_allowed(bucket: str, allowed: frozenset[str]) -> str | None:
@@ -669,6 +822,32 @@ def _assert_gcs_bucket_allowed(bucket: str, allowed: frozenset[str]) -> str | No
             f"Configured buckets: {sorted(allowed)}"
         )
     return None
+
+
+_storage_client: storage.Client | None = None
+_storage_client_lock = threading.Lock()
+
+
+def _get_storage_client() -> storage.Client:
+    """Return the process-wide GCS client, building it once on first use.
+
+    `storage.Client()` discovers credentials, and with no ADC present that
+    means probing the GCE metadata server: 8.88 seconds, measured. It was
+    being constructed per fetch and directly on the event loop, so a two-input
+    tool (generate_transition, generate_bridge) froze the whole server —
+    including every in-flight Veo poll and the MCP read loop — for ~18s. Call
+    this only from a worker thread.
+
+    A failed construction is deliberately not cached: credentials can appear
+    after startup (a metadata server that was slow to come up, a mounted
+    service-account file), and caching the failure would make that
+    unrecoverable without a restart.
+    """
+    global _storage_client
+    with _storage_client_lock:
+        if _storage_client is None:
+            _storage_client = storage.Client()
+        return _storage_client
 
 
 async def _read_capped_http(resp: aiohttp.ClientResponse, limit: int) -> bytes:
@@ -707,10 +886,12 @@ async def fetch(
                 raise ValueError(f"Invalid GCS URI: {uri}")
             bucket_name, object_path = parts
             _assert_gcs_bucket_allowed(bucket_name, allowed_gcs_buckets)
-            client = storage.Client()
-            blob = client.bucket(bucket_name).blob(object_path)
 
             def _download_capped() -> bytes:
+                # Client construction happens here, inside the worker thread:
+                # credential discovery is blocking network work and must never
+                # run on the event loop.
+                blob = _get_storage_client().bucket(bucket_name).blob(object_path)
                 blob.reload()
                 if blob.size is not None and blob.size > max_bytes:
                     raise ValueError(
@@ -726,26 +907,46 @@ async def fetch(
             # to 169.254.169.254/ or an internal host is otherwise fetched
             # with only the original host validated.
             timeout = aiohttp.ClientTimeout(total=60)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                current_url = uri
-                for _hop in range(MAX_HTTP_REDIRECTS + 1):
-                    await _assert_http_host_public_async(current_url)
-                    async with session.get(current_url, allow_redirects=False) as resp:
-                        if resp.status in (301, 302, 303, 307, 308):
-                            location = resp.headers.get("Location")
-                            if not location:
-                                raise ValueError(
-                                    f"Redirect from {current_url} missing "
-                                    "Location header"
-                                )
-                            current_url = urljoin(current_url, location)
-                            continue
-                        if resp.status == 200:
-                            return await _read_capped_http(resp, max_bytes)
-                        raise ValueError(f"HTTP {resp.status}")
-                raise ValueError(
-                    f"Exceeded redirect limit ({MAX_HTTP_REDIRECTS}) fetching {uri}"
-                )
+            resolver = _VettedAddressResolver()
+            # use_dns_cache=False so the pin set for THIS hop is the one the
+            # connector uses; a cached entry from an earlier hop would defeat
+            # the per-hop re-validation.
+            connector = aiohttp.TCPConnector(resolver=resolver, use_dns_cache=False)
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=timeout, connector=connector
+                ) as session:
+                    current_url = uri
+                    for _hop in range(MAX_HTTP_REDIRECTS + 1):
+                        vetted = await _assert_http_host_public_async(current_url)
+                        if vetted:
+                            # Connect to the address that was just checked, not
+                            # to whatever a second lookup would return.
+                            host = urlparse(current_url).hostname or ""
+                            resolver.pin(host, list(vetted))
+                        async with session.get(
+                            current_url, allow_redirects=False
+                        ) as resp:
+                            if resp.status in (301, 302, 303, 307, 308):
+                                location = resp.headers.get("Location")
+                                if not location:
+                                    raise ValueError(
+                                        f"Redirect from {current_url} missing "
+                                        "Location header"
+                                    )
+                                current_url = urljoin(current_url, location)
+                                continue
+                            if resp.status == 200:
+                                return await _read_capped_http(resp, max_bytes)
+                            raise ValueError(f"HTTP {resp.status}")
+                    raise ValueError(
+                        f"Exceeded redirect limit ({MAX_HTTP_REDIRECTS}) fetching {uri}"
+                    )
+            finally:
+                # The session normally owns and closes the connector, but a
+                # test double for ClientSession does not — close it here so a
+                # connector is never left dangling.
+                await connector.close()
 
         # Local file access — require allowed_dir
         if allowed_dir is None:
@@ -837,6 +1038,35 @@ _SIDECAR_SCAN_LIMIT = 200
 _SIDECAR_MAX_BYTES = 256 * 1024
 _SIDECAR_SCAN_TIMEOUT_SECONDS = 5.0
 
+# Dedicated pool for caller-triggered filesystem probes.
+#
+# asyncio.to_thread runs on the loop's SINGLE SHARED default executor
+# (max_workers = min(32, cpu_count + 4) — 12 here, 6 on a two-core container),
+# and a thread blocked in a syscall on a stale mount cannot be cancelled: the
+# wait_for deadline returns the request while the thread stays parked forever.
+# So N concurrent edit_video dry runs against a wedged mount permanently
+# exhaust the pool that every generation path also uses (image, video, omni,
+# storyboard, frame extraction) — the server stops rendering entirely while
+# each individual request still looks like it handled its timeout correctly.
+# Giving probes their own small pool means a wedged mount can consume only
+# these threads. Queued work behind them still waits, but render work is
+# never behind it.
+_PROBE_EXECUTOR_MAX_WORKERS = 4
+_probe_executor: ThreadPoolExecutor | None = None
+_probe_executor_lock = threading.Lock()
+
+
+def _get_probe_executor() -> ThreadPoolExecutor:
+    """Return the process-wide filesystem-probe pool, created on first use."""
+    global _probe_executor
+    with _probe_executor_lock:
+        if _probe_executor is None:
+            _probe_executor = ThreadPoolExecutor(
+                max_workers=_PROBE_EXECUTOR_MAX_WORKERS,
+                thread_name_prefix="fs-probe",
+            )
+        return _probe_executor
+
 
 def _source_duration_for_interaction(
     videos_dir: Path, interaction_id: str
@@ -912,13 +1142,23 @@ async def _source_duration_or_none(
 
     Note the worker thread cannot be cancelled — if the underlying syscall is
     genuinely wedged the thread stays parked until the OS releases it. The
-    request returns regardless, which is the property that matters here; the
-    scan bounds keep the worst case to one thread per stuck edit quote.
+    request returns regardless, which is the property that matters here.
+
+    That is why this runs on `_get_probe_executor()` and not `asyncio.to_thread`.
+    The scan bounds do NOT keep the worst case to one thread per stuck quote,
+    as this docstring previously claimed: to_thread shares the loop's single
+    default executor with every generation path, so enough parked probe
+    threads stop the server rendering anything at all. The dedicated pool caps
+    the blast radius at the probes themselves.
     """
+    loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(
-                _source_duration_for_interaction, videos_dir, interaction_id
+            loop.run_in_executor(
+                _get_probe_executor(),
+                _source_duration_for_interaction,
+                videos_dir,
+                interaction_id,
             ),
             timeout=_SIDECAR_SCAN_TIMEOUT_SECONDS,
         )
@@ -944,6 +1184,7 @@ def _video_cost_estimate(
     include_audio: bool = True,
     actual: bool = False,
     presnapped: bool = False,
+    generation_mode: str = "text_to_video",
 ) -> Any:
     """Raw pricing estimate for a video call, or None if unpriceable.
 
@@ -955,6 +1196,13 @@ def _video_cost_estimate(
         already clamped (loop_extend's 7s steps, omni's [3,10] clamp) — no
         re-snap, but still is_estimate=True: nothing ran.
     The default snaps the way the impl will, so a quote matches the bill.
+
+    ``generation_mode`` is what makes that snap correct on the modes Veo
+    overrides: reference-to-video always renders 8s and an extension always
+    renders 7s, so dropping the mode quoted a 4s reference render at half the
+    price the caller is actually charged. It only applies to the snapping
+    path — an ``actual``/``presnapped`` figure is already the effective
+    length.
     """
     try:
         import dataclasses
@@ -976,7 +1224,13 @@ def _video_cost_estimate(
             if cost is not None and presnapped and not actual:
                 cost = dataclasses.replace(cost, is_estimate=True)
             return cost
-        return estimate_video_cost(model, duration_seconds, res, include_audio)
+        return estimate_video_cost(
+            model,
+            duration_seconds,
+            res,
+            include_audio,
+            generation_mode=generation_mode,
+        )
     except Exception:  # pragma: no cover - defensive
         logger.debug("Could not compute video cost", exc_info=True)
         return None
@@ -1004,6 +1258,7 @@ def _video_cost(
     include_audio: bool = True,
     actual: bool = False,
     presnapped: bool = False,
+    generation_mode: str = "text_to_video",
 ) -> dict[str, Any] | None:
     """Cost for a video call, shaped for the MCP response."""
     return _cost_payload(
@@ -1014,8 +1269,280 @@ def _video_cost(
             include_audio=include_audio,
             actual=actual,
             presnapped=presnapped,
+            generation_mode=generation_mode,
         )
     )
+
+
+def _snapped_duration_for_quote(
+    model: str,
+    duration_seconds: float,
+    generation_mode: str = "text_to_video",
+) -> float:
+    """The duration a dry run should report: what will really be rendered.
+
+    A quote that prints the request beside a price for the snapped value
+    contradicts itself — 5s was reported as "5" next to a cost detailing "4s
+    of video". Falls back to the request if pricing cannot be imported, since
+    a quote is worth more than a failure.
+    """
+    try:
+        from .pricing import snap_video_duration
+
+        return float(snap_video_duration(model, duration_seconds, generation_mode))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not snap quoted duration", exc_info=True)
+        return duration_seconds
+
+
+# Keys a generate_clip beat may carry. Anything else is refused rather than
+# dropped: the beat dict is the one place in this server where a plausible
+# wrong key costs full price and produces no diagnostic at all. An agent that
+# chains generate_storyboard (which returns image_url) or copies
+# generate_video's image_uri into a beat got a text-to-video render with no
+# image conditioning and no way to tell from the response that anything was
+# ignored.
+_BEAT_KEYS = frozenset(
+    {
+        "prompt",
+        "duration_seconds",
+        "seed",
+        "first_frame_uri",
+        "negative_prompt",
+        "audio_prompt",
+    }
+)
+
+# Storyboard shot fields, accepted on a beat and ignored. generate_storyboard
+# documents its shot list as feedable straight into generate_clip as `beats`,
+# so refusing the two keys that workflow carries would break the chain the
+# docstring advertises.
+_BEAT_IGNORED_KEYS = frozenset({"caption", "notes"})
+
+_SHOT_KEYS = frozenset({"prompt", "caption", "duration_seconds", "notes"})
+
+# Wrong names seen (or trivially reachable) in agent-authored specs, mapped to
+# what the caller meant. Keys are compared lowercased.
+_BEAT_KEY_SUGGESTIONS: dict[str, str] = {
+    "image": "first_frame_uri",
+    "image_url": "first_frame_uri",
+    "image_uri": "first_frame_uri",
+    "first_frame": "first_frame_uri",
+    "frame_uri": "first_frame_uri",
+    "start_frame_uri": "first_frame_uri",
+    "duration": "duration_seconds",
+    "length": "duration_seconds",
+    "seconds": "duration_seconds",
+    "random_seed": "seed",
+    "text": "prompt",
+    "description": "prompt",
+    "negative": "negative_prompt",
+    "audio": "audio_prompt",
+}
+
+_SHOT_KEY_SUGGESTIONS: dict[str, str] = {
+    "duration": "duration_seconds",
+    "length": "duration_seconds",
+    "seconds": "duration_seconds",
+    "text": "prompt",
+    "description": "prompt",
+    "title": "caption",
+    "slug": "caption",
+    "slug_line": "caption",
+    "label": "caption",
+    "note": "notes",
+    "camera": "notes",
+    "camera_notes": "notes",
+}
+
+
+def _assemble_clip_manifest(
+    *,
+    aspect_ratio: str,
+    beat_model: str,
+    animatic: bool,
+    segments: list[dict[str, Any]],
+    total_duration: float,
+    beat_count: int,
+    include_audio: bool,
+    errors: list[dict[str, Any]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Build generate_clip's manifest, including the cost of what rendered.
+
+    Split out of the tool so the cancellation path can produce the same
+    document from a partial run: the beats already rendered were already
+    billed, and their total is the one figure that exists nowhere else.
+    """
+    manifest: dict[str, Any] = {
+        "kind": "clip",
+        "aspect_ratio": aspect_ratio,
+        "model": beat_model,
+        "animatic": animatic,
+        "segments": segments,
+        "total_duration_seconds": total_duration,
+        "beat_count": beat_count,
+    }
+    # Total what the segments actually rendered, segment by segment —
+    # summing the runtime into one estimate would snap it to 8s.
+    try:
+        from .pricing import sum_costs
+
+        segment_costs = [
+            _video_cost_estimate(
+                seg.get("model", beat_model),
+                float(seg.get("duration_seconds") or 0),
+                resolution="720p",
+                include_audio=bool(seg.get("audio_enabled", include_audio)),
+                actual=_segment_is_metered(seg),
+                presnapped=not _segment_is_metered(seg),
+            )
+            for seg in segments
+            if seg.get("video_url")
+        ]
+        if segment_costs:
+            manifest["cost"] = _cost_payload(sum_costs(segment_costs, label="clip"))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not total clip cost", exc_info=True)
+    if errors:
+        manifest["errors"] = errors
+    if warnings:
+        # The same warning (e.g. "audio not honored on the Gemini API") is
+        # emitted per beat and per bridge; dedupe at the clip level, preserving
+        # first-seen order, so the manifest carries each distinct warning once
+        # instead of one copy per segment.
+        manifest["warnings"] = list(dict.fromkeys(warnings))
+    return manifest
+
+
+def _assemble_loop_extend_manifest(
+    *,
+    source_video_uri: str,
+    prompt: str,
+    served_model: str,
+    aspect_ratio: str,
+    steps: list[str],
+    final_video_url: str,
+    include_audio: bool,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Build loop_extend's manifest for the extensions that actually ran.
+
+    ``times`` is taken from the steps that completed rather than the count
+    requested, so the same function describes a finished chain and one cut
+    short by a disconnect — and never bills for a render that did not happen.
+    """
+    manifest: dict[str, Any] = {
+        "kind": "loop_extend",
+        "source_video_uri": source_video_uri,
+        "prompt": prompt,
+        # The model that actually ran: the impl translates Veo IDs
+        # per backend (the Gemini API serves -preview spellings).
+        "model": served_model,
+        "aspect_ratio": aspect_ratio,
+        "times": len(steps),
+        "final_video_url": final_video_url,
+        "extension_steps": list(steps),
+    }
+    cost = _video_cost(
+        served_model,
+        float(len(steps) * 7),
+        resolution="720p",
+        include_audio=include_audio,
+        actual=True,
+    )
+    if cost:
+        manifest["cost"] = cost
+    if warnings:
+        # Same warning repeats per step; dedupe, preserving order.
+        manifest["warnings"] = list(dict.fromkeys(warnings))
+    return manifest
+
+
+def _write_clip_manifest(manifest: dict[str, Any]) -> str | None:
+    """Write a clip manifest next to the last locally-rendered segment.
+
+    Used when the response itself will never reach anyone (the caller
+    disconnected mid-clip): every beat has its own sidecar, but the clip-level
+    total lives only in the return value, so without this the record of what
+    the run cost dies with the request. Written to ``<stem>_clip.json`` rather
+    than ``<stem>.json`` so it cannot overwrite that segment's own sidecar.
+    """
+    for segment in reversed(manifest.get("segments") or []):
+        url = segment.get("video_url") or ""
+        if not isinstance(url, str) or not url.startswith("file://"):
+            continue
+        media_path = Path(url[7:])
+        target = media_path.with_name(f"{media_path.stem}_clip.json")
+        try:
+            target.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        except OSError as e:
+            logger.warning("Failed to write clip manifest %s: %s", target, e)
+            return None
+        return f"file://{target}"
+    return None
+
+
+def _normalize_spec_key(key: str) -> str:
+    """Fold a spec key to letters and digits, so casing/spelling variants match."""
+    return "".join(ch for ch in key.lower() if ch.isalnum())
+
+
+def _validate_spec_keys(
+    spec: dict[str, Any],
+    field: str,
+    allowed: frozenset[str],
+    suggestions: dict[str, str],
+    ignored: frozenset[str] = frozenset(),
+) -> None:
+    """Reject unknown keys in a beat/shot dict, naming what was probably meant.
+
+    Silently dropping them is the expensive failure: the render still runs and
+    still bills, just without the conditioning the caller paid for.
+    """
+    unknown = [
+        str(key) for key in spec if str(key) not in allowed and str(key) not in ignored
+    ]
+    if not unknown:
+        return
+
+    problems: list[str] = []
+    for key in sorted(unknown):
+        target = suggestions.get(key.lower())
+        if target is None:
+            # Catches camelCase and punctuation variants ("durationSeconds",
+            # "first-frame-uri") without an entry per spelling.
+            normalized = _normalize_spec_key(key)
+            target = next(
+                (
+                    name
+                    for name in sorted(allowed)
+                    if _normalize_spec_key(name) == normalized
+                ),
+                None,
+            )
+        problems.append(f"'{key}'" + (f" (did you mean '{target}'?)" if target else ""))
+
+    raise ValueError(
+        f"{field} has unknown key(s): {', '.join(problems)}. "
+        f"Accepted keys: {', '.join(sorted(allowed))}."
+    )
+
+
+def _validate_seed(seed: Any, field: str) -> None:
+    """Raise ValueError for a seed the render would choke on.
+
+    Statically checkable and cheap here; left to the impl it surfaces as a
+    TypeError from the seed comparison in src/video.py — after every earlier
+    beat has already rendered and billed. Negative seeds are deliberately
+    allowed: the impl drops them with a warning rather than failing.
+    """
+    if seed is None:
+        return
+    if isinstance(seed, bool) or not isinstance(seed, (int, float)):
+        raise ValueError(f"{field} must be an integer, got {type(seed).__name__}")
+    if isinstance(seed, float) and (not math.isfinite(seed) or seed != int(seed)):
+        raise ValueError(f"{field} must be a whole number, got {seed!r}")
 
 
 # Create MCP server with lifespan
@@ -1097,8 +1624,24 @@ async def generate_image(
             14 for a fresh call. The real run reports the metered figure.
 
     Returns:
-        JSON with image_url, image_preview, and model info. For Gemini 3.x image models,
-        includes thought_signature_url pointing to a file with editing context.
+        Two content blocks: a JPEG preview of the image, then JSON with
+        message, image_url, prompt and model. The preview is that separate
+        image block — there is no image_preview key in the JSON.
+
+        The JSON also carries, when they apply: thought_signature_url (Gemini
+        3.x, pass it back to keep editing), cost (metered from the token
+        counts the API reported), usage (those raw token counts), warnings
+        (e.g. a retired model ID rerouted to its GA replacement, or a size the
+        resolved model cannot produce), and sidecar_url pointing at the
+        manifest written next to the image.
+
+        When the model answers with text instead of an image — a safety
+        refusal or a clarifying question — there is no preview block and the
+        JSON reports message, generated_text, model, and the usage/cost of
+        that billed exchange.
+
+        A dry run reports dry_run, requested_model, model, prompt, image_size,
+        estimated_cost and any warnings.
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
@@ -1168,8 +1711,7 @@ async def generate_image(
                     f"previous generate_image call, got: {thought_signature_url}"
                 )
             sig_path = Path(thought_signature_url[7:])
-            validated_sig = _validate_local_path(sig_path, data_dir)
-            thought_signature = validated_sig.read_text()
+            thought_signature = await _read_thought_signature_async(sig_path, data_dir)
 
         await ctx.info(f"Generating image with model={model}")
         result = await generate_image_impl(
@@ -1189,6 +1731,18 @@ async def generate_image(
         # model responds with text only (e.g. a safety refusal or a clarifying
         # question). Surface that text instead of crashing on a missing key.
         if "image_url" not in result:
+            # A refusal or a clarifying question is still a billed call: the
+            # tokens were metered and the account was charged. Returning usage
+            # without a cost made every refusal invisible to an agent totalling
+            # spend. Priced at n=0 images, so the reported output tokens are
+            # billed as text rather than at the 20x image rate.
+            text_usage = result.get("usage")
+            if text_usage:
+                text_cost = _image_cost(
+                    result.get("model", model), image_size, usage=text_usage, n=0
+                )
+                if text_cost:
+                    result["cost"] = text_cost
             for warning in result.get("warnings", []):
                 await ctx.warning(warning)
             await ctx.info("Model returned text only")
@@ -1434,7 +1988,9 @@ async def generate_storyboard(
         shots: Ordered shot specs. Each accepts:
             {prompt: str, caption?: str, duration_seconds?: float,
              notes?: str}. `prompt` is required; `caption` is a short slug
-            line, `notes` are camera/lighting notes.
+            line, `notes` are camera/lighting notes. Any other key is an
+            error naming what you probably meant, rather than a silently
+            dropped field on a board that still bills per frame.
         title: Board title drawn on the sheet.
         subtitle: Optional second line under the title.
         model: Image model for the keyframes.
@@ -1474,6 +2030,7 @@ async def generate_storyboard(
                     '{"prompt": "...", "caption": "...", "duration_seconds": 4}, '
                     f"got {type(shot).__name__}"
                 )
+            _validate_spec_keys(shot, f"shots[{i}]", _SHOT_KEYS, _SHOT_KEY_SUGGESTIONS)
             if not str(shot.get("prompt", "")).strip():
                 raise ValueError(f"shots[{i}] is missing a non-empty 'prompt'")
             for field in ("prompt", "caption", "notes"):
@@ -1723,7 +2280,22 @@ async def generate_video(
             extension); any that were passed are noted in the response.
 
     Returns:
-        JSON with video_url and generation details including generation_mode
+        JSON. A Veo render reports message, video_url, prompt, model,
+        audio_enabled, duration_seconds, generation_mode, cost (metered from
+        the rendered duration) and sidecar_url — or `manifest` inline instead
+        of sidecar_url when the output landed in GCS; `warnings` and
+        `extended_from` appear only when they apply.
+
+        A draft (draft=True) is an omni render and reports the same
+        message/video_url/prompt/model/duration_seconds/generation_mode/cost
+        plus interaction_id, duration_source and requested_* fields.
+        generation_mode is "draft". There is no audio_enabled: omni exposes no
+        audio control, so the server cannot state what the render carries —
+        include_audio is reported under `warnings` as ignored instead.
+
+        A dry run reports dry_run, model, resolution, generation_mode,
+        requested_duration_seconds, the snapped duration_seconds that will
+        actually render, and estimated_cost.
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
@@ -1734,6 +2306,10 @@ async def generate_video(
         _validate_duration_seconds(duration_seconds)
 
         if dry_run:
+            # Draft mode routes to omni, which serves a plain text/image
+            # request and snaps on its own [3, 10]s clamp — the Veo modes
+            # below do not apply to it.
+            quoted_mode = "text_to_video"
             if not draft:
                 # Same checks the impl applies, so a quote can never succeed
                 # for a render the real call would refuse. The mode is derived
@@ -1760,19 +2336,20 @@ async def generate_video(
             # Report the duration that will actually render. Returning the
             # request beside a price for the snapped value (5s quoted as "4s
             # of video") made the payload contradict itself.
-            try:
-                from .pricing import snap_video_duration
-
-                quoted_duration: float = snap_video_duration(
-                    est_model, duration_seconds
-                )
-            except Exception:  # pragma: no cover - defensive
-                quoted_duration = duration_seconds
+            #
+            # The mode has to travel with the duration: Veo forces 8s for a
+            # reference render and 7s for an extension, so a 4s reference
+            # request was quoted at half what the render bills — a pre-flight
+            # may over-state but must never under-state.
+            quoted_duration = _snapped_duration_for_quote(
+                est_model, duration_seconds, quoted_mode
+            )
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
                 "model": est_model,
                 "resolution": est_res,
+                "generation_mode": "draft" if draft else quoted_mode,
                 "requested_duration_seconds": duration_seconds,
                 "duration_seconds": quoted_duration,
                 "estimated_cost": _video_cost(
@@ -1780,6 +2357,7 @@ async def generate_video(
                     duration_seconds,
                     resolution=est_res,
                     include_audio=include_audio,
+                    generation_mode=quoted_mode,
                 ),
             }
             return json.dumps(payload, indent=2)
@@ -1843,6 +2421,12 @@ async def generate_video(
                     "draft mode (gemini-omni-flash) ignored Veo-only params: "
                     + ", ".join(ignored)
                 )
+            # The omni impl reports neither of these, so a draft response was
+            # missing the two keys this tool's own Returns block names and
+            # every non-draft response carries. `prompt` is the text actually
+            # sent (audio_prompt inlined), matching what the Veo path reports.
+            result.setdefault("generation_mode", "draft")
+            result.setdefault("prompt", draft_prompt)
             return json.dumps(result, indent=2)
 
         # Fetch first frame image
@@ -2075,12 +2659,16 @@ async def generate_transition(
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
                     "model": model,
-                    "duration_seconds": duration_seconds,
+                    "requested_duration_seconds": duration_seconds,
+                    "duration_seconds": _snapped_duration_for_quote(
+                        model, duration_seconds, "first_last_frame"
+                    ),
                     "estimated_cost": _video_cost(
                         model,
                         duration_seconds,
                         resolution="720p",
                         include_audio=include_audio,
+                        generation_mode="first_last_frame",
                     ),
                 },
                 indent=2,
@@ -2260,13 +2848,17 @@ async def generate_bridge(
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
                     "model": model,
-                    "duration_seconds": duration_seconds,
+                    "requested_duration_seconds": duration_seconds,
+                    "duration_seconds": _snapped_duration_for_quote(
+                        model, duration_seconds, "first_last_frame"
+                    ),
                     "preflight_checks": preflight,
                     "estimated_cost": _video_cost(
                         model,
                         duration_seconds,
                         resolution="720p",
                         include_audio=include_audio,
+                        generation_mode="first_last_frame",
                     ),
                 },
                 indent=2,
@@ -2407,7 +2999,13 @@ async def generate_clip(
              first_frame_uri?: str, negative_prompt?: str,
              audio_prompt?: str}. If `first_frame_uri` is supplied and
             cannot be fetched, the beat fails (rather than silently
-            falling back to text-to-video).
+            falling back to text-to-video). Any other key is an error naming
+            what you probably meant — the still to condition on is
+            `first_frame_uri`, not `image_url` (what generate_storyboard
+            returns) or `image_uri` (what generate_video calls it), and a
+            dropped key would have cost a full render. `caption` and `notes`
+            are the exception: they are accepted and ignored, so a
+            generate_storyboard shot list can be passed straight through.
         aspect_ratio: Default 9:16 for vertical social clips.
         model: VEO model applied to every beat.
         include_audio: Enable audio on each beat (only effective on Vertex).
@@ -2435,11 +3033,27 @@ async def generate_clip(
         {
           "kind": "clip",
           "aspect_ratio": "9:16",
+          "model": "<the model every beat rendered on>",
+          "animatic": false,
           "segments": [ ... ordered beat / bridge segments ... ],
           "total_duration_seconds": <sum>,
+          "beat_count": <len(beats)>,
+          "cost": { ... total of the segments that rendered ... },
           "errors": [ {"beat_index": N, "error": "..."} ],  // only on failure
+          "warnings": [ ... ],                              // only when non-empty
         }
+
+        A dry run instead returns {"dry_run": true, "message", "model",
+        "beat_count", "bridge_count", "preflight_checks", "estimated_cost"} —
+        the price of every beat plus every bridge, and nothing is generated.
     """
+    # Accumulators live outside the try so the cancellation handler below can
+    # still see what was rendered — and billed — before the caller vanished.
+    segments: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    clip_warnings: list[str] = []
+    total_duration = 0.0
+    beat_model = OMNI_MODEL if animatic else model
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
@@ -2453,21 +3067,53 @@ async def generate_clip(
                 "nearly doubles that. Split the sequence into several clips."
             )
 
-        # Validate every beat before rendering any of them. A bad duration in
-        # beat 5 would otherwise only surface after beats 1-4 had been
-        # generated and billed.
+        # Validate every statically checkable field of every beat before
+        # rendering any of them. Anything left to the impl surfaces mid-run —
+        # a bad seed in beat 3 failed only after beats 1-2 had rendered and
+        # billed — and nothing here needs the network to decide.
         for beat_index, beat_spec in enumerate(beats):
             if not isinstance(beat_spec, dict):
                 raise ValueError(
                     f"beats[{beat_index}] must be an object with a 'prompt', "
                     f"got {type(beat_spec).__name__}"
                 )
+            _validate_spec_keys(
+                beat_spec,
+                f"beats[{beat_index}]",
+                _BEAT_KEYS,
+                _BEAT_KEY_SUGGESTIONS,
+                ignored=_BEAT_IGNORED_KEYS,
+            )
             if not str(beat_spec.get("prompt", "") or "").strip():
                 raise ValueError(f"beats[{beat_index}] is missing a non-empty 'prompt'")
             _validate_duration_seconds(
                 beat_spec.get("duration_seconds"),
                 f"beats[{beat_index}].duration_seconds",
             )
+            _validate_seed(beat_spec.get("seed"), f"beats[{beat_index}].seed")
+            for text_field in ("prompt", "negative_prompt", "audio_prompt"):
+                value = beat_spec.get(text_field)
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(
+                        f"beats[{beat_index}].{text_field} must be a string, "
+                        f"got {type(value).__name__}"
+                    )
+            first_frame = beat_spec.get("first_frame_uri")
+            if first_frame is not None:
+                if not isinstance(first_frame, str):
+                    raise ValueError(
+                        f"beats[{beat_index}].first_frame_uri must be a string "
+                        f"URI (gs://, http(s)://, file://), got "
+                        f"{type(first_frame).__name__}"
+                    )
+                # An empty string is falsy, so the beat would silently render
+                # text-to-video at full price instead of conditioning on the
+                # frame the caller believes they supplied.
+                if not first_frame.strip():
+                    raise ValueError(
+                        f"beats[{beat_index}].first_frame_uri is empty; omit the "
+                        "key entirely for a text-to-video beat"
+                    )
 
         # Validate the clip-level aspect ratio once, up front. Otherwise the
         # impl's per-value ValueError fires inside every beat's error handler,
@@ -2528,7 +3174,6 @@ async def generate_clip(
         # outer handler so the tool returns a top-level {"error": ...} rather
         # than failing every beat individually and returning a success-shaped
         # clip with empty segments.
-        clip_warnings: list[str] = []
         if animatic:
             # Fast omni preview path: no Veo GCS, no bridges. video_client is a
             # harmless placeholder (never used — beats route to omni below).
@@ -2561,11 +3206,7 @@ async def generate_clip(
                 is_vertex_client,
             )
 
-        segments: list[dict[str, Any]] = []
-        errors: list[dict[str, Any]] = []
-        total_duration = 0.0
         prev_video_bytes: bytes | None = None
-        beat_model = OMNI_MODEL if animatic else model
 
         for idx, beat in enumerate(beats):
             try:
@@ -2774,47 +3415,45 @@ async def generate_clip(
                 else:
                     prev_video_bytes = None
 
-        clip_manifest: dict[str, Any] = {
-            "kind": "clip",
-            "aspect_ratio": aspect_ratio,
-            "model": beat_model,
-            "animatic": animatic,
-            "segments": segments,
-            "total_duration_seconds": total_duration,
-            "beat_count": len(beats),
-        }
-        # Total what the segments actually rendered, segment by segment —
-        # summing the runtime into one estimate would snap it to 8s.
-        try:
-            from .pricing import sum_costs
-
-            segment_costs = [
-                _video_cost_estimate(
-                    seg.get("model", beat_model),
-                    float(seg.get("duration_seconds") or 0),
-                    resolution="720p",
-                    include_audio=bool(seg.get("audio_enabled", include_audio)),
-                    actual=_segment_is_metered(seg),
-                    presnapped=not _segment_is_metered(seg),
-                )
-                for seg in segments
-                if seg.get("video_url")
-            ]
-            if segment_costs:
-                clip_manifest["cost"] = _cost_payload(
-                    sum_costs(segment_costs, label="clip")
-                )
-        except Exception:  # pragma: no cover - defensive
-            logger.debug("Could not total clip cost", exc_info=True)
-        if errors:
-            clip_manifest["errors"] = errors
-        if clip_warnings:
-            # The same warning (e.g. "audio not honored on the Gemini API")
-            # is emitted per beat and per bridge; dedupe at the clip level,
-            # preserving first-seen order, so the manifest carries each
-            # distinct warning once instead of one copy per segment.
-            clip_manifest["warnings"] = list(dict.fromkeys(clip_warnings))
+        clip_manifest = _assemble_clip_manifest(
+            aspect_ratio=aspect_ratio,
+            beat_model=beat_model,
+            animatic=animatic,
+            segments=segments,
+            total_duration=total_duration,
+            beat_count=len(beats),
+            include_audio=include_audio,
+            errors=errors,
+            warnings=clip_warnings,
+        )
         return json.dumps(clip_manifest, indent=2)
+    except asyncio.CancelledError:
+        # A cancellation is a BaseException, so the handler below never saw
+        # it: a client that disconnected after five beats had rendered took
+        # the clip-level total — the only record of what the run cost — with
+        # it. Each beat's own sidecar survives; this persists the clip
+        # manifest so the money already spent stays accounted for. The
+        # cancellation is re-raised, never swallowed.
+        if segments:
+            partial = _assemble_clip_manifest(
+                aspect_ratio=aspect_ratio,
+                beat_model=beat_model,
+                animatic=animatic,
+                segments=segments,
+                total_duration=total_duration,
+                beat_count=len(beats),
+                include_audio=include_audio,
+                errors=errors,
+                warnings=clip_warnings,
+            )
+            partial["cancelled"] = True
+            manifest_url = _write_clip_manifest(partial)
+            logger.warning(
+                "generate_clip cancelled after %d segment(s); manifest written to %s",
+                len(segments),
+                manifest_url or "nowhere (no local segment to write beside)",
+            )
+        raise
     except Exception as e:
         await ctx.error(f"Clip generation failed: {e}")
         logger.exception("Tool error")
@@ -2872,6 +3511,10 @@ async def generate_video_omni(
         # clamps to [3, 10]s, which would turn a negative or NaN duration
         # into a billed 3s render instead of an error.
         _validate_duration_seconds(duration_seconds)
+        # src/omni.py refuses anything but 16:9 / 9:16, so quoting one was
+        # the quote accepting what the run refuses — every other video tool
+        # front-loads this check and these two did not.
+        _validate_aspect_ratio(aspect_ratio)
 
         gcs_warnings: list[str] = []
         if output_gcs_uri:
@@ -3013,6 +3656,12 @@ async def edit_video(
         # clamps to [3, 10]s, which would turn a negative or NaN duration
         # into a billed 3s render instead of an error.
         _validate_duration_seconds(duration_seconds)
+        # An edit does not send the ratio on the wire, but src/omni.py still
+        # rejects an unsupported one before it gets that far, so a quote that
+        # accepted '4:3' promised a render the tool refuses. Validating here
+        # keeps the two answers identical instead of deciding the edit case
+        # differently from the impl that owns it.
+        _validate_aspect_ratio(aspect_ratio)
 
         if dry_run:
             # An edit inherits its duration from the source video, so the
@@ -3109,6 +3758,15 @@ async def loop_extend(
         JSON with the final video_url and the ordered list of intermediate
         extension URLs.
     """
+    # Outside the try so the cancellation handler can still record the
+    # extensions that rendered — and billed — before the caller vanished.
+    steps: list[str] = []
+    step_warnings: list[str] = []
+    current = video_uri
+    # The model that actually ran. Seeded with the request so it is bound
+    # even if the loop body never executes, then overwritten with the
+    # backend-translated ID the impl reports.
+    served_model = str(model)
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
@@ -3163,13 +3821,6 @@ async def loop_extend(
         # Validate the initial gs:// source against the allowlist (intermediate
         # outputs land in the already-validated gcs_uri bucket).
 
-        current = video_uri
-        steps: list[str] = []
-        step_warnings: list[str] = []
-        # The model that actually ran. Seeded with the request so it is bound
-        # even if the loop body never executes, then overwritten with the
-        # backend-translated ID the impl reports.
-        served_model = str(model)
         for i in range(times):
             await ctx.info(f"Extension {i + 1}/{times}")
             ext_result = await generate_video_impl(
@@ -3191,18 +3842,16 @@ async def loop_extend(
             step_warnings.extend(ext_result.get("warnings") or [])
             served_model = ext_result.get("model", model)
 
-        manifest: dict[str, Any] = {
-            "kind": "loop_extend",
-            "source_video_uri": video_uri,
-            "prompt": prompt,
-            # The model that actually ran: the impl translates Veo IDs
-            # per backend (the Gemini API serves -preview spellings).
-            "model": served_model,
-            "aspect_ratio": aspect_ratio,
-            "times": times,
-            "final_video_url": current,
-            "extension_steps": steps,
-        }
+        manifest = _assemble_loop_extend_manifest(
+            source_video_uri=video_uri,
+            prompt=prompt,
+            served_model=served_model,
+            aspect_ratio=aspect_ratio,
+            steps=steps,
+            final_video_url=current,
+            include_audio=include_audio,
+            warnings=step_warnings,
+        )
         result: dict[str, Any] = {
             "message": f"Extended video {times} time(s)",
             "video_url": current,
@@ -3210,27 +3859,41 @@ async def loop_extend(
             "times": times,
             "extension_steps": steps,
         }
-        cost = _video_cost(
-            served_model,
-            float(times * 7),
-            resolution="720p",
-            include_audio=include_audio,
-            actual=True,
-        )
-        if cost:
-            result["cost"] = cost
-            manifest["cost"] = cost
-        if step_warnings:
-            # Same warning repeats per step; dedupe, preserving order.
-            deduped = list(dict.fromkeys(step_warnings))
-            result["warnings"] = deduped
-            manifest["warnings"] = deduped
+        if manifest.get("cost"):
+            result["cost"] = manifest["cost"]
+        if manifest.get("warnings"):
+            result["warnings"] = manifest["warnings"]
         sidecar_url = _write_sidecar(current, manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
         else:
             result["manifest"] = manifest
         return json.dumps(result, indent=2)
+    except asyncio.CancelledError:
+        # Same hole generate_clip had: a cancellation is a BaseException, so
+        # the handler below never ran and a caller that disconnected after
+        # three of five extensions lost the entire chain's record. Each
+        # extension was billed; write the partial manifest, then let the
+        # cancellation continue.
+        if steps:
+            partial = _assemble_loop_extend_manifest(
+                source_video_uri=video_uri,
+                prompt=prompt,
+                served_model=served_model,
+                aspect_ratio=aspect_ratio,
+                steps=steps,
+                final_video_url=current,
+                include_audio=include_audio,
+                warnings=step_warnings,
+            )
+            partial["cancelled"] = True
+            sidecar_url = _write_sidecar(current, partial)
+            logger.warning(
+                "loop_extend cancelled after %d extension(s); manifest written to %s",
+                len(steps),
+                sidecar_url or "nowhere (the last extension is not a local file)",
+            )
+        raise
     except Exception as e:
         await ctx.error(f"Loop extend failed: {e}")
         logger.exception("Tool error")

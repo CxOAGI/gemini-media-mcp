@@ -3,7 +3,9 @@
 import asyncio
 import base64
 import logging
+import math
 import uuid
+from collections.abc import Mapping, Sequence
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -102,13 +104,60 @@ _IMAGE_SIZE_SUPPORT: dict[str, frozenset[str]] = {
 }
 
 
-def _usage_dict(response: Any) -> dict[str, int] | None:
+def _field(obj: Any, *names: str) -> Any:
+    """Read the first present field from an SDK object or a plain mapping.
+
+    Duck-typed on purpose: the SDK returns objects, but a REST-shaped dict and
+    a hand-rolled double must read the same way, and a missing field must never
+    raise.
+    """
+    for name in names:
+        value = obj.get(name) if isinstance(obj, Mapping) else getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _modality_details(details: Any) -> list[dict[str, Any]]:
+    """Flatten a ``*_tokens_details`` list into plain, JSON-safe entries.
+
+    ``src.pricing`` prices an image call exactly when the response says how the
+    output split across modalities. Dropping these lists forced every live call
+    onto the fallback heuristic, which attributes only the table's image-token
+    count and bills every remaining candidate token at the TEXT rate — a 20x
+    understatement whenever a response carries more than one image part (a
+    thinking model's interim renders do exactly that). The shape emitted here
+    (``modality`` as a string, ``token_count`` as an int) is what
+    ``pricing._modality_tokens`` reads.
+    """
+    if not isinstance(details, Sequence) or isinstance(details, (str, bytes)):
+        return []
+    entries: list[dict[str, Any]] = []
+    for entry in details:
+        modality = _field(entry, "modality")
+        tokens = _field(entry, "token_count", "tokenCount")
+        if modality is None or not isinstance(tokens, int) or isinstance(tokens, bool):
+            continue
+        # Modality arrives as an enum on the SDK path; str(enum) would serialize
+        # as "MediaModality.IMAGE", which pricing matches but reads badly in the
+        # response payload, so unwrap .value when it has one.
+        entries.append(
+            {
+                "modality": str(getattr(modality, "value", modality)),
+                "token_count": tokens,
+            }
+        )
+    return entries
+
+
+def _usage_dict(response: Any) -> dict[str, Any] | None:
     """Extract token counts from a response's usage_metadata as a plain dict.
 
     Returned to the caller so cost can be computed from what the API actually
-    metered rather than from a pre-flight estimate. Kept as a plain dict of
-    ints because the result travels through ``json.dumps`` in the MCP layer,
-    which cannot serialize the SDK's usage object.
+    metered rather than from a pre-flight estimate. Kept as plain data (ints
+    and lists of small dicts) because the result travels through
+    ``json.dumps`` in the MCP layer, which cannot serialize the SDK's usage
+    object.
     """
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
@@ -120,11 +169,21 @@ def _usage_dict(response: Any) -> dict[str, int] | None:
         "thoughts_token_count",
         "cached_content_token_count",
     )
-    out: dict[str, int] = {}
+    out: dict[str, Any] = {}
     for field in fields:
         value = getattr(usage, field, None)
         if isinstance(value, int):
             out[field] = value
+    # The per-modality breakdown is the only thing that lets pricing bill image
+    # output at the image rate instead of guessing, so it has to survive the
+    # trip to plain data.
+    for field, alias in (
+        ("prompt_tokens_details", "promptTokensDetails"),
+        ("candidates_tokens_details", "candidatesTokensDetails"),
+    ):
+        entries = _modality_details(_field(usage, field, alias))
+        if entries:
+            out[field] = entries
     return out or None
 
 
@@ -146,6 +205,117 @@ _GEMINI3_IMAGE_MODELS = {
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-lite-image",
 }
+
+# Decompression-bomb guards for input images. The byte caps upstream bound what
+# arrives on the wire, which says nothing about what it costs to DECODE: a solid
+# 9999x9999 PNG is 316KB encoded and ~500MB in memory, and fourteen references
+# like that took the server to 2.8GB RSS because every decoded frame stays alive
+# until generate_content returns. Pillow's own MAX_IMAGE_PIXELS does not bound
+# this either — it only warns until twice its limit.
+#
+# Ceiling on the SOURCE pixel count, checked from the header before any pixels
+# are decoded. Roughly 6300x6300, and deliberately under the 50MP Pillow limit
+# the server installs so a permitted image never trips the bomb warning.
+_MAX_SOURCE_PIXELS = 40_000_000
+# What is RETAINED per image. Gemini downsamples image input to a few hundred
+# thousand pixels before tokenizing it, so shrinking a larger source costs
+# nothing the model can see while capping each held frame at ~12MB.
+_MAX_DECODED_PIXELS = 4_000_000
+# Ceiling on the retained pixels of a whole request. An edit input plus the
+# fourteen references Gemini 3.x allows, each at the full per-image budget,
+# stay under this — the documented workflow cannot trip it. It is here so that
+# raising the per-image budget cannot silently reintroduce the batch blow-up.
+_MAX_TOTAL_DECODED_PIXELS = 64_000_000
+
+
+def _megapixels(pixels: float) -> str:
+    """Format a pixel count for an error message."""
+    return f"{pixels / 1_000_000:.1f}MP"
+
+
+def _open_input_image(data: bytes, label: str, budget: int) -> Image.Image:
+    """Decode one input image within the decompression-bomb budget.
+
+    Args:
+        data: Encoded image bytes.
+        label: How this image is named in an error, e.g. "Reference image 3".
+        budget: Retained-pixel allowance left for the rest of the request.
+
+    Returns:
+        A decoded image, downscaled when the source exceeds the per-image
+        budget. The caller owns it and must close it.
+
+    Raises:
+        ValueError: If the source is too large to decode, or the request's
+            total decoded budget is exhausted.
+    """
+    image = Image.open(BytesIO(data))
+    try:
+        width, height = image.size
+        pixels = width * height
+        # Checked before .load(): the point is to never materialize the bitmap.
+        if pixels > _MAX_SOURCE_PIXELS:
+            raise ValueError(
+                f"{label} is {width}x{height} ({_megapixels(pixels)}), above the "
+                f"{_megapixels(_MAX_SOURCE_PIXELS)} limit for input images. "
+                "Downscale it before sending."
+            )
+        if pixels > _MAX_DECODED_PIXELS:
+            scale = math.sqrt(_MAX_DECODED_PIXELS / pixels)
+            target = (max(1, int(width * scale)), max(1, int(height * scale)))
+            # thumbnail() drafts JPEG decoding down inside the decoder and
+            # replaces the bitmap in place, so the oversized copy never sits
+            # alongside the small one.
+            image.thumbnail(target, Image.Resampling.LANCZOS)
+        else:
+            image.load()
+        retained = image.width * image.height
+        if retained > budget:
+            raise ValueError(
+                f"{label} ({image.width}x{image.height}) does not fit this "
+                f"request's remaining decoded-image budget of "
+                f"{_megapixels(budget)} (total "
+                f"{_megapixels(_MAX_TOTAL_DECODED_PIXELS)}). Send fewer or "
+                "smaller reference images."
+            )
+    except BaseException:
+        image.close()
+        raise
+    return image
+
+
+def _prepare_input_images(
+    image_bytes: bytes | None,
+    reference_images: list[bytes] | None,
+    max_refs: int,
+) -> list[Image.Image]:
+    """Decode the edit input and reference images under the pixel budgets.
+
+    Raises:
+        ValueError: If any image blows a budget. Everything already decoded is
+            closed first, so a rejected batch does not leak the frames that
+            preceded it.
+    """
+    sources: list[tuple[str, bytes]] = []
+    if image_bytes:
+        sources.append(("The input image", image_bytes))
+    if reference_images:
+        for position, ref_bytes in enumerate(reference_images[:max_refs], start=1):
+            sources.append((f"Reference image {position}", ref_bytes))
+
+    images: list[Image.Image] = []
+    remaining = _MAX_TOTAL_DECODED_PIXELS
+    try:
+        for label, data in sources:
+            image = _open_input_image(data, label, remaining)
+            images.append(image)
+            remaining -= image.width * image.height
+    except BaseException:
+        for image in images:
+            image.close()
+        raise
+    return images
+
 
 # Lazily-created, module-level cached Vertex AI client pinned to the "global"
 # location. Gemini 3.x image models require the global location on Vertex; this
@@ -305,20 +475,10 @@ async def generate_image(
             # on every call.
             client = _get_vertex_global_client()
 
-    # Prepare input images
-    pil_images: list[Image.Image] = []
-    if image_bytes:
-        pil_image = Image.open(BytesIO(image_bytes))
-        pil_image.load()
-        pil_images.append(pil_image)
-
-    # Process reference images (up to 14 for Gemini 3.x image models)
-    if reference_images:
-        max_refs = 14 if model_id in _GEMINI3_IMAGE_MODELS else 1
-        for ref_bytes in reference_images[:max_refs]:
-            ref_image = Image.open(BytesIO(ref_bytes))
-            ref_image.load()
-            pil_images.append(ref_image)
+    # Prepare input images (up to 14 references for Gemini 3.x image models).
+    # Decoding is budgeted: see _open_input_image.
+    max_refs = 14 if model_id in _GEMINI3_IMAGE_MODELS else 1
+    pil_images = _prepare_input_images(image_bytes, reference_images, max_refs)
 
     try:
         # Build contents for Gemini models
@@ -372,6 +532,13 @@ async def generate_image(
             contents=contents,
             config=config,
         )
+
+        # The decoded inputs are dead once the request has been serialized and
+        # answered; holding them until the outer finally kept every reference
+        # frame alive through the file write and thumbnailing too.
+        for pil_img in pil_images:
+            pil_img.close()
+        pil_images.clear()
 
         output_bytes = None
         fallback_image_bytes = None

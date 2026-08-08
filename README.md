@@ -30,7 +30,7 @@ If you prefer to configure everything by hand, the manual steps are below.
 ### Prerequisites
 
 - For images **and** video with the simplest setup: a Gemini API key ([setup instructions](#gemini-api-setup)). Veo 3.1 video works on the **paid** Gemini API tier, and Veo 3.1 Lite is served exclusively through the Gemini API.
-- For images and video with GCS output and Vertex-only features (e.g. the `generate_audio` flag): a Google Cloud project with the Vertex AI API enabled and a service account with Vertex AI permissions ([setup instructions](#vertex-ai-setup))
+- For images and video with GCS output and Vertex-only features (e.g. controllable audio: `include_audio` is only honoured on Vertex, where it maps to Veo's `generate_audio` config; on the Gemini API Veo 3.1 always produces audio): a Google Cloud project with the Vertex AI API enabled and a service account with Vertex AI permissions ([setup instructions](#vertex-ai-setup))
 
 ### Environment Variables
 
@@ -60,6 +60,28 @@ Optional security hardening:
 # If unset and VIDEO_GCS_BUCKET is not set, gs:// fetches log a warning.
 export GCS_ALLOWED_BUCKETS=bucket-a,bucket-b
 ```
+
+Other variables the server reads:
+
+| Variable | Description |
+|---|---|
+| `DATA_FOLDER` | Where generated media is written (default `data`). **Required** when running in a container |
+| `VIDEO_GCS_BUCKET` | Default bucket for large video output; also seeds the `GCS_ALLOWED_BUCKETS` allowlist |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Service account key as inline JSON instead of a file path (Vertex mode only). Written by `setup`; the server materialises it into a temp file. `GOOGLE_APPLICATION_CREDENTIALS` also accepts inline JSON |
+| `RUNNING_IN_CONTAINER` | Set to `true` by the Docker image. Makes `DATA_FOLDER` mandatory and switches the sse/streamable-http bind address to `0.0.0.0` (`127.0.0.1` otherwise). Presence of `/.dockerenv` has the same effect |
+| `FASTMCP_HOST` | Bind address for the sse/streamable-http transports; `--host` wins over it |
+
+### CLI flags
+
+```bash
+gemini-media-mcp [--log-level LEVEL] [--host HOST] [--port PORT] [--mount-path PATH] [stdio|sse|streamable-http]
+```
+
+- `--log-level`: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`
+- `--host` / `--port`: bind address and port for `sse` / `streamable-http` (default port 8000)
+- `--mount-path`: mount path for the `sse` / `streamable-http` transports (e.g. `/mcp`)
+
+`--host`, `--port` and `--mount-path` are also accepted *after* the transport subcommand, which is the only form a `docker run` entrypoint can produce. `--log-level` must come before it.
 
 Local file:// and bare-path inputs are always restricted to `DATA_FOLDER`.
 HTTP(S) fetches reject hosts that resolve to private, loopback, link-local,
@@ -141,7 +163,7 @@ Two artifacts come back, because MCP clients render inline images but do not exe
 2. **A self-contained HTML page written to disk** (`file://` URL) with full-size frames, complete prompt text and cumulative timecode. Fully offline: images embedded as data URIs, no external requests.
 
 **Parameters:**
-- `shots` (required): ordered specs — `{prompt, caption?, duration_seconds?, notes?}`. `caption` is a slug line, `notes` are camera/lighting notes
+- `shots` (required): ordered specs — `{prompt, caption?, duration_seconds?, notes?}`. `caption` is a slug line, `notes` are camera/lighting notes. Capped at **24 shots** per call, because every shot is a billed image
 - `title`, `subtitle`: drawn on the board
 - `model`, `aspect_ratio`, `image_size`: keyframe generation settings (`9:16` gives vertical panels)
 - `theme`: `dark` (default) or `light`
@@ -155,9 +177,9 @@ Generate images using Gemini image models.
 
 **Parameters:**
 - `prompt` (required): Text description of the image
-- `model`: Pick by use case.
+- `model` (required — there is no default; name one explicitly): Pick by use case.
   **GA (stable) — preferred in production:**
-  - `gemini-3.1-flash-image` (Nano Banana 2) — **default**; fast, up to 4K output, up to 14 reference images
+  - `gemini-3.1-flash-image` (Nano Banana 2) — the general-purpose choice; fast, up to 4K output, up to 14 reference images
   - `gemini-3-pro-image` (Nano Banana Pro) — 4K, reasoning, `thought_signature` for multi-turn editing
   - `gemini-3.1-flash-lite-image` — cheapest, but **1K output only** (2K/4K are unsupported)
 
@@ -167,8 +189,12 @@ Generate images using Gemini image models.
   > |---|---|---|
   > | `gemini-3-pro-image-preview` | 2026-06-25 | `gemini-3-pro-image` |
   > | `gemini-3.1-flash-image-preview` | 2026-06-25 | `gemini-3.1-flash-image` |
-  > | all 8 `imagen-3.0-*` / `imagen-4.0-*` image IDs | 2026-08-17 | `gemini-3.1-flash-image` |
+  > | `imagen-3.0-generate-002` | 2025-11-10 | `gemini-3.1-flash-image` |
+  > | `imagen-3.0-capability-001`, `imagen-3.0-capability-002`, `imagen-3.0-fast-generate-001`, `imagen-3.0-generate-001`, `imagen-4.0-fast-generate-001`, `imagen-4.0-generate-001` | 2026-08-17 | `gemini-3.1-flash-image` |
+  > | `imagen-4.0-ultra-generate-001` | 2026-08-17 | `gemini-3-pro-image` |
   > | `gemini-2.5-flash-image` | 2026-10-02 (scheduled) | `gemini-3.1-flash-image` |
+  >
+  > Imagen Ultra is the top Imagen tier, so it reroutes to the top Gemini image model rather than dropping to flash — **`gemini-3-pro-image` is billed at a materially higher rate than `gemini-3.1-flash-image`**. Price the call with `dry_run` before running it.
   >
   > Every substitution is announced on three channels so it cannot go unnoticed: a `warnings` entry in the response JSON, an MCP `warning`-level log notification to the client, and a `WARNING` record in the server log.
   >
@@ -176,7 +202,7 @@ Generate images using Gemini image models.
 - `image_uri`: Input image URI for image-to-image generation
 - `image_base64`: Base64 encoded input image
 - `aspect_ratio`: Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`)
-- `person_generation`: Policy for generating people (e.g. `allow_adult`, `dont_allow`)
+- `person_generation`: Policy for generating people — `dont_allow`, `allow_adult`, or `allow_all` (some regions restrict these values)
 - `dry_run`: Return only the cost estimate and the resolved model/parameters — generates nothing, free and instant
 
 Every real run reports `usage` (the token counts the API metered) and `cost` derived from them, and writes both into the sidecar manifest. A dry run prices **the call that would actually be issued**: ask for `imagen-4.0-generate-001` at 4K and it quotes `gemini-3.1-flash-image`; ask `gemini-3.1-flash-lite-image` for 4K and it quotes its 1K default and tells you why.
@@ -193,19 +219,19 @@ Every real run reports `usage` (the token counts the API metered) and `cost` der
 
 ### generate_video
 
-Generate videos using VEO models. Video works on **both** credential modes: Veo 3.1 runs on the paid Gemini API tier as well as on Vertex AI. Vertex AI additionally provides GCS output and some Vertex-only features (e.g. the `generate_audio` flag). Veo 3.1 Lite is served **exclusively** through the Gemini API.
+Generate videos using VEO models. Video works on **both** credential modes: Veo 3.1 runs on the paid Gemini API tier as well as on Vertex AI. Vertex AI additionally provides GCS output and some Vertex-only features (e.g. `include_audio`, which is only honoured on Vertex). Veo 3.1 Lite is served **exclusively** through the Gemini API.
 
 **Parameters:**
 - `prompt` (required): Text description of the video
-- `model`: Model to use:
-  - `veo-3.1-generate-001` (default): Highest quality, 4/6/8s duration, audio support
+- `model` (required — there is no default; name one explicitly):
+  - `veo-3.1-generate-001`: Highest quality, 4/6/8s duration, audio support
   - `veo-3.1-fast-generate-001`: Faster generation with audio support
   - `veo-3.1-lite-generate-preview`: Most cost-effective, 4/6/8s, audio; text-to-video and image-to-video only (no extension, reference images, first/last-frame, or 4K). Served via the Gemini API only; Vertex AI projects may return 404 for this model.
 - `aspect_ratio`: `16:9` (default) or `9:16`
 - `resolution`: Output resolution, `720p`, `1080p`, or `4K` (4K not supported on Veo 3.1 Lite)
-- `duration_seconds`: Video duration (4/6/8s)
-- `include_audio`: Enable audio generation
-- `person_generation`: Policy for generating people (e.g. `allow_adult`, `dont_allow`)
+- `duration_seconds`: Video duration (4/6/8s), **default `8.0`** — the longest and most expensive option. Omitting it on `veo-3.1-generate-001` bills a full 8s render (from $3.20 at 720p/1080p); pass `4` explicitly when a short beat will do.
+- `include_audio` (default `false`): Enable audio generation (Vertex only; on the Gemini API Veo 3.1 always produces audio)
+- `person_generation`: Policy for generating people — `allow_adult` or `allow_all` (some regions restrict these values)
 - `audio_prompt`: Audio description
 - `negative_prompt`: Things to avoid in the video
 - `seed`: Random seed for reproducibility
@@ -237,11 +263,12 @@ Fast conversational video generation via Google's `gemini-omni-flash-preview` (I
 
 **Parameters:**
 - `prompt` (required): Text description of the video
-- `image_uris`: List of image URIs to condition on (optional)
+- `image_uris`: List of image URIs to condition on (optional; **at most 8** — more is rejected, since each is buffered in memory)
 - `input_video_uri`: A video to edit (optional)
-- `aspect_ratio`: `16:9` (default) or `9:16`
-- `duration_seconds`: Video duration, 3–10 (default 6)
+- `aspect_ratio`: `16:9` (default) or `9:16` — **not sent when the request is an edit** (an `input_video_uri` or a `previous_interaction_id` makes it one); the API rejects it on an edit task
+- `duration_seconds`: Video duration, 3–10 (default 6) — likewise **not sent on an edit**, and the rendered length is then chosen by the service: a measured 3s source edited with `duration_seconds=4` came back at 10.01s. On an edit the response reports `duration_seconds: null` and the quote uses omni's 10s maximum as an upper bound
 - `previous_interaction_id`: Continue editing a prior omni result (optional)
+- `timeout_seconds`: Overall deadline for create + polling (default 600). A render typically takes over a minute; raise it for long queues
 
 **Notes:**
 - 720p only, 24fps
@@ -255,8 +282,9 @@ Conversational edit of a previously omni-generated video. Because omni holds the
 **Parameters:**
 - `previous_interaction_id` (required): The `interaction_id` from a prior `generate_video_omni` response
 - `prompt` (required): The edit instruction (e.g. `"make the sky stormy"`)
-- `aspect_ratio`: `16:9` (default) or `9:16`
-- `duration_seconds`: Video duration, 3–10 (default 6)
+- `aspect_ratio`: accepted but **never sent** — the API rejects it on an edit task, so it does not change the output
+- `duration_seconds`: accepted but **never sent**, and it does not set the output length. The service picks the rendered length, and it is predictable from neither this value nor the source video: a measured 3s source edited with `duration_seconds=4` rendered 10.01s. The response reports `duration_seconds: null`; a real run bills the length measured from the rendered file, and `dry_run` quotes omni's 10s maximum so a pre-flight never under-states
+- `timeout_seconds`: Overall deadline for the edit render (default 600)
 
 ### loop_extend
 
@@ -285,10 +313,10 @@ This is the highest-leverage tool in the server: one call produces a whole seque
 - `beats` (required): Ordered list of beat specs. Each accepts `{prompt, duration_seconds?, seed?, first_frame_uri?, negative_prompt?, audio_prompt?}`
 - `aspect_ratio`: Default `9:16` for vertical social clips
 - `model`: VEO model applied to every beat (default `veo-3.1-fast-generate-001`)
-- `include_audio`: Audio per beat (Vertex only)
+- `include_audio` (default `true`): Audio per beat (Vertex only)
 - `beats` are capped at 20 per call — each is a billed Veo render, and `add_bridges` nearly doubles that. Split longer sequences into several clips
 - `add_bridges`: Generate a transition between consecutive beats using the last frame of beat N and the first frame of beat N+1. Requires local (`file://`) beat outputs
-- `animatic`: Render every beat with `gemini-omni-flash` (fast 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
+- `animatic`: Render every beat with `gemini-omni-flash-preview` (fast 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
 - `output_gcs_uri`: GCS URI for all outputs
 
 **Partial failure is non-fatal.** A failed beat is recorded in the manifest's `errors` list and the run continues; bridges that would have used the failed beat are skipped.
@@ -316,7 +344,8 @@ Same primitive as `generate_transition`, but takes **two clips instead of two st
 **Parameters:**
 - `from_clip_uri` (required): Clip whose last frame starts the bridge
 - `to_clip_uri` (required): Clip whose first frame ends the bridge
-- `prompt`, `model`, `duration_seconds`, `aspect_ratio`, `include_audio`, `audio_prompt`, `negative_prompt`, `seed`, `output_gcs_uri` — as above
+- `prompt`: Transition motion and style (default: `smooth cinematic cut between the two clips`)
+- `model`, `duration_seconds`, `aspect_ratio`, `include_audio`, `audio_prompt`, `negative_prompt`, `seed`, `output_gcs_uri` — as above
 
 **Returns:** JSON with `video_url`, `sidecar_url`, and the source clip URIs.
 
@@ -393,7 +422,7 @@ The simplest way to generate both images and video:
 4. Copy your key (starts with `AIzaSy...`)
 5. Set the environment variable: `export GEMINI_API_KEY=your-api-key`
 
-**Note**: The Gemini API supports Veo 3.1 video generation on the **paid** tier, and Veo 3.1 Lite is available only through the Gemini API. Vertex AI adds GCS output and some Vertex-only features (e.g. the `generate_audio` flag), but is not required for video.
+**Note**: The Gemini API supports Veo 3.1 video generation on the **paid** tier, and Veo 3.1 Lite is available only through the Gemini API. Vertex AI adds GCS output and some Vertex-only features (e.g. controllable audio — `include_audio` only takes effect on Vertex), but is not required for video.
 
 
 ## Contributing
