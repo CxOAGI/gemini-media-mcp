@@ -31,6 +31,9 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 
 ## Tools Details
 
+> **Pricing built in:** every generation tool accepts `dry_run: true` and returns the cost of the exact call that would run, generating nothing. Real runs report metered cost in the response and sidecar manifest.
+
+
 ### Tool: **`plan_generation`**
 
 Decide how to generate something before spending anything. Returns ranked, ready-to-call plans with costs, plus the models it ruled out and why. Pure rule-based routing — no model call, no cost, instant.

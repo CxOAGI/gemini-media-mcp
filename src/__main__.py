@@ -335,6 +335,17 @@ async def _omni_generate_and_manifest(
     )
     if gcs_warning:
         result.setdefault("warnings", []).append(gcs_warning)
+    # Cost from the duration the interaction actually rendered (clamped by
+    # the impl), not the request — covers omni, edit_video and draft mode.
+    cost = _video_cost(
+        result.get("model") or OMNI_MODEL,
+        float(result.get("duration_seconds", duration_seconds)),
+        resolution="720p",
+        include_audio=False,
+        actual=True,
+    )
+    if cost:
+        result["cost"] = cost
     manifest: dict[str, Any] = {
         "kind": "omni_video",
         "prompt": prompt,
@@ -725,6 +736,67 @@ def _image_cost(
 ) -> dict[str, Any] | None:
     """Cost for an image call, shaped for the MCP response."""
     return _cost_payload(_image_cost_estimate(model, image_size, usage=usage, n=n))
+
+
+def _video_cost_estimate(
+    model: str,
+    duration_seconds: float,
+    *,
+    resolution: str | None = None,
+    include_audio: bool = True,
+    actual: bool = False,
+    presnapped: bool = False,
+) -> Any:
+    """Raw pricing estimate for a video call, or None if unpriceable.
+
+    Two independent knobs, because "already the effective duration" and
+    "was actually metered" are different facts:
+      - ``actual=True``: a real run's effective duration — no re-snap, and
+        is_estimate=False because the render happened.
+      - ``presnapped=True``: a pre-flight quote for a duration this caller
+        already clamped (loop_extend's 7s steps, omni's [3,10] clamp) — no
+        re-snap, but still is_estimate=True: nothing ran.
+    The default snaps the way the impl will, so a quote matches the bill.
+    """
+    try:
+        import dataclasses
+
+        from .pricing import actual_video_cost, estimate_video_cost
+
+        res = resolution or "720p"
+        if actual or presnapped:
+            cost = actual_video_cost(
+                model, duration_seconds, res, include_audio, snap_duration=False
+            )
+            if cost is not None and presnapped and not actual:
+                cost = dataclasses.replace(cost, is_estimate=True)
+            return cost
+        return estimate_video_cost(model, duration_seconds, res, include_audio)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not compute video cost", exc_info=True)
+        return None
+
+
+def _video_cost(
+    model: str,
+    duration_seconds: float,
+    *,
+    resolution: str | None = None,
+    include_audio: bool = True,
+    actual: bool = False,
+    presnapped: bool = False,
+) -> dict[str, Any] | None:
+    """Cost for a video call, shaped for the MCP response."""
+    return _cost_payload(
+        _video_cost_estimate(
+            model,
+            duration_seconds,
+            resolution=resolution,
+            include_audio=include_audio,
+            actual=actual,
+            presnapped=presnapped,
+        )
+    )
 
 
 # Create MCP server with lifespan
@@ -1354,6 +1426,7 @@ async def generate_video(
     extend_video_uri: str | None = None,
     output_gcs_uri: str | None = None,
     draft: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Generate a video using Google VEO models.
 
@@ -1399,6 +1472,10 @@ async def generate_video(
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
             Vertex AI only — on the Gemini API, output is always returned inline
             and an explicit output_gcs_uri is rejected.
+        dry_run: When True, generate nothing and return only the cost
+            estimate for the call that would run (the omni draft price when
+            draft=True). Free and instant. A real run reports the actual
+            cost, derived from the effective duration the API rendered.
         draft: When True, route to gemini-omni-flash for a fast 720p draft
             instead of Veo. Iterate cheaply, then re-run with draft=False to
             finalize on Veo. Omni ignores Veo-only controls (seed,
@@ -1415,6 +1492,24 @@ async def generate_video(
         # Fail fast on an unsupported aspect ratio before any fetch work.
         _validate_aspect_ratio(aspect_ratio)
         _validate_duration_seconds(duration_seconds)
+
+        if dry_run:
+            est_model = OMNI_MODEL if draft else model
+            est_res = "720p" if draft else (resolution or "720p")
+            payload: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "model": est_model,
+                "resolution": est_res,
+                "duration_seconds": duration_seconds,
+                "estimated_cost": _video_cost(
+                    est_model,
+                    duration_seconds,
+                    resolution=est_res,
+                    include_audio=include_audio,
+                ),
+            }
+            return json.dumps(payload, indent=2)
 
         # Draft mode: hand off to the fast omni path. Omni supports only a
         # text prompt + optional input image(s), so Veo-only controls are
@@ -1579,6 +1674,16 @@ async def generate_video(
         await ctx.info("Video generated successfully")
 
         # Write sidecar manifest alongside local video output.
+        # Cost from the snapped duration the impl actually sent to Veo.
+        cost = _video_cost(
+            result.get("model", model),
+            float(result.get("duration_seconds", duration_seconds)),
+            resolution=resolution or "720p",
+            include_audio=result.get("audio_enabled", include_audio),
+            actual=True,
+        )
+        if cost:
+            result["cost"] = cost
         manifest: dict[str, Any] = {
             "kind": "video",
             "prompt": prompt,
@@ -1595,6 +1700,7 @@ async def generate_video(
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
             "video_url": result.get("video_url"),
+            "cost": cost,
             "source_image_uri": image_uri,
             "last_frame_uri": last_frame_uri,
             "reference_image_uris": reference_image_uris,
@@ -1635,6 +1741,7 @@ async def generate_transition(
     negative_prompt: str | None = None,
     seed: int | None = None,
     output_gcs_uri: str | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Generate a transition video between two still frames using VEO 3.1.
 
@@ -1657,6 +1764,10 @@ async def generate_transition(
         seed: Random seed for reproducibility
         output_gcs_uri: GCS output URI for large videos
 
+        dry_run: When True, return only the cost estimate for the Veo render
+            that would run (first/last frame are not fetched). A real run reports
+            the metered cost of the snapped duration.
+
     Returns:
         JSON with video_url, sidecar_url, and generation metadata.
     """
@@ -1667,6 +1778,23 @@ async def generate_transition(
         # Fail fast on an unsupported aspect ratio before any fetch work.
         _validate_aspect_ratio(aspect_ratio)
         _validate_duration_seconds(duration_seconds)
+
+        if dry_run:
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "message": "Estimate only — nothing was generated",
+                    "model": model,
+                    "duration_seconds": duration_seconds,
+                    "estimated_cost": _video_cost(
+                        model,
+                        duration_seconds,
+                        resolution="720p",
+                        include_audio=include_audio,
+                    ),
+                },
+                indent=2,
+            )
 
         # Resolve the client up front so GCS gating can see which backend is
         # in play (the Gemini API does not support GCS output).
@@ -1716,6 +1844,16 @@ async def generate_transition(
         )
         await ctx.info("Transition generated successfully")
 
+        # Cost from the snapped duration the impl actually sent to Veo.
+        cost = _video_cost(
+            result.get("model", model),
+            float(result.get("duration_seconds", duration_seconds)),
+            resolution="720p" or "720p",
+            include_audio=result.get("audio_enabled", include_audio),
+            actual=True,
+        )
+        if cost:
+            result["cost"] = cost
         manifest: dict[str, Any] = {
             "kind": "transition",
             "prompt": prompt,
@@ -1730,6 +1868,7 @@ async def generate_transition(
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
             "video_url": result.get("video_url"),
+            "cost": cost,
             "first_frame_uri": first_frame_uri,
             "last_frame_uri": last_frame_uri,
         }
@@ -1768,6 +1907,7 @@ async def generate_bridge(
     negative_prompt: str | None = None,
     seed: int | None = None,
     output_gcs_uri: str | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Generate a short transition video that bridges two existing clips.
 
@@ -1790,6 +1930,10 @@ async def generate_bridge(
         seed: Random seed for reproducibility.
         output_gcs_uri: GCS URI for large video output.
 
+        dry_run: When True, return only the cost estimate for the Veo render
+            that would run (source clips are not fetched). A real run reports
+            the metered cost of the snapped duration.
+
     Returns:
         JSON with video_url, sidecar_url, and the source clip URIs.
     """
@@ -1800,6 +1944,23 @@ async def generate_bridge(
         # Fail fast on an unsupported aspect ratio before any fetch work.
         _validate_aspect_ratio(aspect_ratio)
         _validate_duration_seconds(duration_seconds)
+
+        if dry_run:
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "message": "Estimate only — nothing was generated",
+                    "model": model,
+                    "duration_seconds": duration_seconds,
+                    "estimated_cost": _video_cost(
+                        model,
+                        duration_seconds,
+                        resolution="720p",
+                        include_audio=include_audio,
+                    ),
+                },
+                indent=2,
+            )
 
         # Resolve the client up front so GCS gating can see which backend is
         # in play (the Gemini API does not support GCS output).
@@ -1853,6 +2014,16 @@ async def generate_bridge(
         )
         await ctx.info("Bridge generated successfully")
 
+        # Cost from the snapped duration the impl actually sent to Veo.
+        cost = _video_cost(
+            result.get("model", model),
+            float(result.get("duration_seconds", duration_seconds)),
+            resolution="720p" or "720p",
+            include_audio=result.get("audio_enabled", include_audio),
+            actual=True,
+        )
+        if cost:
+            result["cost"] = cost
         manifest: dict[str, Any] = {
             "kind": "bridge",
             "prompt": prompt,
@@ -1867,6 +2038,7 @@ async def generate_bridge(
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
             "video_url": result.get("video_url"),
+            "cost": cost,
             "from_clip_uri": from_clip_uri,
             "to_clip_uri": to_clip_uri,
         }
@@ -1901,6 +2073,7 @@ async def generate_clip(
     add_bridges: bool = False,
     output_gcs_uri: str | None = None,
     animatic: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Generate a multi-beat short clip — the building block for a reel / short.
 
@@ -1932,6 +2105,10 @@ async def generate_clip(
             Bridges require local (file://) beat outputs; skipped when
             beats land in GCS.
         output_gcs_uri: GCS URI for all outputs (optional).
+        dry_run: When True, price the whole reel — every beat, plus every
+            bridge when add_bridges is set — and generate nothing. The single
+            most useful pre-flight in the server: a clip is the most expensive
+            call it can make.
         animatic: When True, render every beat with gemini-omni-flash (fast,
             cheap 720p) instead of Veo, for a quick storyboard preview of the
             whole reel before committing to full Veo renders. Bridges are not
@@ -1982,6 +2159,42 @@ async def generate_clip(
         # producing a success-shaped manifest with zero segments instead of a
         # clear top-level failure.
         _validate_aspect_ratio(aspect_ratio)
+
+        if dry_run:
+            est_model = OMNI_MODEL if animatic else model
+            beat_costs = [
+                _video_cost_estimate(
+                    est_model,
+                    float(b.get("duration_seconds", 4.0)),
+                    resolution="720p",
+                    include_audio=include_audio and not animatic,
+                )
+                for b in beats
+            ]
+            bridge_count = len(beats) - 1 if (add_bridges and not animatic) else 0
+            bridge_costs = [
+                _video_cost_estimate(model, 4.0, resolution="720p", include_audio=False)
+                for _ in range(bridge_count)
+            ]
+            try:
+                from .pricing import sum_costs
+
+                total = _cost_payload(
+                    sum_costs(beat_costs + bridge_costs, label="clip")
+                )
+            except Exception:  # pragma: no cover - defensive
+                total = None
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "message": "Estimate only — nothing was generated",
+                    "model": est_model,
+                    "beat_count": len(beats),
+                    "bridge_count": bridge_count,
+                    "estimated_cost": total,
+                },
+                indent=2,
+            )
 
         # Resolve the client ONCE, before the beat loop. If the model can't be
         # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY, or omni
@@ -2224,6 +2437,28 @@ async def generate_clip(
             "total_duration_seconds": total_duration,
             "beat_count": len(beats),
         }
+        # Total what the segments actually rendered, segment by segment —
+        # summing the runtime into one estimate would snap it to 8s.
+        try:
+            from .pricing import sum_costs
+
+            segment_costs = [
+                _video_cost_estimate(
+                    seg.get("model", beat_model),
+                    float(seg.get("duration_seconds") or 0),
+                    resolution="720p",
+                    include_audio=bool(seg.get("audio_enabled", include_audio)),
+                    actual=True,
+                )
+                for seg in segments
+                if seg.get("video_url")
+            ]
+            if segment_costs:
+                clip_manifest["cost"] = _cost_payload(
+                    sum_costs(segment_costs, label="clip")
+                )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Could not total clip cost", exc_info=True)
         if errors:
             clip_manifest["errors"] = errors
         if clip_warnings:
@@ -2250,6 +2485,7 @@ async def generate_video_omni(
     previous_interaction_id: str | None = None,
     output_gcs_uri: str | None = None,
     timeout_seconds: int = 600,
+    dry_run: bool = False,
 ) -> str:
     """Generate a video fast with gemini-omni-flash (Interactions API).
 
@@ -2273,6 +2509,9 @@ async def generate_video_omni(
         timeout_seconds: Overall deadline for the render (create + polling).
             Generation typically takes over a minute; raise for long queues.
 
+        dry_run: When True, return only the cost estimate for the clamped
+            duration and generate nothing.
+
     Returns:
         JSON with video_url, interaction_id (pass to edit_video / this tool to
         keep editing), and generation details.
@@ -2283,6 +2522,26 @@ async def generate_video_omni(
         # clamps to [3, 10]s, which would turn a negative or NaN duration
         # into a billed 3s render instead of an error.
         _validate_duration_seconds(duration_seconds)
+
+        if dry_run:
+            # Mirror the impl's clamp so the quote matches the render.
+            clamped = min(10, max(3, round(duration_seconds)))
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "message": "Estimate only — nothing was generated",
+                    "model": OMNI_MODEL,
+                    "duration_seconds": clamped,
+                    "estimated_cost": _video_cost(
+                        OMNI_MODEL,
+                        float(clamped),
+                        resolution="720p",
+                        include_audio=False,
+                        presnapped=True,
+                    ),
+                },
+                indent=2,
+            )
         data_dir = app_ctx.data_folder
 
         if output_gcs_uri:
@@ -2354,6 +2613,7 @@ async def edit_video(
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
     timeout_seconds: int = 600,
+    dry_run: bool = False,
 ) -> str:
     """Conversationally edit a video generated by gemini-omni-flash.
 
@@ -2373,6 +2633,9 @@ async def edit_video(
         duration_seconds: Desired duration, clamped to 3-10s (default 6)
         timeout_seconds: Overall deadline for the edit render (default 600)
 
+        dry_run: When True, return only the cost estimate for the clamped
+            duration and generate nothing.
+
     Returns:
         JSON with the edited video_url and a new interaction_id for further edits.
     """
@@ -2382,6 +2645,26 @@ async def edit_video(
         # clamps to [3, 10]s, which would turn a negative or NaN duration
         # into a billed 3s render instead of an error.
         _validate_duration_seconds(duration_seconds)
+
+        if dry_run:
+            # Mirror the impl's clamp so the quote matches the render.
+            clamped = min(10, max(3, round(duration_seconds)))
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "message": "Estimate only — nothing was generated",
+                    "model": OMNI_MODEL,
+                    "duration_seconds": clamped,
+                    "estimated_cost": _video_cost(
+                        OMNI_MODEL,
+                        float(clamped),
+                        resolution="720p",
+                        include_audio=False,
+                        presnapped=True,
+                    ),
+                },
+                indent=2,
+            )
 
         await ctx.info(f"Editing video (interaction {previous_interaction_id})")
         result = await _omni_generate_and_manifest(
@@ -2411,6 +2694,7 @@ async def loop_extend(
     aspect_ratio: str = "16:9",
     include_audio: bool = True,
     output_gcs_uri: str | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Extend a Veo-generated video multiple times in one call.
 
@@ -2429,6 +2713,8 @@ async def loop_extend(
         include_audio: Generate audio on the extended sections (default True,
             so extending an audio video doesn't go silent; Vertex only)
         output_gcs_uri: GCS output URI (required on Vertex for extensions)
+        dry_run: When True, return only the cost of the extension chain
+            (times x ~7s at the model's rate) and generate nothing.
 
     Returns:
         JSON with the final video_url and the ordered list of intermediate
@@ -2440,6 +2726,26 @@ async def loop_extend(
 
         if times < 1 or times > 20:
             raise ValueError("times must be between 1 and 20.")
+
+        if dry_run:
+            # Each extension is a ~7s Veo render billed like any other.
+            return json.dumps(
+                {
+                    "dry_run": True,
+                    "message": "Estimate only — nothing was generated",
+                    "model": model,
+                    "times": times,
+                    "added_seconds": times * 7,
+                    "estimated_cost": _video_cost(
+                        model,
+                        float(times * 7),
+                        resolution="720p",
+                        include_audio=include_audio,
+                        presnapped=True,  # 7s steps must not re-snap to 8
+                    ),
+                },
+                indent=2,
+            )
         if model in _VEO_LITE_MODELS:
             raise ValueError("Veo 3.1 Lite does not support video extension.")
         _validate_aspect_ratio(aspect_ratio)
@@ -2513,6 +2819,16 @@ async def loop_extend(
             "times": times,
             "extension_steps": steps,
         }
+        cost = _video_cost(
+            served_model,
+            float(times * 7),
+            resolution="720p",
+            include_audio=include_audio,
+            actual=True,
+        )
+        if cost:
+            result["cost"] = cost
+            manifest["cost"] = cost
         if step_warnings:
             # Same warning repeats per step; dedupe, preserving order.
             deduped = list(dict.fromkeys(step_warnings))

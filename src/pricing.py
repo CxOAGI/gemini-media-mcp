@@ -1067,13 +1067,17 @@ def cost_to_dict(estimate: CostEstimate | None) -> dict[str, Any] | None:
     """Convert a cost to a JSON-safe dict for an MCP tool response."""
     if estimate is None:
         return None
+    # The tool response is a presentation boundary: intermediate arithmetic
+    # stays full-precision, but 3 * $0.80 must not reach a caller as
+    # $2.4000000000000004. Six decimals keeps sub-cent precision for the
+    # smallest real charges (a 512px image is ~$0.045).
     return {
-        "usd": estimate.usd,
+        "usd": round(estimate.usd, 6),
         "usd_display": format_cost(estimate),
         "is_estimate": estimate.is_estimate,
         "unit": estimate.unit,
         "detail": estimate.detail,
-        "breakdown": dict(estimate.breakdown),
+        "breakdown": {k: round(v, 6) for k, v in estimate.breakdown.items()},
         "pricing_as_of": PRICING_AS_OF,
     }
 

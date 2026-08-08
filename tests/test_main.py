@@ -4804,3 +4804,175 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
     )
     assert payload["errors"] and "first_frame" in str(payload["errors"][0])
     assert payload["segments"] == []
+
+
+# ============================================================================
+# dry_run + cost on the video tools
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "expected_usd"),
+    [
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-generate-001",
+                "duration_seconds": 8,
+                "resolution": "1080p",
+            },
+            3.2,
+            id="veo_1080p",
+        ),
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-generate-001",
+                "duration_seconds": 8,
+                "draft": True,
+            },
+            0.81088,
+            id="draft_prices_omni_not_veo",
+        ),
+        pytest.param(
+            "generate_transition",
+            {"first_frame_uri": "f", "last_frame_uri": "l"},
+            0.4,
+            id="transition",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {"from_clip_uri": "a", "to_clip_uri": "b"},
+            0.4,
+            id="bridge",
+        ),
+        pytest.param(
+            "loop_extend",
+            {"video_uri": "file:///x.mp4", "times": 4},
+            11.2,
+            id="loop_extend_prices_7s_steps_not_snapped_8s",
+        ),
+        pytest.param(
+            "generate_video_omni",
+            {"prompt": "x", "duration_seconds": 6},
+            0.60816,
+            id="omni",
+        ),
+        pytest.param(
+            "edit_video",
+            {"previous_interaction_id": "i", "prompt": "x"},
+            0.60816,
+            id="edit",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_dry_runs_quote_without_spending(
+    tool: str,
+    kwargs: dict[str, Any],
+    expected_usd: float,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every video tool can be priced before committing, and a dry run must
+    never reach a generation impl. The draft case must quote omni's rate, and
+    loop_extend must price its ~7s steps rather than snapping 28s to 8s."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    for impl in ("generate_video_impl", "generate_video_omni_impl"):
+        monkeypatch.setattr(main_mod, impl, must_not_spend)
+
+    payload = json.loads(
+        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+    )
+    assert payload["dry_run"] is True
+    assert payload["estimated_cost"]["usd"] == pytest.approx(expected_usd)
+    assert payload["estimated_cost"]["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_clip_dry_run_prices_beats_and_bridges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reel is the most expensive call in the server; its quote must count
+    every render — bridges included — and the animatic quote must use omni."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+    beats = [{"prompt": "b", "duration_seconds": 8}] * 3
+
+    plain = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+        )
+    )
+    bridged = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+        )
+    )
+    animatic = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, animatic=True, dry_run=True
+        )
+    )
+    assert plain["estimated_cost"]["usd"] == pytest.approx(3 * 0.8)
+    # Two 4s bridge renders on the fast tier.
+    assert bridged["bridge_count"] == 2
+    assert bridged["estimated_cost"]["usd"] == pytest.approx(3 * 0.8 + 2 * 0.4)
+    assert animatic["model"] == "gemini-omni-flash-preview"
+    # Writing this test surfaced the real economics: omni ($0.10136/s) is
+    # price-PARITY with the fast tier ($0.10/s), not cheaper. The animatic's
+    # value against the default model is avoiding a wasted full render, and
+    # it IS ~4x cheaper than the standard/1080p tiers.
+    assert animatic["estimated_cost"]["usd"] == pytest.approx(24 * 0.10136)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_real_run_reports_metered_cost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real run's cost comes from the effective duration the impl reports —
+    a 5s request that snapped to 4s must bill 4s, not 5."""
+    import src.__main__ as main_mod
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "v.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs["prompt"],
+            "model": "veo-3.1-generate-preview",
+            "duration_seconds": 4,  # snapped from the 5s request
+            "audio_enabled": True,
+            "generation_mode": "text_to_video",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", mock_impl)
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path),
+            prompt="a cat",
+            model="veo-3.1-generate-001",
+            duration_seconds=5.0,
+        )
+    )
+    assert payload["cost"]["usd"] == pytest.approx(4 * 0.40)
+    manifest = json.loads(Path(payload["sidecar_url"][7:]).read_text())
+    assert manifest["cost"]["usd"] == payload["cost"]["usd"]

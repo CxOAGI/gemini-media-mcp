@@ -113,6 +113,9 @@ This writes files to your host path and returns paths like `/Users/yourusername/
 
 ## Available Tools
 
+**Every generation tool supports `dry_run: true`** — it returns the cost estimate for the exact call that would run (rerouted model, snapped duration, bridges counted) and generates nothing. Real runs report the metered cost in the response and the sidecar manifest. `generate_clip` is the one to always price first: 3 beats at 8s is $2.40 on the fast tier and $9.60 on standard.
+
+
 ### plan_generation
 
 **Start here when you are not sure which tool or model to use.** Describe what you want in plain language and get back ranked, ready-to-call plans — which tool, which model, which parameters, why that model won, what each option costs, and which models were ruled out and for what reason.
