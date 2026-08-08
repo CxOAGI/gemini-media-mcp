@@ -377,16 +377,21 @@ _VIDEO_PROFILES: dict[str, ModelProfile] = {
     OMNI_MODEL: ModelProfile(
         model=OMNI_MODEL,
         media_kind="video",
-        cost_index=0.0,
+        # Grounded in the published rates, not vibes: omni is $0.10136/s
+        # against Fast's $0.10/s, so it is marginally the DEARER of the two.
+        # It sat at 0.0 — the cheapest slot in the family — which made a
+        # budget=cheap request rank a $0.4054 route above a $0.40 one.
+        cost_index=0.27,
         fidelity_index=0.30,
         speed_index=1.0,
         text_rendering_index=0.0,
-        summary="fast, cheap 720p/24fps drafts with conversational editing",
+        summary="fastest 720p/24fps drafts with conversational editing",
     ),
     "veo-3.1-lite-generate-preview": ModelProfile(
         model="veo-3.1-lite-generate-preview",
         media_kind="video",
-        cost_index=0.25,
+        # $0.05/s — genuinely the cheapest video route.
+        cost_index=0.0,
         fidelity_index=0.60,
         speed_index=0.80,
         text_rendering_index=0.0,
@@ -395,7 +400,8 @@ _VIDEO_PROFILES: dict[str, ModelProfile] = {
     "veo-3.1-fast-generate-001": ModelProfile(
         model="veo-3.1-fast-generate-001",
         media_kind="video",
-        cost_index=0.60,
+        # $0.10/s — half the standard tier, a hair under omni.
+        cost_index=0.25,
         fidelity_index=0.85,
         speed_index=0.60,
         text_rendering_index=0.0,
@@ -803,6 +809,16 @@ _MINUTES_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(?:m\b|min\b|mins\b|minute\b|minutes\b)"
 )
 
+# "by another 30 seconds", "add 20s", "extend by 2 minutes" — an amount to
+# ADD, not a total. Without this, the plain duration pattern takes the first
+# number in the sentence, so "extend my 8 second clip by another 30 seconds"
+# read the SOURCE length and planned one 7s extension instead of five.
+_ADDED_DURATION_PATTERN = re.compile(
+    r"(?:by|add|plus|another)\s+(?:another\s+)?(\d+(?:\.\d+)?)\s*"
+    r"(?:-|\s)?\s*(s\b|sec\b|secs\b|second\b|seconds\b"
+    r"|m\b|min\b|mins\b|minute\b|minutes\b)"
+)
+
 # "3 beats", "5 shots", "4 scenes" — how many segments the output has.
 _BEAT_PATTERN = re.compile(r"(\d+)\s*(?:beats?|shots?|scenes?|cuts?|segments?)\b")
 
@@ -912,6 +928,11 @@ class IntentSignals:
     wants_best: bool = False
     aspect_ratio: str | None = None
     duration_seconds: float | None = None
+    # Seconds to ADD, when the intent asked for an amount rather than a total
+    # ("by another 30 seconds"). Distinct from duration_seconds because an
+    # extension request names a delta, and reading it as a total plans one
+    # 7s extension for a 30s ask.
+    added_duration_seconds: float | None = None
     beat_count: int | None = None
     reference_image_count: int | None = None
     matched_terms: tuple[str, ...] = ()
@@ -957,6 +978,13 @@ def infer_signals(intent: str) -> IntentSignals:
 
     duration_match = _DURATION_PATTERN.search(text)
     minutes_match = _MINUTES_PATTERN.search(text)
+    added_match = _ADDED_DURATION_PATTERN.search(text)
+    added_duration: float | None = None
+    if added_match is not None:
+        added_value = float(added_match.group(1))
+        added_duration = (
+            added_value * 60.0 if added_match.group(2).startswith("m") else added_value
+        )
     if duration_match is not None:
         duration = float(duration_match.group(1))
     elif minutes_match is not None:
@@ -1042,6 +1070,7 @@ def infer_signals(intent: str) -> IntentSignals:
         wants_best=bool(best_hits),
         aspect_ratio=aspect_ratio,
         duration_seconds=duration,
+        added_duration_seconds=added_duration,
         beat_count=beat_count,
         reference_image_count=reference_count,
         matched_terms=matched,
@@ -1207,6 +1236,9 @@ class ResolvedRequest:
     last_frame_uri: str | None
     source_video_uri: str | None
     needs_extension: bool
+    # Seconds the caller asked to ADD, when they named an amount rather than
+    # a total runtime. Drives the extension count directly.
+    added_duration_seconds: float | None
     # True when extension was implied by a long runtime rather than asked
     # for. An implied extension has no source video yet, so the plan must
     # lead with a seed render; an explicit one references a clip the
@@ -1415,6 +1447,7 @@ def resolve_request(
         last_frame_uri=given.last_frame_uri,
         source_video_uri=given.source_video_uri,
         needs_extension=bool(needs_extension),
+        added_duration_seconds=signals.added_duration_seconds,
         extension_implied=bool(
             needs_extension
             and implied_extension
@@ -2147,7 +2180,15 @@ def _video_params(
         )
     elif tool == "loop_extend":
         times = 1
-        if request.total_duration_seconds is not None:
+        if request.added_duration_seconds is not None:
+            # The caller named an amount to add, so use it directly rather
+            # than deriving a delta from a total that may be the SOURCE
+            # clip's length.
+            times = max(
+                1,
+                math.ceil(request.added_duration_seconds / VEO_EXTENSION_SECONDS),
+            )
+        elif request.total_duration_seconds is not None:
             extra = request.total_duration_seconds - VEO_MAX_CLIP_SECONDS
             times = max(1, math.ceil(extra / VEO_EXTENSION_SECONDS))
         if times > VEO_MAX_EXTENSIONS:
@@ -2320,7 +2361,8 @@ def _aggregate_video_cost(
         source=getattr(probe, "source", None),
         source_note=getattr(probe, "source_note", None),
         detail=(
-            f"{segments} renders totalling {total_seconds:g}s @ {resolution} on "
+            f"{segments} render{'s' if segments != 1 else ''} totalling "
+            f"{total_seconds:g}s @ {resolution} on "
             f"{model} (${rate:g}/s)"
         ),
         breakdown={

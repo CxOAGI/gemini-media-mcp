@@ -620,7 +620,15 @@ def test_omni_is_reached_through_its_own_tool() -> None:
     [
         ("a video of a cat", None, DEFAULT_VIDEO_MODEL),
         ("a video of a cat", RoutingConstraints(budget="best"), VEO),
-        ("a video of a cat", RoutingConstraints(budget="cheap"), OMNI_MODEL),
+        # Lite, not omni: omni is $0.10136/s against Lite's $0.05/s. This case
+        # asserted omni until its cost_index was corrected from 0.0 — the
+        # cheapest slot in the family — which had a budget=cheap request
+        # ranking a $0.4054 route above a $0.40 one.
+        (
+            "a video of a cat",
+            RoutingConstraints(budget="cheap"),
+            "veo-3.1-lite-generate-preview",
+        ),
     ],
 )
 def test_video_ranking(
@@ -1448,3 +1456,90 @@ def test_planner_and_tool_agree_on_extension_price() -> None:
     )
     assert tool_quote is not None
     assert top.cost.usd == pytest.approx(tool_quote.usd)
+
+
+def test_video_cost_indices_track_the_published_rates() -> None:
+    """The routing profiles' cost_index must order the same way real money
+    does, or budget=cheap recommends the dearer route.
+
+    omni sat at 0.0 — the cheapest slot in the family — while actually costing
+    $0.10136/s against Veo Fast's $0.10/s, so a cheap budget ranked a $0.4054
+    route above a $0.40 one and called it "cheap".
+    """
+    from src.pricing import estimate_video_cost
+    from src.routing import _VIDEO_PROFILES
+
+    by_rate: list[tuple[float, float, str]] = []
+    for model, profile in _VIDEO_PROFILES.items():
+        cost = estimate_video_cost(model, 8, "720p", True)
+        assert cost is not None, model
+        by_rate.append((cost.breakdown["usd_per_second"], profile.cost_index, model))
+
+    ranked = sorted(by_rate)
+    indices = [cost_index for _rate, cost_index, _model in ranked]
+    assert indices == sorted(indices), (
+        "cost_index must be non-decreasing in real $/s; got "
+        + ", ".join(f"{m}={c} at ${r}/s" for r, c, m in ranked)
+    )
+
+
+def test_a_cheap_budget_never_recommends_a_dearer_route() -> None:
+    """The end-to-end version of the above: the top route under budget=cheap
+    must not cost more than a route it outranked."""
+    from src.pricing import estimate_video_cost
+
+    plan = plan_generation(
+        "a video of steam", RoutingConstraints(budget="cheap", duration_seconds=4)
+    )
+    costs = [
+        (route.model, estimate_video_cost(route.model, 4, "720p", True))
+        for route in plan.routes
+    ]
+    priced = [(m, c.usd) for m, c in costs if c is not None]
+    assert priced
+    top_model, top_cost = priced[0]
+    assert top_cost == min(usd for _m, usd in priced), (
+        f"{top_model} won on a cheap budget at ${top_cost}, but a cheaper "
+        f"route was available: {priced}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected_times"),
+    [
+        pytest.param(
+            "extend my existing 8 second clip by another 30 seconds",
+            5,
+            id="delta_after_a_source_length",
+        ),
+        pytest.param("extend this by another 30 seconds", 5, id="delta_only"),
+        pytest.param("extend this by 2 minutes", 18, id="delta_in_minutes"),
+        pytest.param("extend this clip", 1, id="no_amount_named"),
+    ],
+)
+def test_an_extension_amount_is_read_as_a_delta_not_a_total(
+    intent: str, expected_times: int
+) -> None:
+    """ "extend my 8 second clip by another 30 seconds" planned ONE 7s
+    extension. The duration pattern takes the first number in the sentence,
+    which here is the SOURCE clip's length, not the amount to add. An amount
+    named with "by"/"add"/"another" now drives the extension count directly.
+    """
+    plan = plan_generation(
+        intent,
+        RoutingConstraints(needs_extension=True, source_video_uri="file:///v.mp4"),
+    )
+    top = plan.recommended
+    assert top is not None
+    assert top.params["times"] == expected_times
+
+
+def test_a_single_render_is_not_described_in_the_plural() -> None:
+    """Cosmetic, but it is the first line a caller reads: "1 renders"."""
+    plan = plan_generation(
+        "extend this clip",
+        RoutingConstraints(needs_extension=True, source_video_uri="file:///v.mp4"),
+    )
+    top = plan.recommended
+    assert top is not None and top.cost is not None
+    assert "1 render totalling" in top.cost.detail

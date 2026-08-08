@@ -1537,13 +1537,13 @@ async def generate_video(
             estimate for the call that would run (the omni draft price when
             draft=True). Free and instant. A real run reports the actual
             cost, derived from the effective duration the API rendered.
-        draft: When True, route to gemini-omni-flash for a fast 720p draft.
-               Faster, but NOT cheaper than veo-3.1-fast-generate-001: omni is
-               $0.10136/s against Fast's $0.10/s. The saving is real only
-               against veo-3.1-generate-001 ($0.40/s). Use it for speed and to
-               avoid burning a full-fidelity render on a bad idea.
-            instead of Veo. Iterate fast, then re-run with draft=False to
-            finalize on Veo. Omni ignores Veo-only controls (seed,
+        draft: When True, route to gemini-omni-flash for a fast 720p draft
+            instead of Veo, then re-run with draft=False to finalize.
+            Faster, but NOT cheaper than veo-3.1-fast-generate-001: omni is
+            $0.10136/s against Fast's $0.10/s. The saving is real only against
+            veo-3.1-generate-001 ($0.40/s), so use draft for speed and to
+            avoid burning a full-fidelity render on a bad idea — not to spend
+            less than Fast. Omni ignores Veo-only controls (seed,
             negative_prompt, resolution, last frame, reference images,
             extension); any that were passed are noted in the response.
 
@@ -2628,7 +2628,10 @@ async def generate_video_omni(
             video conversationally (see also the edit_video tool)
         output_gcs_uri: Optional gs:// destination for the video (Vertex only;
             ignored with a warning on the Gemini API, which returns bytes
-            inline). Must be in the configured bucket allowlist.
+            inline). Checked against the bucket allowlist when one is
+            configured (GCS_ALLOWED_BUCKETS / VIDEO_GCS_BUCKET); with no
+            allowlist set the server warns and defers to ambient
+            credentials, so a dry run quotes rather than refusing.
         timeout_seconds: Overall deadline for the render (create + polling).
             Generation typically takes over a minute; raise for long queues.
 
@@ -2759,9 +2762,12 @@ async def edit_video(
         timeout_seconds: Overall deadline for the edit render (default 600)
 
         dry_run: When True, return only the cost estimate and generate
-            nothing. NOTE: an edit inherits duration and aspect ratio from the
-            source video, so the quote is for the source's length, which this
-            tool cannot know in advance — treat it as a lower bound.
+            nothing. An edit inherits duration and aspect ratio from the source
+            video, so the quote resolves the source's real length from the
+            sidecar written when it was generated — no API call, and exact when
+            this server produced the source. For a source generated elsewhere
+            the length is unknowable, so the quote falls back to the requested
+            duration and says so in `duration_source`.
 
     Returns:
         JSON with the edited video_url and a new interaction_id for further edits.
