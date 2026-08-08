@@ -283,6 +283,7 @@ This is the highest-leverage tool in the server: one call produces a whole seque
 - `aspect_ratio`: Default `9:16` for vertical social clips
 - `model`: VEO model applied to every beat (default `veo-3.1-fast-generate-001`)
 - `include_audio`: Audio per beat (Vertex only)
+- `beats` are capped at 20 per call — each is a billed Veo render, and `add_bridges` nearly doubles that. Split longer sequences into several clips
 - `add_bridges`: Generate a transition between consecutive beats using the last frame of beat N and the first frame of beat N+1. Requires local (`file://`) beat outputs
 - `animatic`: Render every beat with `gemini-omni-flash` (fast, cheap 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
 - `output_gcs_uri`: GCS URI for all outputs

@@ -49,6 +49,12 @@ MAX_HTTP_REDIRECTS = 5
 # error rather than a silent truncation.
 MAX_STORYBOARD_SHOTS = 24
 
+# Upper bound on beats in one clip. Same reasoning as the storyboard cap, but
+# it matters far more here: a beat is a Veo render costing roughly a hundred
+# times an image and taking minutes, and add_bridges nearly doubles the count.
+# Matches loop_extend's existing ceiling of 20 chained renders.
+MAX_CLIP_BEATS = 20
+
 
 def _decode_base64_capped(data: str, max_bytes: int | None = None) -> bytes:
     """Base64-decode input and enforce the same size cap as URI fetches.
@@ -1947,6 +1953,12 @@ async def generate_clip(
 
         if not beats:
             raise ValueError("beats list must not be empty")
+        if len(beats) > MAX_CLIP_BEATS:
+            raise ValueError(
+                f"beats has {len(beats)} entries; the limit is {MAX_CLIP_BEATS} "
+                "because every beat is a billed Veo render, and add_bridges "
+                "nearly doubles that. Split the sequence into several clips."
+            )
 
         # Validate every beat before rendering any of them. A bad duration in
         # beat 5 would otherwise only surface after beats 1-4 had been

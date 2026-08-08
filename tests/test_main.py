@@ -4652,3 +4652,37 @@ def test_http_transport_bind_address(
         resolved = os.environ["FASTMCP_HOST"]
 
     assert resolved == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_refuses_an_oversized_beat_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The storyboard cap was never traced to generate_clip, which has the same
+    unbounded-billed-renders shape but roughly a hundred times the unit cost:
+    500 beats at 8s is about $400 of Veo, uncapped, one render at a time.
+    """
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("an oversized clip must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+
+    result = await main_mod.generate_clip(
+        ctx=_video_ctx(tmp_path),
+        beats=[{"prompt": f"beat {i}"} for i in range(main_mod.MAX_CLIP_BEATS + 1)],
+    )
+    error = json.loads(result)["error"]
+    assert str(main_mod.MAX_CLIP_BEATS) in error
+    assert "billed" in error
+
+
+def test_billed_batch_tools_all_have_a_ceiling() -> None:
+    """Any tool that loops over a caller-supplied list of billed renders needs
+    a cap. This is the check that would have caught generate_clip."""
+    from src.__main__ import MAX_CLIP_BEATS, MAX_STORYBOARD_SHOTS
+
+    assert 0 < MAX_STORYBOARD_SHOTS <= 100
+    assert 0 < MAX_CLIP_BEATS <= 100
