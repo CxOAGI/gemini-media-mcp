@@ -716,3 +716,124 @@ async def test_the_planner_still_agrees_with_generate_videos_quote(
     )
 
     assert payload["estimated_cost"]["usd"] == pytest.approx(round(route.cost.usd, 6))
+
+
+# ============================================================================
+# An omni EDIT is any turn that continues footage — a prior interaction OR an
+# input video. Both send no duration and render a service-chosen ~10s length,
+# so both quote and both bill the 10s upper bound, never the request.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_input_video_edit_dry_run_quotes_the_upper_bound(
+    tmp_path: Path,
+) -> None:
+    """The quote for an input-video edit must match edit_video's, not the
+    clamped request — under-quoting it 3.3x was the same defect edit_video
+    already fixed, surviving because the guard keyed on previous_interaction_id
+    while omni also treats input_video_uri as an edit."""
+    from src.__main__ import edit_video, generate_video_omni
+    from src.omni import OMNI_MAX_DURATION_SECONDS
+
+    omni = json.loads(
+        await generate_video_omni(
+            ctx=_make_ctx(tmp_path),
+            prompt="make it night",
+            input_video_uri="gs://bucket/source.mp4",
+            duration_seconds=3,
+            dry_run=True,
+        )
+    )
+    assert omni["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert "upper bound" in omni["duration_source"]
+
+    # It agrees with the tool built for edits, to the cent.
+    edit = json.loads(
+        await edit_video(
+            ctx=_make_ctx(tmp_path),
+            previous_interaction_id="i-1",
+            prompt="make it night",
+            dry_run=True,
+        )
+    )
+    assert omni["estimated_cost"]["usd"] == edit["estimated_cost"]["usd"]
+    # And it does NOT collapse to the clamped-request price.
+    assert omni["estimated_cost"]["usd"] > 3 * 0.10136
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_fresh_omni_dry_run_still_quotes_the_clamped_request(
+    tmp_path: Path,
+) -> None:
+    """The edit branch must not swallow a genuine fresh render, which IS
+    honoured at its clamped length."""
+    from src.__main__ import generate_video_omni
+
+    fresh = json.loads(
+        await generate_video_omni(
+            ctx=_make_ctx(tmp_path), prompt="a dog", duration_seconds=3, dry_run=True
+        )
+    )
+    assert fresh["duration_seconds"] == 3
+    assert fresh["estimated_cost"]["usd"] < 0.4
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_input_video_edit_bills_the_upper_bound_when_unmeasurable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real-run counterpart: an input-video edit delivered to gs:// could
+    not be measured and was billing the raw 3s request at metered confidence,
+    3.3x under the ~10s an edit actually renders."""
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        # Exactly what omni returns for an edit task: no duration on the wire.
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/out.mp4",
+            "interaction_id": "i-new",
+            "model": OMNI_MODEL,
+            "duration_seconds": None,
+            "aspect_ratio": None,
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(
+        main_mod, "_client_for_omni", lambda app_ctx, need_gcs=False: MagicMock()
+    )
+    app_ctx = _make_ctx(tmp_path).request_context.lifespan_context
+
+    result = await main_mod._omni_generate_and_manifest(
+        app_ctx,
+        _make_ctx(tmp_path),
+        prompt="make it night",
+        input_video_bytes=b"a video",
+        duration_seconds=3.0,
+    )
+    assert result["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert result["duration_source"].startswith("upper bound")
+    assert result["cost"]["is_estimate"] is True
+    assert result["cost"]["usd"] > 3 * 0.10136
+
+
+def test_actual_video_cost_rejects_a_nonfinite_or_negative_duration() -> None:
+    """A negative duration bills a negative amount; NaN serializes as
+    invalid-JSON `NaN`. estimate_video_cost guards both — the metered path
+    must too, even though callers currently snap to finite ints upstream."""
+    from src.pricing import actual_video_cost
+
+    for bad in (-5.0, float("nan"), float("inf"), float("-inf")):
+        assert (
+            actual_video_cost(VEO, bad, "720p", False, snap_duration=False) is None
+        ), bad
+    # A real duration still prices.
+    ok = actual_video_cost(VEO, 4.0, "720p", False, snap_duration=False)
+    assert ok is not None and ok.usd == pytest.approx(1.6)

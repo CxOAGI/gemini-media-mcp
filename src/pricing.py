@@ -1026,6 +1026,17 @@ def actual_video_cost(
         # No duration and no token counts: there is nothing to price from.
         return None
 
+    # Same guard estimate_video_cost applies: a negative duration would bill a
+    # negative dollar amount, and NaN survives a bare < 0 check and serializes
+    # as invalid-JSON `NaN`. Current callers snap to finite ints upstream, so
+    # this hardens the public entry point rather than fixing a live path.
+    try:
+        duration_seconds = float(duration_seconds)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(duration_seconds) or duration_seconds < 0:
+        return None
+
     usd_per_second = pricing.usd_per_second_by_resolution.get(effective_resolution)
     if usd_per_second is None:
         return None

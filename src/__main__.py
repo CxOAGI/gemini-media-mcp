@@ -370,8 +370,17 @@ async def _omni_generate_and_manifest(
             effective_duration = measured
             duration_source = "measured from the rendered video"
 
+    # An edit is any turn that continues existing footage — a prior
+    # interaction OR an input video — mirroring omni's own _select_task_type.
+    # Both send no duration on the wire and come back with duration_seconds
+    # None, so keying the upper-bound rule on previous_interaction_id alone
+    # missed the input-video edit: it fell through to the fresh-render branch,
+    # which billed the raw request (3.3x low) and labelled it "the length
+    # asked for" — the falsified inherit model, resurrected on the second
+    # edit form.
+    is_edit = bool(previous_interaction_id) or input_video_bytes is not None
     billed_upper_bound = False
-    if effective_duration is None and previous_interaction_id:
+    if effective_duration is None and is_edit:
         # An edit whose render cannot be measured (e.g. gs:// delivery). Two
         # measurements put the render at Omni's maximum regardless of the
         # source (3.00s and 3.01s sources both rendered 10.01s), so billing
@@ -3530,7 +3539,40 @@ async def generate_video_omni(
                 gcs_warnings.append(allowlist_warning)
 
         if dry_run:
-            # Mirror the impl's clamp so the quote matches the render.
+            # An input video (or a prior interaction) makes this an edit —
+            # omni._select_task_type keys on either — and an edit sends no
+            # duration and renders a service-chosen length that measured 10s
+            # regardless of the request. Quoting the clamped request here
+            # under-quoted an input-video edit 3.3x, the same defect edit_video
+            # already fixed; match it and quote the maximum as an upper bound.
+            if previous_interaction_id or input_video_uri:
+                quoted = float(OMNI_MAX_DURATION_SECONDS)
+                return json.dumps(
+                    {
+                        "dry_run": True,
+                        "message": "Estimate only — nothing was generated",
+                        "model": OMNI_MODEL,
+                        "duration_seconds": quoted,
+                        "duration_source": (
+                            "upper bound: an edit's rendered length is chosen "
+                            "by the service and is not predictable from the "
+                            f"request or the source, so this quotes Omni's "
+                            f"{OMNI_MAX_DURATION_SECONDS}s maximum. The real "
+                            "run reports the measured duration."
+                        ),
+                        "estimated_cost": _video_cost(
+                            OMNI_MODEL,
+                            quoted,
+                            resolution="720p",
+                            include_audio=False,
+                            presnapped=True,
+                        ),
+                        **({"warnings": gcs_warnings} if gcs_warnings else {}),
+                    },
+                    indent=2,
+                )
+            # A fresh render honours the clamped request; mirror the impl's
+            # clamp so the quote matches what it will bill.
             clamped = min(10, max(3, round(duration_seconds)))
             return json.dumps(
                 {
