@@ -215,8 +215,9 @@ def _build_create_kwargs(
         so conversational-edit turns send NO generation_config;
       * edit tasks reject ``duration`` in response_format ("Duration cannot
         be set in response format for edit task") — duration and aspect
-        ratio are inherited from the source video, so neither is sent for
-        any edit-type request.
+        ratio cannot be sent for an edit-type request, so neither is. What
+        the service then renders is undocumented and is NOT the source's
+        length — a measured 3s source came back at 10.01s.
     """
     task_type = _select_task_type(
         previous_interaction_id=previous_interaction_id,
@@ -396,9 +397,11 @@ async def generate_video_omni(
         image_count=len(image_bytes_list or []),
     )
     if task_type == "edit":
-        # Edits inherit length and framing from the source video; the API
-        # rejects duration (and task alongside previous_interaction_id), so
-        # neither is sent.
+        # The API rejects duration (and task alongside previous_interaction_id)
+        # on an edit, so neither duration nor aspect ratio is sent. What the
+        # service then renders is NOT the source's length — a measured 3s
+        # source came back at 10.01s — and is undocumented, so the warning
+        # promises nothing and points at the measured figure instead.
         warnings.append(
             "Edit requests do not send duration_seconds or aspect_ratio — the "
             "API rejects them on an edit task — so the rendered length is "
@@ -490,7 +493,7 @@ async def generate_video_omni(
         "model": OMNI_MODEL,
         # For an edit the duration was never sent, so reporting the request
         # here would describe a render that did not happen — and the caller
-        # bills from this field. None means "inherited, resolve it upstream";
+        # bills from this field. None means "unknown here, resolve upstream";
         # the request is kept separately so nothing is lost.
         "duration_seconds": None if task_type == "edit" else clamped_duration,
         "requested_duration_seconds": clamped_duration,

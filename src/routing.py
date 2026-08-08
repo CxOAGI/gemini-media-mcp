@@ -2175,8 +2175,10 @@ def _video_params(
             "duration_seconds": duration,
         }
         caveats.append(
-            "Edits inherit duration and aspect ratio from the source video; the "
-            "values above are echoed for planning only."
+            "An edit does not send duration or aspect ratio — the API rejects "
+            "them on an edit task — and the rendered length is chosen by the "
+            "service, predictable from neither the request nor the source. "
+            "Cost is measured from the rendered file; a quote is an upper bound."
         )
     elif tool == "loop_extend":
         times = 1

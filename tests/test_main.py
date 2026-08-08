@@ -5589,3 +5589,38 @@ async def test_clip_quote_reports_the_ffmpeg_check_when_bridging(
         )
     )
     assert plain["preflight_checks"] == []
+
+
+def test_no_surface_claims_an_edit_inherits_the_source_duration() -> None:
+    """The inherit model is falsified and must not survive anywhere.
+
+    A measured 3s source edited with duration_seconds=4 rendered 10.01s, so
+    the length is neither the source's nor the request's. That claim was
+    written into a docstring, a runtime warning, a planner caveat and a
+    fallback string, and each was corrected in a different round because
+    nothing checked them together. This is the check that would have caught
+    all four at once.
+    """
+    import ast
+    import pathlib
+
+    offenders: list[str] = []
+    for path in sorted(pathlib.Path("src").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            # Docstrings and user-facing strings only; comments are exempt
+            # because they may legitimately describe the falsified model.
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            text = " ".join(node.value.lower().split())
+            if "inherit" not in text:
+                continue
+            claims_duration = "duration" in text or "length" in text
+            disclaims = any(
+                phrase in text
+                for phrase in ("not predictable", "chosen by the service")
+            )
+            if claims_duration and not disclaims:
+                offenders.append(f"{path.name}:{node.lineno}: {text[:80]}")
+
+    assert not offenders, "stale inherit-duration claim(s):\n" + "\n".join(offenders)

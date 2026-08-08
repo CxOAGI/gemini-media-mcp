@@ -20,8 +20,9 @@ def measure_video_duration(path: Path) -> float | None:
 
     The only duration source that cannot drift. Every other figure in this
     server is either the caller's request or a value the server previously
-    wrote down, so a wrong assumption propagates: an edit inherits its length
-    from its source, and each edit's sidecar seeds the next one's estimate.
+    wrote down, so a wrong assumption propagates: each edit's sidecar seeds the
+    next one's estimate, and an edit's rendered length is chosen by the
+    service rather than predictable from the request or the source.
     Measuring the artifact settles what actually rendered, independent of what
     was asked for or recorded.
 
