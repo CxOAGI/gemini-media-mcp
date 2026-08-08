@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -738,19 +739,31 @@ def _image_cost(
     return _cost_payload(_image_cost_estimate(model, image_size, usage=usage, n=n))
 
 
+# Bounds on the sidecar scan behind an edit_video quote. A media directory is
+# user-controlled and may sit on a network mount, so the lookup is capped in
+# every dimension rather than trusted to finish.
+_SIDECAR_SCAN_LIMIT = 200
+_SIDECAR_MAX_BYTES = 256 * 1024
+_SIDECAR_SCAN_TIMEOUT_SECONDS = 5.0
+
+
 def _source_duration_for_interaction(
     videos_dir: Path, interaction_id: str
 ) -> float | None:
     """Duration of a prior omni interaction, from the sidecars we wrote.
 
     An edit inherits its duration from the source video, so quoting the
-    caller's ``duration_seconds`` overstated a 3s edit by 3.3x when they asked
-    for 10s. The omni manifest already records ``interaction_id`` alongside
-    ``duration_seconds``, so the real length is discoverable locally — no API
-    call, which keeps a dry run free, instant and offline.
+    caller's ``duration_seconds`` overstated a 3s edit by 3.3x. The omni
+    manifest records ``interaction_id`` alongside ``duration_seconds``, so the
+    real length is discoverable locally — no API call, which keeps a dry run
+    free, instant and offline.
 
-    Returns None when the source was not produced by this server (or its
-    sidecar is gone), which is the honest "cannot know" answer.
+    Hardened because the media directory is caller-controlled and may live on
+    a network mount: a named pipe among the sidecars made ``read_text`` block
+    forever, hanging every edit_video quote. Only regular files are opened,
+    reads are size-capped, and the scan stops after a fixed number of
+    candidates. Anything unreadable is skipped, never fatal — the caller's
+    fallback already reports an unknown source honestly.
 
     Args:
         videos_dir: Directory the video sidecars are written to.
@@ -759,17 +772,25 @@ def _source_duration_for_interaction(
     Returns:
         The recorded duration in seconds, or None if it cannot be determined.
     """
+    candidates: list[tuple[float, Path]] = []
     try:
-        sidecars = sorted(
-            videos_dir.glob("*.json"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        for entry in videos_dir.glob("*.json"):
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            # Regular files only: a FIFO, socket or device node would block
+            # the read indefinitely, and a directory would raise.
+            if not S_ISREG(stat.st_mode) or stat.st_size > _SIDECAR_MAX_BYTES:
+                continue
+            candidates.append((stat.st_mtime, entry))
     except OSError:  # pragma: no cover - unreadable media dir
         return None
+
     # Newest first: an interaction id is chained forward by edits, so the most
     # recent manifest naming it is the closest ancestor of this edit.
-    for sidecar in sidecars[:200]:
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    for _mtime, sidecar in candidates[:_SIDECAR_SCAN_LIMIT]:
         try:
             manifest = json.loads(sidecar.read_text())
         except (OSError, ValueError):
@@ -780,6 +801,42 @@ def _source_duration_for_interaction(
         if isinstance(duration, (int, float)) and duration > 0:
             return float(duration)
     return None
+
+
+async def _source_duration_or_none(
+    videos_dir: Path, interaction_id: str
+) -> float | None:
+    """Run the sidecar lookup off the event loop, with a deadline.
+
+    Even bounded, this is filesystem work: on a slow or stale mount it would
+    stall the whole server, since one blocked coroutine blocks every request.
+    A timeout degrades to the honest "source unknown" quote rather than
+    hanging a call the caller was told is instant.
+
+    Note the worker thread cannot be cancelled — if the underlying syscall is
+    genuinely wedged the thread stays parked until the OS releases it. The
+    request returns regardless, which is the property that matters here; the
+    scan bounds keep the worst case to one thread per stuck edit quote.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _source_duration_for_interaction, videos_dir, interaction_id
+            ),
+            timeout=_SIDECAR_SCAN_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        # Deliberately broad: the fallback quote is honest about not knowing
+        # the source length, so nothing this lookup can do should fail a call
+        # the caller was promised is free and instant.
+        logger.warning(
+            "Sidecar lookup for interaction %s failed or exceeded %.0fs; "
+            "quoting the requested duration instead",
+            interaction_id,
+            _SIDECAR_SCAN_TIMEOUT_SECONDS,
+            exc_info=True,
+        )
+        return None
 
 
 def _video_cost_estimate(
@@ -2064,12 +2121,19 @@ async def generate_bridge(
             from .video import validate_render_options
 
             validate_render_options(model, generation_mode="first_last_frame")
+
+            # Report the environmental check positively. It runs above (and
+            # refuses when ffmpeg is missing), but a passing check looks
+            # identical to no check at all — which is exactly how a reviewer
+            # on an ffmpeg-equipped host read it.
+            preflight = ["ffmpeg available for frame decoding"]
             return json.dumps(
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
                     "model": model,
                     "duration_seconds": duration_seconds,
+                    "preflight_checks": preflight,
                     "estimated_cost": _video_cost(
                         model,
                         duration_seconds,
@@ -2785,7 +2849,7 @@ async def edit_video(
             # overstated a 3s edit by 3.3x. Recover the real length from the
             # sidecar of the interaction being edited; fall back to the
             # request only when the source is unknown, and say so.
-            source_duration = _source_duration_for_interaction(
+            source_duration = await _source_duration_or_none(
                 app_ctx.videos_dir, previous_interaction_id
             )
             payload: dict[str, Any] = {

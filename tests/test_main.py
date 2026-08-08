@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -5310,3 +5311,151 @@ def test_source_duration_lookup_survives_a_junk_sidecar(tmp_path: Path) -> None:
     assert _source_duration_for_interaction(videos_dir, "i-7") == 6.0
     assert _source_duration_for_interaction(videos_dir, "absent") is None
     assert _source_duration_for_interaction(tmp_path / "nope", "i-7") is None
+
+
+def test_sidecar_lookup_cannot_be_hung_by_a_non_regular_file(tmp_path: Path) -> None:
+    """A named pipe among the sidecars hung every edit_video quote forever.
+
+    Path.read_text() on a FIFO blocks until someone writes; the media
+    directory is caller-controlled and may sit on a network mount, so the
+    scan opens regular files only. Any real deployment hitting a stale mount
+    entry or a device node had the same failure.
+    """
+    import os
+
+    from src.__main__ import _source_duration_for_interaction
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    (videos_dir / "good.json").write_text(
+        json.dumps({"interaction_id": "i-1", "duration_seconds": 4})
+    )
+    os.mkfifo(videos_dir / "blocking.json")
+
+    # Would never return before the fix.
+    assert _source_duration_for_interaction(videos_dir, "i-1") == 4.0
+    assert _source_duration_for_interaction(videos_dir, "absent") is None
+
+
+def test_sidecar_lookup_skips_implausibly_large_files(tmp_path: Path) -> None:
+    """A manifest is a few hundred bytes. Slurping a multi-megabyte file that
+    happens to end in .json wastes time and memory for nothing."""
+    from src.__main__ import _SIDECAR_MAX_BYTES, _source_duration_for_interaction
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    padding = " " * (_SIDECAR_MAX_BYTES + 1)
+    (videos_dir / "huge.json").write_text(
+        json.dumps({"interaction_id": "i-1", "duration_seconds": 9}) + padding
+    )
+    assert _source_duration_for_interaction(videos_dir, "i-1") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_edit_video_quote_returns_even_when_the_lookup_stalls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quote is advertised as instant, so a slow or stale media mount must
+    degrade to the honest fallback rather than hang the request. One blocked
+    coroutine blocks the whole server."""
+    import src.__main__ as main_mod
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    def slow_lookup(*_args: Any, **_kwargs: Any) -> float | None:
+        # Comfortably past the deadline, but short enough that the worker
+        # finishes during the test: asyncio.to_thread cannot be cancelled, so
+        # a 30s sleep would outlive the event loop and error at teardown.
+        time.sleep(1.0)
+        return 3.0
+
+    monkeypatch.setattr(main_mod, "_source_duration_for_interaction", slow_lookup)
+    monkeypatch.setattr(main_mod, "_SIDECAR_SCAN_TIMEOUT_SECONDS", 0.2)
+
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="i-42",
+            prompt="x",
+            duration_seconds=6,
+            dry_run=True,
+        )
+    )
+    assert payload["dry_run"] is True
+    assert "unknown" in payload["duration_source"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_edit_video_dry_run_never_touches_the_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload that says "nothing was generated" must not have generated
+    anything — the hang raised a reasonable fear that the quote had started
+    reaching the interactions API and could be billing."""
+    import src.__main__ as main_mod
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    async def must_not_run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not reach the omni impl")
+
+    monkeypatch.setattr(main_mod, "_omni_generate_and_manifest", must_not_run)
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", must_not_run)
+
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="i-1",
+            prompt="x",
+            dry_run=True,
+        )
+    )
+    assert payload["message"].startswith("Estimate only")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_bridge_quote_reports_that_the_ffmpeg_check_ran(tmp_path: Path) -> None:
+    """A passing environmental check is invisible — it looks exactly like no
+    check at all, which is how two review rounds read it on an
+    ffmpeg-equipped host. The quote now says the check ran."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.generate_bridge(
+            ctx=_video_ctx(tmp_path),
+            from_clip_uri="a",
+            to_clip_uri="b",
+            dry_run=True,
+        )
+    )
+    assert any("ffmpeg" in check for check in payload["preflight_checks"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_bridge_quote_is_refused_without_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: the check must actually refuse, not merely announce."""
+    import imageio_ffmpeg
+
+    import src.__main__ as main_mod
+
+    def no_ffmpeg() -> str:
+        raise RuntimeError("No ffmpeg exe could be found")
+
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", no_ffmpeg)
+
+    payload = json.loads(
+        await main_mod.generate_bridge(
+            ctx=_video_ctx(tmp_path),
+            from_clip_uri="a",
+            to_clip_uri="b",
+            dry_run=True,
+        )
+    )
+    assert "ffmpeg is required" in payload["error"]
+    assert "estimated_cost" not in payload
