@@ -185,8 +185,13 @@ def _load_extend_video(location: Path, allowed_dir: Path | None) -> types.Video:
     if allowed_dir is not None:
         allowed = allowed_dir.resolve()
         if resolved != allowed and not resolved.is_relative_to(allowed):
+            # Same wording the fetch-based inputs use, so one confinement
+            # violation does not read two different ways depending on which
+            # parameter tripped it.
             raise ValueError(
-                f"Access denied: '{location}' is outside the allowed directory."
+                f"'{location}' is outside the permitted data folder "
+                f"(DATA_FOLDER at {allowed}); copy the file under that folder, "
+                "or pass a gs:// or https:// URI instead."
             )
     try:
         stat = resolved.stat()

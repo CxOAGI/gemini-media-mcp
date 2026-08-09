@@ -1167,7 +1167,7 @@ async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> N
     operation = FakeOperation(done=True, result=result)
     client = FakeGenaiClient(operation=operation)
 
-    with pytest.raises(ValueError, match="Access denied"):
+    with pytest.raises(ValueError, match="outside the permitted data folder"):
         await generate_video(
             client=client,  # type: ignore[arg-type]
             prompt="Extend",
