@@ -79,7 +79,7 @@ gemini-media-mcp [--log-level LEVEL] [--host HOST] [--port PORT] [--mount-path P
 
 - `--log-level`: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`
 - `--host` / `--port`: bind address and port for `sse` / `streamable-http` (default port 8000)
-- `--mount-path`: mount path for the `sse` / `streamable-http` transports (e.g. `/mcp`)
+- `--mount-path`: mount path for the `sse` transport (e.g. `/custom`). `streamable-http` ignores it and always serves `/mcp`.
 
 `--host`, `--port` and `--mount-path` are also accepted *after* the transport subcommand, which is the only form a `docker run` entrypoint can produce. `--log-level` must come before it.
 

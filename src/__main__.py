@@ -27,6 +27,7 @@ from google import genai
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent
 from PIL import Image as PILImage
 
@@ -172,6 +173,13 @@ def setup_vertex_credentials() -> Path | None:
 
     if not sa_json and gac.strip().startswith("{"):
         sa_json = gac
+        # On an HTTP transport the lifespan re-runs per connection. This
+        # function overwrites GOOGLE_APPLICATION_CREDENTIALS with the temp
+        # file path below, and teardown deletes that file — so the second
+        # connection would find GOOGLE_APPLICATION_CREDENTIALS pointing at a
+        # deleted path and no inline JSON to rebuild from. Persist the JSON to
+        # the primary variable so every subsequent lifespan rebuilds cleanly.
+        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = sa_json
 
     if sa_json:
         try:
@@ -599,13 +607,20 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     images_dir.mkdir(parents=True, exist_ok=True)
     videos_dir.mkdir(parents=True, exist_ok=True)
 
+    # The credential file is written BEFORE the client is built, and building
+    # a Vertex client can fail (bad service-account JSON, no ambient project).
+    # With the write outside the try, that failure left the service-account
+    # private key in /tmp — and on an HTTP transport the lifespan re-runs per
+    # connection, so a misconfigured server that stays up accumulated one
+    # leaked key file per connection attempt. Everything that can fail after
+    # the write now lives under the finally.
     temp_creds_path = setup_vertex_credentials()
-    client = create_client()
-    gemini_api_client = create_gemini_api_client()
-    video_gcs_bucket = os.environ.get("VIDEO_GCS_BUCKET")
-    allowed_gcs_buckets = _compute_allowed_gcs_buckets()
-
     try:
+        client = create_client()
+        gemini_api_client = create_gemini_api_client()
+        video_gcs_bucket = os.environ.get("VIDEO_GCS_BUCKET")
+        allowed_gcs_buckets = _compute_allowed_gcs_buckets()
+
         yield AppContext(
             data_folder=data_folder,
             images_dir=images_dir,
@@ -3032,10 +3047,12 @@ async def generate_clip(
             available in animatic mode (add_bridges is ignored), and Veo-only
             per-beat controls (seed, negative_prompt) are ignored. Each beat
             is measured from the rendered file, so an animatic's reported cost
-            is metered and lands marginally above the quote's nominal seconds
-            (omni overshoots the clamped request by about a frame per beat);
-            beats delivered to GCS cannot be measured, and the total then says
-            so by reporting itself as an estimate.
+            is metered: it lands about a frame per beat above the *nominal*
+            request (omni overshoots the clamped duration), but the dry-run
+            quote already includes that per-beat allowance, so the metered
+            total comes in at or under the quote. Beats delivered to GCS
+            cannot be measured, and the total then says so by reporting itself
+            as an estimate.
 
     Returns:
         JSON clip manifest:
@@ -3948,7 +3965,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mount-path",
         default=None,
-        help="Mount path for SSE/HTTP transport (e.g., /mcp)",
+        help="Mount path for the sse transport (e.g., /custom). Ignored by "
+        "streamable-http, which always serves /mcp.",
     )
     parser.add_argument(
         "--host",
@@ -4046,6 +4064,34 @@ def _resolve_http_host(cli_host: str | None) -> str:
     return "0.0.0.0" if is_running_in_container() else "127.0.0.1"  # noqa: S104
 
 
+# Loopback spellings the SDK treats as "protect with a localhost Host
+# allowlist"; anything else is an interface an operator deliberately exposed.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _transport_security_for(host: str) -> TransportSecuritySettings:
+    """DNS-rebinding settings matching the host, re-derived at run time.
+
+    Mirrors the SDK's constructor rule (mcp.server.fastmcp): a loopback bind
+    keeps the localhost Host/Origin allowlist that stops a browser page from
+    rebinding to a local server, while a non-loopback bind — which only
+    happens when an operator asked for it — disables the check, because the
+    Host header that reaches the server is the container/LAN name, which no
+    allowlist assembled here could enumerate.
+    """
+    if host in _LOOPBACK_HOSTS:
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
+            allowed_origins=[
+                "http://127.0.0.1:*",
+                "http://localhost:*",
+                "http://[::1]:*",
+            ],
+        )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
 def main() -> None:
     """Entry point."""
     parser = _build_arg_parser()
@@ -4097,7 +4143,20 @@ def main() -> None:
         # which made the Dockerfile's own documented `-p 8000:8000` usage
         # impossible. Bind all interfaces there, but keep loopback elsewhere
         # so a local run is not exposed to the network by surprise.
-        mcp.settings.host = _resolve_http_host(getattr(args, "host", None))
+        resolved_host = _resolve_http_host(getattr(args, "host", None))
+        mcp.settings.host = resolved_host
+        # The SDK derives DNS-rebinding protection from the host AT
+        # CONSTRUCTION, and `mcp` is built at import with the default
+        # 127.0.0.1 — so its Host allowlist was frozen to localhost before
+        # this line ever ran. Left alone, a container bind to 0.0.0.0 then
+        # rejected every non-localhost Host header with 421, breaking the
+        # very container HTTP use case the bind change above exists for.
+        # Re-derive it from the host actually chosen, mirroring the SDK's own
+        # rule: lock to localhost when bound to loopback, and when an operator
+        # has explicitly bound a public interface, do not second-guess it with
+        # a Host allowlist we cannot possibly populate (the container's
+        # hostnames are unknown here).
+        mcp.settings.transport_security = _transport_security_for(resolved_host)
         if getattr(args, "port", None):
             mcp.settings.port = args.port  # type: ignore[union-attr]
         logger.info(
