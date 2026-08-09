@@ -37,7 +37,7 @@ from .omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
 from .routing import BudgetPreference, MediaKind
 from .storyboard import Theme
 from .omni import generate_video_omni as generate_video_omni_impl
-from .video import _VEO_LITE_MODELS, VideoModel
+from .video import _VEO_LITE_MODELS, TranslatedVideoModel, VideoModel
 from .video import generate_video as generate_video_impl
 from .video_utils import (
     assert_frame_decoding_available,
@@ -2360,7 +2360,7 @@ async def generate_storyboard(
 async def generate_video(
     ctx: Context[ServerSession, AppContext],
     prompt: str,
-    model: VideoModel,
+    model: VideoModel | TranslatedVideoModel,
     aspect_ratio: str = "16:9",
     duration_seconds: float = 8.0,
     include_audio: bool = False,
@@ -2773,7 +2773,7 @@ async def generate_transition(
     first_frame_uri: str,
     last_frame_uri: str,
     prompt: str = "smooth cinematic transition between the two frames",
-    model: VideoModel = "veo-3.1-fast-generate-001",
+    model: VideoModel | TranslatedVideoModel = "veo-3.1-fast-generate-001",
     duration_seconds: float = 4.0,
     aspect_ratio: str = "16:9",
     include_audio: bool = False,
@@ -2951,7 +2951,7 @@ async def generate_bridge(
     from_clip_uri: str,
     to_clip_uri: str,
     prompt: str = "smooth cinematic cut between the two clips",
-    model: VideoModel = "veo-3.1-fast-generate-001",
+    model: VideoModel | TranslatedVideoModel = "veo-3.1-fast-generate-001",
     duration_seconds: float = 4.0,
     aspect_ratio: str = "16:9",
     include_audio: bool = False,
@@ -3145,7 +3145,7 @@ async def generate_clip(
     ctx: Context[ServerSession, AppContext],
     beats: list[dict[str, Any]],
     aspect_ratio: str = "9:16",
-    model: VideoModel = "veo-3.1-fast-generate-001",
+    model: VideoModel | TranslatedVideoModel = "veo-3.1-fast-generate-001",
     include_audio: bool = True,
     add_bridges: bool = False,
     output_gcs_uri: str | None = None,
@@ -3957,7 +3957,7 @@ async def loop_extend(
     video_uri: str,
     prompt: str = "continue the action",
     times: int = 1,
-    model: VideoModel = "veo-3.1-generate-001",
+    model: VideoModel | TranslatedVideoModel = "veo-3.1-generate-001",
     aspect_ratio: str = "16:9",
     include_audio: bool = True,
     output_gcs_uri: str | None = None,

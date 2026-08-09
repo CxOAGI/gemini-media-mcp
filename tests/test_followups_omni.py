@@ -263,3 +263,110 @@ async def test_empty_inline_data_falls_through_to_uri(tmp_path: Path) -> None:
         videos_dir=videos_dir,
     )
     assert Path(result["video_url"][7:]).read_bytes() == b"REAL"
+
+
+# ============================================================================
+# A returned model ID must round-trip: an agent that feeds result["model"]
+# from a Gemini-API render back into the next call must not hit a rejection.
+# ============================================================================
+
+
+def test_every_returnable_video_model_is_also_accepted() -> None:
+    """On the Gemini API a render reports a `-preview` model; the type it is
+    validated against rejected those, so chaining that ID into loop_extend or
+    generate_video failed. Every ID a run can return must be an accepted
+    input."""
+    import typing
+
+    from src.video import TranslatedVideoModel, VideoModel, _GEMINI_API_MODEL_IDS
+
+    # The tools accept the union: the canonical catalogue the planner ranks
+    # over, plus the translated spellings a Gemini-API render reports back.
+    accepted = set(typing.get_args(VideoModel)) | set(
+        typing.get_args(TranslatedVideoModel)
+    )
+    returnable: set[str] = set()
+    for canonical in (
+        "veo-3.1-generate-001",
+        "veo-3.1-fast-generate-001",
+        "veo-3.1-lite-generate-preview",
+    ):
+        returnable.add(canonical)  # Vertex reports the canonical id
+        returnable.add(_GEMINI_API_MODEL_IDS.get(canonical, canonical))  # Gemini API
+    assert returnable <= accepted, f"not accepted: {returnable - accepted}"
+
+    # But the planner's candidate catalogue must stay canonical-only — folding
+    # the aliases into VideoModel made it rank each model twice.
+    assert set(typing.get_args(VideoModel)).isdisjoint(
+        typing.get_args(TranslatedVideoModel)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_returned_preview_id_normalizes_before_the_backend_translation(
+    tmp_path: Path,
+) -> None:
+    """A `-preview` id passed back must resolve to canonical first: raw on
+    Vertex it would 404, and the reported model must be identical to what a
+    caller who named the canonical id would have gotten."""
+    from tests.test_video import (
+        FakeGeneratedVideo,
+        FakeGenaiClient,
+        FakeOperation,
+        FakeVideoObject,
+        FakeVideoResult,
+    )
+    from src.video import generate_video
+
+    async def report(vertexai: bool, model_in: str) -> str:
+        op = FakeOperation(
+            done=True,
+            result=FakeVideoResult(
+                [FakeGeneratedVideo(FakeVideoObject(video_bytes=b"v"))]
+            ),
+        )
+        client = FakeGenaiClient(operation=op, vertexai=vertexai)
+        out = tmp_path / f"{vertexai}-{model_in}"
+        out.mkdir()
+        result = await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="p",
+            videos_dir=out,
+            model=model_in,  # type: ignore[arg-type]
+        )
+        return result["model"]
+
+    # On Vertex a fed-back preview id must not be sent raw (it would 404) — it
+    # is normalized, so the reported model is the canonical one.
+    assert await report(True, "veo-3.1-generate-preview") == "veo-3.1-generate-001"
+    # On the Gemini API, naming the canonical id or feeding back the preview id
+    # both report the same served spelling.
+    assert await report(False, "veo-3.1-generate-001") == "veo-3.1-generate-preview"
+    assert await report(False, "veo-3.1-generate-preview") == "veo-3.1-generate-preview"
+
+
+def test_the_video_tool_schemas_accept_the_translated_ids() -> None:
+    """The round-trip only works if the TOOL signatures accept the alias, not
+    just the impl — a signature left as bare VideoModel would have MCP reject
+    a fed-back -preview id before the tool ran. Guards the __main__ wiring."""
+    import asyncio
+
+    import src.__main__ as main_mod
+
+    tools = {t.name: t for t in asyncio.run(main_mod.mcp.list_tools())}
+    aliases = {"veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"}
+    for name in (
+        "generate_video",
+        "generate_transition",
+        "generate_bridge",
+        "generate_clip",
+        "loop_extend",
+    ):
+        prop = tools[name].inputSchema["properties"]["model"]
+        accepted = set(prop.get("enum") or [])
+        for branch in prop.get("anyOf", []):
+            accepted |= set(branch.get("enum") or [])
+        assert aliases <= accepted, (
+            f"{name} rejects the translated ids: {aliases - accepted}"
+        )

@@ -76,6 +76,20 @@ VideoModel = Literal[
     "veo-3.1-lite-generate-preview",
 ]
 
+# The IDs the Gemini API backend serves under, and the ones a real run REPORTS
+# back in its `model` field on that backend. Accepted as tool input purely so a
+# returned model round-trips: an agent that reads result["model"] from a
+# Gemini-API render and feeds it into loop_extend / generate_video must not hit
+# a schema rejection. Kept SEPARATE from VideoModel on purpose — the planner
+# enumerates VideoModel as its candidate catalogue (routing.LIVE_VIDEO_MODELS),
+# and folding these spellings in would make it rank each model twice. They
+# resolve to the canonical `-001` id before anything downstream sees them (see
+# _CANONICAL_VIDEO_MODEL_IDS). Same split as ImageModel vs RetiredImageModel.
+TranslatedVideoModel = Literal[
+    "veo-3.1-generate-preview",
+    "veo-3.1-fast-generate-preview",
+]
+
 # Veo 3.1 Lite does not support 4K output or video extension.
 _VEO_LITE_MODELS = {"veo-3.1-lite-generate-preview"}
 
@@ -86,6 +100,15 @@ _VEO_LITE_MODELS = {"veo-3.1-lite-generate-preview"}
 _GEMINI_API_MODEL_IDS = {
     "veo-3.1-generate-001": "veo-3.1-generate-preview",
     "veo-3.1-fast-generate-001": "veo-3.1-fast-generate-preview",
+}
+
+# Reverse of the per-backend map: a caller may pass back a `-preview` ID that a
+# prior Gemini-API render reported. Normalize it to the canonical `-001` name
+# BEFORE the per-backend translation runs, so the request behaves identically
+# to one that named the canonical model — on Vertex it stays `-001` (a raw
+# `-preview` would 404 there), on the Gemini API it re-translates to `-preview`.
+_CANONICAL_VIDEO_MODEL_IDS = {
+    preview: canonical for canonical, preview in _GEMINI_API_MODEL_IDS.items()
 }
 
 # Generation mode for VEO 3.1
@@ -240,7 +263,7 @@ async def generate_video(
     client: genai.Client,
     prompt: str,
     videos_dir: Path,
-    model: VideoModel = "veo-3.1-generate-001",
+    model: VideoModel | TranslatedVideoModel = "veo-3.1-generate-001",
     image_bytes: bytes | None = None,
     allowed_dir: Path | None = None,
     aspect_ratio: str = "16:9",
@@ -293,6 +316,11 @@ async def generate_video(
         Dictionary with video_url and generation metadata
     """
     model_id = str(model)
+
+    # Normalize a served `-preview` ID a caller fed back from a prior render to
+    # its canonical `-001` name first, so the per-backend translation below is
+    # the single source of the served spelling.
+    model_id = _CANONICAL_VIDEO_MODEL_IDS.get(model_id, model_id)
 
     # Translate model IDs per backend: the Gemini Developer API serves Veo
     # under `-preview` IDs and 404s on the Vertex `-001` names.
