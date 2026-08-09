@@ -640,6 +640,33 @@ def _validate_aspect_ratio(aspect_ratio: str) -> None:
         )
 
 
+def _fetch_failure(param: str, uri: str, data_dir: Path) -> str:
+    """Message for a failed fetch that names WHY, for local paths.
+
+    fetch() returns None on any failure, so a confinement refusal and a
+    missing file both surfaced as the same "Could not fetch" — a caller cannot
+    tell whether to move the file into DATA_FOLDER or fix a typo'd path. The
+    two cases need different actions, so for a local path we re-run the same
+    containment/existence check the fetch used and name the reason. Remote
+    (gs://, http) failures stay generic: the reason is not knowable offline.
+    """
+    base = f"Could not fetch {param}: {uri}"
+    if not uri or uri.startswith(("gs://", "http://", "https://")):
+        return base
+    raw = uri[7:] if uri.startswith("file://") else uri
+    try:
+        _validate_local_path(Path(raw), data_dir)
+    except ValueError as reason:
+        if "outside the allowed directory" in str(reason):
+            return (
+                f"{base} — outside the permitted data folder (DATA_FOLDER at "
+                f"{data_dir}); copy the file under that folder, or pass a "
+                "gs:// or https:// URI instead"
+            )
+        return f"{base} — {reason}"
+    return base  # validation passes; the failure was a read/size error
+
+
 def _validate_duration_seconds(
     duration_seconds: float | None,
     field: str = "duration_seconds",
@@ -1884,7 +1911,7 @@ async def generate_image(
             # SSRF rejection, size cap) must not silently downgrade to a
             # text-to-image generation.
             if image_bytes is None:
-                raise ValueError(f"Could not fetch image_uri: {image_uri}")
+                raise ValueError(_fetch_failure("image_uri", image_uri, data_dir))
         elif image_base64:
             image_bytes = _decode_base64_capped(image_base64)
 
@@ -1900,7 +1927,9 @@ async def generate_image(
                 # Don't silently drop a reference the caller explicitly asked
                 # for — that would quietly change the generation result.
                 if ref_bytes is None:
-                    raise ValueError(f"Could not fetch reference image: {ref_uri}")
+                    raise ValueError(
+                        _fetch_failure("reference image", ref_uri, data_dir)
+                    )
                 reference_images.append(ref_bytes)
 
         # Read thought signature from file if URL provided. A malformed value
@@ -2665,7 +2694,7 @@ async def generate_video(
                     allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
                 )
                 if b is None:
-                    raise ValueError(f"Could not fetch image_uri: {image_uri}")
+                    raise ValueError(_fetch_failure("image_uri", image_uri, data_dir))
                 draft_image_bytes = [b]
             elif image_base64:
                 draft_image_bytes = [_decode_base64_capped(image_base64)]
@@ -2709,7 +2738,7 @@ async def generate_video(
             # Fail loudly rather than silently degrading image-to-video to
             # text-to-video when the provided URI can't be fetched.
             if image_bytes is None:
-                raise ValueError(f"Could not fetch image_uri: {image_uri}")
+                raise ValueError(_fetch_failure("image_uri", image_uri, data_dir))
         elif image_base64:
             image_bytes = _decode_base64_capped(image_base64)
 
@@ -2724,7 +2753,9 @@ async def generate_video(
             # A provided last frame that can't be fetched must not silently
             # drop first+last mode back to plain image-to-video.
             if last_frame_bytes is None:
-                raise ValueError(f"Could not fetch last_frame_uri: {last_frame_uri}")
+                raise ValueError(
+                    _fetch_failure("last_frame_uri", last_frame_uri, data_dir)
+                )
         elif last_frame_base64:
             last_frame_bytes = _decode_base64_capped(last_frame_base64)
 
@@ -2738,7 +2769,9 @@ async def generate_video(
                     allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
                 )
                 if ref_bytes is None:
-                    raise ValueError(f"Could not fetch reference image: {ref_uri}")
+                    raise ValueError(
+                        _fetch_failure("reference image", ref_uri, data_dir)
+                    )
                 reference_images.append(ref_bytes)
 
         # Resolve the client up front: Veo Lite (and pure Gemini-API
@@ -2962,7 +2995,9 @@ async def generate_transition(
         if first_bytes is None or last_bytes is None:
             raise ValueError(
                 "Could not fetch one or both transition frames. "
-                f"first_frame_uri={first_frame_uri}, last_frame_uri={last_frame_uri}"
+                + _fetch_failure("first_frame_uri", first_frame_uri, data_dir)
+                + "; "
+                + _fetch_failure("last_frame_uri", last_frame_uri, data_dir)
             )
 
         gcs_uri = _resolve_video_gcs(
@@ -3153,7 +3188,9 @@ async def generate_bridge(
         if from_bytes is None or to_bytes is None:
             raise ValueError(
                 "Could not fetch one or both bridge clips. "
-                f"from_clip_uri={from_clip_uri}, to_clip_uri={to_clip_uri}"
+                + _fetch_failure("from_clip_uri", from_clip_uri, data_dir)
+                + "; "
+                + _fetch_failure("to_clip_uri", to_clip_uri, data_dir)
             )
 
         await ctx.info("Extracting bridge frames")
@@ -3511,7 +3548,7 @@ async def generate_clip(
                     )
                     if image_bytes is None:
                         raise ValueError(
-                            f"Could not fetch first_frame_uri: {first_frame_uri}"
+                            _fetch_failure("first_frame_uri", first_frame_uri, data_dir)
                         )
 
                 await ctx.info(f"Generating beat {idx + 1}/{len(beats)}")
@@ -3887,7 +3924,7 @@ async def generate_video_omni(
                     allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
                 )
                 if b is None:
-                    raise ValueError(f"Could not fetch image_uri: {uri}")
+                    raise ValueError(_fetch_failure("image_uri", uri, data_dir))
                 image_bytes_list.append(b)
 
         input_video_bytes = None
@@ -3898,7 +3935,9 @@ async def generate_video_omni(
                 allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
             )
             if input_video_bytes is None:
-                raise ValueError(f"Could not fetch input_video_uri: {input_video_uri}")
+                raise ValueError(
+                    _fetch_failure("input_video_uri", input_video_uri, data_dir)
+                )
 
         await ctx.info("Generating video with gemini-omni-flash")
         result = await _omni_generate_and_manifest(

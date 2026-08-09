@@ -114,3 +114,31 @@ async def test_image_quote_warning_is_future_tense(tmp_path: Path) -> None:
     warning = next(w for w in r.get("warnings", []) if "reference images" in w)
     assert "will not be sent" in warning
     assert "were not sent" not in warning
+
+
+@pytest.mark.asyncio
+async def test_fetch_failure_names_confinement_vs_missing(tmp_path: Path) -> None:
+    """A blocked file and a missing file must give the caller different,
+    actionable reasons — not the same generic "could not fetch". One says move
+    the file into DATA_FOLDER; the other says fix the path."""
+    from src.__main__ import generate_image
+
+    ctx = _video_ctx(tmp_path, vertexai=True)
+
+    async def err(uri: str) -> str:
+        out = await generate_image(
+            ctx=ctx, prompt="x", model="gemini-3.1-flash-image", image_uri=uri
+        )
+        text = out if isinstance(out, str) else out[0].text
+        return json.loads(text).get("error", "")
+
+    outside = await err("file:///etc/hosts")
+    assert "outside the permitted data folder" in outside
+    assert "DATA_FOLDER" in outside
+
+    missing_inside = f"file://{tmp_path / 'images' / 'nope.png'}"
+    (tmp_path / "images").mkdir(exist_ok=True)
+    missing = await err(missing_inside)
+    assert "File not found" in missing
+    # The two cases are distinguishable, which is the whole point.
+    assert "outside the permitted data folder" not in missing
