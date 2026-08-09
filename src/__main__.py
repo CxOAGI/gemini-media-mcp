@@ -1704,7 +1704,15 @@ def _validate_seed(seed: Any, field: str) -> None:
 # Create MCP server with lifespan
 mcp = FastMCP(
     "gemini-media-mcp",
-    instructions="MCP server for generating images and videos using Google Gemini and VEO models.",
+    instructions=(
+        "Generate and edit images and video on Google Gemini and Veo 3.1. "
+        "plan_generation ranks tool and model options for an intent with costs "
+        "and generates nothing; generate_storyboard and generate_clip build "
+        "reviewable boards and multi-beat reels; generate_transition and "
+        "generate_bridge join shots; edit_video and loop_extend revise and "
+        "extend footage. Every generation tool takes dry_run to return a cost "
+        "estimate before spending."
+    ),
     lifespan=app_lifespan,
 )
 

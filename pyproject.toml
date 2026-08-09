@@ -1,7 +1,7 @@
 [project]
 name = "gemini-media-mcp"
 dynamic = ["version"]
-description = "MCP server for Gemini media generation"
+description = "Plan, generate, compose, and edit images and video on Google Gemini and Veo 3.1, with per-call cost estimates"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.13"

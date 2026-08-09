@@ -1,6 +1,6 @@
 # Gemini Media MCP Server
 
-MCP server for generating images and videos using Google Gemini and VEO models.
+Plan, generate, compose, and edit images and video on Google Gemini and Veo 3.1, with a cost estimate before every call.
 
 [What is an MCP Server?](https://www.anthropic.com/news/model-context-protocol)
 

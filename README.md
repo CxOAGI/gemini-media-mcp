@@ -1,6 +1,14 @@
 # Gemini Media MCP
 
-MCP server for generating images and videos using Google Gemini and VEO models.
+Plan, generate, compose, and edit images and video on Google Gemini and Veo 3.1, with a cost estimate before every call.
+
+## What it does
+
+- **Plan:** `plan_generation` ranks tool and model options for an intent with costs, and generates nothing.
+- **Generate:** images with Gemini, video with Veo 3.1, fast video with Omni.
+- **Compose:** storyboards, multi-beat reels, transitions between stills, bridges between clips.
+- **Edit and extend:** conversational video edits, loop and extend.
+- **Cost-aware:** any call runs `dry_run` for a quote; real runs report metered cost and its pricing source.
 
 ## Quick start
 
