@@ -86,15 +86,27 @@ def test_no_storyboard_signal_leaves_the_video_plan_unchanged() -> None:
     assert recommended.tool == "generate_clip"
 
 
-def test_storyboard_route_leaves_the_animatic_workflow_in_place() -> None:
-    """The storyboard sits alongside the animatic, it does not replace it: the
-    animatic workflow is keyed off the top VIDEO render, not routes[0]."""
+def test_storyboard_route_leads_the_workflow_over_the_animatic() -> None:
+    """When the storyboard previz out-ranks the delivery clip it leads the
+    workflow, replacing the animatic: recommending a top storyboard route AND an
+    animatic-first workflow was two contradictory previz steps in one answer."""
     plan = plan_generation(
         "storyboard a 4 shot commercial", RoutingConstraints(num_beats=4)
     )
-    assert _storyboard_route(plan) is plan.recommended
-    assert plan.workflow, "the animatic workflow should still be recommended"
-    assert plan.workflow[0].params.get("animatic") is True
+    board = _storyboard_route(plan)
+    assert board is not None and board is plan.recommended
+    assert [(w.order, w.tool) for w in plan.workflow] == [
+        (1, "generate_storyboard"),
+        (2, "generate_clip"),
+    ]
+    # The previz step is the storyboard, not an animatic clip render.
+    step1, step2 = plan.workflow
+    assert "animatic" not in step1.params
+    assert step1.params["shots"] == board.params["shots"]
+    # The delivery clip is the top VIDEO render (not the storyboard).
+    clip = next(r for r in plan.routes if r.tool == "generate_clip")
+    assert step2.params == clip.params
+    assert step2.params.get("animatic") is not True
 
 
 @pytest.mark.parametrize(
@@ -251,3 +263,165 @@ def test_pinned_unknown_video_model_is_still_a_conflict() -> None:
         "a video of a dog", RoutingConstraints(pinned_model="veo-9-imaginary")
     )
     assert "pinned_model_not_routable" in _conflict_codes(plan)
+
+
+# ============================================================================
+# FOLLOW-UP FINDING A — the workflow leads with the storyboard, not an animatic
+# ============================================================================
+
+
+def test_storyboard_previz_leads_the_workflow_when_it_out_ranks_the_clip() -> None:
+    """Reproduction: a board that out-ranks the clip is the plan's cheap first
+    pass, so the workflow leads with generate_storyboard, then the delivery
+    clip — not the animatic the pre-fix code emitted while the board was the
+    recommended route. The two previz recommendations now agree."""
+    plan = plan_generation(
+        "storyboard a 6 shot sequence before committing to renders",
+        RoutingConstraints(num_beats=6),
+    )
+    board = _storyboard_route(plan)
+    assert board is not None and board is plan.recommended
+
+    step1, step2 = plan.workflow
+    assert step1.tool == "generate_storyboard"
+    assert "animatic" not in step1.params
+    assert step1.params["shots"] == board.params["shots"]
+
+    clip = next(r for r in plan.routes if r.tool == "generate_clip")
+    assert step2.tool == "generate_clip"
+    assert step2.params == clip.params
+    assert step2.params.get("animatic") is not True
+    # The board is genuinely the cheaper first step it is now recommended as.
+    assert board.cost is not None and clip.cost is not None
+    assert board.cost.usd < clip.cost.usd
+
+
+def test_non_storyboard_clip_keeps_the_animatic_workflow() -> None:
+    """Guard: the storyboard-first workflow must not disturb plans with no
+    board. A plain multi-beat clip still gets the animatic-first workflow."""
+    plan = plan_generation("a 4 shot reel about shoes")
+    assert _storyboard_route(plan) is None
+    assert [(w.order, w.tool) for w in plan.workflow] == [
+        (1, "generate_clip"),
+        (2, "generate_clip"),
+    ]
+    assert plan.workflow[0].params["animatic"] is True
+
+
+# ============================================================================
+# FOLLOW-UP FINDING B — the storyboard route is reachable for any media_kind
+# ============================================================================
+
+_CONTACT_SHEET = "a storyboard contact sheet with 4 keyframe panels and slug lines"
+
+
+@pytest.mark.parametrize("media_kind", ["image", "video", None])
+def test_board_deliverable_offers_the_storyboard_for_any_media_kind(
+    media_kind: str | None,
+) -> None:
+    """A contact-sheet deliverable reaches generate_storyboard whether the
+    request resolves to image, video or is left unset — its output IS images,
+    so the board must not be hidden behind media_kind=video."""
+    constraints = (
+        RoutingConstraints(media_kind=media_kind)  # type: ignore[arg-type]
+        if media_kind is not None
+        else None
+    )
+    plan = plan_generation(_CONTACT_SHEET, constraints)
+    board = _storyboard_route(plan)
+    assert board is not None, f"expected a storyboard route (media_kind={media_kind})"
+    # A request that names a contact sheet wants the board, not the renders.
+    assert board is plan.recommended
+    assert len(board.params["shots"]) == 4
+
+
+def test_board_deliverable_out_ranks_the_video_renders() -> None:
+    """Reproduction: the board previz sank below three Veo renders once slug
+    lines forced the pricier text model. It must now out-score the clip."""
+    plan = plan_generation(_CONTACT_SHEET, RoutingConstraints(media_kind="video"))
+    board = _storyboard_route(plan)
+    assert board is not None and board is plan.recommended
+    clip = next(r for r in plan.routes if r.tool == "generate_clip")
+    assert board.score > clip.score
+
+
+def test_plain_image_request_gets_no_storyboard_route() -> None:
+    """Guard: an image brief with no board vocabulary is untouched — only
+    generate_image routes, and no storyboard route sneaks in."""
+    plan = plan_generation(
+        "a high-res poster of a mountain", RoutingConstraints(media_kind="image")
+    )
+    assert _storyboard_route(plan) is None
+    assert {route.tool for route in plan.routes} == {"generate_image"}
+
+
+def test_plain_video_request_is_unchanged_by_the_reachability_fix() -> None:
+    """Guard: a plain multi-shot video brief still gets no storyboard route and
+    still recommends the clip."""
+    plan = plan_generation("a 3 shot reel about shoes with music")
+    assert _storyboard_route(plan) is None
+    assert plan.recommended is not None
+    assert plan.recommended.tool == "generate_clip"
+
+
+def test_board_deliverable_cost_matches_estimate_for_the_text_model() -> None:
+    """Planner<->tool parity on the path FINDING B makes hot: a slug-line board
+    picks the strong text renderer, and the route quote must still equal
+    estimate_image_cost(model, 1K, shots) — generate_storyboard's dry_run path."""
+    plan = plan_generation(_CONTACT_SHEET, RoutingConstraints(media_kind="image"))
+    board = _storyboard_route(plan)
+    assert board is not None
+    # Slug lines demand the strongest text renderer even though it is priciest.
+    assert board.model == PRO_IMAGE
+    assert board.params["image_size"] == "1K"
+    expected = estimate_image_cost(PRO_IMAGE, "1K", 4)
+    assert expected is not None and board.cost is not None
+    assert board.cost.usd == expected.usd
+
+
+# ============================================================================
+# FOLLOW-UP FINDING C — panel/keyframe/frame counts drive the shot count
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        ("a storyboard with 4 keyframe panels", 4),
+        ("6 panels", 6),
+        ("8 keyframes", 8),
+        ("a 5 frame animation", 5),
+        # The vocabulary it already parsed must keep working.
+        ("6 shots of the product", 6),
+        ("a 3 beat reel", 3),
+    ],
+)
+def test_panel_and_keyframe_counts_infer_shot_count(intent: str, expected: int) -> None:
+    assert infer_signals(intent).beat_count == expected
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        # "4k" is a resolution; the digit is not a panel count.
+        "a 4k panel on a wall",
+        # A frame rate, not a shot count.
+        "render at 24 frames per second",
+        # Nothing countable -> falls back to the default at plan time.
+        "a storyboard of a chase scene",
+    ],
+)
+def test_shot_count_vocab_does_not_over_fire(intent: str) -> None:
+    assert infer_signals(intent).beat_count is None
+
+
+def test_panel_count_flows_through_to_the_board_shot_count() -> None:
+    """End to end: '4 keyframe panels' plans a 4-shot board, not the 3-shot
+    default it silently fell back to before the vocabulary was parsed."""
+    plan = plan_generation(
+        "a storyboard contact sheet with 4 keyframe panels",
+        RoutingConstraints(media_kind="image"),
+    )
+    board = _storyboard_route(plan)
+    assert board is not None
+    assert len(board.params["shots"]) == 4

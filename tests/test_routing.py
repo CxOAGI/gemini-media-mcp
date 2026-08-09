@@ -928,7 +928,10 @@ def test_expensive_multi_beat_clips_recommend_an_animatic_first() -> None:
 
 
 def test_a_draft_clip_gets_the_animatic_as_the_deliverable() -> None:
-    plan = plan_generation("a rough 4 shot storyboard reel")
+    # No storyboard vocabulary here: a board previz would out-rank the clip and
+    # lead the workflow instead (see test_planner_followups), so this keeps the
+    # intent a plain draft clip to exercise the animatic-as-deliverable path.
+    plan = plan_generation("a rough 4 shot reel")
     assert len(plan.workflow) == 1
     assert plan.workflow[0].params["animatic"] is True
 

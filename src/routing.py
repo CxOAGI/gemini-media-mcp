@@ -1010,8 +1010,17 @@ def _duration_value(text: str, pattern: re.Pattern[str]) -> float | None:
     return None
 
 
-# "3 beats", "5 shots", "4 scenes" — how many segments the output has.
-_BEAT_PATTERN = re.compile(r"(\d+)\s*(?:beats?|shots?|scenes?|cuts?|segments?)\b")
+# "3 beats", "5 shots", "4 scenes", "4 keyframe panels" — how many segments the
+# output has. A storyboard names its segments panels/keyframes/frames exactly as
+# a clip names them beats/shots, so all count the same thing; without them "4
+# keyframe panels" fell through to the 3-beat default and planned the wrong
+# board size. The digit must sit immediately before the noun (so "a 4k panel" is
+# a resolution, not 4 shots), and "N frames per second" is a frame rate, not a
+# shot count.
+_BEAT_PATTERN = re.compile(
+    r"(\d+)\s*(?:beats?|shots?|scenes?|cuts?|segments?|panels?|keyframes?"
+    r"|frames?(?!\s+per\s+second))\b"
+)
 
 # "up to 6 reference images", "3 reference photos".
 _REFERENCE_COUNT_PATTERN = re.compile(
@@ -1831,6 +1840,7 @@ def _score_route(
     demanded_capabilities: tuple[float, ...],
     quality_is_demanded: bool,
     default_model: str,
+    cost_index_override: float | None = None,
 ) -> float:
     """Score one candidate model against the resolved request.
 
@@ -1846,12 +1856,20 @@ def _score_route(
             about (empty means "no opinion").
         quality_is_demanded: Whether the request is quality-led.
         default_model: The documented default for this media kind.
+        cost_index_override: Cost position to score budget alignment against
+            instead of ``profile.cost_index``. Used only for a storyboard
+            route, whose 1K keyframe board is cheap on any image model, so the
+            keyframe model's delivery-cost tier must not be what places the
+            previz in the ranking.
 
     Returns:
         The score, rounded to 4 decimals so equal inputs compare equal.
     """
     target_cost = _BUDGET_TARGET_COST[request.budget]
-    budget_term = 1.0 - abs(profile.cost_index - target_cost)
+    cost_index = (
+        profile.cost_index if cost_index_override is None else cost_index_override
+    )
+    budget_term = 1.0 - abs(cost_index - target_cost)
 
     capability_term = (
         sum(demanded_capabilities) / len(demanded_capabilities)
@@ -2061,6 +2079,17 @@ def _plan_image(
             "Iterating: generate_image returns a thought_signature_url — reuse it "
             "for multi-turn edits instead of regenerating from scratch."
         )
+
+    # A storyboard's deliverable — keyframe stills plus a PNG contact sheet — is
+    # itself images, so a board brief that resolved to media_kind=image (a
+    # "storyboard contact sheet with N panels") must still be able to reach
+    # generate_storyboard; without this it saw only generate_image and the board
+    # tool was unreachable for the exact request it was built for. Gated inside
+    # the helper on the storyboard signal, so a plain image request (no board
+    # vocabulary) gets no storyboard route.
+    storyboard_route = _plan_storyboard_route(request)
+    if storyboard_route is not None:
+        routes.append(storyboard_route)
 
     ranked = _rank(routes, _IMAGE_PROFILES)
 
@@ -2782,8 +2811,26 @@ def _plan_storyboard_route(request: ResolvedRequest) -> RoutedCall | None:
         scored.append((score, profile))
     # Same total order as _rank: score desc, then fidelity desc, then id asc.
     scored.sort(key=lambda sp: (-sp[0], -sp[1].fidelity_index, sp[1].model))
-    score, profile = scored[0]
+    _, profile = scored[0]
     model = profile.model
+
+    # Rank the route on what the board actually costs, not the keyframe model's
+    # delivery tier. Model selection above is budget-aware (cheap picks lite,
+    # "best" picks pro), but the board is a set of cheap 1K stills whatever the
+    # model — so when a slug-line/caption brief forces the pricier text renderer
+    # the route must not sink BELOW the very per-second video renders it exists
+    # to precede. Scoring budget alignment from the cheap end (cost_index 0.0)
+    # keeps the previz at the top of the plan for a board deliverable while
+    # leaving cheap boards (already lite) unchanged.
+    demanded = (profile.text_rendering_index,) if request.needs_text_rendering else ()
+    score = _score_route(
+        profile,
+        request,
+        demanded_capabilities=demanded,
+        quality_is_demanded=quality_is_demanded,
+        default_model=DEFAULT_IMAGE_MODEL,
+        cost_index_override=0.0,
+    )
 
     cost = _estimate_image_cost(model, _STORYBOARD_IMAGE_SIZE, shots)
     aspect_ratio = request.aspect_ratio or "16:9"
@@ -3179,6 +3226,49 @@ def _build_workflow(
     if not render_routes:
         return ()
     best = render_routes[0]
+
+    # When the storyboard previz is the top route, IT is the plan's cheap first
+    # pass — so the workflow must lead with it, not with an animatic. Proposing a
+    # top storyboard route AND an animatic-first workflow put two contradictory
+    # previz steps in one answer, and the animatic's own rationale concedes it is
+    # ~1x the delivery cost while the board previsualizes the same shots for a
+    # fraction of it. Only fires when the storyboard out-ranks the delivery clip;
+    # a plan where it does not keeps the animatic path untouched.
+    storyboard_route = next(
+        (route for route in routes if route.tool == "generate_storyboard"), None
+    )
+    if (
+        storyboard_route is not None
+        and routes[0] is storyboard_route
+        and best.tool == "generate_clip"
+    ):
+        shots = len(storyboard_route.params.get("shots", ()))
+        board_lead = f"Storyboard all {shots} shots on {storyboard_route.model} first"
+        if storyboard_route.cost is not None and best.cost is not None:
+            board_lead += (
+                f" (est. ${storyboard_route.cost.usd:.2f} against "
+                f"${best.cost.usd:.2f} for the full clip render)"
+            )
+        return (
+            WorkflowStep(
+                order=1,
+                tool="generate_storyboard",
+                params=storyboard_route.params,
+                rationale=(
+                    f"{board_lead}: review framing and pacing as cheap keyframe "
+                    "stills before paying for any per-second video."
+                ),
+            ),
+            WorkflowStep(
+                order=2,
+                tool=best.tool,
+                params=best.params,
+                rationale=(
+                    "Once the keyframes read correctly, render the delivery clip "
+                    f"on {best.model}; the board's shot list feeds generate_clip."
+                ),
+            ),
+        )
 
     if (
         best.tool == "loop_extend"
