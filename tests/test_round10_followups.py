@@ -56,13 +56,21 @@ async def test_dry_run_warns_on_over_count_references(tmp_path: Path) -> None:
     """The render truncates over-count references with a warning; the quote was
     silent about it. Now both disclose it."""
     ctx = _video_ctx(tmp_path, vertexai=True)
-    r = await _gv(ctx, prompt="x", model=VEO, reference_image_uris=list("abcde"))
+    # gs:// refs are uncheckable offline and still price, so the over-count
+    # (>3 for video, >14 for images) warning path is reached; local dummy
+    # paths would now be refused as outside DATA_FOLDER before the warning.
+    r = await _gv(
+        ctx,
+        prompt="x",
+        model=VEO,
+        reference_image_uris=[f"gs://b/{c}.png" for c in "abcde"],
+    )
     assert any("Veo 3.1 accepts 3" in w for w in r.get("warnings", []))
     r = await _gi(
         ctx,
         prompt="x",
         model="gemini-3.1-flash-image",
-        reference_image_uris=[str(i) for i in range(16)],
+        reference_image_uris=[f"gs://b/{i}.png" for i in range(16)],
     )
     assert any("accept 14" in w for w in r.get("warnings", []))
 
@@ -94,7 +102,9 @@ async def test_omni_dry_run_reports_the_clamped_request(tmp_path: Path) -> None:
 async def test_a_non_conflicting_video_request_still_prices(tmp_path: Path) -> None:
     """The new validation must not refuse a legitimate single-input call."""
     ctx = _video_ctx(tmp_path, vertexai=True)
-    r = await _gv(ctx, prompt="x", model=VEO, image_uri="a")
+    # gs:// is uncheckable offline and still prices; a bare path would now be
+    # refused as outside DATA_FOLDER, which is not what this test exercises.
+    r = await _gv(ctx, prompt="x", model=VEO, image_uri="gs://b/a.png")
     assert r["generation_mode"] == "image_to_video"
     assert r["estimated_cost"]["usd"] > 0
 
@@ -105,11 +115,14 @@ async def test_image_quote_warning_is_future_tense(tmp_path: Path) -> None:
     tense — past tense ("were not sent") in a payload that also says "nothing
     was generated" reads as if the call already ran."""
     ctx = _video_ctx(tmp_path, vertexai=True)
+    # gs:// refs are uncheckable offline and still price, so the truncation
+    # warning is reached; local dummy paths would now be refused as outside
+    # DATA_FOLDER before the warning is built.
     r = await _gi(
         ctx,
         prompt="x",
         model="gemini-3.1-flash-image",
-        reference_image_uris=[str(i) for i in range(16)],
+        reference_image_uris=[f"gs://b/{i}.png" for i in range(16)],
     )
     warning = next(w for w in r.get("warnings", []) if "reference images" in w)
     assert "will not be sent" in warning

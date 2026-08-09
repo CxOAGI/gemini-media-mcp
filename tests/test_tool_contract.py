@@ -72,7 +72,10 @@ async def test_reference_render_quote_covers_the_forced_eight_seconds(
             prompt="a dog",
             model=VEO,
             duration_seconds=4,
-            reference_image_uris=["file:///a.png", "file:///b.png"],
+            # gs:// refs are uncheckable offline and still price; the scheme
+            # does not change the forced-8s duration this test asserts. Local
+            # dummy paths would now be refused as outside DATA_FOLDER.
+            reference_image_uris=["gs://b/a.png", "gs://b/b.png"],
             dry_run=True,
         )
     )
@@ -103,7 +106,10 @@ async def test_extension_quote_matches_the_seven_seconds_veo_renders(
             prompt="keep going",
             model=VEO,
             duration_seconds=8,
-            extend_video_uri="file:///clip.mp4",
+            # gs:// is uncheckable offline and still prices; the scheme does not
+            # change the 7s an extension renders. A local dummy path would now
+            # be refused as outside DATA_FOLDER.
+            extend_video_uri="gs://b/clip.mp4",
             dry_run=True,
         )
     )
@@ -231,12 +237,12 @@ async def test_sibling_quotes_report_the_duration_they_price(
     import src.__main__ as main_module
 
     tool = getattr(main_module, tool_name)
-    # gs:// clip sources are uncheckable offline and still price; local dummy
-    # paths would now be refused as outside DATA_FOLDER. The scheme does not
-    # change the duration this test asserts. generate_transition's frames are
-    # not source-validated, so its dummy paths are left as-is.
+    # gs:// sources are uncheckable offline and still price; local dummy paths
+    # would now be refused as outside DATA_FOLDER (both tools source-validate
+    # their frames/clips on the dry_run path). The scheme does not change the
+    # duration this test asserts.
     kwargs: dict[str, Any] = (
-        {"first_frame_uri": "file:///a.png", "last_frame_uri": "file:///b.png"}
+        {"first_frame_uri": "gs://bucket/a.png", "last_frame_uri": "gs://bucket/b.png"}
         if tool_name == "generate_transition"
         else {"from_clip_uri": "gs://bucket/a.mp4", "to_clip_uri": "gs://bucket/b.mp4"}
     )
@@ -629,21 +635,22 @@ async def test_a_cancelled_extension_chain_still_records_its_cost(
 @pytest.mark.parametrize(
     ("mode", "mode_kwargs"),
     [
+        # gs:// sources are uncheckable offline and still price; this test only
+        # cares about the snapped duration and cost, which the scheme does not
+        # change. Local dummy paths would now be refused as outside DATA_FOLDER.
         pytest.param("text_to_video", {}, id="text"),
-        pytest.param("image_to_video", {"image_uri": "file:///a.png"}, id="image"),
+        pytest.param("image_to_video", {"image_uri": "gs://b/a.png"}, id="image"),
         pytest.param(
             "first_last_frame",
-            {"image_uri": "file:///a.png", "last_frame_uri": "file:///b.png"},
+            {"image_uri": "gs://b/a.png", "last_frame_uri": "gs://b/b.png"},
             id="first_last",
         ),
         pytest.param(
             "reference_to_video",
-            {"reference_image_uris": ["file:///a.png"]},
+            {"reference_image_uris": ["gs://b/a.png"]},
             id="reference",
         ),
-        pytest.param(
-            "extend_video", {"extend_video_uri": "file:///c.mp4"}, id="extend"
-        ),
+        pytest.param("extend_video", {"extend_video_uri": "gs://b/c.mp4"}, id="extend"),
     ],
 )
 async def test_a_quote_never_falls_below_the_metered_bill(

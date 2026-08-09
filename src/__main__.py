@@ -1906,6 +1906,19 @@ async def generate_image(
             resolved, plan_warnings, effective_size = resolve_image_model(
                 model, image_size
             )
+
+            # Refuse a local source the real run would reject, so a quote does
+            # not price a render that cannot fetch its inputs. After the model
+            # resolution so a model error still takes precedence. base64 inputs
+            # are inline bytes, not paths, so they are never passed here.
+            # References are sliced to reference_image_uris[
+            # :_MAX_IMAGE_REFERENCE_IMAGES] — the render fetches only that many,
+            # so validating a bad 15th reference would refuse one the render
+            # silently drops (and warns about, below).
+            _assert_local_source(image_uri, data_dir, "image_uri")
+            for ref_uri in (reference_image_uris or [])[:_MAX_IMAGE_REFERENCE_IMAGES]:
+                _assert_local_source(ref_uri, data_dir, "reference image")
+
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
@@ -2611,6 +2624,21 @@ async def generate_video(
                 else:
                     quoted_mode = "text_to_video"
                 validate_render_options(model, resolution, quoted_mode)
+
+                # Refuse a local source the real run would reject, so a quote
+                # does not price a render that cannot fetch its inputs. AFTER
+                # validate_render_options so a Lite mode-restriction still takes
+                # precedence (mirrors generate_bridge). base64 frames are inline
+                # bytes, not paths, so they are never passed here. References
+                # are sliced to what the render fetches (reference_image_uris[:
+                # _MAX_REFERENCE_IMAGES]) — validating beyond that would refuse
+                # an over-count reference the render silently truncates (and
+                # warns about below), refusing what the real run accepts.
+                _assert_local_source(image_uri, data_dir, "image_uri")
+                _assert_local_source(last_frame_uri, data_dir, "last_frame_uri")
+                _assert_local_source(extend_video_uri, data_dir, "extend_video_uri")
+                for ref_uri in (reference_image_uris or [])[:_MAX_REFERENCE_IMAGES]:
+                    _assert_local_source(ref_uri, data_dir, "reference image")
             # Report the model the real run will report, not the raw input: a
             # caller who pinned (or fed back) a `-preview` id saw the quote say
             # `-preview` while the render reported the resolved `-001` name.
@@ -2978,6 +3006,14 @@ async def generate_transition(
             from .video import validate_render_options
 
             validate_render_options(model, generation_mode="first_last_frame")
+
+            # Refuse a local frame the real run would reject, so a quote does
+            # not price a transition that cannot fetch its frames. After
+            # validate_render_options so a Lite mode-restriction still takes
+            # precedence (mirrors generate_bridge); remote frames (gs://) are
+            # uncheckable offline and still price.
+            _assert_local_source(first_frame_uri, data_dir, "first_frame_uri")
+            _assert_local_source(last_frame_uri, data_dir, "last_frame_uri")
             return json.dumps(
                 {
                     "dry_run": True,

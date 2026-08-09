@@ -196,13 +196,13 @@ _PAYLOAD_ROUNDING_USD = 5e-7
 
 # URIs the planner deliberately leaves out (it was never given them) but the
 # tool signature requires. Dry runs never fetch them, but they now validate
-# local file sources, so the clip/video stubs use gs:// (uncheckable offline,
-# still priced) rather than a dummy file:// path that would be refused as
-# outside DATA_FOLDER. generate_transition frames are not source-validated.
+# local file sources, so every stub uses gs:// (uncheckable offline, still
+# priced) rather than a dummy file:// path that would be refused as outside
+# DATA_FOLDER. generate_transition frames are now source-validated too.
 _MISSING_URI_STUBS: dict[str, dict[str, Any]] = {
     "generate_transition": {
-        "first_frame_uri": "file:///a.png",
-        "last_frame_uri": "file:///b.png",
+        "first_frame_uri": "gs://bucket/a.png",
+        "last_frame_uri": "gs://bucket/b.png",
     },
     "generate_bridge": {
         "from_clip_uri": "gs://bucket/a.mp4",
@@ -304,16 +304,20 @@ _INVARIANT_INTENTS: list[tuple[str, RoutingConstraints | None]] = [
     ("a cheap 4 second clip of steam", RoutingConstraints(budget="cheap")),
     ("a draft video of a robot", RoutingConstraints(is_draft=True)),
     (
+        # gs:// frames so the transition route the planner emits carries
+        # sources the tool's dry_run prices; local dummy paths would now be
+        # refused as outside DATA_FOLDER, and the scheme does not change the
+        # route or quote.
         "a crossfade between these frames",
         RoutingConstraints(
-            first_frame_uri="file:///a.png", last_frame_uri="file:///b.png"
+            first_frame_uri="gs://bucket/a.png", last_frame_uri="gs://bucket/b.png"
         ),
     ),
     (
         "a 4K crossfade between these frames",
         RoutingConstraints(
-            first_frame_uri="file:///a.png",
-            last_frame_uri="file:///b.png",
+            first_frame_uri="gs://bucket/a.png",
+            last_frame_uri="gs://bucket/b.png",
             resolution="4K",
         ),
     ),

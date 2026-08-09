@@ -4857,7 +4857,10 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
         ),
         pytest.param(
             "generate_transition",
-            {"first_frame_uri": "f", "last_frame_uri": "l"},
+            # gs:// frames are uncheckable offline and still price; local dummy
+            # paths would now be refused as outside DATA_FOLDER, and the scheme
+            # does not change the priced duration.
+            {"first_frame_uri": "gs://b/f.png", "last_frame_uri": "gs://b/l.png"},
             0.4,
             id="transition",
         ),
@@ -5171,7 +5174,10 @@ async def test_dry_run_refuses_every_lite_restriction(
         pytest.param("veo-3.1-lite-generate-preview", {}, id="lite_text_to_video"),
         pytest.param(
             "veo-3.1-lite-generate-preview",
-            {"image_uri": "a"},
+            # gs:// so the image_to_video quote exercises the Lite guard, not
+            # the new local-source refusal; a bare path would now be refused as
+            # outside DATA_FOLDER before the price is returned.
+            {"image_uri": "gs://b/a.png"},
             id="lite_image_to_video",
         ),
     ],
