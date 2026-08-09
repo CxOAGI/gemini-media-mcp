@@ -425,3 +425,27 @@ def test_panel_count_flows_through_to_the_board_shot_count() -> None:
     board = _storyboard_route(plan)
     assert board is not None
     assert len(board.params["shots"]) == 4
+
+
+def test_storyboard_workflow_previews_in_the_delivery_aspect_ratio() -> None:
+    """The previz must be reviewed in the aspect the clip will render.
+
+    generate_clip defaults to 9:16 while the storyboard defaults to 16:9, so
+    the chained workflow reviewed a landscape board then delivered a vertical
+    clip — reviewing the wrong frame defeats the previz. Both steps must carry
+    one aspect ratio.
+    """
+    plan = plan_generation(
+        "storyboard a 4 shot commercial before renders",
+        RoutingConstraints(num_beats=4),
+    )
+    aspects = {w.params.get("aspect_ratio") for w in plan.workflow}
+    assert len(plan.workflow) == 2
+    assert len(aspects) == 1, f"workflow steps disagree on aspect: {aspects}"
+
+    # And an explicit request is carried through both steps unchanged.
+    vertical = plan_generation(
+        "storyboard a 4 shot vertical tiktok ad before renders",
+        RoutingConstraints(num_beats=4),
+    )
+    assert {w.params.get("aspect_ratio") for w in vertical.workflow} == {"9:16"}

@@ -3249,11 +3249,21 @@ def _build_workflow(
                 f" (est. ${storyboard_route.cost.usd:.2f} against "
                 f"${best.cost.usd:.2f} for the full clip render)"
             )
+        # Preview in the aspect ratio of the DELIVERABLE. generate_clip defaults
+        # to 9:16 while the storyboard defaults to 16:9, so without this the
+        # board reviewed landscape while the clip rendered vertical — reviewing
+        # the wrong frame defeats the point of the previz. When the request
+        # names an aspect both already carry it; this only reconciles the
+        # split defaults.
+        board_params = storyboard_route.params
+        clip_aspect = best.params.get("aspect_ratio")
+        if clip_aspect and board_params.get("aspect_ratio") != clip_aspect:
+            board_params = {**board_params, "aspect_ratio": clip_aspect}
         return (
             WorkflowStep(
                 order=1,
                 tool="generate_storyboard",
-                params=storyboard_route.params,
+                params=board_params,
                 rationale=(
                     f"{board_lead}: review framing and pacing as cheap keyframe "
                     "stills before paying for any per-second video."
