@@ -667,6 +667,27 @@ def _fetch_failure(param: str, uri: str, data_dir: Path) -> str:
     return base  # validation passes; the failure was a read/size error
 
 
+def _assert_local_source(uri: str | None, data_dir: Path, param: str) -> None:
+    """Refuse, on a dry run, a local source the real run would reject.
+
+    The project invariant is that a quote refuses everything the real run
+    refuses. A local file source that is missing or outside DATA_FOLDER is
+    exactly what fetch() rejects on the real run, yet dry_run priced it — so a
+    quote succeeded for a call guaranteed to fail. Remote sources (gs://, http,
+    https) are not checkable offline, so they are left for the real fetch and
+    still price in a quote. Reuses the same containment/existence check and the
+    same message the real run emits (via _fetch_failure), so the dry-run
+    refusal reads identically to the render's.
+    """
+    if not uri or uri.startswith(("gs://", "http://", "https://")):
+        return
+    raw = uri[7:] if uri.startswith("file://") else uri
+    try:
+        _validate_local_path(Path(raw), data_dir)
+    except ValueError:
+        raise ValueError(_fetch_failure(param, uri, data_dir)) from None
+
+
 def _validate_duration_seconds(
     duration_seconds: float | None,
     field: str = "duration_seconds",
@@ -3144,6 +3165,13 @@ async def generate_bridge(
 
             validate_render_options(model, generation_mode="first_last_frame")
 
+            # Refuse a local clip the real run would reject, so a quote does not
+            # price a bridge that cannot render. After validate_render_options so
+            # a Lite mode-restriction error still takes precedence; remote clips
+            # (gs://) are uncheckable offline and still price.
+            _assert_local_source(from_clip_uri, data_dir, "from_clip_uri")
+            _assert_local_source(to_clip_uri, data_dir, "to_clip_uri")
+
             # Report the environmental check positively. It runs above (and
             # refuses when ffmpeg is missing), but a passing check looks
             # identical to no check at all — which is exactly how a reviewer
@@ -3424,6 +3452,16 @@ async def generate_clip(
                     raise ValueError(
                         f"beats[{beat_index}].first_frame_uri is empty; omit the "
                         "key entirely for a text-to-video beat"
+                    )
+                # On a dry run, refuse a local frame the real run's per-beat
+                # fetch would reject, so a quote does not price a beat that
+                # cannot render. Guarded to dry_run: a real run keeps its
+                # per-beat failure (recorded in errors, clip continues) for a
+                # source only discoverable at fetch time, while a local path is
+                # decidable now and a quote must refuse it up front.
+                if dry_run:
+                    _assert_local_source(
+                        first_frame, data_dir, f"beats[{beat_index}].first_frame_uri"
                     )
 
         # Validate the clip-level aspect ratio once, up front. Otherwise the
@@ -3850,6 +3888,13 @@ async def generate_video_omni(
             # Disclose the GCS-allowlist warning on the notification channel,
             # not only in the quote body.
             await _emit_warnings(ctx, gcs_warnings)
+            # Refuse local sources the real run would reject, so a quote does
+            # not price a call that cannot run. Remote sources still price.
+            for uri in image_uris or []:
+                _assert_local_source(uri, app_ctx.data_folder, "image_uri")
+            _assert_local_source(
+                input_video_uri, app_ctx.data_folder, "input_video_uri"
+            )
             # An input video (or a prior interaction) makes this an edit —
             # omni._select_task_type keys on either — and an edit sends no
             # duration and renders a service-chosen length that measured 10s
@@ -4173,6 +4218,10 @@ async def loop_extend(
             )
 
         if dry_run:
+            # Refuse a local source the real run would reject, so a quote does
+            # not price an extension that cannot run. A gs:// source was already
+            # allowlist-checked above and still prices.
+            _assert_local_source(video_uri, data_dir, "video_uri")
             # Each extension is a ~7s Veo render billed like any other.
             return json.dumps(
                 {

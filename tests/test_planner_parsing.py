@@ -195,17 +195,20 @@ def _tool_ctx(tmp_path: Path) -> MagicMock:
 _PAYLOAD_ROUNDING_USD = 5e-7
 
 # URIs the planner deliberately leaves out (it was never given them) but the
-# tool signature requires. Dry runs never fetch them.
+# tool signature requires. Dry runs never fetch them, but they now validate
+# local file sources, so the clip/video stubs use gs:// (uncheckable offline,
+# still priced) rather than a dummy file:// path that would be refused as
+# outside DATA_FOLDER. generate_transition frames are not source-validated.
 _MISSING_URI_STUBS: dict[str, dict[str, Any]] = {
     "generate_transition": {
         "first_frame_uri": "file:///a.png",
         "last_frame_uri": "file:///b.png",
     },
     "generate_bridge": {
-        "from_clip_uri": "file:///a.mp4",
-        "to_clip_uri": "file:///b.mp4",
+        "from_clip_uri": "gs://bucket/a.mp4",
+        "to_clip_uri": "gs://bucket/b.mp4",
     },
-    "loop_extend": {"video_uri": "file:///a.mp4"},
+    "loop_extend": {"video_uri": "gs://bucket/a.mp4"},
 }
 
 
@@ -315,8 +318,11 @@ _INVARIANT_INTENTS: list[tuple[str, RoutingConstraints | None]] = [
         ),
     ),
     (
+        # gs:// so the loop_extend route the planner emits carries a source the
+        # tool's dry_run prices; a local dummy path would now be refused as
+        # outside DATA_FOLDER, and the scheme does not change the route or quote.
         "make it 30 seconds long",
-        RoutingConstraints(media_kind="video", source_video_uri="file:///a.mp4"),
+        RoutingConstraints(media_kind="video", source_video_uri="gs://bucket/a.mp4"),
     ),
     ("make the sky stormy", RoutingConstraints(previous_interaction_id="int-1")),
 ]

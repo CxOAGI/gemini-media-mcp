@@ -231,10 +231,14 @@ async def test_sibling_quotes_report_the_duration_they_price(
     import src.__main__ as main_module
 
     tool = getattr(main_module, tool_name)
+    # gs:// clip sources are uncheckable offline and still price; local dummy
+    # paths would now be refused as outside DATA_FOLDER. The scheme does not
+    # change the duration this test asserts. generate_transition's frames are
+    # not source-validated, so its dummy paths are left as-is.
     kwargs: dict[str, Any] = (
         {"first_frame_uri": "file:///a.png", "last_frame_uri": "file:///b.png"}
         if tool_name == "generate_transition"
-        else {"from_clip_uri": "file:///a.mp4", "to_clip_uri": "file:///b.mp4"}
+        else {"from_clip_uri": "gs://bucket/a.mp4", "to_clip_uri": "gs://bucket/b.mp4"}
     )
 
     payload = json.loads(

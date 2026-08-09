@@ -4863,13 +4863,19 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
         ),
         pytest.param(
             "generate_bridge",
-            {"from_clip_uri": "a", "to_clip_uri": "b"},
+            # gs:// clips are uncheckable offline and still price; a local dummy
+            # path would now be refused as outside DATA_FOLDER, and the scheme
+            # does not change the priced duration.
+            {"from_clip_uri": "gs://b/a.mp4", "to_clip_uri": "gs://b/b.mp4"},
             0.4,
             id="bridge",
         ),
         pytest.param(
             "loop_extend",
-            {"video_uri": "file:///x.mp4", "times": 4},
+            # gs:// source is uncheckable offline and still prices; a local
+            # dummy path would now be refused as outside DATA_FOLDER, and the
+            # scheme does not change the priced 7s steps.
+            {"video_uri": "gs://b/x.mp4", "times": 4},
             11.2,
             id="loop_extend_prices_7s_steps_not_snapped_8s",
         ),
@@ -5446,8 +5452,11 @@ async def test_bridge_quote_reports_that_the_ffmpeg_check_ran(tmp_path: Path) ->
     payload = json.loads(
         await main_mod.generate_bridge(
             ctx=_video_ctx(tmp_path),
-            from_clip_uri="a",
-            to_clip_uri="b",
+            # gs:// clips are uncheckable offline and still price; local dummy
+            # paths would now be refused as outside DATA_FOLDER. This test is
+            # about the ffmpeg preflight, not the source scheme.
+            from_clip_uri="gs://b/a.mp4",
+            to_clip_uri="gs://b/b.mp4",
             dry_run=True,
         )
     )
