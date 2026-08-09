@@ -41,6 +41,7 @@ from .omni import (
 )
 from .omni import OMNI_MODEL
 from .video import (
+    _CANONICAL_VIDEO_MODEL_IDS,  # pyright: ignore[reportPrivateUsage]
     _VEO_LITE_MODELS,  # pyright: ignore[reportPrivateUsage]
     VideoModel,
 )
@@ -54,6 +55,7 @@ BudgetPreference = Literal["cheap", "balanced", "best"]
 Backend = Literal["vertex", "gemini_api", "unknown"]
 ToolName = Literal[
     "generate_image",
+    "generate_storyboard",
     "generate_video",
     "generate_video_omni",
     "generate_clip",
@@ -120,6 +122,13 @@ MAX_VIDEO_REFERENCE_IMAGES = 3
 # into a module whose entire promise is that it only computes. Planning more
 # beats than this emitted a fully quoted route the tool refuses outright.
 MAX_CLIP_BEATS = 20
+
+# generate_storyboard hard-errors above this many shots, because every shot is
+# a billed image generation. Mirrored from src/__main__.py's
+# MAX_STORYBOARD_SHOTS (the source of truth) for the same reason MAX_CLIP_BEATS
+# is mirrored rather than imported. A storyboard route beyond this count would
+# be a fully priced plan the tool refuses outright.
+MAX_STORYBOARD_SHOTS = 24
 
 # generate_clip renders every bridge at exactly 4.0s regardless of how long the
 # beats are (the duration_seconds=4.0 bridge render in src/__main__.py), and
@@ -579,26 +588,45 @@ _IMAGE_TERMS: frozenset[str] = frozenset(
 
 # Anything that has to come out with readable glyphs. This is the single
 # strongest reason to pay for gemini-3-pro-image.
+#
+# Term matching is whole-word (see _term_pattern), so plurals are listed
+# explicitly — "captions"/"labels"/"panels" do NOT match the singular forms,
+# which is exactly why a storyboard/caption brief whose whole point is legible
+# on-panel text was routing to the weakest text renderer.
 _TEXT_RENDERING_TERMS: frozenset[str] = frozenset(
     {
         "banner",
         "brand",
         "branding",
         "caption",
+        "captions",
         "chart",
         "diagram",
         "flyer",
         "headline",
         "infographic",
         "label",
+        "labels",
         "lettering",
         "logo",
+        "lower third",
+        "lower-third",
+        "lower thirds",
+        "lower-thirds",
         "menu",
         "packaging",
+        # "panel"/"panels" is deliberately NOT here: a solar panel, control
+        # panel or wood panel carries no text, and it over-triggered a stronger
+        # (pricier) text renderer for unrelated images. A storyboard's panels
+        # are covered by the storyboard signal plus caption/slug-line/label.
         "poster",
         "sign",
         "signage",
         "slide",
+        "slug line",
+        "slug lines",
+        "slugline",
+        "sluglines",
         "subtitle",
         "text",
         "title card",
@@ -685,6 +713,34 @@ _MULTI_SHOT_TERMS: frozenset[str] = frozenset(
         "storyboard",
         "tiktok",
         "trailer",
+    }
+)
+
+# Previsualization before committing to renders: the caller wants to see the
+# shots as cheap stills first. These drive the generate_storyboard route — the
+# intended step between an idea and generate_clip. Multi-word phrases anchor as
+# whole phrases (see _term_pattern), so "before committing" matches "before
+# committing to renders" but not "committing".
+_STORYBOARD_TERMS: frozenset[str] = frozenset(
+    {
+        "before committing",
+        "before rendering",
+        "keyframe",
+        "keyframes",
+        "mock up the shots",
+        "mockup the shots",
+        "panel",
+        "panels",
+        "plan the shots",
+        "pre-vis",
+        "previsualize",
+        "previz",
+        "shot sheet",
+        "shot sheets",
+        "shotlist",
+        "shotlists",
+        "storyboard",
+        "storyboards",
     }
 )
 
@@ -1082,6 +1138,7 @@ class IntentSignals:
     wants_draft: bool = False
     wants_iteration: bool = False
     wants_multi_shot: bool = False
+    wants_storyboard: bool = False
     wants_extension: bool = False
     wants_audio: bool = False
     wants_transition: bool = False
@@ -1128,6 +1185,7 @@ def infer_signals(intent: str) -> IntentSignals:
     draft_hits = _matched_terms(text, _DRAFT_TERMS)
     iteration_hits = _matched_terms(text, _ITERATION_TERMS)
     multi_hits = _matched_terms(text, _MULTI_SHOT_TERMS)
+    storyboard_hits = _matched_terms(text, _STORYBOARD_TERMS)
     extension_hits = _matched_terms(text, _EXTENSION_TERMS)
     audio_hits = _matched_terms(text, _AUDIO_TERMS)
     cheap_hits = _matched_terms(text, _CHEAP_TERMS)
@@ -1198,6 +1256,7 @@ def infer_signals(intent: str) -> IntentSignals:
                 + draft_hits
                 + iteration_hits
                 + multi_hits
+                + storyboard_hits
                 + extension_hits
                 + audio_hits
                 + cheap_hits
@@ -1224,6 +1283,7 @@ def infer_signals(intent: str) -> IntentSignals:
         # An explicit beat/shot count is itself a multi-shot signal.
         wants_multi_shot=bool(multi_hits)
         or (beat_count is not None and beat_count > 1),
+        wants_storyboard=bool(storyboard_hits),
         wants_extension=bool(extension_hits),
         wants_audio=bool(audio_hits),
         wants_transition=bool(transition_hits),
@@ -1413,6 +1473,7 @@ class ResolvedRequest:
     wants_bridge: bool
     wants_transition: bool
     wants_gcs_output: bool
+    wants_storyboard: bool
     num_beats: int
     is_draft: bool
     is_iterating: bool
@@ -1461,6 +1522,18 @@ def resolve_request(
         The fully resolved request.
     """
     given = constraints or RoutingConstraints()
+
+    # A Gemini-API render reports its model under a `-preview` Veo id, and the
+    # generation tools accept that spelling as an alias of the canonical `-001`
+    # model so a returned id round-trips. Normalize a pinned preview id to its
+    # canonical name up front — BEFORE the live-model check in _plan_video —
+    # so pinning a preview id is planned as its canonical model instead of
+    # rejected as "not a live video model". Source of truth for the mapping is
+    # video._CANONICAL_VIDEO_MODEL_IDS; a non-preview id passes through
+    # unchanged.
+    pinned_model = given.pinned_model
+    if pinned_model is not None:
+        pinned_model = _CANONICAL_VIDEO_MODEL_IDS.get(pinned_model, pinned_model)
 
     # Media kind: explicit, then inferred from the text, then inferred from
     # constraints that only exist for video (frames to interpolate between, a
@@ -1622,6 +1695,7 @@ def resolve_request(
         wants_bridge=signals.wants_bridge,
         wants_transition=signals.wants_transition,
         wants_gcs_output=bool(wants_gcs_output),
+        wants_storyboard=signals.wants_storyboard,
         num_beats=int(num_beats),
         is_draft=bool(is_draft),
         is_iterating=bool(is_iterating),
@@ -1631,7 +1705,7 @@ def resolve_request(
             or False
         ),
         resolution=resolution,
-        pinned_model=given.pinned_model,
+        pinned_model=pinned_model,
         previous_interaction_id=given.previous_interaction_id,
     )
 
@@ -2657,6 +2731,116 @@ def _video_cost(
     return _estimate_video_cost(model, duration, resolution, request.needs_audio)
 
 
+# Size a storyboard previews at. generate_storyboard leaves image_size unset by
+# default (its docstring: "storyboard frames rarely need to be large"), which
+# prices at the model default of 1K; fixing 1K here keeps the board cheap and
+# is the only size flash-lite can render at all. Cost parity with the tool's
+# dry_run holds because both price the same (model, 1K, shot count).
+_STORYBOARD_IMAGE_SIZE = "1K"
+
+
+def _plan_storyboard_route(request: ResolvedRequest) -> RoutedCall | None:
+    """A generate_storyboard previz route for a storyboard-flavoured request.
+
+    generate_storyboard is the intended step between an idea and generate_clip:
+    one keyframe still per shot, so a multi-shot sequence can be reviewed for
+    framing and pacing before any per-second video spend — typically an order
+    of magnitude cheaper than rendering the clip. It is otherwise undiscoverable
+    through the planner, which is documented as the tool to call first.
+
+    Offered only when the intent actually signals previsualization AND the
+    sequence is genuinely multi-shot, so requests without that signal are
+    unchanged. Priced through the same estimate_image_cost path
+    generate_storyboard's own dry_run uses (one keyframe per shot), so the quote
+    beside this route equals what the tool reports for the same shots and model.
+
+    Returns None when the request is not a storyboard previz.
+    """
+    if not request.wants_storyboard or request.num_beats < 2:
+        return None
+
+    shots = min(request.num_beats, MAX_STORYBOARD_SHOTS)
+
+    # Choose the keyframe model with the image planner's own scoring, so the
+    # board respects budget and — the point of the paired text-rendering fix —
+    # a captions/slug-line brief prefers a stronger text renderer. Size is fixed
+    # at 1K, so quality counts as demanded only when the caller wants "best".
+    quality_is_demanded = request.budget == "best"
+    scored: list[tuple[float, ModelProfile]] = []
+    for model in sorted(LIVE_IMAGE_MODELS):
+        profile = _IMAGE_PROFILES[model]
+        demanded = (
+            (profile.text_rendering_index,) if request.needs_text_rendering else ()
+        )
+        score = _score_route(
+            profile,
+            request,
+            demanded_capabilities=demanded,
+            quality_is_demanded=quality_is_demanded,
+            default_model=DEFAULT_IMAGE_MODEL,
+        )
+        scored.append((score, profile))
+    # Same total order as _rank: score desc, then fidelity desc, then id asc.
+    scored.sort(key=lambda sp: (-sp[0], -sp[1].fidelity_index, sp[1].model))
+    score, profile = scored[0]
+    model = profile.model
+
+    cost = _estimate_image_cost(model, _STORYBOARD_IMAGE_SIZE, shots)
+    aspect_ratio = request.aspect_ratio or "16:9"
+
+    params: dict[str, Any] = {
+        "shots": [
+            {
+                "prompt": request.intent,
+                "duration_seconds": request.clip_duration_seconds,
+            }
+            for _ in range(shots)
+        ],
+        "model": model,
+        "aspect_ratio": aspect_ratio,
+        "image_size": _STORYBOARD_IMAGE_SIZE,
+    }
+
+    caveats: list[str] = [
+        f"Replace each of the {shots} shot prompts with that shot's own "
+        "description — they are seeded from the intent.",
+        "Keyframes are stills, not the clip: the board previews framing and "
+        "pacing, then its shot list feeds straight into generate_clip.",
+    ]
+    if request.num_beats > MAX_STORYBOARD_SHOTS:
+        caveats.append(
+            f"{request.num_beats} shots were asked for but generate_storyboard "
+            f"renders at most {MAX_STORYBOARD_SHOTS}; planned at "
+            f"{MAX_STORYBOARD_SHOTS}. Split the sequence across several boards."
+        )
+    if request.needs_text_rendering and model != "gemini-3-pro-image":
+        caveats.append(
+            "gemini-3-pro-image renders on-panel text (slug lines, captions) "
+            "most legibly; expect to re-roll glyphs on this one."
+        )
+
+    rationale = (
+        f"generate_storyboard on {model}: render {shots} keyframe stills to "
+        "previsualize the sequence"
+    )
+    if cost is not None:
+        rationale += f" for about ${cost.usd:.2f}"
+    rationale += (
+        " before committing to the per-second video render; the shot list then "
+        f"feeds straight into generate_clip. budget={request.budget}"
+    )
+
+    return RoutedCall(
+        tool="generate_storyboard",
+        model=model,
+        params=params,
+        score=score,
+        rationale=rationale,
+        caveats=tuple(caveats),
+        cost=cost,
+    )
+
+
 def _plan_video(
     request: ResolvedRequest,
 ) -> tuple[
@@ -2874,6 +3058,16 @@ def _plan_video(
             "is an ordered segment list for a downstream cutting MCP."
         )
 
+    # A storyboard previz sits alongside the video routes: for a
+    # previsualization-flavoured multi-shot brief it is the cheap first step,
+    # ranked on the image-model scale so it lands ahead of the per-second
+    # renders. Gated inside the helper, so non-storyboard requests are
+    # untouched. A pinned video model still wins outright (the filter below
+    # drops every non-pinned route, storyboard included).
+    storyboard_route = _plan_storyboard_route(request)
+    if storyboard_route is not None:
+        routes.append(storyboard_route)
+
     ranked = _rank(routes, _VIDEO_PROFILES)
 
     # Same rule as the image planner: a surviving pin is the only plan.
@@ -2976,7 +3170,15 @@ def _build_workflow(
     """
     if not routes:
         return ()
-    best = routes[0]
+    # The animatic/seed-clip workflows are keyed off the primary VIDEO render.
+    # A storyboard previz may now outrank it (it is the cheap first step, not
+    # the delivery render), so skip past it to the top video route — for every
+    # non-storyboard plan this is still routes[0], leaving existing behaviour
+    # unchanged.
+    render_routes = [route for route in routes if route.tool != "generate_storyboard"]
+    if not render_routes:
+        return ()
+    best = render_routes[0]
 
     if (
         best.tool == "loop_extend"
