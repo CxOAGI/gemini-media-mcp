@@ -438,19 +438,28 @@ async def test_generate_storyboard_dry_run_emits_plan_warnings(
 
 
 # ===========================================================================
-# Defect 3 — the contact sheet is rendered once and reused inline
+# Defect 3 — the contact sheet is rendered once, and what goes inline is a
+# bounded preview of it rather than every byte
 # ===========================================================================
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_generate_storyboard_reuses_sheet_for_inline(
+async def test_generate_storyboard_composites_once_and_previews_the_sheet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The inline PNG is the exact sheet written to disk — composited once."""
+    """The board is composited once, and the inline copy is a bounded preview.
+
+    Both halves matter and pull against each other. Compositing a second time
+    at a smaller width re-decoded every frame and re-ran a LANCZOS pass per
+    panel — seconds on a 24-shot board. Returning the on-disk sheet verbatim
+    instead was fast but shipped a 1.1MB result that no MCP client accepts.
+    Downscaling the one finished sheet satisfies both.
+    """
     import src.__main__ as main_mod
     from src import storyboard as sb
     from src.__main__ import generate_storyboard
+    from src.storyboard import INLINE_PREVIEW_MAX_BYTES
 
     ctx = _ctx(_app_ctx(tmp_path))
 
@@ -478,17 +487,31 @@ async def test_generate_storyboard_reuses_sheet_for_inline(
 
     monkeypatch.setattr(sb, "render_contact_sheet", counting_render)
 
-    # Six shots so the pre-fix 1200-wide inline copy differed from the
-    # 1760-wide on-disk sheet — a one-shot board would match either way.
+    # Six shots so the inline copy is meaningfully narrower than the 1760-wide
+    # on-disk sheet — a one-shot board would fit the budget either way.
     shots = [{"prompt": f"shot {i}", "notes": "wide"} for i in range(6)]
     blocks = await generate_storyboard(ctx=ctx, shots=shots)
 
-    inline_png = blocks[0].data
+    inline = blocks[0].data
     payload = json.loads(blocks[1].text)
     sheet_path = Path(payload["sheet_url"][7:])
 
     assert calls["n"] == 1  # composited exactly once
-    assert inline_png == sheet_path.read_bytes()  # inline reuses that sheet
+    assert inline.startswith(b"\xff\xd8")  # a JPEG preview, not the PNG sheet
+    assert len(inline) <= INLINE_PREVIEW_MAX_BYTES
+
+    # Derived from the sheet, not the sheet: byte size is the wrong comparison
+    # here, because these frames are flat colour and PNG compresses that better
+    # than JPEG can. What holds for any board is that the preview never exceeds
+    # the sheet's own width, and the full-resolution sheet is still on disk.
+    # That a *large* board is actually scaled down is pinned by
+    # tests/test_media_limits.py, on frames that do not compress away.
+    assert inline != sheet_path.read_bytes()
+    with Image.open(BytesIO(inline)) as preview_img:
+        preview_w = preview_img.width
+    with Image.open(sheet_path) as sheet_img:
+        assert sheet_img.format == "PNG"
+        assert preview_w <= sheet_img.width
 
 
 # ===========================================================================

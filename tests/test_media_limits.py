@@ -15,6 +15,7 @@ detail dropped in passing changes the answer downstream:
 
 import base64
 import json
+import random
 import re
 import struct
 import threading
@@ -34,6 +35,10 @@ from src.storyboard import (
     StoryboardFrame,
     _load_font,  # pyright: ignore[reportPrivateUsage]
     render_html,
+)
+from tests.test_followups_tools import (  # pyright: ignore[reportPrivateUsage]
+    _app_ctx,
+    _ctx,
 )
 
 # ============================================================================
@@ -523,6 +528,131 @@ def test_html_embed_falls_back_to_the_raw_bytes_when_undecodable() -> None:
     )
 
     assert _embedded_frames(document) == [("image/png", garbage)]
+
+
+# ============================================================================
+# Storyboard response: inline payload size
+# ============================================================================
+
+
+def _noise(width: int, height: int, seed: int) -> bytes:
+    """A keyframe that does not compress away.
+
+    ``_solid`` paints one colour, which composites into a sheet of a few
+    kilobytes — it would fit the budget whatever the shot count and never show
+    the bug. Real keyframes are photographic; noise is their worst end.
+    """
+    data = random.Random(seed).randbytes(width * height * 3)
+    image = Image.frombytes("RGB", (width, height), data)
+    try:
+        return _encode(image)
+    finally:
+        image.close()
+
+
+async def _board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shots: int
+) -> list[Any]:
+    """Run generate_storyboard over ``shots`` incompressible keyframes."""
+    import src.__main__ as main_mod
+    from src.__main__ import generate_storyboard
+
+    async def mock_image_impl(**kwargs: Any) -> dict[str, Any]:
+        images_dir: Path = kwargs["images_dir"]
+        idx = len(list(images_dir.glob("shot_*.png")))
+        path = images_dir / f"shot_{idx}.png"
+        path.write_bytes(_noise(320, 180, seed=idx))
+        return {
+            "message": "ok",
+            "image_url": f"file://{path}",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr(main_mod, "generate_image_impl", mock_image_impl)
+    return await generate_storyboard(
+        ctx=_ctx(_app_ctx(tmp_path)),
+        shots=[
+            {"prompt": f"shot {i}", "caption": f"SHOT {i}", "notes": "slow push in"}
+            for i in range(shots)
+        ],
+    )
+
+
+def _wire_bytes(blocks: list[Any]) -> int:
+    """What the response costs on the wire, image blocks base64 and all."""
+    total = 0
+    for block in blocks:
+        data = getattr(block, "data", None)
+        total += len(base64.b64encode(data)) if data else len(block.text)
+    return total
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120.0)
+@pytest.mark.parametrize("shots", [12, 24])
+async def test_storyboard_response_stays_under_the_client_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shots: int
+) -> None:
+    """The reproduction: a board too big to arrive is a board you never see.
+
+    Returning the composited sheet verbatim put a 12-shot board at 1.11MB and a
+    24-shot board at 1.25MB once base64'd — past what Claude Desktop accepts, so
+    the whole result was dropped after every shot had been billed. Both counts
+    are well inside the cap now, on frames that compress worse than real ones.
+    """
+    blocks = await _board(tmp_path, monkeypatch, shots)
+
+    assert _wire_bytes(blocks) < 1024 * 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120.0)
+async def test_storyboard_inline_preview_shrinks_but_the_disk_sheet_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The board is bounded inline and full-resolution on disk — both at once.
+
+    The inline copy is the only one with a size problem; shrinking the artifact
+    the user actually opens would trade one defect for another.
+    """
+    blocks = await _board(tmp_path, monkeypatch, 24)
+    inline = blocks[0].data
+    payload = json.loads(blocks[1].text)
+
+    with Image.open(BytesIO(inline)) as preview:
+        assert preview.format == "JPEG"
+        preview_w = preview.width
+    with Image.open(Path(payload["sheet_url"][7:])) as sheet:
+        assert sheet.format == "PNG"
+        assert preview_w < sheet.width  # this board genuinely needed shrinking
+
+    assert Path(payload["storyboard_url"][7:]).is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120.0)
+async def test_storyboard_degrades_to_text_when_the_preview_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An undecodable sheet drops the image block, not the whole board.
+
+    Every shot has been paid for by this point, and both artifacts are already
+    on disk, so the URLs still have to come back.
+    """
+
+    def undecodable(sheet_png: bytes, *, max_bytes: int = 0) -> bytes:
+        return b""
+
+    # generate_storyboard imports the helper at call time, so the module
+    # attribute is what it resolves.
+    monkeypatch.setattr(src.storyboard, "render_sheet_preview", undecodable)
+    blocks = await _board(tmp_path, monkeypatch, 2)
+
+    assert len(blocks) == 1
+    payload = json.loads(blocks[0].text)
+    assert Path(payload["sheet_url"][7:]).is_file()
+    assert Path(payload["storyboard_url"][7:]).is_file()
 
 
 # ============================================================================

@@ -13,6 +13,10 @@ Why two artifacts?
     1. ``render_contact_sheet`` composites a real PNG — a grid of numbered
        panels with shot text drawn under each frame. This is the artifact the
        user looks at in chat, so it has to stand on its own.
+       ``render_sheet_preview`` then bounds a copy of it for the response,
+       because a full-size board is over a megabyte from about a dozen shots
+       up and a result that large does not arrive at all. The full-size sheet
+       is written to disk either way.
     2. ``render_html`` emits a fully self-contained HTML document (images as
        ``data:`` URIs, CSS/JS inlined, zero external requests) that the user
        opens in a browser for the richer review pass: full prompts, notes,
@@ -1180,6 +1184,104 @@ def render_contact_sheet(
         sheet.close()
 
 
+# An MCP client rejects a tool result past roughly a megabyte, and base64
+# inflates whatever is sent by a third, so the budget below leaves the encoded
+# block near 470KB with the JSON body's few kilobytes on top. The full-size
+# sheet is not the thing that has to fit: it is already on disk at sheet_url,
+# and returning every byte of it inline made a 12-shot board a 1.11MB result
+# and a 24-shot board 1.25MB — neither of which arrives at all.
+INLINE_PREVIEW_MAX_BYTES = 350 * 1024
+# Scaling is by width, not longest edge: panel width is what makes the board
+# legible, while its height is only whatever the grid needed. A thumbnail() box
+# would shrink a tall 9:16 board by its height and throw away the readability
+# that matters. The floor is the width below which the panel text is gone
+# anyway, so shrinking further would buy bytes at the cost of the whole point.
+_PREVIEW_MAX_WIDTH = 1600
+_PREVIEW_MIN_WIDTH = 640
+_PREVIEW_START_QUALITY = 80
+_PREVIEW_MIN_QUALITY = 60
+_PREVIEW_MAX_ATTEMPTS = 4
+
+
+def render_sheet_preview(
+    sheet_png: bytes, *, max_bytes: int = INLINE_PREVIEW_MAX_BYTES
+) -> bytes:
+    """Shrink a composited contact sheet into a JPEG that fits in a response.
+
+    The caller has already written the full-resolution sheet to disk and hands
+    those same bytes here, so this decodes one finished PNG rather than
+    re-compositing the board — the board is still rendered exactly once.
+
+    Quality is spent before pixels. A softer photograph still reads as the
+    shot it is, whereas a slug line shrunk past its font size is simply gone,
+    so the first over-budget attempt drops straight to the quality floor and
+    only the ones after that scale the board down. JPEG size is roughly linear
+    in pixel count, so an over-budget attempt says how far to back off: the
+    next pass scales by ``sqrt(budget / actual)`` with a little headroom. Most
+    boards converge in one or two encodes; the loop is bounded regardless.
+
+    Args:
+        sheet_png: Encoded contact sheet, as returned by
+            :func:`render_contact_sheet`.
+        max_bytes: Byte budget for the returned JPEG, before base64.
+
+    Returns:
+        JPEG bytes, or ``b""`` if ``sheet_png`` could not be decoded. Falling
+        back to the original bytes — what :func:`_embed_uri` does for a frame —
+        is the one thing that cannot happen here, since their size is the
+        entire problem; an empty result tells the caller to omit the block.
+    """
+    try:
+        with Image.open(BytesIO(sheet_png)) as source:
+            # The sheet canvas is RGB already (no alpha, so no matte colour to
+            # guess); convert defensively for anything else that reaches here.
+            flat = source.convert("RGB")
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not decode the contact sheet for preview (%s)", exc)
+        return b""
+
+    try:
+        width = min(_PREVIEW_MAX_WIDTH, flat.width)
+        quality = _PREVIEW_START_QUALITY
+        data = b""
+        for attempt in range(_PREVIEW_MAX_ATTEMPTS):
+            data = _encode_preview(flat, width, quality)
+            if len(data) <= max_bytes:
+                return data
+            if attempt == 0:
+                quality = _PREVIEW_MIN_QUALITY
+                continue
+            if width <= _PREVIEW_MIN_WIDTH:
+                break
+            shrink = max(0.5, math.sqrt(max_bytes / len(data)) * 0.95)
+            width = max(_PREVIEW_MIN_WIDTH, int(width * shrink))
+        # A board already billed for every shot is not worth failing over a
+        # preview that came in a little heavy, so the smallest attempt goes out.
+        logger.warning(
+            "Storyboard preview stayed at %d bytes, over the %d budget",
+            len(data),
+            max_bytes,
+        )
+        return data
+    finally:
+        flat.close()
+
+
+def _encode_preview(sheet: Image.Image, width: int, quality: int) -> bytes:
+    """Encode ``sheet`` as JPEG, scaled to ``width`` with its aspect kept."""
+    buffer = BytesIO()
+    if width >= sheet.width:
+        sheet.save(buffer, format="JPEG", quality=quality, optimize=True)
+        return buffer.getvalue()
+    height = max(1, round(sheet.height * width / sheet.width))
+    scaled = sheet.resize((width, height), Image.Resampling.LANCZOS)
+    try:
+        scaled.save(buffer, format="JPEG", quality=quality, optimize=True)
+    finally:
+        scaled.close()
+    return buffer.getvalue()
+
+
 # ============================================================================
 # HTML
 # ============================================================================
@@ -1471,7 +1573,7 @@ def write_storyboard(
 ) -> dict[str, str]:
     """Render both artifacts to ``out_dir`` and return their locations.
 
-    The PNG is the inline-displayable one; the HTML is the browser review
+    The PNG is the one a client can display; the HTML is the browser review
     page and embeds the same PNG as an overview strip.
 
     Args:
@@ -1488,9 +1590,10 @@ def write_storyboard(
     Returns:
         ``{"sheet_path", "sheet_url", "html_path", "html_url"}`` — paths are
         absolute, URLs are ``file://``. The contact sheet is composited once
-        here and written to ``sheet_path``; a caller that also needs the PNG
-        inline should read it back from disk rather than re-render it (a
-        24-shot board's re-decode + LANCZOS pass measured seconds).
+        here and written to ``sheet_path`` at full resolution; a caller that
+        also needs it inline should read it back and pass it through
+        :func:`render_sheet_preview` rather than re-render it at a smaller
+        size (a 24-shot board's re-decode + LANCZOS pass measured seconds).
 
     Raises:
         ValueError: If ``frames`` is empty.

@@ -2241,8 +2241,10 @@ async def generate_storyboard(
 
     Two artifacts come back, because MCP clients render inline images but do
     not execute HTML:
-      1. A composited contact-sheet PNG, returned inline. This is the thing
-         you look at.
+      1. A composited contact-sheet PNG, written full-resolution to disk
+         (sheet_url) and returned inline as a downscaled preview. The preview
+         is the thing you look at; open sheet_url when a panel needs a closer
+         read than it survives.
       2. A self-contained HTML page written to disk (open the file:// URL in a
          browser) with full-size frames, complete prompt text and cumulative
          timecode.
@@ -2271,8 +2273,9 @@ async def generate_storyboard(
         dry_run: Estimate the cost of the whole board and generate nothing.
 
     Returns:
-        The contact sheet inline, plus JSON with storyboard_url (HTML),
-        sheet_url (PNG), per-shot results, total cost and total runtime.
+        A preview of the contact sheet inline, plus JSON with storyboard_url
+        (HTML), sheet_url (the full-resolution PNG), per-shot results, total
+        cost and total runtime.
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
@@ -2340,7 +2343,7 @@ async def generate_storyboard(
                     await ctx.warning(warning)
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
-        from .storyboard import StoryboardFrame, write_storyboard
+        from .storyboard import StoryboardFrame, render_sheet_preview, write_storyboard
 
         frames: list[StoryboardFrame] = []
         shot_results: list[dict[str, Any]] = []
@@ -2424,12 +2427,19 @@ async def generate_storyboard(
             subtitle=subtitle,
             theme=theme,
         )
+
         # Reuse the single sheet write_storyboard already composited (and wrote
         # to disk) for the inline copy, reading it back rather than compositing
         # the board a second time — the earlier separate render re-decoded every
         # frame and re-ran a LANCZOS pass per panel, measured in seconds on a
-        # 24-shot board, to reproduce the same storyboard.
-        inline_png = await asyncio.to_thread(Path(artifacts["sheet_path"]).read_bytes)
+        # 24-shot board, to reproduce the same storyboard. What goes inline is a
+        # bounded preview of it: a full-size sheet is over a megabyte from about
+        # a dozen shots up, which an MCP client refuses outright, and the sheet
+        # that matters is the one on disk at sheet_url.
+        def _sheet_preview() -> bytes:
+            return render_sheet_preview(Path(artifacts["sheet_path"]).read_bytes())
+
+        inline_preview = await asyncio.to_thread(_sheet_preview)
 
         failed = [r for r in shot_results if "error" in r]
         total_runtime = sum(float(s.get("duration_seconds") or 0) for s in shots)
@@ -2459,10 +2469,15 @@ async def generate_storyboard(
                 logger.debug("Could not total storyboard cost", exc_info=True)
 
         await ctx.info("Storyboard complete")
-        return [
-            Image(data=inline_png, format="png"),
-            TextContent(type="text", text=json.dumps(response_data, indent=2)),
-        ]
+        # A sheet the preview could not decode still has both artifacts on disk,
+        # so the board is delivered text-only rather than failing outright.
+        blocks: list[Any] = []
+        if inline_preview:
+            blocks.append(Image(data=inline_preview, format="jpeg"))
+        blocks.append(
+            TextContent(type="text", text=json.dumps(response_data, indent=2))
+        )
+        return blocks
     except Exception as e:
         await ctx.error(f"Storyboard failed: {e}")
         logger.exception("Tool error")

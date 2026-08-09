@@ -1,6 +1,7 @@
 """Tests for storyboard.py contact-sheet and HTML rendering."""
 
 import base64
+import random
 import re
 from collections.abc import Iterator, Sequence
 from io import BytesIO
@@ -12,10 +13,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 import src.storyboard
 from src.storyboard import (
+    INLINE_PREVIEW_MAX_BYTES,
     StoryboardFrame,
     format_timecode,
     render_contact_sheet,
     render_html,
+    render_sheet_preview,
     write_storyboard,
 )
 from src.storyboard import (
@@ -33,6 +36,8 @@ from src.storyboard import (
 
 _OUTER_PAD = src.storyboard._OUTER_PAD  # pyright: ignore[reportPrivateUsage]
 _GUTTER = src.storyboard._GUTTER  # pyright: ignore[reportPrivateUsage]
+_PREVIEW_MAX_WIDTH = src.storyboard._PREVIEW_MAX_WIDTH  # pyright: ignore[reportPrivateUsage]
+_PREVIEW_MIN_WIDTH = src.storyboard._PREVIEW_MIN_WIDTH  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.fixture(autouse=True)
@@ -881,6 +886,175 @@ def test_write_storyboard_creates_missing_directories(tmp_path: Path) -> None:
     target = tmp_path / "a" / "b" / "c"
     result = write_storyboard(make_frames(1), target)
     assert Path(result["sheet_path"]).parent == target
+
+
+# ============================================================================
+# render_sheet_preview: the copy that has to fit in a tool result
+# ============================================================================
+
+
+def noise_image(width: int, height: int, seed: int = 0) -> bytes:
+    """Encode an incompressible PNG.
+
+    ``make_image`` paints a solid colour, which a board composites into a sheet
+    of a few kilobytes — it would fit any budget on the first attempt and never
+    exercise the backoff. Photographic keyframes are the case that matters, and
+    noise is their worst end.
+    """
+    data = random.Random(seed).randbytes(width * height * 3)
+    image = Image.frombytes("RGB", (width, height), data)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    image.close()
+    return buffer.getvalue()
+
+
+def noise_frames(
+    count: int, width: int = 320, height: int = 180
+) -> list[StoryboardFrame]:
+    """Frames whose keyframes do not compress away."""
+    return [
+        StoryboardFrame(
+            index=i + 1,
+            image_bytes=noise_image(width, height, seed=i),
+            prompt=f"Shot {i + 1}: a wide establishing shot of somewhere moody.",
+            caption=f"SHOT {i + 1}",
+            duration_seconds=4.0,
+            notes="Handheld, 35mm",
+        )
+        for i in range(count)
+    ]
+
+
+def open_jpeg(data: bytes) -> tuple[int, int]:
+    """Assert ``data`` is a real JPEG and return its size."""
+    with Image.open(BytesIO(data)) as image:
+        image.load()
+        assert image.format == "JPEG"
+        return image.size
+
+
+@pytest.mark.parametrize(
+    ("shots", "frame_size"),
+    [
+        (4, (320, 180)),
+        (12, (320, 180)),
+        (24, (320, 180)),
+        (12, (180, 320)),  # 9:16 — the tallest board, so the tightest budget
+        (24, (180, 320)),
+    ],
+)
+def test_render_sheet_preview_fits_the_budget(
+    shots: int, frame_size: tuple[int, int]
+) -> None:
+    """The reproduction: a full sheet is megabytes, and megabytes do not arrive.
+
+    Returning the sheet verbatim made a 12-shot board a 1.1MB tool result and a
+    24-shot board 1.25MB, past what an MCP client accepts — and that was on
+    frames that compress far better than real ones.
+    """
+    sheet = render_contact_sheet(noise_frames(shots, *frame_size))
+    preview = render_sheet_preview(sheet)
+
+    assert len(preview) <= INLINE_PREVIEW_MAX_BYTES
+    assert len(preview) < len(sheet)
+    open_jpeg(preview)
+    # What actually reaches the client, base64 and all, with room for the JSON.
+    assert len(base64.b64encode(preview)) < 700 * 1024
+
+
+def test_render_sheet_preview_keeps_a_board_that_already_fits_at_full_size() -> None:
+    """A sheet inside the budget is not shrunk for the sake of it."""
+    sheet = render_contact_sheet(make_frames(4))
+    assert len(sheet) < INLINE_PREVIEW_MAX_BYTES  # solid colour composites small
+
+    width, _ = open_jpeg(render_sheet_preview(sheet))
+    assert width == min(_PREVIEW_MAX_WIDTH, open_png(sheet)[0])
+
+
+def test_render_sheet_preview_scales_by_width_not_longest_edge() -> None:
+    """A tall board keeps the width that makes its panels readable.
+
+    Fitting a box — ``thumbnail((1600, 1600))`` — would scale a 1000x4000 sheet
+    by its *height*, down to 400 wide, throwing away the panel legibility that
+    is the entire point of the artifact.
+    """
+    tall = Image.new("RGB", (1000, 4000), (20, 20, 24))
+    buffer = BytesIO()
+    tall.save(buffer, format="PNG")
+    tall.close()
+
+    width, height = open_jpeg(render_sheet_preview(buffer.getvalue()))
+    assert (width, height) == (1000, 4000)
+
+
+def test_render_sheet_preview_preserves_the_aspect_ratio() -> None:
+    """A shrunk board is not stretched."""
+    sheet = render_contact_sheet(noise_frames(24, 180, 320))
+    sheet_w, sheet_h = open_png(sheet)
+    preview_w, preview_h = open_jpeg(render_sheet_preview(sheet))
+
+    assert preview_w < sheet_w  # this board does need shrinking
+    assert abs(preview_w / preview_h - sheet_w / sheet_h) < 0.01
+
+
+def test_render_sheet_preview_spends_quality_before_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Softening a photograph costs less than shrinking a slug line.
+
+    A blurrier frame still reads as the shot it is; caption text scaled past its
+    font size is simply gone. So the first over-budget attempt drops quality at
+    the same width, and only the ones after that scale the board down.
+    """
+    attempts: list[tuple[int, int]] = []
+    original = src.storyboard._encode_preview  # pyright: ignore[reportPrivateUsage]
+
+    def spy(sheet: Image.Image, width: int, quality: int) -> bytes:
+        attempts.append((width, quality))
+        return original(sheet, width, quality)
+
+    monkeypatch.setattr(src.storyboard, "_encode_preview", spy)
+
+    sheet = render_contact_sheet(noise_frames(12))
+    render_sheet_preview(sheet, max_bytes=20 * 1024)  # small enough to force a chain
+
+    assert len(attempts) >= 3, attempts
+    assert attempts[1][0] == attempts[0][0]  # same width...
+    assert attempts[1][1] < attempts[0][1]  # ...lower quality
+    assert attempts[2][0] < attempts[1][0]  # only then, narrower
+
+
+def test_render_sheet_preview_stops_shrinking_at_the_legible_floor() -> None:
+    """An unmeetable budget yields an oversized preview, not an unreadable one.
+
+    The board has already been billed a frame per shot by this point, so a
+    preview that came in heavy is worth returning; one scaled past readability
+    is not.
+    """
+    sheet = render_contact_sheet(noise_frames(24, 180, 320))
+    preview = render_sheet_preview(sheet, max_bytes=1024)
+
+    width, _ = open_jpeg(preview)
+    assert width == _PREVIEW_MIN_WIDTH
+    assert len(preview) > 1024  # over budget, and returned anyway
+
+
+def test_render_sheet_preview_returns_empty_for_undecodable_bytes() -> None:
+    """An unreadable sheet drops the block; it does not fail the board.
+
+    Falling back to the original bytes — what ``_embed_uri`` does for a frame
+    it cannot shrink — is the one thing that cannot happen here, because their
+    size is the whole problem.
+    """
+    assert render_sheet_preview(b"not an image at all") == b""
+    assert render_sheet_preview(b"") == b""
+
+
+def test_render_sheet_preview_is_deterministic() -> None:
+    """Same sheet in, same bytes out — as with every other artifact here."""
+    sheet = render_contact_sheet(noise_frames(12))
+    assert render_sheet_preview(sheet) == render_sheet_preview(sheet)
 
 
 # ============================================================================
