@@ -18,7 +18,7 @@ Plan, generate, compose, and edit images and video on Google Gemini and Veo 3.1,
 |-------------------------------|-------------------|
 | `plan_generation` | Pick the right tool + model for an intent, with costs and ruled-out options. Generates nothing |
 | `generate_image` | Generate images using Gemini image models |
-| `generate_storyboard` | Render a keyframe per shot and return a real storyboard (inline contact sheet + HTML) |
+| `generate_storyboard` | Render a keyframe per shot and return a real storyboard (inline contact-sheet preview + full-size PNG and HTML on disk) |
 | `generate_video` | Generate videos using VEO models (with optional fast `draft` mode) |
 | `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a fast animatic preview |
 | `generate_transition` | Veo first+last-frame transition between two stills |
@@ -68,7 +68,7 @@ Render one keyframe per shot and compose a real, readable storyboard.
 | `dry_run` | boolean *optional* | Price the whole board without generating |
 
 **Notes:**
-- Returns a contact-sheet PNG **inline** plus a self-contained HTML page on disk
+- Writes a full-resolution contact-sheet PNG and a self-contained HTML page to disk, and returns a downscaled **inline** preview of the sheet — the full board runs past the size an MCP client will accept from about a dozen shots up, so open `sheet_url` for a closer read
 - A failed shot renders as a marked error panel and isn't billed — partial boards stay reviewable
 - `shots` feeds straight into `generate_clip` as `beats`
 

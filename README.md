@@ -167,7 +167,7 @@ It catches requests that cannot work *before* you pay for the failure — 4K on 
 The missing step between an idea and `generate_clip`. Renders one keyframe per shot, then composes them into a **real, readable storyboard** — numbered panels with slug lines, prompts, camera notes and duration badges — instead of a bare list of image URLs.
 
 Two artifacts come back, because MCP clients render inline images but do not execute HTML:
-1. **A composited contact-sheet PNG, returned inline** — this is the thing you look at in chat.
+1. **A composited contact-sheet PNG** — written full-resolution to disk (`sheet_url`) and returned inline as a downscaled preview. The preview is the thing you look at in chat; open `sheet_url` when a panel needs a closer read. It is downscaled because the full board runs past a megabyte from about a dozen shots up, and an MCP client drops a result that large outright.
 2. **A self-contained HTML page written to disk** (`file://` URL) with full-size frames, complete prompt text and cumulative timecode. Fully offline: images embedded as data URIs, no external requests.
 
 **Parameters:**
