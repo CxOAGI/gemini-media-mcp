@@ -1831,15 +1831,24 @@ async def generate_image(
         # An over-count reference list is truncated to what the model accepts;
         # say so on both surfaces rather than silently dropping a reference the
         # caller supplied (the render was doing this with no signal at all).
+        # Tense follows the surface: a dry_run has sent nothing yet, so past
+        # tense there ("were not sent") reads as if the call already ran.
         ref_count = len(reference_image_uris) if reference_image_uris else 0
-        image_ref_warnings: list[str] = []
-        if ref_count > _MAX_IMAGE_REFERENCE_IMAGES:
-            image_ref_warnings.append(
+
+        def _image_ref_warning(*, future: bool) -> list[str]:
+            if ref_count <= _MAX_IMAGE_REFERENCE_IMAGES:
+                return []
+            dropped = ref_count - _MAX_IMAGE_REFERENCE_IMAGES
+            tail = (
+                "will not be sent and will not influence the image"
+                if future
+                else "were not sent and did not influence this image"
+            )
+            return [
                 f"{ref_count} reference images were supplied but Gemini image "
                 f"models accept {_MAX_IMAGE_REFERENCE_IMAGES}; the last "
-                f"{ref_count - _MAX_IMAGE_REFERENCE_IMAGES} were not sent and "
-                "did not influence this image."
-            )
+                f"{dropped} {tail}."
+            ]
 
         if dry_run:
             # Resolve the model the same way the impl would, so the estimate
@@ -1858,7 +1867,7 @@ async def generate_image(
                 "image_size": effective_size,
                 "estimated_cost": _image_cost(resolved, effective_size),
             }
-            warnings = list(plan_warnings) + image_ref_warnings
+            warnings = list(plan_warnings) + _image_ref_warning(future=True)
             if warnings:
                 payload["warnings"] = warnings
                 await _emit_warnings(ctx, warnings)
@@ -1970,7 +1979,9 @@ async def generate_image(
         # discloses the dropped references the quote already flagged. These go
         # out on the MCP logging channel as well as in the payload, so a client
         # that only reads the image sees them too.
-        impl_warnings = (result.get("warnings") or []) + image_ref_warnings
+        impl_warnings = (result.get("warnings") or []) + _image_ref_warning(
+            future=False
+        )
         if impl_warnings:
             response_data["warnings"] = impl_warnings
             await _emit_warnings(ctx, impl_warnings)
@@ -4066,7 +4077,12 @@ async def loop_extend(
         prompt: What the continuation should depict
         times: Number of ~7s extensions to chain (1-20)
         model: Veo model (not the Lite model)
-        aspect_ratio: Must match the source video (16:9 or 9:16)
+        aspect_ratio: 16:9 or 9:16. An extension continues the source, so the
+            rendered aspect ratio is the source's; this value must match it.
+            The server does not verify the match — the source is typically a
+            remote gs:// clip it cannot probe — so a value that differs from
+            the source may be ignored or distort the render rather than being
+            refused here.
         include_audio: Generate audio on the extended sections (default True,
             so extending an audio video doesn't go silent; Vertex only)
         output_gcs_uri: GCS output URI (required on Vertex for extensions)

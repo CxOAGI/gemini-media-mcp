@@ -97,3 +97,20 @@ async def test_a_non_conflicting_video_request_still_prices(tmp_path: Path) -> N
     r = await _gv(ctx, prompt="x", model=VEO, image_uri="a")
     assert r["generation_mode"] == "image_to_video"
     assert r["estimated_cost"]["usd"] > 0
+
+
+@pytest.mark.asyncio
+async def test_image_quote_warning_is_future_tense(tmp_path: Path) -> None:
+    """A dry_run has sent nothing, so its truncation warning must be future
+    tense — past tense ("were not sent") in a payload that also says "nothing
+    was generated" reads as if the call already ran."""
+    ctx = _video_ctx(tmp_path, vertexai=True)
+    r = await _gi(
+        ctx,
+        prompt="x",
+        model="gemini-3.1-flash-image",
+        reference_image_uris=[str(i) for i in range(16)],
+    )
+    warning = next(w for w in r.get("warnings", []) if "reference images" in w)
+    assert "will not be sent" in warning
+    assert "were not sent" not in warning
