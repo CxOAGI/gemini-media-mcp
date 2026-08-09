@@ -171,8 +171,12 @@ def setup_vertex_credentials() -> Path | None:
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 
+    # Remember which variable the operator actually set so a parse failure
+    # can name it in the error below.
+    sa_json_source = "GOOGLE_SERVICE_ACCOUNT_JSON"
     if not sa_json and gac.strip().startswith("{"):
         sa_json = gac
+        sa_json_source = "GOOGLE_APPLICATION_CREDENTIALS"
         # On an HTTP transport the lifespan re-runs per connection. This
         # function overwrites GOOGLE_APPLICATION_CREDENTIALS with the temp
         # file path below, and teardown deletes that file — so the second
@@ -184,6 +188,20 @@ def setup_vertex_credentials() -> Path | None:
     if sa_json:
         try:
             data = json.loads(sa_json)
+        except json.JSONDecodeError as e:
+            # A configured service-account JSON that does not parse must fail
+            # loudly. Returning None here dropped through to
+            # genai.Client(vertexai=True), which then discovered whatever
+            # ambient ADC happened to exist — so a typo'd credential silently
+            # ran the server as a DIFFERENT identity than configured, with one
+            # log line as the only signal.
+            raise ValueError(
+                f"{sa_json_source} is set but is not valid JSON: {e}. "
+                "Refusing to fall back to ambient application-default "
+                "credentials — that would run the server as a different "
+                "identity than configured. Fix the JSON or unset the variable."
+            ) from e
+        try:
             fd, path_str = tempfile.mkstemp(suffix=".json", prefix="gcp_sa_")
             path = Path(path_str)
             with open(fd, "w") as f:
@@ -196,7 +214,7 @@ def setup_vertex_credentials() -> Path | None:
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
             logger.info("Created temp credentials file: %s", path)
             return path
-        except (json.JSONDecodeError, OSError) as e:
+        except OSError as e:
             logger.error("Failed to setup credentials: %s", e)
             return None
 
@@ -482,6 +500,120 @@ async def _omni_generate_and_manifest(
         # ignored params) isn't lost. Matches the Veo tools' fallback.
         result["manifest"] = manifest
     return result
+
+
+async def _emit_warnings(
+    ctx: Context[ServerSession, AppContext], warnings: Any
+) -> None:
+    """Mirror body/manifest warnings onto the MCP notification channel.
+
+    The video tools only ever recorded warnings in the JSON body or the
+    sidecar manifest, so an agent watching the notification stream never saw
+    "include_audio not honored", "add_bridges ignored in animatic mode", a
+    GCS-allowlist warning, or a model reroute. generate_image already mirrors
+    its warnings via ctx.warning; this brings the video tools in line.
+    Dedupes so a distinct warning is emitted at most once per call.
+    """
+    seen: set[str] = set()
+    for warning in warnings or []:
+        if warning in seen:
+            continue
+        seen.add(warning)
+        await ctx.warning(warning)
+
+
+def _draft_ignored_veo_params(
+    *,
+    seed: int | None,
+    negative_prompt: str | None,
+    resolution: str | None,
+    person_generation: str | None,
+    last_frame: str | None,
+    reference_image_uris: list[str] | None,
+    extend_video_uri: str | None,
+    output_gcs_uri: str | None,
+    include_audio: bool,
+) -> list[str]:
+    """Veo-only params gemini-omni-flash drops on a draft render.
+
+    Shared by generate_video's dry_run and real draft paths so a quote
+    discloses exactly the ignored paid parameters the real run reports —
+    a pre-flight that hid them let a caller spend on controls omni never
+    honored.
+    """
+    # `is not None` (not truthiness): seed=0 is a valid Veo seed and must be
+    # reported as ignored too.
+    ignored = [
+        name
+        for name, val in (
+            ("seed", seed),
+            ("negative_prompt", negative_prompt),
+            ("resolution", resolution),
+            ("person_generation", person_generation),
+            ("last_frame_uri", last_frame),
+            ("reference_image_uris", reference_image_uris),
+            ("extend_video_uri", extend_video_uri),
+            ("output_gcs_uri", output_gcs_uri),
+        )
+        if val is not None and val != []
+    ]
+    # include_audio is only notable when explicitly enabled (omni has no
+    # audio control).
+    if include_audio:
+        ignored.append("include_audio")
+    return ignored
+
+
+def _draft_ignored_warning(ignored: list[str]) -> str:
+    """The single warning line naming the Veo-only params a draft dropped."""
+    return "draft mode (gemini-omni-flash) ignored Veo-only params: " + ", ".join(
+        ignored
+    )
+
+
+def _animatic_mode_warnings(
+    *, add_bridges: bool, output_gcs_uri: str | None, include_audio: bool
+) -> list[str]:
+    """Clip-level params gemini-omni-flash drops in animatic mode.
+
+    Shared by generate_clip's dry_run and real run so a quote discloses the
+    ignored inputs (add_bridges, output_gcs_uri, include_audio) the render
+    silently drops — the pre-flight used to return an empty warnings list.
+    """
+    warnings: list[str] = []
+    if add_bridges:
+        warnings.append(
+            "add_bridges is ignored in animatic mode "
+            "(bridges are a Veo first/last-frame feature)."
+        )
+    if output_gcs_uri:
+        warnings.append(
+            "output_gcs_uri is ignored in animatic mode; omni previews "
+            "are always written locally."
+        )
+    if include_audio:
+        warnings.append(
+            "include_audio is ignored in animatic mode "
+            "(gemini-omni-flash previews carry no controllable audio)."
+        )
+    return warnings
+
+
+def _animatic_beat_dropped_warning(beat: dict[str, Any], idx: int) -> str | None:
+    """Warning naming the Veo-only per-beat params animatic mode drops, if any.
+
+    Shared by the beat loop and the dry_run disclosure so the quote lists the
+    same ignored per-beat controls (seed, negative_prompt) the render reports.
+    """
+    dropped = [
+        name for name in ("negative_prompt", "seed") if beat.get(name) is not None
+    ]
+    if not dropped:
+        return None
+    return (
+        f"animatic mode ignored Veo-only beat params "
+        f"({', '.join(dropped)}) on beat {idx}."
+    )
 
 
 def _validate_aspect_ratio(aspect_ratio: str) -> None:
@@ -2088,9 +2220,14 @@ async def generate_storyboard(
             }
             if plan_warnings:
                 payload["warnings"] = plan_warnings
+                # Mirror the plan warnings onto the notification channel, as
+                # generate_image's dry_run does — a quote that hid a retired
+                # model reroute understated what the real run discloses.
+                for warning in plan_warnings:
+                    await ctx.warning(warning)
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
-        from .storyboard import StoryboardFrame, render_contact_sheet, write_storyboard
+        from .storyboard import StoryboardFrame, write_storyboard
 
         frames: list[StoryboardFrame] = []
         shot_results: list[dict[str, Any]] = []
@@ -2174,15 +2311,12 @@ async def generate_storyboard(
             subtitle=subtitle,
             theme=theme,
         )
-        # A narrower sheet for the inline copy: the full-size board is on disk.
-        inline_png = await asyncio.to_thread(
-            render_contact_sheet,
-            frames,
-            title=title,
-            subtitle=subtitle,
-            theme=theme,
-            max_sheet_width=1200,
-        )
+        # Reuse the single sheet write_storyboard already composited (and wrote
+        # to disk) for the inline copy, reading it back rather than compositing
+        # the board a second time — the earlier separate render re-decoded every
+        # frame and re-ran a LANCZOS pass per panel, measured in seconds on a
+        # 24-shot board, to reproduce the same storyboard.
+        inline_png = await asyncio.to_thread(Path(artifacts["sheet_path"]).read_bytes)
 
         failed = [r for r in shot_results if "error" in r]
         total_runtime = sum(float(s.get("duration_seconds") or 0) for s in shots)
@@ -2384,31 +2518,43 @@ async def generate_video(
                     generation_mode=quoted_mode,
                 ),
             }
+            # Disclose the Veo-only params a draft will drop, exactly as the
+            # real draft run does — a quote that hid them let a caller price a
+            # render believing paid controls (seed, negative_prompt, ...) were
+            # honored when omni ignores them.
+            if draft:
+                ignored = _draft_ignored_veo_params(
+                    seed=seed,
+                    negative_prompt=negative_prompt,
+                    resolution=resolution,
+                    person_generation=person_generation,
+                    last_frame=last_frame_uri or last_frame_base64,
+                    reference_image_uris=reference_image_uris,
+                    extend_video_uri=extend_video_uri,
+                    output_gcs_uri=output_gcs_uri,
+                    include_audio=include_audio,
+                )
+                if ignored:
+                    payload["ignored_veo_params"] = ignored
+                    payload["warnings"] = [_draft_ignored_warning(ignored)]
+                    await _emit_warnings(ctx, payload["warnings"])
             return json.dumps(payload, indent=2)
 
         # Draft mode: hand off to the fast omni path. Omni supports only a
         # text prompt + optional input image(s), so Veo-only controls are
         # ignored — surface which ones so the caller isn't surprised.
         if draft:
-            # `is not None` (not truthiness): seed=0 is a valid Veo seed and
-            # must be reported as ignored too. include_audio is only notable
-            # when explicitly enabled (omni has no audio control).
-            ignored = [
-                name
-                for name, val in (
-                    ("seed", seed),
-                    ("negative_prompt", negative_prompt),
-                    ("resolution", resolution),
-                    ("person_generation", person_generation),
-                    ("last_frame_uri", last_frame_uri or last_frame_base64),
-                    ("reference_image_uris", reference_image_uris),
-                    ("extend_video_uri", extend_video_uri),
-                    ("output_gcs_uri", output_gcs_uri),
-                )
-                if val is not None and val != []
-            ]
-            if include_audio:
-                ignored.append("include_audio")
+            ignored = _draft_ignored_veo_params(
+                seed=seed,
+                negative_prompt=negative_prompt,
+                resolution=resolution,
+                person_generation=person_generation,
+                last_frame=last_frame_uri or last_frame_base64,
+                reference_image_uris=reference_image_uris,
+                extend_video_uri=extend_video_uri,
+                output_gcs_uri=output_gcs_uri,
+                include_audio=include_audio,
+            )
             # audio_prompt CAN be honored best-effort: inline it into the
             # prompt text, exactly like the Veo path does.
             draft_prompt = prompt
@@ -2442,8 +2588,7 @@ async def generate_video(
             )
             if ignored:
                 result.setdefault("warnings", []).append(
-                    "draft mode (gemini-omni-flash) ignored Veo-only params: "
-                    + ", ".join(ignored)
+                    _draft_ignored_warning(ignored)
                 )
             # The omni impl reports neither of these, so a draft response was
             # missing the two keys this tool's own Returns block names and
@@ -2451,6 +2596,9 @@ async def generate_video(
             # sent (audio_prompt inlined), matching what the Veo path reports.
             result.setdefault("generation_mode", "draft")
             result.setdefault("prompt", draft_prompt)
+            # Mirror warnings (ignored Veo params, any GCS notice) onto the
+            # notification channel, not just the JSON body.
+            await _emit_warnings(ctx, result.get("warnings"))
             return json.dumps(result, indent=2)
 
         # Fetch first frame image
@@ -2602,6 +2750,7 @@ async def generate_video(
         warnings = result.get("warnings")
         if warnings:
             manifest["warnings"] = warnings
+            await _emit_warnings(ctx, warnings)
         sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
@@ -2777,6 +2926,7 @@ async def generate_transition(
         warnings = result.get("warnings")
         if warnings:
             manifest["warnings"] = warnings
+            await _emit_warnings(ctx, warnings)
         sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
@@ -2971,6 +3121,7 @@ async def generate_bridge(
         warnings = result.get("warnings")
         if warnings:
             manifest["warnings"] = warnings
+            await _emit_warnings(ctx, warnings)
         sidecar_url = _write_sidecar(result.get("video_url", ""), manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url
@@ -3181,18 +3332,33 @@ async def generate_clip(
                 )
             except Exception:  # pragma: no cover - defensive
                 total = None
-            return json.dumps(
-                {
-                    "dry_run": True,
-                    "message": "Estimate only — nothing was generated",
-                    "model": est_model,
-                    "beat_count": len(beats),
-                    "bridge_count": bridge_count,
-                    "preflight_checks": preflight,
-                    "estimated_cost": total,
-                },
-                indent=2,
-            )
+            dry_payload: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "model": est_model,
+                "beat_count": len(beats),
+                "bridge_count": bridge_count,
+                "preflight_checks": preflight,
+                "estimated_cost": total,
+            }
+            # Disclose the same warnings a real animatic run would emit for
+            # these inputs, so a quote reveals the ignored inputs (add_bridges,
+            # output_gcs_uri, include_audio, Veo-only per-beat params) before
+            # anything is spent — the quote used to return no warnings at all.
+            if animatic:
+                dry_warnings = _animatic_mode_warnings(
+                    add_bridges=add_bridges,
+                    output_gcs_uri=output_gcs_uri,
+                    include_audio=include_audio,
+                )
+                for beat_index, beat_spec in enumerate(beats):
+                    beat_warning = _animatic_beat_dropped_warning(beat_spec, beat_index)
+                    if beat_warning:
+                        dry_warnings.append(beat_warning)
+                if dry_warnings:
+                    dry_payload["warnings"] = dry_warnings
+                    await _emit_warnings(ctx, dry_warnings)
+            return json.dumps(dry_payload, indent=2)
 
         # Resolve the client ONCE, before the beat loop. If the model can't be
         # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY, or omni
@@ -3206,22 +3372,16 @@ async def generate_clip(
             _client_for_omni(app_ctx)  # fail fast if omni is unavailable
             video_client = app_ctx.client
             gcs_uri = None
-            if add_bridges:
-                add_bridges = False
-                clip_warnings.append(
-                    "add_bridges is ignored in animatic mode "
-                    "(bridges are a Veo first/last-frame feature)."
+            clip_warnings.extend(
+                _animatic_mode_warnings(
+                    add_bridges=add_bridges,
+                    output_gcs_uri=output_gcs_uri,
+                    include_audio=include_audio,
                 )
-            if output_gcs_uri:
-                clip_warnings.append(
-                    "output_gcs_uri is ignored in animatic mode; omni previews "
-                    "are always written locally."
-                )
-            if include_audio:
-                clip_warnings.append(
-                    "include_audio is ignored in animatic mode "
-                    "(gemini-omni-flash previews carry no controllable audio)."
-                )
+            )
+            # Bridges are a Veo first/last-frame feature; disabling here is what
+            # the warning above discloses.
+            add_bridges = False
         else:
             video_client = _client_for_video_model(app_ctx, model)
             is_vertex_client = getattr(video_client._api_client, "vertexai", False)
@@ -3266,16 +3426,9 @@ async def generate_clip(
                     beat_prompt = prompt
                     if beat.get("audio_prompt"):
                         beat_prompt = f"{prompt}\nAudio: {beat['audio_prompt']}"
-                    dropped = [
-                        name
-                        for name in ("negative_prompt", "seed")
-                        if beat.get(name) is not None
-                    ]
-                    if dropped:
-                        clip_warnings.append(
-                            f"animatic mode ignored Veo-only beat params "
-                            f"({', '.join(dropped)}) on beat {idx}."
-                        )
+                    dropped_warning = _animatic_beat_dropped_warning(beat, idx)
+                    if dropped_warning:
+                        clip_warnings.append(dropped_warning)
                     beat_result = await generate_video_omni_impl(
                         client=_client_for_omni(app_ctx),
                         prompt=beat_prompt,
@@ -3452,6 +3605,10 @@ async def generate_clip(
             errors=errors,
             warnings=clip_warnings,
         )
+        # Mirror the aggregated warnings (animatic drops, per-beat ignored Veo
+        # params, GCS notices) onto the notification channel, not just the JSON
+        # manifest — an agent watching the stream saw none of them before.
+        await _emit_warnings(ctx, clip_warnings)
         return json.dumps(clip_manifest, indent=2)
     except asyncio.CancelledError:
         # A cancellation is a BaseException, so the handler below never saw
@@ -3556,6 +3713,9 @@ async def generate_video_omni(
                 gcs_warnings.append(allowlist_warning)
 
         if dry_run:
+            # Disclose the GCS-allowlist warning on the notification channel,
+            # not only in the quote body.
+            await _emit_warnings(ctx, gcs_warnings)
             # An input video (or a prior interaction) makes this an edit —
             # omni._select_task_type keys on either — and an edit sends no
             # duration and renders a service-chosen length that measured 10s
@@ -3656,6 +3816,15 @@ async def generate_video_omni(
                 "input_video_uri": input_video_uri,
             },
         )
+        # The allowlist warning computed above never reached the real-run body
+        # (it was only wired into the dry_run payload). Merge it so the body
+        # and the notification channel agree, then mirror every warning.
+        if gcs_warnings:
+            body_warnings = result.setdefault("warnings", [])
+            for warning in gcs_warnings:
+                if warning not in body_warnings:
+                    body_warnings.append(warning)
+        await _emit_warnings(ctx, result.get("warnings"))
         return json.dumps(result, indent=2)
     except Exception as e:
         await ctx.error(f"Omni video generation failed: {e}")
@@ -3774,6 +3943,7 @@ async def edit_video(
             timeout_seconds=timeout_seconds,
             manifest_extra={"kind": "omni_edit"},
         )
+        await _emit_warnings(ctx, result.get("warnings"))
         return json.dumps(result, indent=2)
     except Exception as e:
         await ctx.error(f"Video edit failed: {e}")
@@ -3922,6 +4092,9 @@ async def loop_extend(
             result["cost"] = manifest["cost"]
         if manifest.get("warnings"):
             result["warnings"] = manifest["warnings"]
+            # Mirror the extension-chain warnings (e.g. include_audio ignored
+            # on the Gemini API path) onto the notification channel.
+            await _emit_warnings(ctx, manifest["warnings"])
         sidecar_url = _write_sidecar(current, manifest)
         if sidecar_url:
             result["sidecar_url"] = sidecar_url

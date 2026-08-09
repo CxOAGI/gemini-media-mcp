@@ -1487,7 +1487,10 @@ def write_storyboard(
 
     Returns:
         ``{"sheet_path", "sheet_url", "html_path", "html_url"}`` — paths are
-        absolute, URLs are ``file://``.
+        absolute, URLs are ``file://``. The contact sheet is composited once
+        here and written to ``sheet_path``; a caller that also needs the PNG
+        inline should read it back from disk rather than re-render it (a
+        24-shot board's re-decode + LANCZOS pass measured seconds).
 
     Raises:
         ValueError: If ``frames`` is empty.

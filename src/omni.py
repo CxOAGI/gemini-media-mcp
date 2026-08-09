@@ -63,6 +63,14 @@ _MAX_DURATION = 10
 # whose rendered length the service chooses and does not document.
 OMNI_MAX_DURATION_SECONDS = _MAX_DURATION
 
+# Cap on the delivered-video download. Mirrors MAX_FETCH_BYTES (50 MB) in
+# src/__main__.py — defined here rather than imported because this module does
+# not own that file. files.download buffers the whole response body, so without
+# this the one delivered-file path would be the only fetch in the server that
+# reads an untrusted body uncapped; a 720p/<=10s clip is far under it in
+# practice, so this is defence-in-depth matching the rest of the codebase.
+_MAX_DELIVERED_VIDEO_BYTES = 50 * 1024 * 1024
+
 # Interval (seconds) between polls of an in-flight background interaction.
 _POLL_INTERVAL = 5
 
@@ -132,7 +140,10 @@ def _detect_video_mime(data: bytes) -> str:
     brand = _ftyp_brand(data)
     if brand is not None:
         if brand.startswith("qt"):
-            return "video/quicktime"
+            # The SDK's VideoContentMimeType literal set spells MOV "video/mov"
+            # (google/genai/_gaos/types/interactions/videocontent.py); the
+            # RFC "video/quicktime" is not in it and rides as UnrecognizedStr.
+            return "video/mov"
         if brand in _HEIF_BRANDS or brand in _HEIF_SEQUENCE_BRANDS:
             raise ValueError(
                 "Input labeled as video but the data is a HEIC/HEIF image."
@@ -143,7 +154,10 @@ def _detect_video_mime(data: bytes) -> str:
     if data[:3] == b"\x00\x00\x01" and data[3:4] in (b"\xba", b"\xb3"):
         return "video/mpeg"
     if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
-        return "video/x-msvideo"
+        # SDK spells AVI "video/avi", not the RFC "video/x-msvideo" — the
+        # latter is absent from VideoContentMimeType and rides as
+        # UnrecognizedStr. See the MOV note above.
+        return "video/avi"
     raise ValueError(
         "Unrecognized video input format; could not detect a supported video "
         "MIME type from the data. Supported: MP4, QuickTime/MOV, WebM, MPEG, AVI."
@@ -323,9 +337,29 @@ async def _resolve_video_bytes(
     # ASSUMED SDK SHAPE: files.get resolves the uri/name to a file resource and
     # files.download returns its raw bytes.
     file_obj = await run_within_deadline(client.files.get, name=uri)
+
+    # Reject an oversize clip before buffering when the resource advertises its
+    # size, so the cap can hold without first allocating the whole body.
+    declared_size = _field(file_obj, "size_bytes")
+    if declared_size is not None and declared_size > _MAX_DELIVERED_VIDEO_BYTES:
+        raise ValueError(
+            f"Delivered video size {declared_size} exceeds cap "
+            f"{_MAX_DELIVERED_VIDEO_BYTES}: {uri}"
+        )
+
     data = await run_within_deadline(client.files.download, file=file_obj)
-    if data is None:
+    # files.download returns bytes, so a zero-length body is b"" not None: the
+    # None-only guard let an empty download write a 0-byte .mp4 and report
+    # success. `not data` catches both None and b"".
+    if not data:
         raise ValueError(f"Downloaded video file was empty: {uri}")
+    # Hard enforcement of the cap even when no size was advertised (or it lied);
+    # every other fetch in the server bounds its body the same way.
+    if len(data) > _MAX_DELIVERED_VIDEO_BYTES:
+        raise ValueError(
+            f"Downloaded video ({len(data)} bytes) exceeds cap "
+            f"{_MAX_DELIVERED_VIDEO_BYTES}: {uri}"
+        )
     return bytes(data)
 
 

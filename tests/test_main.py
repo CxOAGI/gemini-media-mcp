@@ -187,14 +187,10 @@ class FakeContextManager:
             Path,
             id="vertexai_with_gac_json",
         ),
-        pytest.param(
-            {
-                "GOOGLE_GENAI_USE_VERTEXAI": "true",
-                "GOOGLE_SERVICE_ACCOUNT_JSON": "not valid json",
-            },
-            None,
-            id="invalid_json",
-        ),
+        # The invalid-JSON case no longer returns None: a malformed
+        # GOOGLE_SERVICE_ACCOUNT_JSON now raises rather than silently falling
+        # back to ambient ADC. That behaviour is covered in
+        # tests/test_followups_tools.py.
     ],
 )
 @pytest.mark.timeout(1.0)
