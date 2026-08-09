@@ -193,16 +193,6 @@ def _create_test_image(width: int = 100, height: int = 100, mode: str = "RGB") -
         ),
         pytest.param(
             {
-                "prompt": "",
-                "model": "veo-3.1-generate-001",
-                "aspect_ratio": "16:9",
-                "duration_seconds": 5.0,
-            },
-            {"success": True},
-            id="veo2_empty_prompt",
-        ),
-        pytest.param(
-            {
                 "prompt": "Test negative",
                 "model": "veo-3.1-generate-001",
                 "aspect_ratio": "16:9",
@@ -261,6 +251,28 @@ async def test_generate_video_veo2(
         input["model"], input["model"]
     )
     assert "video_url" in gen_result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_video_refuses_an_empty_prompt(tmp_path: Path) -> None:
+    """An empty prompt is refused before any render — the impl used to send it
+    to the API, which either errors or bills a garbage full-price render."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    operation = FakeOperation(
+        done=True,
+        result=FakeVideoResult([FakeGeneratedVideo(FakeVideoObject(b"v"))]),
+    )
+    client = FakeGenaiClient(operation=operation)
+
+    with pytest.raises(ValueError, match="non-empty"):
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="   ",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+        )
 
 
 # ============================================================================

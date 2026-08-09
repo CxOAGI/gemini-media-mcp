@@ -170,24 +170,6 @@ _VEO_DOWNLOAD_TIMEOUT_SECONDS = 600.0
 _VEO_SUBMIT_HTTP_TIMEOUT_MS = int(_VEO_SUBMIT_TIMEOUT_SECONDS * 1000)
 
 
-# Impl argument -> the name the MCP caller actually typed. A conflict message
-# that only names the internal bytes argument leaves the caller guessing which
-# of their parameters to remove.
-_INPUT_PARAM_NAMES = {
-    "image_bytes": "a first frame (image_uri/image_base64)",
-    "last_frame_bytes": "a last frame (last_frame_uri/last_frame_base64)",
-    "reference_images": "reference images (reference_image_uris)",
-}
-
-
-def _named_inputs(**supplied: Any) -> str:
-    """Render the non-empty inputs among ``supplied`` as a caller-facing list."""
-    names = [_INPUT_PARAM_NAMES[key] for key, value in supplied.items() if value]
-    if len(names) == 1:
-        return names[0]
-    return f"{', '.join(names[:-1])} and {names[-1]}"
-
-
 def _load_extend_video(location: Path, allowed_dir: Path | None) -> types.Video:
     """Read a local clip for extend_video into an inline types.Video.
 
@@ -257,6 +239,70 @@ def validate_render_options(
             "Veo 3.1 Lite supports only text-to-video and image-to-video; "
             "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
         )
+
+
+def validate_video_request_inputs(
+    *,
+    prompt: str,
+    has_first_frame: bool,
+    has_last_frame: bool,
+    reference_count: int,
+    has_extend: bool,
+) -> None:
+    """Raise for a request no render could honor, before any work is spent.
+
+    Shared by the generation impl and the tools' dry_run quotes so a quote can
+    never succeed for a call the real run would refuse — the mode ladder below
+    silently picks one input and drops the rest, so an unenforced conflict
+    billed a full render that ignored half of what the caller supplied.
+    ``has_*`` are presence flags (URI or inline bytes) since the tool front
+    door has URIs, not bytes.
+    """
+    if not prompt or not prompt.strip():
+        raise ValueError("prompt must be a non-empty description of the video.")
+
+    frame_names = []
+    if has_first_frame:
+        frame_names.append("image_uri/image_base64")
+    if has_last_frame:
+        frame_names.append("last_frame_uri/last_frame_base64")
+
+    if has_extend and (has_first_frame or has_last_frame or reference_count):
+        others = list(frame_names)
+        if reference_count:
+            others.append("reference_image_uris")
+        joined = others[0] if len(others) == 1 else ", ".join(others)
+        raise ValueError(
+            f"extend_video_uri cannot be combined with {joined}. An extension "
+            "continues the source clip and sends no image inputs; drop the "
+            "image inputs or drop extend_video_uri."
+        )
+    if reference_count and (has_first_frame or has_last_frame):
+        joined = frame_names[0] if len(frame_names) == 1 else ", ".join(frame_names)
+        raise ValueError(
+            f"reference images cannot be combined with {joined}. "
+            "Reference-to-video sends neither a first nor a last frame and "
+            "always renders 8 seconds; drop one or the other."
+        )
+    if has_last_frame and not has_first_frame:
+        raise ValueError(
+            "A last frame was provided without a first frame. First+last "
+            "frame mode requires both; provide image_uri/image_base64 too."
+        )
+
+
+def resolve_served_video_model(model: str, is_vertexai: bool) -> str:
+    """The model id a real run reports for ``model`` on this backend.
+
+    A caller may pin a canonical `-001` id or feed back the `-preview` id a
+    prior Gemini-API render returned; either way the served id is derived the
+    same way the impl derives it, so a dry_run's `model` field matches what the
+    real run will report instead of echoing the raw input.
+    """
+    canonical = _CANONICAL_VIDEO_MODEL_IDS.get(model, model)
+    if not is_vertexai:
+        return _GEMINI_API_MODEL_IDS.get(canonical, canonical)
+    return canonical
 
 
 async def generate_video(
@@ -332,40 +378,17 @@ async def generate_video(
     # not be honored but should not abort the whole generation).
     warnings: list[str] = []
 
-    # Inputs that cannot all be honored are a hard error, not a silent pick.
-    # The mode ladder below chooses exactly one of them and everything else is
-    # dropped after the caller has already paid to fetch it — and in the
-    # reference case the duration is forced 4s -> 8s on top, doubling the bill
-    # for a render nobody asked for.
-    if extend_video_uri and (image_bytes or last_frame_bytes or reference_images):
-        conflicting = _named_inputs(
-            image_bytes=image_bytes,
-            last_frame_bytes=last_frame_bytes,
-            reference_images=reference_images,
-        )
-        raise ValueError(
-            f"extend_video_uri cannot be combined with {conflicting}. An "
-            "extension continues the source clip and sends no image inputs; "
-            "drop the image inputs or drop extend_video_uri."
-        )
-    if reference_images and (image_bytes or last_frame_bytes):
-        conflicting = _named_inputs(
-            image_bytes=image_bytes,
-            last_frame_bytes=last_frame_bytes,
-        )
-        raise ValueError(
-            f"reference images cannot be combined with {conflicting}. "
-            "Reference-to-video sends neither a first nor a last frame and "
-            "always renders 8 seconds; drop one or the other."
-        )
-
-    # A last frame without a first frame would silently classify as
-    # text_to_video and the fetched frame would be discarded — reject it.
-    if last_frame_bytes and not image_bytes:
-        raise ValueError(
-            "A last frame was provided without a first frame. First+last "
-            "frame mode requires both; provide image_uri/image_base64 too."
-        )
+    # Inputs that cannot all be honored are a hard error, not a silent pick:
+    # the mode ladder below chooses exactly one and drops the rest after the
+    # caller has paid to fetch them. Shared with the tools' dry_run so a quote
+    # refuses exactly what the render refuses.
+    validate_video_request_inputs(
+        prompt=prompt,
+        has_first_frame=bool(image_bytes),
+        has_last_frame=bool(last_frame_bytes),
+        reference_count=len(reference_images) if reference_images else 0,
+        has_extend=bool(extend_video_uri),
+    )
 
     # Determine generation mode based on inputs
     generation_mode: str = "text_to_video"

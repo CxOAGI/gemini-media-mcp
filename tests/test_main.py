@@ -986,8 +986,11 @@ def _create_test_image(width: int = 100, height: int = 100) -> bytes:
                 "image_uri": None,
                 "image_base64": None,
             },
-            {"success": True, "has_image": True},
-            id="empty_prompt",
+            # An empty prompt is now refused before spending, matching the
+            # composites (generate_clip / generate_storyboard) which already
+            # reject a blank beat/shot prompt.
+            {"success": False, "error": True},
+            id="empty_prompt_refused",
         ),
         pytest.param(
             {
@@ -2464,8 +2467,16 @@ async def test_generate_video_raises_on_unfetchable_image_uri(
 async def test_generate_video_raises_on_unfetchable_last_frame(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A provided last_frame_uri that can't be fetched errors."""
+    """A provided last_frame_uri that can't be fetched errors.
+
+    A first frame is supplied so this is a valid first+last-frame request that
+    clears input validation; the failure under test is the unfetchable last
+    frame, not the (separately validated) last-frame-without-first conflict.
+    """
     from src.__main__ import generate_video
+
+    first_frame = tmp_path / "first.png"
+    first_frame.write_bytes(_create_test_image())
 
     async def should_not_run(**kwargs: Any) -> dict[str, Any]:
         raise AssertionError("impl must not run when last_frame fetch fails")
@@ -2476,6 +2487,7 @@ async def test_generate_video_raises_on_unfetchable_last_frame(
         ctx=_video_ctx(tmp_path),
         prompt="p",
         model="veo-3.1-generate-001",
+        image_uri=f"file://{first_frame}",
         last_frame_uri=f"file://{tmp_path / 'nope.png'}",
     )
     payload = json.loads(result)

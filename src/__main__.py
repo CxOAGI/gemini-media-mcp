@@ -37,7 +37,14 @@ from .omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
 from .routing import BudgetPreference, MediaKind
 from .storyboard import Theme
 from .omni import generate_video_omni as generate_video_omni_impl
-from .video import _VEO_LITE_MODELS, TranslatedVideoModel, VideoModel
+from .video import (
+    _MAX_REFERENCE_IMAGES,
+    _VEO_LITE_MODELS,
+    TranslatedVideoModel,
+    VideoModel,
+    resolve_served_video_model,
+    validate_video_request_inputs,
+)
 from .video import generate_video as generate_video_impl
 from .video_utils import (
     assert_frame_decoding_available,
@@ -70,6 +77,10 @@ MAX_STORYBOARD_SHOTS = 24
 # times an image and taking minutes, and add_bridges nearly doubles the count.
 # Matches loop_extend's existing ceiling of 20 chained renders.
 MAX_CLIP_BEATS = 20
+
+# Reference images a Gemini 3.x image model accepts; extras are truncated with
+# a warning rather than silently dropped (the docstring's "up to 14").
+_MAX_IMAGE_REFERENCE_IMAGES = 14
 
 
 def _decode_base64_capped(data: str, max_bytes: int | None = None) -> bytes:
@@ -1811,6 +1822,25 @@ async def generate_image(
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
 
+        # Refuse an empty prompt on both the quote and the render: the
+        # composites (generate_clip / generate_storyboard) already reject a
+        # blank beat/shot prompt, but the primitive priced and billed one.
+        if not prompt or not prompt.strip():
+            raise ValueError("prompt must be a non-empty description of the image.")
+
+        # An over-count reference list is truncated to what the model accepts;
+        # say so on both surfaces rather than silently dropping a reference the
+        # caller supplied (the render was doing this with no signal at all).
+        ref_count = len(reference_image_uris) if reference_image_uris else 0
+        image_ref_warnings: list[str] = []
+        if ref_count > _MAX_IMAGE_REFERENCE_IMAGES:
+            image_ref_warnings.append(
+                f"{ref_count} reference images were supplied but Gemini image "
+                f"models accept {_MAX_IMAGE_REFERENCE_IMAGES}; the last "
+                f"{ref_count - _MAX_IMAGE_REFERENCE_IMAGES} were not sent and "
+                "did not influence this image."
+            )
+
         if dry_run:
             # Resolve the model the same way the impl would, so the estimate
             # prices what would actually run rather than the requested alias.
@@ -1828,10 +1858,10 @@ async def generate_image(
                 "image_size": effective_size,
                 "estimated_cost": _image_cost(resolved, effective_size),
             }
-            if plan_warnings:
-                payload["warnings"] = plan_warnings
-                for warning in plan_warnings:
-                    await ctx.warning(warning)
+            warnings = list(plan_warnings) + image_ref_warnings
+            if warnings:
+                payload["warnings"] = warnings
+                await _emit_warnings(ctx, warnings)
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         image_bytes = None
@@ -1852,7 +1882,7 @@ async def generate_image(
         # Fetch reference images
         reference_images: list[bytes] = []
         if reference_image_uris:
-            for ref_uri in reference_image_uris[:14]:  # Max 14 for Gemini 3.x
+            for ref_uri in reference_image_uris[:_MAX_IMAGE_REFERENCE_IMAGES]:
                 ref_bytes = await fetch(
                     ref_uri,
                     allowed_dir=data_dir,
@@ -1935,14 +1965,15 @@ async def generate_image(
         if usage:
             response_data["usage"] = usage
 
-        # Surface impl warnings (e.g. an Imagen ID rerouted to its GA target).
-        # These go out on the MCP logging channel as well as in the payload, so
-        # a client that only reads the image sees them too.
-        impl_warnings = result.get("warnings")
+        # Surface impl warnings (e.g. an Imagen ID rerouted to its GA target),
+        # plus the reference-truncation warning computed up front so the render
+        # discloses the dropped references the quote already flagged. These go
+        # out on the MCP logging channel as well as in the payload, so a client
+        # that only reads the image sees them too.
+        impl_warnings = (result.get("warnings") or []) + image_ref_warnings
         if impl_warnings:
             response_data["warnings"] = impl_warnings
-            for warning in impl_warnings:
-                await ctx.warning(warning)
+            await _emit_warnings(ctx, impl_warnings)
 
         # Write sidecar manifest so downstream tools (e.g. vfx-mcp) can read
         # generation parameters without parsing response JSON.
@@ -2404,6 +2435,11 @@ async def generate_video(
                  runs in Vertex mode, Lite calls are automatically routed
                  through the Gemini API client, so GEMINI_API_KEY must also
                  be set to use Lite.
+                 Prefer these three names. The schema also accepts
+                 "veo-3.1-generate-preview" and "veo-3.1-fast-generate-preview"
+                 — the spellings the Gemini API backend reports back — so a
+                 model returned by a prior render round-trips; they resolve to
+                 the -001 models above.
         aspect_ratio: 16:9 (default) or 9:16
         duration_seconds: Video duration (4/6/8s)
         include_audio: Enable audio generation
@@ -2467,9 +2503,26 @@ async def generate_video(
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
 
-        # Fail fast on an unsupported aspect ratio before any fetch work.
+        # Fail fast, before any fetch work AND on the dry_run path, so a quote
+        # refuses exactly what the render refuses: empty prompt and mutually
+        # exclusive inputs (the same check the impl runs). Draft routes to
+        # omni, which takes only a prompt + optional images, so the frame /
+        # extend conflicts do not apply there.
         _validate_aspect_ratio(aspect_ratio)
         _validate_duration_seconds(duration_seconds)
+        if draft:
+            if not prompt or not prompt.strip():
+                raise ValueError("prompt must be a non-empty description of the video.")
+        else:
+            validate_video_request_inputs(
+                prompt=prompt,
+                has_first_frame=bool(image_uri or image_base64),
+                has_last_frame=bool(last_frame_uri or last_frame_base64),
+                reference_count=len(reference_image_uris)
+                if reference_image_uris
+                else 0,
+                has_extend=bool(extend_video_uri),
+            )
 
         if dry_run:
             # Draft mode routes to omni, which serves a plain text/image
@@ -2497,7 +2550,17 @@ async def generate_video(
                 else:
                     quoted_mode = "text_to_video"
                 validate_render_options(model, resolution, quoted_mode)
-            est_model = OMNI_MODEL if draft else model
+            # Report the model the real run will report, not the raw input: a
+            # caller who pinned (or fed back) a `-preview` id saw the quote say
+            # `-preview` while the render reported the resolved `-001` name.
+            # Resolve it the way the impl does for the primary backend.
+            if draft:
+                est_model = OMNI_MODEL
+            else:
+                est_model = resolve_served_video_model(
+                    str(model),
+                    getattr(app_ctx.client._api_client, "vertexai", False),
+                )
             est_res = "720p" if draft else (resolution or "720p")
             # Report the duration that will actually render. Returning the
             # request beside a price for the snapped value (5s quoted as "4s
@@ -2546,6 +2609,21 @@ async def generate_video(
                     payload["ignored_veo_params"] = ignored
                     payload["warnings"] = [_draft_ignored_warning(ignored)]
                     await _emit_warnings(ctx, payload["warnings"])
+            elif (
+                quoted_mode == "reference_to_video"
+                and reference_image_uris
+                and len(reference_image_uris) > _MAX_REFERENCE_IMAGES
+            ):
+                # The render warns and truncates over-count references; the
+                # quote must say so too rather than pricing them all in silence.
+                n = len(reference_image_uris)
+                warning = (
+                    f"{n} reference images were supplied but Veo 3.1 accepts "
+                    f"{_MAX_REFERENCE_IMAGES}; the last {n - _MAX_REFERENCE_IMAGES} "
+                    "will not be sent and will not influence the render."
+                )
+                payload["warnings"] = [warning]
+                await _emit_warnings(ctx, [warning])
             return json.dumps(payload, indent=2)
 
         # Draft mode: hand off to the fast omni path. Omni supports only a
@@ -3764,6 +3842,10 @@ async def generate_video_omni(
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
                     "model": OMNI_MODEL,
+                    # Report both, like generate_video and edit_video: a caller
+                    # who asked for 2s must see it snapped to 3 here, not a bare
+                    # 3 with no sign their request was clamped.
+                    "requested_duration_seconds": duration_seconds,
                     "duration_seconds": clamped,
                     "estimated_cost": _video_cost(
                         OMNI_MODEL,
