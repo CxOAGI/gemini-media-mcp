@@ -254,7 +254,9 @@ async def test_previous_interaction_id_forwarded(tmp_path: Path) -> None:
     assert "generation_config" not in kwargs
     assert "duration" not in kwargs["response_format"][0]
     assert "aspect_ratio" not in kwargs["response_format"][0]
-    assert any("inherit" in w for w in result["warnings"])
+    # The warning no longer claims inheritance: measurement showed the
+    # rendered length is neither the source's nor the request's.
+    assert any("predictable" in w for w in result["warnings"])
     assert result["interaction_id"] == "int-2"
 
 
@@ -561,12 +563,15 @@ def test_detect_image_mime_rejects_unknown_and_video() -> None:
         pytest.param(
             b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00", "video/mp4", id="mp4"
         ),
+        # MOV/AVI use the SDK's VideoContentMimeType spellings (video/mov,
+        # video/avi), not the RFC video/quicktime / video/x-msvideo, which are
+        # absent from that literal set and would ride as UnrecognizedStr.
         pytest.param(
-            b"\x00\x00\x00\x18ftypqt  \x00\x00\x00\x00", "video/quicktime", id="mov"
+            b"\x00\x00\x00\x18ftypqt  \x00\x00\x00\x00", "video/mov", id="mov"
         ),
         pytest.param(b"\x1a\x45\xdf\xa3rest", "video/webm", id="webm"),
         pytest.param(b"\x00\x00\x01\xbarest", "video/mpeg", id="mpeg"),
-        pytest.param(b"RIFF\x00\x00\x00\x00AVI LIST", "video/x-msvideo", id="avi"),
+        pytest.param(b"RIFF\x00\x00\x00\x00AVI LIST", "video/avi", id="avi"),
     ],
 )
 def test_detect_video_mime(data: bytes, expected: str) -> None:

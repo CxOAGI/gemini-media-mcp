@@ -1,6 +1,6 @@
 # Gemini Media MCP Server
 
-MCP server for generating images and videos using Google Gemini and VEO models.
+Plan, generate, compose, and edit images and video on Google Gemini and Veo 3.1, with a cost estimate before every call.
 
 [What is an MCP Server?](https://www.anthropic.com/news/model-context-protocol)
 
@@ -12,12 +12,17 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 | **Author** | [CxOAGI](https://github.com/CxOAGI) |
 | **Repository** | [https://github.com/CxOAGI/gemini-media-mcp](https://github.com/CxOAGI/gemini-media-mcp) |
 
-## Available Tools (5)
+## Available Tools (10)
 
 | Tools provided by this Server | Short Description |
 |-------------------------------|-------------------|
-| `generate_image` | Generate images using Gemini or Imagen models |
+| `plan_generation` | Pick the right tool + model for an intent, with costs and ruled-out options. Generates nothing |
+| `generate_image` | Generate images using Gemini image models |
+| `generate_storyboard` | Render a keyframe per shot and return a real storyboard (inline contact-sheet preview + full-size PNG and HTML on disk) |
 | `generate_video` | Generate videos using VEO models (with optional fast `draft` mode) |
+| `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a fast animatic preview |
+| `generate_transition` | Veo first+last-frame transition between two stills |
+| `generate_bridge` | Transition between two existing clips (frames extracted for you) |
 | `generate_video_omni` | Fast conversational video via `gemini-omni-flash-preview` (Interactions API) |
 | `edit_video` | Conversationally edit a previously omni-generated video |
 | `loop_extend` | Extend a Veo video multiple times in one call |
@@ -26,26 +31,93 @@ MCP server for generating images and videos using Google Gemini and VEO models.
 
 ## Tools Details
 
+> **Pricing built in:** every generation tool accepts `dry_run: true` and returns the cost of the exact call that would run, generating nothing. Real runs report metered cost in the response and sidecar manifest.
+
+
+### Tool: **`plan_generation`**
+
+Decide how to generate something before spending anything. Returns ranked, ready-to-call plans with costs, plus the models it ruled out and why. Pure rule-based routing — no model call, no cost, instant.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `intent` | string | Plain-language description of what you want to make |
+| `budget` | string *optional* | `cheap`, `balanced`, or `best` |
+| `media_kind` / `aspect_ratio` / `image_size` / `duration_seconds` / `num_beats` | *optional* | Force a value instead of inferring it |
+| `needs_text_rendering` / `needs_4k` / `needs_audio` / `needs_extension` / `wants_gcs_output` / `is_draft` | boolean *optional* | Hard requirements |
+| `num_reference_images` | integer *optional* | How many references you'll supply |
+| `pinned_model` | string *optional* | A model you must use; reported as a conflict if it can't satisfy the request |
+
+**Notes:**
+- Catches impossible combinations before you pay for the failure (4K on a 1K-only model, extension on Veo Lite, GCS on the Gemini API)
+- Every rejected model comes with a reason — nothing is dropped silently
+
+*This tool is read-only.*
+
+---
+
+### Tool: **`generate_storyboard`**
+
+Render one keyframe per shot and compose a real, readable storyboard.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `shots` | array | Ordered specs: `{prompt, caption?, duration_seconds?, notes?}`. Capped at 24 shots per call — every shot is a billed image |
+| `title` / `subtitle` | string *optional* | Drawn on the board |
+| `model` / `aspect_ratio` / `image_size` | string *optional* | Keyframe settings (`9:16` → vertical panels) |
+| `theme` | string *optional* | `dark` (default) or `light` |
+| `dry_run` | boolean *optional* | Price the whole board without generating |
+
+**Notes:**
+- Writes a full-resolution contact-sheet PNG and a self-contained HTML page to disk, and returns a downscaled **inline** preview of the sheet — the full board runs past the size an MCP client will accept from about a dozen shots up, so open `sheet_url` for a closer read
+- A failed shot renders as a marked error panel and isn't billed — partial boards stay reviewable
+- `shots` feeds straight into `generate_clip` as `beats`
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
 ### Tool: **`generate_image`**
 
-Generate images using Gemini or Imagen models
+Generate images using Gemini image models
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description of the image to generate |
-| `model` | string *optional* | Model to use (see list below) |
+| `model` | string **required** | Model to use — no default; name one explicitly (see list below) |
 | `image_uri` | string *optional* | Input image URI for image-to-image generation |
 | `image_base64` | string *optional* | Base64 encoded input image for image-to-image generation |
 | `aspect_ratio` | string *optional* | Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`) |
-| `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
+| `person_generation` | string *optional* | Policy for generating people: `dont_allow`, `allow_adult`, or `allow_all` |
+| `dry_run` | boolean *optional* | Return only the cost estimate; generates nothing |
 
 **Available Models (GA):**
-- `gemini-3.1-flash-image` - Nano Banana 2; fast, 4K output, up to 14 reference images
+- `gemini-3.1-flash-image` - Nano Banana 2; the general-purpose choice; fast, up to 4K output, up to 14 reference images
 - `gemini-3-pro-image` - Nano Banana Pro; 4K, reasoning, multi-turn editing
-- `gemini-3.1-flash-lite-image` - cheapest; recommended migration target
-- `gemini-2.5-flash-image` - Nano Banana; now considered legacy (migrate to `gemini-3.1-flash-lite-image`)
+- `gemini-3.1-flash-lite-image` - cheapest, but **1K output only** (2K/4K unsupported)
 
-> **Note:** `imagen-3.0-generate-002` was shut down on 2025-11-10. The Imagen 4.x models are deprecated with a scheduled shutdown of 2026-08-17; prefer the Gemini image models above.
+### HTTP transports
+
+```bash
+docker run --rm -p 8000:8000 -e GEMINI_API_KEY=... -e DATA_FOLDER=/data \
+  -v /host/path:/data cxoagi/gemini-media-mcp streamable-http   # or: sse
+```
+
+The server binds `0.0.0.0` inside a container so the published port is reachable, and `127.0.0.1` when run directly so a local run is not exposed to the network (the image sets `RUNNING_IN_CONTAINER=true` to signal which case applies). Override with `--host` / `--port` or `FASTMCP_HOST`. `--mount-path` sets the mount path for the `sse` transport only (e.g. `/custom`); `streamable-http` ignores it and always serves `/mcp`. `--log-level` takes `DEBUG`, `INFO` (default), `WARNING`, `ERROR` or `CRITICAL`. `--host`, `--port` and `--mount-path` are accepted after the transport subcommand, which is the form `docker run` produces; `--log-level` must come before it.
+
+> **Retired IDs are rerouted, not failed.** Requesting one still returns an image — the server substitutes the GA replacement Google published instead of letting the call 404 — and announces the swap three ways: a `warnings` entry in the response JSON, an MCP `warning` log notification, and a `WARNING` record in the server log. Request a GA model directly.
+>
+> | Retired ID | Gone since | Served by |
+> |---|---|---|
+> | `gemini-3-pro-image-preview` | 2026-06-25 | `gemini-3-pro-image` |
+> | `gemini-3.1-flash-image-preview` | 2026-06-25 | `gemini-3.1-flash-image` |
+> | `imagen-3.0-generate-002` | 2025-11-10 | `gemini-3.1-flash-image` |
+> | `imagen-3.0-capability-001`, `imagen-3.0-capability-002`, `imagen-3.0-fast-generate-001`, `imagen-3.0-generate-001`, `imagen-4.0-fast-generate-001`, `imagen-4.0-generate-001` | 2026-08-17 | `gemini-3.1-flash-image` |
+> | `imagen-4.0-ultra-generate-001` | 2026-08-17 | `gemini-3-pro-image` |
+> | `gemini-2.5-flash-image` | 2026-10-02 (scheduled) | `gemini-3.1-flash-image` |
+>
+> Imagen Ultra reroutes to the top Gemini image model rather than dropping to flash, and **`gemini-3-pro-image` is billed at a materially higher rate than `gemini-3.1-flash-image`** — price it with `dry_run` first.
 
 *This tool may perform destructive updates.*
 
@@ -60,19 +132,20 @@ Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the p
 | Parameters | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description of the video to generate |
-| `model` | string *optional* | VEO model to use: `veo-3.1-generate-001` (default), `veo-3.1-fast-generate-001`, `veo-3.1-lite-generate-preview` |
+| `model` | string **required** | VEO model to use — no default; name one explicitly: `veo-3.1-generate-001`, `veo-3.1-fast-generate-001`, `veo-3.1-lite-generate-preview` |
 | `aspect_ratio` | string *optional* | Video aspect ratio: `16:9` (default) or `9:16` |
 | `resolution` | string *optional* | Output resolution: `720p`, `1080p`, or `4K` (4K not on Lite) |
-| `duration_seconds` | integer *optional* | Video duration in seconds (4/6/8s) |
-| `include_audio` | boolean *optional* | Enable audio generation |
+| `duration_seconds` | number *optional* | Video duration in seconds (4/6/8s). **Default `8.0`**, the longest and priciest option — an omitted duration on `veo-3.1-generate-001` bills a full 8s render (from $3.20 at 720p/1080p) |
+| `include_audio` | boolean *optional* | Enable audio generation (default `false`; honoured on Vertex only — on the Gemini API Veo 3.1 always produces audio) |
 | `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
+| `dry_run` | boolean *optional* | Return only the cost estimate; generates nothing |
 | `audio_prompt` | string *optional* | Audio description |
 | `negative_prompt` | string *optional* | Things to avoid in the video |
 | `seed` | integer *optional* | Random seed for reproducibility |
 | `image_uri` | string *optional* | Input image URI for image-to-video generation |
 | `draft` | boolean *optional* | When `true`, routes to `gemini-omni-flash-preview` for a fast 720p draft instead of Veo (default `false`) |
 
-**Available Models:**
+**Available Models** (no default — `model` must be supplied):
 - `veo-3.1-generate-001` - VEO 3.1 (4/6/8 seconds with audio support)
 - `veo-3.1-fast-generate-001` - VEO 3.1 Fast (faster generation)
 - `veo-3.1-lite-generate-preview` - VEO 3.1 Lite (cheapest; Gemini-API-only; text-to-video and image-to-video only)
@@ -90,22 +163,86 @@ Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the p
 
 ---
 
+### Tool: **`generate_clip`**
+
+Generate a multi-beat short clip — the building block for a reel. One call renders the whole sequence and returns an ordered manifest for a downstream cutting MCP.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `beats` | array | Ordered beat specs: `{prompt, duration_seconds?, seed?, first_frame_uri?, negative_prompt?, audio_prompt?}`. Capped at 20 beats per call |
+| `aspect_ratio` | string *optional* | `9:16` (default, vertical social) or `16:9` |
+| `model` | string *optional* | Veo model for every beat (default `veo-3.1-fast-generate-001`) |
+| `include_audio` | boolean *optional* | Audio per beat (default `true`; Vertex only) |
+| `add_bridges` | boolean *optional* | Generate a transition between consecutive beats (requires local beat outputs) |
+| `animatic` | boolean *optional* | Render every beat with `gemini-omni-flash-preview` for a fast 720p storyboard preview of the whole reel |
+| `output_gcs_uri` | string *optional* | GCS URI for all outputs |
+
+**Notes:**
+- A failed beat is recorded in the manifest's `errors` list; the run continues
+- Returns `{kind, aspect_ratio, segments[], total_duration_seconds, errors[]}`
+- Typical flow: `animatic: true` to preview quickly, then re-run for full Veo renders
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`generate_transition`**
+
+Veo 3.1 first+last-frame transition between two **still frames**.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `first_frame_uri` | string | Starting still (`gs://`, `https://`, `file://`) |
+| `last_frame_uri` | string | Ending still |
+| `prompt` | string *optional* | Transition motion and style |
+| `model` | string *optional* | Veo model (default fast; **Lite is not supported** — no first/last-frame mode) |
+| `duration_seconds` | number *optional* | 4/6/8s, snapped to nearest |
+| `aspect_ratio` | string *optional* | Must match the surrounding clips |
+| `include_audio` / `audio_prompt` / `negative_prompt` / `seed` / `output_gcs_uri` | *optional* | As for `generate_video` |
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`generate_bridge`**
+
+Same as `generate_transition`, but takes two **clips** — it decodes the last frame of the first and the first frame of the second for you.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `from_clip_uri` | string | Clip whose last frame starts the bridge |
+| `to_clip_uri` | string | Clip whose first frame ends the bridge |
+| `prompt` | string *optional* | Transition motion and style (default: `smooth cinematic cut between the two clips`) |
+| `model` / `duration_seconds` / `aspect_ratio` / `include_audio` / `audio_prompt` / `negative_prompt` / `seed` / `output_gcs_uri` | *optional* | As above |
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
 ### Tool: **`generate_video_omni`**
 
-Fast conversational video generation via Google's `gemini-omni-flash-preview` (Interactions API). This is the fast/cheap path for drafts and iteration; the Veo tools remain the high-fidelity path (1080p/4K, seeds, first/last frame). See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
+Fast conversational video generation via Google's `gemini-omni-flash-preview` (Interactions API). This is the fast path for drafts and iteration (not cheaper than Veo Fast: $0.10136/s vs $0.10/s); the Veo tools remain the high-fidelity path (1080p/4K, seeds, first/last frame). See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description of the video to generate |
-| `image_uris` | array *optional* | List of image URIs to condition on |
+| `image_uris` | array *optional* | List of image URIs to condition on — at most 8; a longer list is rejected |
 | `input_video_uri` | string *optional* | A video to edit |
-| `aspect_ratio` | string *optional* | `16:9` (default) or `9:16` |
-| `duration_seconds` | integer *optional* | Video duration, 3–10 (default 6) |
+| `aspect_ratio` | string *optional* | `16:9` (default) or `9:16`. Not sent when the request is an edit (an `input_video_uri` or `previous_interaction_id` makes it one) — the API rejects it on an edit task |
+| `duration_seconds` | number *optional* | Video duration, 3–10 (default 6). Also not sent on an edit; the service then picks the rendered length |
 | `previous_interaction_id` | string *optional* | Continue editing a prior omni result |
+| `timeout_seconds` | integer *optional* | Deadline for create + polling (default 600); raise it for long queues |
 
 **Notes:**
 - 720p only, 24fps
 - No `seed` or `negative_prompt` support
+- On an edit turn the response reports `duration_seconds: null`, and a `dry_run` quotes omni's 10s maximum as an upper bound
 - Response includes an `interaction_id` for multi-turn editing
 
 *This tool may perform destructive updates.*
@@ -122,8 +259,9 @@ Conversational edit of a previously omni-generated video. Omni holds the video c
 |-----------|------|-------------|
 | `previous_interaction_id` | string | The `interaction_id` from a prior `generate_video_omni` response |
 | `prompt` | string | The edit instruction (e.g. `make the sky stormy`) |
-| `aspect_ratio` | string *optional* | `16:9` (default) or `9:16` |
-| `duration_seconds` | integer *optional* | Video duration, 3–10 (default 6) |
+| `aspect_ratio` | string *optional* | Accepted but never sent — the API rejects it on an edit task, so it does not change the output |
+| `duration_seconds` | number *optional* | Accepted but never sent, and it does not set the output length: the service picks it, predictable from neither this value nor the source (a measured 3s source edited with `duration_seconds=4` rendered 10.01s). The response reports `duration_seconds: null`; a real run bills the measured file and `dry_run` quotes omni's 10s maximum |
+| `timeout_seconds` | integer *optional* | Deadline for the edit render (default 600) |
 
 *This tool may perform destructive updates.*
 
@@ -159,7 +297,7 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 
 Two video paths, chosen by where you are in the workflow:
 
-- **`gemini-omni-flash-preview` (fast/cheap)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, negative prompts, or first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
+- **`gemini-omni-flash-preview` (fastest turnaround)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, negative prompts, or first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
 - **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds, first/last-frame control, reference images, extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
 
 Typical workflows:
@@ -235,7 +373,8 @@ Typical workflows:
 | `GOOGLE_GENAI_USE_VERTEXAI` | ✅ | Set to `true` to enable Vertex AI |
 | `GOOGLE_CLOUD_PROJECT` | ✅ | Your Google Cloud project ID |
 | `GOOGLE_CLOUD_LOCATION` | ✅ | Region (e.g., `us-central1`) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | ✅ | Path to service account JSON key (inside container) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | ✅ | Path to service account JSON key (inside container). Also accepts the key as inline JSON |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | — | The service account key as inline JSON, instead of mounting a file. Written by `gemini-media-mcp setup`; the server materialises it into a temp file |
 | `DATA_FOLDER` | ✅ | Output directory path (must match host path in volume) |
 
 ### Gemini API Configuration (Images + Videos)
@@ -244,6 +383,15 @@ Typical workflows:
 |----------|----------|-------------|
 | `GEMINI_API_KEY` | ✅ | Your Gemini API key |
 | `DATA_FOLDER` | ✅ | Output directory path (must match host path in volume) |
+
+### Optional (both modes)
+
+| Variable | Description |
+|----------|-------------|
+| `GCS_ALLOWED_BUCKETS` | Comma-separated allowlist for `gs://` inputs and `output_gcs_uri`. Unset (and no `VIDEO_GCS_BUCKET`) means `gs://` fetches only log a warning |
+| `VIDEO_GCS_BUCKET` | Default bucket for large video output; also seeds the allowlist above |
+| `FASTMCP_HOST` | Bind address for the sse/streamable-http transports; `--host` wins over it |
+| `RUNNING_IN_CONTAINER` | Set to `true` by this image. Makes `DATA_FOLDER` mandatory and binds `0.0.0.0` instead of `127.0.0.1`. Leave it alone unless you are building your own image |
 
 ---
 

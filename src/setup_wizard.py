@@ -8,6 +8,7 @@ and emits a Claude Desktop configuration block.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -199,6 +200,27 @@ def macos_config_path() -> Path:
     )
 
 
+# The written config carries GEMINI_API_KEY, and in Vertex mode the whole
+# service-account JSON including its private key. Left to the umask these land
+# at 0644/0664 — readable by every other account on the machine — so the file
+# and its backup are narrowed to the owner.
+_CREDENTIAL_FILE_MODE = 0o600
+
+
+def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON readable only by the owner, never briefly wider.
+
+    The descriptor is opened at 0600 so a new file is never observable at the
+    umask's permissions, and an existing file is narrowed before the secret is
+    written into it rather than after.
+    """
+    if path.exists():
+        os.chmod(path, _CREDENTIAL_FILE_MODE)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _CREDENTIAL_FILE_MODE)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(payload, indent=2) + "\n")
+
+
 def _merge_and_write(
     config_path: Path,
     new_block: dict[str, Any],
@@ -216,13 +238,16 @@ def _merge_and_write(
             existing = {}
         backup = config_path.with_suffix(config_path.suffix + ".bak")
         shutil.copy2(config_path, backup)
+        # copy2 preserves the source's mode, so a config that was already
+        # world-readable would be duplicated that way.
+        os.chmod(backup, _CREDENTIAL_FILE_MODE)
 
     servers = dict(existing.get("mcpServers") or {})
     servers.update(new_block.get("mcpServers") or {})
     existing["mcpServers"] = servers
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(existing, indent=2) + "\n")
+    _write_private_json(config_path, existing)
     return backup
 
 

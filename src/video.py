@@ -1,11 +1,14 @@
 """Video generation helpers."""
 
 import asyncio
-import os
+import functools
+import threading
 import uuid
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Literal
 
 from google import genai
@@ -15,10 +18,76 @@ from PIL import Image
 # Type for async log callback from MCP context
 LogCallback = Callable[[str], Awaitable[None]]
 
+# Blocking SDK and filesystem work runs here instead of the event loop's shared
+# default executor. `asyncio.wait_for` hands control back to the caller but
+# cannot cancel a thread already inside a blocking syscall, so every timeout
+# parks a worker until the OS releases it. On the shared executor those
+# abandoned workers accumulate against the same small pool that image
+# generation, ffmpeg and every fetch draw from, and twelve of them wedge the
+# whole server. Isolated here, a stalled Veo poll or a dead network mount
+# degrades video generation only, and once the pool is saturated new work
+# queues behind a deadline instead of hanging the request forever.
+_SDK_POOL_MAX_WORKERS = 8
+_sdk_pool_lock = threading.Lock()
+_sdk_pool: ThreadPoolExecutor | None = None
+
+
+def _sdk_executor() -> ThreadPoolExecutor:
+    """Return the process-wide bounded pool for blocking media SDK calls."""
+    global _sdk_pool
+    with _sdk_pool_lock:
+        if _sdk_pool is None:
+            _sdk_pool = ThreadPoolExecutor(
+                max_workers=_SDK_POOL_MAX_WORKERS,
+                thread_name_prefix="media-sdk",
+            )
+        return _sdk_pool
+
+
+async def run_off_loop(
+    call: Callable[[], Any],
+    *,
+    timeout: float,
+    message: str,
+) -> Any:
+    """Run a blocking call in the bounded pool under a hard deadline.
+
+    Shared with ``omni.py`` so both video backends bound their SDK calls the
+    same way. ``call`` must be argument-free — bind arguments with
+    ``functools.partial`` — so nothing it is given can collide with the
+    deadline parameters.
+
+    Raises TimeoutError with ``message`` when the deadline passes. The worker
+    thread is NOT cancelled (nothing can cancel a thread blocked in a syscall);
+    the point is that the caller and the event loop are released regardless.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_sdk_executor(), call), timeout
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(message) from exc
+
+
 VideoModel = Literal[
     "veo-3.1-generate-001",
     "veo-3.1-fast-generate-001",
     "veo-3.1-lite-generate-preview",
+]
+
+# The IDs the Gemini API backend serves under, and the ones a real run REPORTS
+# back in its `model` field on that backend. Accepted as tool input purely so a
+# returned model round-trips: an agent that reads result["model"] from a
+# Gemini-API render and feeds it into loop_extend / generate_video must not hit
+# a schema rejection. Kept SEPARATE from VideoModel on purpose — the planner
+# enumerates VideoModel as its candidate catalogue (routing.LIVE_VIDEO_MODELS),
+# and folding these spellings in would make it rank each model twice. They
+# resolve to the canonical `-001` id before anything downstream sees them (see
+# _CANONICAL_VIDEO_MODEL_IDS). Same split as ImageModel vs RetiredImageModel.
+TranslatedVideoModel = Literal[
+    "veo-3.1-generate-preview",
+    "veo-3.1-fast-generate-preview",
 ]
 
 # Veo 3.1 Lite does not support 4K output or video extension.
@@ -31,6 +100,15 @@ _VEO_LITE_MODELS = {"veo-3.1-lite-generate-preview"}
 _GEMINI_API_MODEL_IDS = {
     "veo-3.1-generate-001": "veo-3.1-generate-preview",
     "veo-3.1-fast-generate-001": "veo-3.1-fast-generate-preview",
+}
+
+# Reverse of the per-backend map: a caller may pass back a `-preview` ID that a
+# prior Gemini-API render reported. Normalize it to the canonical `-001` name
+# BEFORE the per-backend translation runs, so the request behaves identically
+# to one that named the canonical model — on Vertex it stays `-001` (a raw
+# `-preview` would 404 there), on the Gemini API it re-translates to `-preview`.
+_CANONICAL_VIDEO_MODEL_IDS = {
+    preview: canonical for canonical, preview in _GEMINI_API_MODEL_IDS.items()
 }
 
 # Generation mode for VEO 3.1
@@ -55,11 +133,188 @@ def _prepare_image_input(image_bytes: bytes) -> types.Image:
     return types.Image(image_bytes=buf.getvalue(), mime_type=f"image/{fmt.lower()}")
 
 
+# Generation modes Veo 3.1 Lite cannot serve. It handles text-to-video and
+# image-to-video only.
+_LITE_UNSUPPORTED_MODES = ("extend_video", "reference_to_video", "first_last_frame")
+
+# Veo 3.1 accepts at most this many reference images; extras are not sent.
+_MAX_REFERENCE_IMAGES = 3
+
+# Size cap for a local clip handed to extend_video, matching the fetch helper's
+# MAX_FETCH_BYTES — the whole file is read into memory and inlined in the
+# request, so an unbounded read is an OOM the caller controls.
+_EXTEND_MAX_BYTES = 50 * 1024 * 1024
+
+# Deadline for reading that local clip. The media directory is caller-supplied
+# and may live on a network mount, so the read is bounded like the sidecar scan.
+_EXTEND_READ_TIMEOUT_SECONDS = 30.0
+
+# Overall budget for one render: submit plus the whole polling loop. Measured
+# against the monotonic clock so blocked time counts — the previous counter
+# only added the sleep interval, so a stalled call could never reach it.
+_VEO_TOTAL_TIMEOUT_SECONDS = 1800.0
+_VEO_POLL_INTERVAL_SECONDS = 10.0
+
+# Per-call ceilings. google-genai hands timeout=None straight to httpx when
+# HttpOptions.timeout is unset, which disables transport timeouts entirely, so
+# without these a single stalled connection outlives the request that made it.
+_VEO_SUBMIT_TIMEOUT_SECONDS = 120.0
+_VEO_POLL_TIMEOUT_SECONDS = 120.0
+_VEO_DOWNLOAD_TIMEOUT_SECONDS = 600.0
+
+# Transport deadline (milliseconds — HttpOptions.timeout is in ms) applied to
+# the submit call itself. A real transport timeout makes the SDK call *return*
+# rather than being abandoned, so unlike run_off_loop it leaks no worker.
+# Only the submit call can carry it without changing an SDK call signature;
+# see the note on run_off_loop for the rest.
+_VEO_SUBMIT_HTTP_TIMEOUT_MS = int(_VEO_SUBMIT_TIMEOUT_SECONDS * 1000)
+
+
+def _load_extend_video(location: Path, allowed_dir: Path | None) -> types.Video:
+    """Read a local clip for extend_video into an inline types.Video.
+
+    Replaces ``types.Video.from_file``, which is a bare
+    ``Path(location).read_bytes()`` with no guards at all: a FIFO in the media
+    directory blocks that read forever, and a large file is inlined into the
+    request whole. The media directory is caller-controlled and may sit on a
+    network mount, so this applies the same rules the rest of the server
+    already uses — containment in allowed_dir, regular files only, and a size
+    cap — before anything is opened.
+    """
+    resolved = location.resolve()
+    if allowed_dir is not None:
+        allowed = allowed_dir.resolve()
+        if resolved != allowed and not resolved.is_relative_to(allowed):
+            # Same wording the fetch-based inputs use, so one confinement
+            # violation does not read two different ways depending on which
+            # parameter tripped it.
+            raise ValueError(
+                f"'{location}' is outside the permitted data folder "
+                f"(DATA_FOLDER at {allowed}); copy the file under that folder, "
+                "or pass a gs:// or https:// URI instead."
+            )
+    try:
+        stat = resolved.stat()
+    except OSError as exc:
+        raise ValueError(f"Could not read video to extend '{location}': {exc}") from exc
+    # A FIFO, socket or device node would block the read indefinitely, and a
+    # directory would raise a less obvious error.
+    if not S_ISREG(stat.st_mode):
+        raise ValueError(f"Video to extend '{location}' is not a regular file.")
+    if stat.st_size > _EXTEND_MAX_BYTES:
+        raise ValueError(
+            f"Video to extend '{location}' is {stat.st_size} bytes, over the "
+            f"{_EXTEND_MAX_BYTES} byte limit."
+        )
+    return types.Video(video_bytes=resolved.read_bytes(), mime_type="video/mp4")
+
+
+def validate_render_options(
+    model: str,
+    resolution: str | None = None,
+    generation_mode: str | None = None,
+) -> None:
+    """Raise for a model/resolution/mode combination Veo cannot render.
+
+    Shared by the generation path and the tools' dry_run quotes, so a quote
+    can never succeed for a call that would be refused — the same
+    single-source rule as resolve_image_model on the image side. Every Lite
+    restriction lives here; enforcing them per tool is what let a dry run
+    price an extension on a model that cannot extend.
+    """
+    if resolution is not None:
+        valid_resolutions = ("720p", "1080p", "4K")
+        if resolution not in valid_resolutions:
+            raise ValueError(
+                f"Unsupported resolution '{resolution}'. "
+                f"Supported values are {', '.join(valid_resolutions)}."
+            )
+        if resolution == "4K" and model in _VEO_LITE_MODELS:
+            raise ValueError(
+                f"Model {model} does not support 4K resolution. "
+                "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+            )
+    if (
+        generation_mode is not None
+        and model in _VEO_LITE_MODELS
+        and generation_mode in _LITE_UNSUPPORTED_MODES
+    ):
+        raise ValueError(
+            f"Model {model} does not support {generation_mode}. "
+            "Veo 3.1 Lite supports only text-to-video and image-to-video; "
+            "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+        )
+
+
+def validate_video_request_inputs(
+    *,
+    prompt: str,
+    has_first_frame: bool,
+    has_last_frame: bool,
+    reference_count: int,
+    has_extend: bool,
+) -> None:
+    """Raise for a request no render could honor, before any work is spent.
+
+    Shared by the generation impl and the tools' dry_run quotes so a quote can
+    never succeed for a call the real run would refuse — the mode ladder below
+    silently picks one input and drops the rest, so an unenforced conflict
+    billed a full render that ignored half of what the caller supplied.
+    ``has_*`` are presence flags (URI or inline bytes) since the tool front
+    door has URIs, not bytes.
+    """
+    if not prompt or not prompt.strip():
+        raise ValueError("prompt must be a non-empty description of the video.")
+
+    frame_names = []
+    if has_first_frame:
+        frame_names.append("image_uri/image_base64")
+    if has_last_frame:
+        frame_names.append("last_frame_uri/last_frame_base64")
+
+    if has_extend and (has_first_frame or has_last_frame or reference_count):
+        others = list(frame_names)
+        if reference_count:
+            others.append("reference_image_uris")
+        joined = others[0] if len(others) == 1 else ", ".join(others)
+        raise ValueError(
+            f"extend_video_uri cannot be combined with {joined}. An extension "
+            "continues the source clip and sends no image inputs; drop the "
+            "image inputs or drop extend_video_uri."
+        )
+    if reference_count and (has_first_frame or has_last_frame):
+        joined = frame_names[0] if len(frame_names) == 1 else ", ".join(frame_names)
+        raise ValueError(
+            f"reference images cannot be combined with {joined}. "
+            "Reference-to-video sends neither a first nor a last frame and "
+            "always renders 8 seconds; drop one or the other."
+        )
+    if has_last_frame and not has_first_frame:
+        raise ValueError(
+            "A last frame was provided without a first frame. First+last "
+            "frame mode requires both; provide image_uri/image_base64 too."
+        )
+
+
+def resolve_served_video_model(model: str, is_vertexai: bool) -> str:
+    """The model id a real run reports for ``model`` on this backend.
+
+    A caller may pin a canonical `-001` id or feed back the `-preview` id a
+    prior Gemini-API render returned; either way the served id is derived the
+    same way the impl derives it, so a dry_run's `model` field matches what the
+    real run will report instead of echoing the raw input.
+    """
+    canonical = _CANONICAL_VIDEO_MODEL_IDS.get(model, model)
+    if not is_vertexai:
+        return _GEMINI_API_MODEL_IDS.get(canonical, canonical)
+    return canonical
+
+
 async def generate_video(
     client: genai.Client,
     prompt: str,
     videos_dir: Path,
-    model: VideoModel = "veo-3.1-generate-001",
+    model: VideoModel | TranslatedVideoModel = "veo-3.1-generate-001",
     image_bytes: bytes | None = None,
     allowed_dir: Path | None = None,
     aspect_ratio: str = "16:9",
@@ -93,6 +348,10 @@ async def generate_video(
         log_callback: Async callback for progress logging
         last_frame_bytes: Last frame image bytes for first+last frame control
         reference_images: List of reference image bytes (up to 3) for style/character
+        allowed_dir: Directory that file:// / bare-path extend sources must
+            resolve inside. Security boundary, not a convenience: without it
+            any local path readable by the server could be uploaded to the
+            API as "video to extend".
         extend_video_uri: URI of existing VEO video to extend. On Vertex AI
             this requires output_gcs_uri; on the Gemini API the extended
             clip is returned inline and GCS output is not supported.
@@ -109,6 +368,11 @@ async def generate_video(
     """
     model_id = str(model)
 
+    # Normalize a served `-preview` ID a caller fed back from a prior render to
+    # its canonical `-001` name first, so the per-backend translation below is
+    # the single source of the served spelling.
+    model_id = _CANONICAL_VIDEO_MODEL_IDS.get(model_id, model_id)
+
     # Translate model IDs per backend: the Gemini Developer API serves Veo
     # under `-preview` IDs and 404s on the Vertex `-001` names.
     is_vertexai = getattr(client._api_client, "vertexai", False)
@@ -119,13 +383,17 @@ async def generate_video(
     # not be honored but should not abort the whole generation).
     warnings: list[str] = []
 
-    # A last frame without a first frame would silently classify as
-    # text_to_video and the fetched frame would be discarded — reject it.
-    if last_frame_bytes and not image_bytes:
-        raise ValueError(
-            "A last frame was provided without a first frame. First+last "
-            "frame mode requires both; provide image_uri/image_base64 too."
-        )
+    # Inputs that cannot all be honored are a hard error, not a silent pick:
+    # the mode ladder below chooses exactly one and drops the rest after the
+    # caller has paid to fetch them. Shared with the tools' dry_run so a quote
+    # refuses exactly what the render refuses.
+    validate_video_request_inputs(
+        prompt=prompt,
+        has_first_frame=bool(image_bytes),
+        has_last_frame=bool(last_frame_bytes),
+        reference_count=len(reference_images) if reference_images else 0,
+        has_extend=bool(extend_video_uri),
+    )
 
     # Determine generation mode based on inputs
     generation_mode: str = "text_to_video"
@@ -140,17 +408,9 @@ async def generate_video(
 
     # Veo 3.1 Lite (served via the Gemini API) does not support video
     # extension, reference images, or first/last-frame control — fail fast
-    # with a clear message instead of an opaque API error.
-    if model in _VEO_LITE_MODELS and generation_mode in (
-        "extend_video",
-        "reference_to_video",
-        "first_last_frame",
-    ):
-        raise ValueError(
-            f"Model {model_id} does not support {generation_mode}. "
-            "Veo 3.1 Lite supports only text-to-video and image-to-video; "
-            "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
-        )
+    # with a clear message instead of an opaque API error. Shared with the
+    # tools' dry_run quotes so both refuse the same combinations.
+    validate_render_options(model, generation_mode=generation_mode)
 
     # Prepare image inputs
     first_frame_input: types.Image | None = None
@@ -167,7 +427,18 @@ async def generate_video(
     elif generation_mode == "reference_to_video" and reference_images:
         # VEO 3.1 supports up to 3 reference images (asset type)
         # Must wrap in VideoGenerationReferenceImage with reference_type="asset"
-        for ref_bytes in reference_images[:3]:
+        if len(reference_images) > _MAX_REFERENCE_IMAGES:
+            # A truncation, not a conflict: the render the caller asked for
+            # still happens, just without the extras. Say so rather than
+            # letting a reference the caller explicitly supplied vanish and
+            # quietly change the generation result.
+            warnings.append(
+                f"{len(reference_images)} reference images were supplied but "
+                f"Veo 3.1 accepts {_MAX_REFERENCE_IMAGES}; the last "
+                f"{len(reference_images) - _MAX_REFERENCE_IMAGES} were not "
+                "sent and did not influence this render."
+            )
+        for ref_bytes in reference_images[:_MAX_REFERENCE_IMAGES]:
             ref_image = _prepare_image_input(ref_bytes)
             reference_image_inputs.append(
                 types.VideoGenerationReferenceImage(
@@ -233,6 +504,15 @@ async def generate_video(
         config_kwargs["negative_prompt"] = negative_prompt
     if seed is not None and seed >= 0:
         config_kwargs["seed"] = seed
+    elif seed is not None:
+        # Dropping it is right (Veo seeds are non-negative) but doing it
+        # silently costs the caller the one thing a seed buys: they would
+        # re-run the same request expecting the same clip and never learn why
+        # it differs.
+        warnings.append(
+            f"seed={seed} was not sent: Veo seeds must be non-negative, so "
+            "this render is not reproducible."
+        )
 
     # output_gcs_uri is a Vertex-only config field. The Gemini API (e.g. for
     # Veo Lite) does not support GCS output, so only forward it on Vertex.
@@ -244,22 +524,19 @@ async def generate_video(
         config_kwargs["output_gcs_uri"] = output_gcs_uri
 
     if resolution is not None:
-        valid_resolutions = ("720p", "1080p", "4K")
-        if resolution not in valid_resolutions:
-            raise ValueError(
-                f"Unsupported resolution '{resolution}'. "
-                f"Supported values are {', '.join(valid_resolutions)}."
-            )
-        if resolution == "4K" and model in _VEO_LITE_MODELS:
-            raise ValueError(
-                f"Model {model_id} does not support 4K resolution. "
-                "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
-            )
+        validate_render_options(model, resolution)
         config_kwargs["resolution"] = resolution
 
     if person_generation is not None:
         # Pass through as-is and let the API validate the value.
         config_kwargs["person_generation"] = person_generation
+
+    # A real transport deadline on the submit call, so a stalled connection
+    # raises instead of parking a worker thread forever. Merged field-wise
+    # over the client's own HttpOptions, so base_url/api_version survive.
+    config_kwargs["http_options"] = types.HttpOptions(
+        timeout=_VEO_SUBMIT_HTTP_TIMEOUT_MS
+    )
 
     prompt_for_api = prompt
     if audio_prompt:
@@ -288,19 +565,13 @@ async def generate_video(
         # For file:// URIs, load from local file to get proper mime type
         if extend_video_uri.startswith("file://"):
             local_path = Path(extend_video_uri[7:])
-            # Validate path is within allowed directory (prevents LFI)
-            if allowed_dir is not None:
-                resolved = local_path.resolve()
-                allowed = allowed_dir.resolve()
-                if (
-                    not str(resolved).startswith(str(allowed) + os.sep)
-                    and resolved != allowed
-                ):
-                    raise ValueError(
-                        f"Access denied: '{local_path}' is outside the allowed directory."
-                    )
-            api_kwargs["video"] = types.Video.from_file(
-                location=str(local_path), mime_type="video/mp4"
+            api_kwargs["video"] = await run_off_loop(
+                functools.partial(_load_extend_video, local_path, allowed_dir),
+                timeout=_EXTEND_READ_TIMEOUT_SECONDS,
+                message=(
+                    f"Timed out reading the video to extend '{local_path}' "
+                    f"after {_EXTEND_READ_TIMEOUT_SECONDS:.0f}s."
+                ),
             )
         else:
             # Remote URI - pass with mime type
@@ -308,21 +579,35 @@ async def generate_video(
                 uri=extend_video_uri, mimeType="video/mp4"
             )
 
-    operation = await asyncio.to_thread(
-        client.models.generate_videos,
-        **api_kwargs,
+    # The whole render is measured against the monotonic clock, so time spent
+    # blocked inside an SDK call counts toward the budget. The old counter only
+    # accumulated the sleep interval, which meant a stalled call could never
+    # reach the limit and the request hung indefinitely.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _VEO_TOTAL_TIMEOUT_SECONDS
+    expired = f"Video generation timed out after {_VEO_TOTAL_TIMEOUT_SECONDS:.0f}s."
+
+    def _remaining() -> float:
+        left = deadline - loop.time()
+        if left <= 0:
+            raise TimeoutError(expired)
+        return left
+
+    operation = await run_off_loop(
+        functools.partial(client.models.generate_videos, **api_kwargs),
+        timeout=min(_VEO_SUBMIT_TIMEOUT_SECONDS, _remaining()),
+        message="Video generation timed out submitting the request.",
     )
 
     if log_callback:
         await log_callback(f"Polling operation: {operation.name}")
-    timeout = 1800
-    elapsed = 0
     while not operation.done:
-        if elapsed >= timeout:
-            raise TimeoutError("Video generation timed out")
-        await asyncio.sleep(10)
-        elapsed += 10
-        operation = await asyncio.to_thread(client.operations.get, operation)
+        await asyncio.sleep(min(_VEO_POLL_INTERVAL_SECONDS, _remaining()))
+        operation = await run_off_loop(
+            functools.partial(client.operations.get, operation),
+            timeout=min(_VEO_POLL_TIMEOUT_SECONDS, _remaining()),
+            message="Video generation timed out polling the operation.",
+        )
 
     if operation.error:
         raise ValueError(f"VEO error: {operation.error}")
@@ -341,10 +626,18 @@ async def generate_video(
         filepath.write_bytes(video.video_bytes)
         video_url = f"file://{filepath}"
     else:
-        await asyncio.to_thread(client.files.download, file=video)
+        await run_off_loop(
+            functools.partial(client.files.download, file=video),
+            timeout=min(_VEO_DOWNLOAD_TIMEOUT_SECONDS, _remaining()),
+            message="Timed out downloading the generated video.",
+        )
         filename = f"{uuid.uuid4()}.mp4"
         filepath = videos_dir / filename
-        await asyncio.to_thread(video.save, str(filepath))
+        await run_off_loop(
+            functools.partial(video.save, str(filepath)),
+            timeout=min(_VEO_DOWNLOAD_TIMEOUT_SECONDS, _remaining()),
+            message="Timed out writing the generated video to disk.",
+        )
         video_url = f"file://{filepath}"
 
     # Report audio truthfully: on Vertex AI it depends on the generate_audio flag

@@ -37,12 +37,15 @@ live call rejects it, move it into the input part.
 
 import asyncio
 import base64
+import functools
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from google import genai
+
+from .video import run_off_loop
 
 # Type for async log callback from MCP context
 LogCallback = Callable[[str], Awaitable[None]]
@@ -56,8 +59,27 @@ _SUPPORTED_ASPECT_RATIOS = ("16:9", "9:16")
 _MIN_DURATION = 3
 _MAX_DURATION = 10
 
+# Public alias: the tool layer quotes this as the worst case for an edit,
+# whose rendered length the service chooses and does not document.
+OMNI_MAX_DURATION_SECONDS = _MAX_DURATION
+
+# Cap on the delivered-video download. Mirrors MAX_FETCH_BYTES (50 MB) in
+# src/__main__.py — defined here rather than imported because this module does
+# not own that file. files.download buffers the whole response body, so without
+# this the one delivered-file path would be the only fetch in the server that
+# reads an untrusted body uncapped; a 720p/<=10s clip is far under it in
+# practice, so this is defence-in-depth matching the rest of the codebase.
+_MAX_DELIVERED_VIDEO_BYTES = 50 * 1024 * 1024
+
 # Interval (seconds) between polls of an in-flight background interaction.
 _POLL_INTERVAL = 5
+
+# How often an unchanged status is worth repeating. Logging every poll turned
+# one routine render into 15 notifications, 13 of them the identical
+# "in_progress" line, and an animatic multiplies that by its beat count.
+# src/video.py polls for up to 1800s and logs twice; this keeps the state
+# changes plus a sparse heartbeat so a long render still shows liveness.
+_POLL_LOG_INTERVAL_SECONDS = 60.0
 
 # Interaction statuses that mean "still rendering — keep polling". Everything
 # else (failed / cancelled / budget_exceeded / incomplete / requires_action /
@@ -118,7 +140,10 @@ def _detect_video_mime(data: bytes) -> str:
     brand = _ftyp_brand(data)
     if brand is not None:
         if brand.startswith("qt"):
-            return "video/quicktime"
+            # The SDK's VideoContentMimeType literal set spells MOV "video/mov"
+            # (google/genai/_gaos/types/interactions/videocontent.py); the
+            # RFC "video/quicktime" is not in it and rides as UnrecognizedStr.
+            return "video/mov"
         if brand in _HEIF_BRANDS or brand in _HEIF_SEQUENCE_BRANDS:
             raise ValueError(
                 "Input labeled as video but the data is a HEIC/HEIF image."
@@ -129,7 +154,10 @@ def _detect_video_mime(data: bytes) -> str:
     if data[:3] == b"\x00\x00\x01" and data[3:4] in (b"\xba", b"\xb3"):
         return "video/mpeg"
     if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
-        return "video/x-msvideo"
+        # SDK spells AVI "video/avi", not the RFC "video/x-msvideo" — the
+        # latter is absent from VideoContentMimeType and rides as
+        # UnrecognizedStr. See the MOV note above.
+        return "video/avi"
     raise ValueError(
         "Unrecognized video input format; could not detect a supported video "
         "MIME type from the data. Supported: MP4, QuickTime/MOV, WebM, MPEG, AVI."
@@ -211,8 +239,9 @@ def _build_create_kwargs(
         so conversational-edit turns send NO generation_config;
       * edit tasks reject ``duration`` in response_format ("Duration cannot
         be set in response format for edit task") — duration and aspect
-        ratio are inherited from the source video, so neither is sent for
-        any edit-type request.
+        ratio cannot be sent for an edit-type request, so neither is. What
+        the service then renders is undocumented and is NOT the source's
+        length — a measured 3s source came back at 10.01s.
     """
     task_type = _select_task_type(
         previous_interaction_id=previous_interaction_id,
@@ -286,8 +315,14 @@ async def _resolve_video_bytes(
     inline_data: str | bytes | None,
     uri: str | None,
     log_callback: LogCallback | None,
+    run_within_deadline: Callable[..., Awaitable[Any]],
 ) -> bytes:
-    """Materialize mp4 bytes from an inline payload or a Files API uri."""
+    """Materialize mp4 bytes from an inline payload or a Files API uri.
+
+    The download runs through the caller's deadline runner like every other
+    call in this module: an interaction that completes at t=590s of a 600s
+    budget would otherwise hang here forever on an untimed transfer.
+    """
     if inline_data:
         if isinstance(inline_data, str):
             return base64.b64decode(inline_data)
@@ -301,10 +336,30 @@ async def _resolve_video_bytes(
 
     # ASSUMED SDK SHAPE: files.get resolves the uri/name to a file resource and
     # files.download returns its raw bytes.
-    file_obj = await asyncio.to_thread(client.files.get, name=uri)
-    data = await asyncio.to_thread(client.files.download, file=file_obj)
-    if data is None:
+    file_obj = await run_within_deadline(client.files.get, name=uri)
+
+    # Reject an oversize clip before buffering when the resource advertises its
+    # size, so the cap can hold without first allocating the whole body.
+    declared_size = _field(file_obj, "size_bytes")
+    if declared_size is not None and declared_size > _MAX_DELIVERED_VIDEO_BYTES:
+        raise ValueError(
+            f"Delivered video size {declared_size} exceeds cap "
+            f"{_MAX_DELIVERED_VIDEO_BYTES}: {uri}"
+        )
+
+    data = await run_within_deadline(client.files.download, file=file_obj)
+    # files.download returns bytes, so a zero-length body is b"" not None: the
+    # None-only guard let an empty download write a 0-byte .mp4 and report
+    # success. `not data` catches both None and b"".
+    if not data:
         raise ValueError(f"Downloaded video file was empty: {uri}")
+    # Hard enforcement of the cap even when no size was advertised (or it lied);
+    # every other fetch in the server bounds its body the same way.
+    if len(data) > _MAX_DELIVERED_VIDEO_BYTES:
+        raise ValueError(
+            f"Downloaded video ({len(data)} bytes) exceeds cap "
+            f"{_MAX_DELIVERED_VIDEO_BYTES}: {uri}"
+        )
     return bytes(data)
 
 
@@ -348,8 +403,10 @@ async def generate_video_omni(
 
     Returns:
         Dict with message, video_url (file:// or gs://), interaction_id, model,
-        duration_seconds (clamped int), aspect_ratio, and warnings (only when
-        non-empty).
+        duration_seconds (clamped int), aspect_ratio, the requested_* originals,
+        and warnings (only when non-empty). duration_seconds and aspect_ratio
+        are both None for an edit — neither was sent, so neither can be
+        reported as fact.
     """
     # Non-fatal warnings surfaced back to the caller.
     warnings: list[str] = []
@@ -392,12 +449,20 @@ async def generate_video_omni(
         image_count=len(image_bytes_list or []),
     )
     if task_type == "edit":
-        # Edits inherit length and framing from the source video; the API
-        # rejects duration (and task alongside previous_interaction_id), so
-        # the requested values are echoed for planning but not sent.
+        # The API rejects duration (and task alongside previous_interaction_id)
+        # on an edit, so neither duration nor aspect ratio is sent. What the
+        # service then renders is NOT the source's length — a measured 3s
+        # source came back at 10.01s — and is undocumented, so the warning
+        # promises nothing and points at the measured figure instead.
         warnings.append(
-            "Edit requests inherit duration and aspect ratio from the source "
-            "video; the requested duration_seconds/aspect_ratio were not sent."
+            "Edit requests do not send duration_seconds or aspect_ratio — the "
+            "API rejects them on an edit task — so the rendered length is "
+            "chosen by the service and is NOT predictable from the request or "
+            "from the source video's length. A measured 3s source edited with "
+            "duration_seconds=4 rendered 10.01s. The response reports the "
+            "duration measured from the rendered file, or that same 10s "
+            "maximum as a labelled upper bound when the render is delivered "
+            "somewhere it cannot be opened to measure (a gs:// URI)."
         )
 
     if log_callback:
@@ -409,20 +474,20 @@ async def generate_video_omni(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
 
+    expired = f"Omni video interaction timed out after {timeout_seconds}s."
+
     async def _run_within_deadline(func: Any, /, **kwargs: Any) -> Any:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            raise TimeoutError(
-                f"Omni video interaction timed out after {timeout_seconds}s."
-            )
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(func, **kwargs), timeout=remaining
-            )
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                f"Omni video interaction timed out after {timeout_seconds}s."
-            ) from exc
+            raise TimeoutError(expired)
+        # run_off_loop, not asyncio.to_thread: a timed-out call cannot be
+        # cancelled, and abandoning it on the loop's shared default executor
+        # burns a worker that every other request also draws from.
+        return await run_off_loop(
+            functools.partial(func, **kwargs),
+            timeout=remaining,
+            message=expired,
+        )
 
     interaction = await _run_within_deadline(
         client.interactions.create, **create_kwargs
@@ -436,13 +501,19 @@ async def generate_video_omni(
     # `completed` proceeds to extraction; any other terminal status fails fast
     # with the raw status and any error message.
     status = _field(interaction, "status") or _field(interaction, "state")
+    # Report state CHANGES and a sparse heartbeat, never one line per poll.
+    logged_status: Any = object()
+    last_logged_at = loop.time()
     while status in _IN_FLIGHT_STATUSES:
         if loop.time() >= deadline:
-            raise TimeoutError(
-                f"Omni video interaction timed out after {timeout_seconds}s."
-            )
-        if log_callback:
+            raise TimeoutError(expired)
+        if log_callback and (
+            status != logged_status
+            or loop.time() - last_logged_at >= _POLL_LOG_INTERVAL_SECONDS
+        ):
             await log_callback(f"Interaction {interaction_id}: {status}")
+            logged_status = status
+            last_logged_at = loop.time()
         await asyncio.sleep(_POLL_INTERVAL)
         # google-genai's interactions.get takes the id as `id` (positional-or-
         # keyword), NOT `interaction_id`.
@@ -469,7 +540,9 @@ async def generate_video_omni(
         # download, no local write), mirroring the Veo gs:// output path.
         video_url = uri
     else:
-        video_bytes = await _resolve_video_bytes(client, inline_data, uri, log_callback)
+        video_bytes = await _resolve_video_bytes(
+            client, inline_data, uri, log_callback, _run_within_deadline
+        )
         filename = f"{uuid.uuid4()}.mp4"
         filepath = videos_dir / filename
         filepath.write_bytes(video_bytes)
@@ -480,8 +553,18 @@ async def generate_video_omni(
         "video_url": video_url,
         "interaction_id": interaction_id,
         "model": OMNI_MODEL,
-        "duration_seconds": clamped_duration,
-        "aspect_ratio": aspect_ratio,
+        # For an edit the duration was never sent, so reporting the request
+        # here would describe a render that did not happen — and the caller
+        # bills from this field. None means "unknown here, resolve upstream";
+        # the request is kept separately so nothing is lost.
+        "duration_seconds": None if task_type == "edit" else clamped_duration,
+        "requested_duration_seconds": clamped_duration,
+        # Same property as duration above: _build_create_kwargs omits
+        # aspect_ratio on an edit, so reporting the request here would state a
+        # ratio the service never received — editing a 9:16 source under the
+        # 16:9 default renders at the source's ratio, not the request's.
+        "aspect_ratio": None if task_type == "edit" else aspect_ratio,
+        "requested_aspect_ratio": aspect_ratio,
     }
 
     # Include warnings only when non-empty, matching src/video.py.

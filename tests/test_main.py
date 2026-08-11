@@ -2,6 +2,8 @@
 
 import base64
 import json
+import logging
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -185,14 +187,10 @@ class FakeContextManager:
             Path,
             id="vertexai_with_gac_json",
         ),
-        pytest.param(
-            {
-                "GOOGLE_GENAI_USE_VERTEXAI": "true",
-                "GOOGLE_SERVICE_ACCOUNT_JSON": "not valid json",
-            },
-            None,
-            id="invalid_json",
-        ),
+        # The invalid-JSON case no longer returns None: a malformed
+        # GOOGLE_SERVICE_ACCOUNT_JSON now raises rather than silently falling
+        # back to ambient ADC. That behaviour is covered in
+        # tests/test_followups_tools.py.
     ],
 )
 @pytest.mark.timeout(1.0)
@@ -268,9 +266,6 @@ def test_cleanup_credentials(
     ("input", "expected"),
     [
         pytest.param({}, False, id="no_credentials"),
-        pytest.param(
-            {"GOOGLE_GENAI_USE_VERTEXAI": "true"}, True, id="vertexai_enabled"
-        ),
         pytest.param(
             {"GOOGLE_GENAI_USE_VERTEXAI": "true"}, True, id="vertexai_enabled"
         ),
@@ -991,18 +986,21 @@ def _create_test_image(width: int = 100, height: int = 100) -> bytes:
                 "image_uri": None,
                 "image_base64": None,
             },
-            {"success": True, "has_image": True},
-            id="empty_prompt",
+            # An empty prompt is now refused before spending, matching the
+            # composites (generate_clip / generate_storyboard) which already
+            # reject a blank beat/shot prompt.
+            {"success": False, "error": True},
+            id="empty_prompt_refused",
         ),
         pytest.param(
             {
-                "prompt": "Test imagen",
+                "prompt": "Test legacy imagen alias",
                 "model": "imagen-4.0-generate-001",
                 "image_uri": None,
                 "image_base64": None,
             },
             {"success": True, "has_image": True},
-            id="imagen_model",
+            id="legacy_imagen_alias_still_accepted",
         ),
         pytest.param(
             {
@@ -1035,6 +1033,7 @@ async def test_generate_image(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
 
     mock_app_ctx = AppContext(
         data_folder=tmp_path,
@@ -1184,6 +1183,7 @@ async def test_generate_video(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
 
     mock_app_ctx = AppContext(
         data_folder=tmp_path,
@@ -1286,6 +1286,7 @@ async def test_generate_transition_happy_path(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1343,6 +1344,7 @@ async def test_generate_transition_missing_frame(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1413,6 +1415,7 @@ async def test_generate_bridge_happy_path(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1479,6 +1482,7 @@ async def test_generate_bridge_missing_clip(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1520,6 +1524,7 @@ async def test_generate_clip_three_beats_no_bridges(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1580,6 +1585,7 @@ async def test_generate_clip_with_bridges(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1646,6 +1652,7 @@ async def test_generate_clip_partial_failure(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1711,6 +1718,7 @@ async def test_generate_clip_strict_first_frame(
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1754,6 +1762,7 @@ async def test_generate_clip_empty_beats(tmp_path: Path) -> None:
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -1798,6 +1807,7 @@ async def test_e2e_image_to_transition(
         ctx = MagicMock()
         ctx.info = AsyncMock()
         ctx.error = AsyncMock()
+        ctx.warning = AsyncMock()
         ctx.request_context.lifespan_context = app_ctx
         return ctx
 
@@ -2146,6 +2156,7 @@ def _image_ctx(tmp_path: Path) -> MagicMock:
     ctx = MagicMock()
     ctx.info = AsyncMock()
     ctx.error = AsyncMock()
+    ctx.warning = AsyncMock()
     ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=images_dir,
@@ -2156,18 +2167,27 @@ def _image_ctx(tmp_path: Path) -> MagicMock:
 
 
 def _video_ctx(
-    tmp_path: Path, allowed_gcs_buckets: frozenset[str] = frozenset()
+    tmp_path: Path,
+    allowed_gcs_buckets: frozenset[str] = frozenset(),
+    vertexai: bool = False,
 ) -> MagicMock:
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
     ctx = MagicMock()
     ctx.info = AsyncMock()
     ctx.error = AsyncMock()
+    ctx.warning = AsyncMock()
+    # Shape the client explicitly. A bare MagicMock reads as Vertex (every
+    # attribute is truthy), which silently routes tests down the Vertex
+    # branch — where loop_extend requires a GCS target and Lite is refused
+    # for want of a key. That accident has cost real debugging time twice.
+    client = MagicMock()
+    client._api_client.vertexai = vertexai
     ctx.request_context.lifespan_context = AppContext(
         data_folder=tmp_path,
         images_dir=tmp_path / "images",
         videos_dir=videos_dir,
-        client=MagicMock(),
+        client=client,
         allowed_gcs_buckets=allowed_gcs_buckets,
     )
     return ctx
@@ -2272,6 +2292,126 @@ async def test_generate_image_passes_new_params(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
+async def test_generate_image_reports_legacy_imagen_reroute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy Imagen request still succeeds, and both the response and the
+    manifest name the Gemini model that actually served it."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "out.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        # Mirror the impl: the served model replaces the discontinued alias.
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-image",
+            "warnings": [
+                "Model imagen-4.0-generate-001 is discontinued by Google on "
+                "2026-08-17 and was replaced with gemini-3.1-flash-image."
+            ],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    ctx = _image_ctx(tmp_path)
+    result = await generate_image(
+        ctx=ctx,
+        prompt="a cat",
+        model="imagen-4.0-generate-001",
+    )
+    data = json.loads(result[1].text)
+    assert data["model"] == "gemini-3.1-flash-image"
+    assert any("2026-08-17" in w for w in data["warnings"])
+
+    manifest = json.loads(Path(data["sidecar_url"][7:]).read_text())
+    assert manifest["model"] == "gemini-3.1-flash-image"
+    assert any("2026-08-17" in w for w in manifest["warnings"])
+
+    # Also raised on the MCP logging channel, so a client that only renders the
+    # image still sees it.
+    ctx.warning.assert_awaited_once()
+    assert "2026-08-17" in ctx.warning.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_warns_on_text_only_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warnings reach the MCP logging channel on the text-only path too, which
+    returns before the normal response is assembled."""
+    from src.__main__ import generate_image
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "Model returned text only",
+            "generated_text": "I cannot draw that",
+            "model": "gemini-3.1-flash-image",
+            "warnings": [
+                "Model imagen-4.0-generate-001 is discontinued by Google on "
+                "2026-08-17 and was replaced with gemini-3.1-flash-image."
+            ],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    ctx = _image_ctx(tmp_path)
+    result = await generate_image(
+        ctx=ctx,
+        prompt="a cat",
+        model="imagen-4.0-generate-001",
+    )
+    payload = json.loads(result[0].text)
+    assert payload["message"] == "Model returned text only"
+    ctx.warning.assert_awaited_once()
+    assert "2026-08-17" in ctx.warning.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_does_not_warn_without_impl_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean Gemini request raises no MCP warning notification."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "clean.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    ctx = _image_ctx(tmp_path)
+    result = await generate_image(
+        ctx=ctx,
+        prompt="a cat",
+        model="gemini-3.1-flash-image",
+    )
+    assert "warnings" not in json.loads(result[1].text)
+    ctx.warning.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
 async def test_generate_image_rejects_oversize_base64(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2327,8 +2467,16 @@ async def test_generate_video_raises_on_unfetchable_image_uri(
 async def test_generate_video_raises_on_unfetchable_last_frame(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A provided last_frame_uri that can't be fetched errors."""
+    """A provided last_frame_uri that can't be fetched errors.
+
+    A first frame is supplied so this is a valid first+last-frame request that
+    clears input validation; the failure under test is the unfetchable last
+    frame, not the (separately validated) last-frame-without-first conflict.
+    """
     from src.__main__ import generate_video
+
+    first_frame = tmp_path / "first.png"
+    first_frame.write_bytes(_create_test_image())
 
     async def should_not_run(**kwargs: Any) -> dict[str, Any]:
         raise AssertionError("impl must not run when last_frame fetch fails")
@@ -2339,6 +2487,7 @@ async def test_generate_video_raises_on_unfetchable_last_frame(
         ctx=_video_ctx(tmp_path),
         prompt="p",
         model="veo-3.1-generate-001",
+        image_uri=f"file://{first_frame}",
         last_frame_uri=f"file://{tmp_path / 'nope.png'}",
     )
     payload = json.loads(result)
@@ -2404,7 +2553,9 @@ async def test_generate_video_extend_rejects_disallowed_bucket(
     monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
 
     result = await generate_video(
-        ctx=_video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"good"})),
+        ctx=_video_ctx(
+            tmp_path, allowed_gcs_buckets=frozenset({"good"}), vertexai=True
+        ),
         prompt="p",
         model="veo-3.1-generate-001",
         extend_video_uri="gs://evil/clip.mp4",
@@ -2431,7 +2582,8 @@ async def test_generate_video_extend_requires_gcs_output(
 
     # allowlist empty and no output_gcs_uri / VIDEO_GCS_BUCKET.
     result = await generate_video(
-        ctx=_video_ctx(tmp_path),
+        # Vertex explicitly: the GCS requirement is a Vertex-only rule.
+        ctx=_video_ctx(tmp_path, vertexai=True),
         prompt="p",
         model="veo-3.1-generate-001",
         extend_video_uri="gs://anything/clip.mp4",
@@ -2468,6 +2620,7 @@ def _ctx_wrapping(app_ctx: Any) -> Any:
     mock_ctx = MagicMock()
     mock_ctx.info = AsyncMock()
     mock_ctx.error = AsyncMock()
+    mock_ctx.warning = AsyncMock()
     mock_ctx.request_context.lifespan_context = app_ctx
     return mock_ctx
 
@@ -3804,3 +3957,1931 @@ def test_client_for_omni_prefers_vertex_when_gcs_needed(
     assert _client_for_omni(ctx) is gemini_client
     # GCS requested → the Vertex global client wins so delivery works.
     assert _client_for_omni(ctx, need_gcs=True) is global_client
+
+
+# ============================================================================
+# dry_run + cost reporting
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_dry_run_generates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run must never reach the impl, and must quote a cost."""
+    from src.__main__ import generate_image
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not call the generation impl")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="gemini-3-pro-image",
+        image_size="4K",
+        dry_run=True,
+    )
+    payload = json.loads(result[0].text)
+    assert payload["dry_run"] is True
+    assert payload["model"] == "gemini-3-pro-image"
+    assert payload["estimated_cost"]["usd"] > 0
+    assert payload["estimated_cost"]["is_estimate"] is True
+    # No image content is returned for an estimate.
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_dry_run_prices_the_model_that_would_actually_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retired ID must be quoted at its replacement's price, not the alias's,
+    and an impossible size must be dropped before it is priced."""
+    from src.__main__ import generate_image
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not call the generation impl")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    retired = json.loads(
+        (
+            await generate_image(
+                ctx=_image_ctx(tmp_path),
+                prompt="a cat",
+                model="imagen-4.0-generate-001",
+                image_size="4K",
+                dry_run=True,
+            )
+        )[0].text
+    )
+    assert retired["requested_model"] == "imagen-4.0-generate-001"
+    assert retired["model"] == "gemini-3.1-flash-image"
+
+    # flash-lite cannot do 4K, so the estimate must be for its default size.
+    lite = json.loads(
+        (
+            await generate_image(
+                ctx=_image_ctx(tmp_path),
+                prompt="a cat",
+                model="gemini-3.1-flash-lite-image",
+                image_size="4K",
+                dry_run=True,
+            )
+        )[0].text
+    )
+    assert lite["image_size"] is None
+    assert any("does not support image_size=4K" in w for w in lite["warnings"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_generate_image_reports_actual_cost_from_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real run reports metered usage and the cost derived from it."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "cost.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-image",
+            "usage": {
+                "prompt_token_count": 12,
+                "candidates_token_count": 1120,
+                "total_token_count": 1132,
+            },
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="gemini-3.1-flash-image",
+        image_size="1K",
+    )
+    data = json.loads(result[1].text)
+    assert data["usage"]["total_token_count"] == 1132
+    assert data["cost"]["usd"] > 0
+    # Derived from reported usage, not a pre-flight guess.
+    assert data["cost"]["is_estimate"] is False
+
+    # The sidecar carries the cost too, so downstream tools can total a run.
+    manifest = json.loads(Path(data["sidecar_url"][7:]).read_text())
+    assert manifest["cost"]["usd"] == data["cost"]["usd"]
+
+
+# ============================================================================
+# plan_generation + generate_storyboard
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_ranks_and_explains(tmp_path: Path) -> None:
+    """The router tool returns ranked routes and names what it ruled out."""
+    from src.__main__ import plan_generation
+
+    result = await plan_generation(
+        ctx=_image_ctx(tmp_path),
+        intent="a hi-res 4k product shot for print",
+    )
+    payload = json.loads(result[0].text)
+    assert payload["media_kind"] == "image"
+    assert payload["routes"], "expected at least one route"
+    top = payload["routes"][0]
+    assert top["tool"] == "generate_image"
+    assert top["cost"]["usd"] > 0
+    # flash-lite cannot do 4K, so it must be rejected *with a reason*.
+    lite = [
+        r for r in payload["rejected"] if r["model"] == "gemini-3.1-flash-lite-image"
+    ]
+    assert lite and "4K" in lite[0]["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_flags_impossible_requests(tmp_path: Path) -> None:
+    """An unsatisfiable combination is reported as a conflict, not a plan that
+    would fail at call time."""
+    from src.__main__ import plan_generation
+
+    result = await plan_generation(
+        ctx=_image_ctx(tmp_path),
+        intent="extend this video",
+        pinned_model="veo-3.1-lite-generate-preview",
+        needs_extension=True,
+    )
+    payload = json.loads(result[0].text)
+    codes = [c["code"] for c in payload["conflicts"]]
+    assert any("extension_unsupported" in c for c in codes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_is_deterministic(tmp_path: Path) -> None:
+    """Routing is rule-based, so the same request must always plan the same."""
+    from src.__main__ import plan_generation
+
+    ctx = _image_ctx(tmp_path)
+    a = await plan_generation(ctx=ctx, intent="a 3 beat vertical reel about coffee")
+    b = await plan_generation(ctx=ctx, intent="a 3 beat vertical reel about coffee")
+    assert a == b
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_generate_storyboard_survives_a_failed_shot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed shot must not abort the board; it renders as an error panel and
+    is excluded from the cost."""
+    from src.__main__ import generate_storyboard
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+    calls = {"n": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ValueError("safety filter blocked the prompt")
+        out = images_dir / f"shot{calls['n']}.png"
+        out.write_bytes(_create_test_image())
+        return {
+            "message": "ok",
+            "image_url": f"file://{out}",
+            "image_preview": "data:image/jpeg;base64,x",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-image",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[
+            {"prompt": "wide shot", "caption": "EXT. ALLEY", "duration_seconds": 6},
+            {"prompt": "blocked", "caption": "INT. DOOR", "duration_seconds": 4},
+            {"prompt": "close up", "caption": "CU HANDOFF", "duration_seconds": 3},
+        ],
+        title="Test Board",
+    )
+
+    from mcp.server.fastmcp import Image as MCPImage
+
+    assert isinstance(result[0], MCPImage)
+    data = json.loads(result[1].text)
+    assert len(data["errors"]) == 1
+    assert data["errors"][0]["shot"] == 2
+    # Both artifacts exist on disk.
+    assert Path(data["storyboard_url"][7:]).exists()
+    assert Path(data["sheet_url"][7:]).exists()
+    # Only the two successful shots are billed.
+    assert data["cost"]["usd"] == pytest.approx(0.0672 * 2, rel=1e-3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_storyboard_dry_run_prices_every_shot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run totals the whole board and generates nothing."""
+    from src.__main__ import generate_storyboard
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[{"prompt": f"shot {i}"} for i in range(4)],
+        dry_run=True,
+    )
+    payload = json.loads(result[0].text)
+    assert payload["dry_run"] is True
+    assert payload["shots"] == 4
+    assert payload["estimated_cost"]["usd"] == pytest.approx(0.0672 * 4, rel=1e-3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_storyboard_rejects_empty_and_promptless_shots(
+    tmp_path: Path,
+) -> None:
+    """Bad input fails up front rather than rendering an empty board."""
+    from src.__main__ import generate_storyboard
+
+    empty = await generate_storyboard(ctx=_image_ctx(tmp_path), shots=[])
+    assert "error" in json.loads(empty[0].text)
+
+    blank = await generate_storyboard(
+        ctx=_image_ctx(tmp_path), shots=[{"caption": "no prompt"}]
+    )
+    assert "prompt" in json.loads(blank[0].text)["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_storyboard_dry_run_breakdown_matches_the_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cost breakdown must describe the same N shots as the total.
+
+    A single-frame estimate multiplied after the fact left `breakdown` saying
+    one image while `usd` said five — a reader could act on either.
+    """
+    from src.__main__ import generate_storyboard
+
+    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", should_not_run)
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[{"prompt": f"shot {i}"} for i in range(5)],
+        dry_run=True,
+    )
+    cost = json.loads(result[0].text)["estimated_cost"]
+    assert cost["breakdown"]["images"] == 5
+    assert cost["breakdown"]["output_image_usd"] == pytest.approx(cost["usd"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_storyboard_refuses_an_oversized_board(tmp_path: Path) -> None:
+    """Every shot is a billed generation, so an oversized board fails loudly
+    rather than silently truncating to a board that looks complete."""
+    from src.__main__ import MAX_STORYBOARD_SHOTS, generate_storyboard
+
+    result = await generate_storyboard(
+        ctx=_image_ctx(tmp_path),
+        shots=[{"prompt": f"shot {i}"} for i in range(MAX_STORYBOARD_SHOTS + 1)],
+    )
+    error = json.loads(result[0].text)["error"]
+    assert str(MAX_STORYBOARD_SHOTS) in error
+    assert "dry_run" in error
+
+
+@pytest.mark.parametrize(
+    ("bad_shot", "expected"),
+    [
+        pytest.param("a bare string", "must be an object", id="not_a_dict"),
+        pytest.param(None, "must be an object", id="none"),
+        pytest.param(
+            {"prompt": "x", "duration_seconds": "soon"},
+            "duration_seconds must be a number",
+            id="non_numeric_duration",
+        ),
+        pytest.param(
+            {"prompt": "x", "duration_seconds": -3},
+            "duration_seconds must not be negative",
+            id="negative_duration",
+        ),
+        pytest.param(
+            {"prompt": "x", "duration_seconds": float("nan")},
+            "duration_seconds must be finite",
+            id="nan_duration",
+        ),
+        pytest.param(
+            {"prompt": "x", "caption": {"nested": 1}},
+            "caption must be a string",
+            id="non_string_caption",
+        ),
+        pytest.param({"prompt": "   "}, "non-empty 'prompt'", id="blank_prompt"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_storyboard_validates_shots_before_spending_anything(
+    bad_shot: Any,
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed shot fields must be rejected up front.
+
+    A bad duration or caption used to pass validation and only fail while
+    assembling the board — after every keyframe had been generated and billed.
+    """
+    from src.__main__ import generate_storyboard
+
+    async def must_not_spend(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("invalid input must not reach the generation impl")
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", must_not_spend)
+
+    result = await generate_storyboard(ctx=_image_ctx(tmp_path), shots=[bad_shot])
+    assert expected in json.loads(result[0].text)["error"]
+
+
+# ============================================================================
+# Review follow-ups
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_storyboard_logs_a_substitution_once_not_once_per_shot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A board pinned to a retired ID must log the reroute once.
+
+    Each shot used to be handed the raw model, so the impl re-resolved and
+    re-logged it — a 24-shot board produced 24 identical server warnings.
+    """
+    from src.__main__ import generate_storyboard
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+    seen_models: list[str] = []
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        seen_models.append(kwargs["model"])
+        out = images_dir / f"s{len(seen_models)}.png"
+        out.write_bytes(_create_test_image())
+        return {
+            "message": "ok",
+            "image_url": f"file://{out}",
+            "image_preview": "data:image/jpeg;base64,x",
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    with caplog.at_level(logging.WARNING, logger="src.__main__"):
+        result = await generate_storyboard(
+            ctx=_image_ctx(tmp_path),
+            shots=[{"prompt": f"shot {i}"} for i in range(4)],
+            model="imagen-4.0-generate-001",
+        )
+
+    # The impl is handed the resolved model, so it has nothing left to reroute.
+    assert seen_models == ["gemini-3.1-flash-image"] * 4
+    reroutes = [r for r in caplog.records if "2026-08-17" in r.getMessage()]
+    assert len(reroutes) == 1, f"expected one reroute log, got {len(reroutes)}"
+
+    # The caller is still told exactly once, too.
+    data = json.loads(result[1].text)
+    assert len([w for w in data["warnings"] if "2026-08-17" in w]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_image_manifest_records_the_size_actually_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the resolved model cannot produce the requested size, the sidecar
+    must record what was really used rather than the unhonoured request."""
+    from src.__main__ import generate_image
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = images_dir / "sized.png"
+        out.write_bytes(_create_test_image())
+        thumb = base64.b64encode(_create_test_image()).decode()
+        return {
+            "message": "Image generated successfully",
+            "image_url": f"file://{out}",
+            "image_preview": f"data:image/jpeg;base64,{thumb}",
+            "prompt": kwargs["prompt"],
+            "model": "gemini-3.1-flash-lite-image",
+            # The impl reports the effective size: 4K was dropped.
+            "image_size": None,
+            "warnings": ["gemini-3.1-flash-lite-image does not support image_size=4K"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", mock_impl)
+
+    result = await generate_image(
+        ctx=_image_ctx(tmp_path),
+        prompt="a cat",
+        model="gemini-3.1-flash-lite-image",
+        image_size="4K",
+    )
+    data = json.loads(result[1].text)
+    manifest = json.loads(Path(data["sidecar_url"][7:]).read_text())
+    assert manifest["image_size"] is None, "manifest must not claim 4K was used"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_returns_the_same_shape_as_every_other_tool(
+    tmp_path: Path,
+) -> None:
+    """It used to return a bare str while every sibling returns content parts."""
+    from mcp.types import TextContent
+
+    from src.__main__ import plan_generation
+
+    result = await plan_generation(ctx=_image_ctx(tmp_path), intent="a photo")
+    assert isinstance(result, list)
+    assert isinstance(result[0], TextContent)
+    assert json.loads(result[0].text)["media_kind"] == "image"
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        pytest.param(
+            "generate_video",
+            {"prompt": "a cat", "model": "veo-3.1-generate-001"},
+            id="generate_video",
+        ),
+        pytest.param(
+            "generate_transition",
+            {"first_frame_uri": "file:///a.png", "last_frame_uri": "file:///b.png"},
+            id="generate_transition",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {"from_clip_uri": "file:///a.mp4", "to_clip_uri": "file:///b.mp4"},
+            id="generate_bridge",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_tools_reject_a_negative_duration_before_generating(
+    tool: str,
+    kwargs: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative duration snapped to the 4s minimum and was generated and
+    billed, while pricing declined it — the two layers disagreed."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("a negative duration must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+
+    result = await getattr(main_mod, tool)(
+        ctx=_video_ctx(tmp_path), duration_seconds=-5, **kwargs
+    )
+    payload = json.loads(result if isinstance(result, str) else result[0].text)
+    assert "must not be negative" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_validates_every_beat_before_rendering_any(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bad duration in a later beat used to surface only after the earlier
+    beats had been generated and billed."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("an invalid beat must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+
+    result = await main_mod.generate_clip(
+        ctx=_video_ctx(tmp_path),
+        beats=[
+            {"prompt": "fine"},
+            {"prompt": "fine too"},
+            {"prompt": "bad", "duration_seconds": -3},
+        ],
+    )
+    payload = json.loads(result)
+    assert "beats[2].duration_seconds" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_manifest_records_the_model_that_actually_ran(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Veo IDs are translated per backend — the Gemini API serves -preview
+    spellings — so a manifest naming the requested ID misreports what was
+    billed."""
+    import src.__main__ as main_mod
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "v.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs["prompt"],
+            # What the backend actually served.
+            "model": "veo-3.1-generate-preview",
+            "duration_seconds": 8,
+            "audio_enabled": True,
+            "generation_mode": "text_to_video",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", mock_impl)
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path), prompt="a cat", model="veo-3.1-generate-001"
+        )
+    )
+    manifest = json.loads(Path(payload["sidecar_url"][7:]).read_text())
+    assert manifest["model"] == "veo-3.1-generate-preview"
+
+
+@pytest.mark.parametrize("bad", [-5, float("nan"), float("inf")])
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_omni_tools_reject_bad_durations_before_generating(
+    bad: float, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The omni tools clamped instead of validating, so a negative or NaN
+    duration became a billed 3s render. The pattern fix that covered the Veo
+    tools missed them because they had no _validate_aspect_ratio call to
+    anchor the grep."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("a bad duration must not reach the omni impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", must_not_spend)
+    monkeypatch.setattr(main_mod, "edit_video_impl", must_not_spend, raising=False)
+
+    result = await main_mod.generate_video_omni(
+        ctx=_video_ctx(tmp_path), prompt="a cat", duration_seconds=bad
+    )
+    payload = json.loads(result if isinstance(result, str) else result[0].text)
+    assert "duration_seconds" in payload["error"]
+
+    result2 = await main_mod.edit_video(
+        ctx=_video_ctx(tmp_path),
+        previous_interaction_id="abc",
+        prompt="make it stormy",
+        duration_seconds=bad,
+    )
+    payload2 = json.loads(result2 if isinstance(result2, str) else result2[0].text)
+    assert "duration_seconds" in payload2["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_nan_duration_is_rejected_everywhere_a_negative_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NaN passes a bare < 0 check, would be quoted, generated and billed, and
+    then serialized as bare NaN — invalid JSON — in the response. Python's own
+    json.loads accepts NaN, so the value genuinely arrives over MCP."""
+    import src.__main__ as main_mod
+    from src.pricing import estimate_video_cost
+
+    assert estimate_video_cost("veo-3.1-generate-001", float("nan")) is None
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("NaN must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+    result = await main_mod.generate_video(
+        ctx=_video_ctx(tmp_path),
+        prompt="a cat",
+        model="veo-3.1-generate-001",
+        duration_seconds=float("nan"),
+    )
+    assert "must be finite" in json.loads(result)["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_clip_rejects_a_promptless_beat_before_rendering_any(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A beat's prompt is knowable before spending; the check used to live
+    inside the render loop, so beat 3 missing a prompt billed beats 1-2."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("a promptless beat must not reach the impl")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+
+    result = await main_mod.generate_clip(
+        ctx=_video_ctx(tmp_path),
+        beats=[{"prompt": "fine"}, {"prompt": "fine"}, {"caption": "no prompt"}],
+    )
+    assert "beats[2]" in json.loads(result)["error"]
+
+
+@pytest.mark.parametrize(
+    ("in_container", "cli_host", "env_host", "expected"),
+    [
+        pytest.param(True, None, None, "0.0.0.0", id="container_binds_all"),
+        pytest.param(False, None, None, "127.0.0.1", id="local_stays_loopback"),
+        pytest.param(True, "10.0.0.5", None, "10.0.0.5", id="cli_wins"),
+        pytest.param(True, None, "192.168.1.9", "192.168.1.9", id="env_respected"),
+        pytest.param(False, "0.0.0.0", None, "0.0.0.0", id="cli_can_expose_local"),
+        pytest.param(True, "10.0.0.5", "192.168.1.9", "10.0.0.5", id="cli_beats_env"),
+    ],
+)
+def test_http_transport_bind_address(
+    in_container: bool,
+    cli_host: str | None,
+    env_host: str | None,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FastMCP binds 127.0.0.1 by default, which inside a container is the
+    container's own loopback — so the Dockerfile's documented `-p 8000:8000`
+    reached nothing. Containers must bind all interfaces; a local run must not,
+    so it is not exposed to the network by surprise.
+
+    Drives the real resolver — an earlier version of this test re-implemented
+    the precedence rules inline and would have passed no matter what main()
+    did.
+    """
+    import src.__main__ as main_mod
+
+    monkeypatch.setattr(main_mod, "is_running_in_container", lambda: in_container)
+    if env_host:
+        monkeypatch.setenv("FASTMCP_HOST", env_host)
+    else:
+        monkeypatch.delenv("FASTMCP_HOST", raising=False)
+
+    assert main_mod._resolve_http_host(cli_host) == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_host", "expected_port"),
+    [
+        pytest.param(
+            ["sse", "--host", "0.0.0.0"], "0.0.0.0", None, id="after_subcommand"
+        ),
+        pytest.param(
+            ["--host", "1.2.3.4", "sse"], "1.2.3.4", None, id="before_subcommand"
+        ),
+        pytest.param(
+            ["--port", "9999", "streamable-http", "--host", "5.6.7.8"],
+            "5.6.7.8",
+            9999,
+            id="mixed_positions_both_survive",
+        ),
+        pytest.param(["stdio"], None, None, id="no_flags"),
+    ],
+)
+def test_network_flags_parse_in_both_positions(
+    argv: list[str], expected_host: str | None, expected_port: int | None
+) -> None:
+    """The Docker ENTRYPOINT appends arguments after the subcommand, so
+    `docker run <image> sse --host 0.0.0.0` is the only form a container user
+    can produce — and argparse rejects top-level flags in that position unless
+    the subparsers also register them. The subparser copies use SUPPRESS
+    defaults so a value given before the subcommand is not clobbered to None.
+    """
+    from src.__main__ import _build_arg_parser
+
+    args = _build_arg_parser().parse_args(argv)
+    assert getattr(args, "host", None) == expected_host
+    assert getattr(args, "port", None) == expected_port
+
+
+@pytest.mark.parametrize(
+    ("bad", "expect_fragment"),
+    [
+        pytest.param(float("nan"), "positive finite", id="nan"),
+        pytest.param(float("inf"), "positive finite", id="inf"),
+        pytest.param(-8.0, "positive finite", id="negative"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_plan_generation_rejects_nonfinite_durations_with_valid_json(
+    bad: float, expect_fragment: str, tmp_path: Path
+) -> None:
+    """NaN sailed past the <= 0 check (every NaN comparison is False), reached
+    the cost math, and the plan serialized with a bare NaN — invalid JSON that
+    strict clients cannot parse. Infinity got further and overflowed the
+    loop_extend times calculation into an internal error. Both must be clean
+    validation errors, and the response must always be strict JSON.
+    """
+    from src.__main__ import plan_generation
+
+    result = await plan_generation(
+        ctx=_image_ctx(tmp_path), intent="a video of a cat", duration_seconds=bad
+    )
+    text = result[0].text
+
+    def _no_constants(name: str) -> Any:
+        raise AssertionError(f"bare {name} in tool output — invalid strict JSON")
+
+    payload = json.loads(text, parse_constant=_no_constants)
+    assert expect_fragment in payload["error"]
+
+
+# ============================================================================
+# Unfetchable inputs on the tools that never had their own tests
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        pytest.param(
+            "generate_video_omni",
+            {"prompt": "x", "image_uris": ["https://example.com/a.png"]},
+            id="omni_image_uris",
+        ),
+        pytest.param(
+            "generate_video_omni",
+            {"prompt": "x", "input_video_uri": "https://example.com/v.mp4"},
+            id="omni_input_video",
+        ),
+        pytest.param(
+            "generate_transition",
+            {
+                "first_frame_uri": "https://example.com/a.png",
+                "last_frame_uri": "https://example.com/b.png",
+            },
+            id="transition_frames",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {
+                "from_clip_uri": "https://example.com/a.mp4",
+                "to_clip_uri": "https://example.com/b.mp4",
+            },
+            id="bridge_clips",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_unfetchable_inputs_fail_loud_not_silent(
+    tool: str, kwargs: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A supplied URI that cannot be fetched must abort the call, never quietly
+    degrade to a generation without that input. Pinned for image/video long
+    ago; these tools shared the shape but never had their own tests."""
+    import src.__main__ as main_mod
+
+    async def fetch_nothing(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def must_not_generate(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("generation must not run after a failed fetch")
+
+    monkeypatch.setattr(main_mod, "fetch", fetch_nothing)
+    for impl in ("generate_video_impl", "generate_video_omni_impl"):
+        monkeypatch.setattr(main_mod, impl, must_not_generate, raising=False)
+
+    result = await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), **kwargs)
+    payload = json.loads(result if isinstance(result, str) else result[0].text)
+    assert "Could not fetch" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per the manifest contract the beat fails (recorded in errors) rather
+    than silently falling back to text-to-video with the frame dropped."""
+    import src.__main__ as main_mod
+
+    async def fetch_nothing(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def must_not_generate(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("the beat must fail before generation")
+
+    monkeypatch.setattr(main_mod, "fetch", fetch_nothing)
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_generate)
+
+    payload = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path),
+            beats=[{"prompt": "x", "first_frame_uri": "https://example.com/f.png"}],
+        )
+    )
+    assert payload["errors"] and "first_frame" in str(payload["errors"][0])
+    assert payload["segments"] == []
+
+
+# ============================================================================
+# dry_run + cost on the video tools
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "expected_usd"),
+    [
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-generate-001",
+                "duration_seconds": 8,
+                "resolution": "1080p",
+            },
+            3.2,
+            id="veo_1080p",
+        ),
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-generate-001",
+                "duration_seconds": 8,
+                "draft": True,
+            },
+            # Draft renders on omni, which carries one frame of encoder
+            # allowance so the quote is a true ceiling.
+            (8 + 1 / 24) * 0.10136,
+            id="draft_prices_omni_not_veo",
+        ),
+        pytest.param(
+            "generate_transition",
+            # gs:// frames are uncheckable offline and still price; local dummy
+            # paths would now be refused as outside DATA_FOLDER, and the scheme
+            # does not change the priced duration.
+            {"first_frame_uri": "gs://b/f.png", "last_frame_uri": "gs://b/l.png"},
+            0.4,
+            id="transition",
+        ),
+        pytest.param(
+            "generate_bridge",
+            # gs:// clips are uncheckable offline and still price; a local dummy
+            # path would now be refused as outside DATA_FOLDER, and the scheme
+            # does not change the priced duration.
+            {"from_clip_uri": "gs://b/a.mp4", "to_clip_uri": "gs://b/b.mp4"},
+            0.4,
+            id="bridge",
+        ),
+        pytest.param(
+            "loop_extend",
+            # gs:// source is uncheckable offline and still prices; a local
+            # dummy path would now be refused as outside DATA_FOLDER, and the
+            # scheme does not change the priced 7s steps.
+            {"video_uri": "gs://b/x.mp4", "times": 4},
+            11.2,
+            id="loop_extend_prices_7s_steps_not_snapped_8s",
+        ),
+        pytest.param(
+            "generate_video_omni",
+            {"prompt": "x", "duration_seconds": 6},
+            (6 + 1 / 24) * 0.10136,
+            id="omni",
+        ),
+        pytest.param(
+            "edit_video",
+            {"previous_interaction_id": "i", "prompt": "x"},
+            # An edit's rendered length is chosen by the service, so the quote
+            # is Omni's 10s maximum, plus one frame of encoder overhang so the
+            # bound is a true ceiling.
+            (10 + 1 / 24) * 0.10136,
+            id="edit_quotes_the_worst_case",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_dry_runs_quote_without_spending(
+    tool: str,
+    kwargs: dict[str, Any],
+    expected_usd: float,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every video tool can be priced before committing, and a dry run must
+    never reach a generation impl. The draft case must quote omni's rate, and
+    loop_extend must price its ~7s steps rather than snapping 28s to 8s."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    for impl in ("generate_video_impl", "generate_video_omni_impl"):
+        monkeypatch.setattr(main_mod, impl, must_not_spend)
+
+    payload = json.loads(
+        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+    )
+    assert payload["dry_run"] is True
+    assert payload["estimated_cost"]["usd"] == pytest.approx(expected_usd)
+    assert payload["estimated_cost"]["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_clip_dry_run_prices_beats_and_bridges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reel is the most expensive call in the server; its quote must count
+    every render — bridges included — and the animatic quote must use omni."""
+    import src.__main__ as main_mod
+
+    async def must_not_spend(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not generate")
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+    beats = [{"prompt": "b", "duration_seconds": 8}] * 3
+
+    plain = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+        )
+    )
+    bridged = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+        )
+    )
+    animatic = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, animatic=True, dry_run=True
+        )
+    )
+    assert plain["estimated_cost"]["usd"] == pytest.approx(3 * 0.8)
+    # Two 4s bridge renders on the fast tier.
+    assert bridged["bridge_count"] == 2
+    assert bridged["estimated_cost"]["usd"] == pytest.approx(3 * 0.8 + 2 * 0.4)
+    assert animatic["model"] == "gemini-omni-flash-preview"
+    # Writing this test surfaced the real economics: omni ($0.10136/s) is
+    # price-PARITY with the fast tier ($0.10/s), not cheaper. The animatic's
+    # value against the default model is avoiding a wasted full render, and
+    # it IS ~4x cheaper than the standard/1080p tiers.
+    # 3 beats x 8s, each carrying one frame of omni encoder allowance.
+    assert animatic["estimated_cost"]["usd"] == pytest.approx(
+        3 * (8 + 1 / 24) * 0.10136
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_video_real_run_reports_metered_cost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real run's cost comes from the effective duration the impl reports —
+    a 5s request that snapped to 4s must bill 4s, not 5."""
+    import src.__main__ as main_mod
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = videos_dir / "v.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "prompt": kwargs["prompt"],
+            "model": "veo-3.1-generate-preview",
+            "duration_seconds": 4,  # snapped from the 5s request
+            "audio_enabled": True,
+            "generation_mode": "text_to_video",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", mock_impl)
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path),
+            prompt="a cat",
+            model="veo-3.1-generate-001",
+            duration_seconds=5.0,
+        )
+    )
+    assert payload["cost"]["usd"] == pytest.approx(4 * 0.40)
+    manifest = json.loads(Path(payload["sidecar_url"][7:]).read_text())
+    assert manifest["cost"]["usd"] == payload["cost"]["usd"]
+
+
+# ============================================================================
+# A quote must never succeed for a call the real run would refuse
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "expected_error"),
+    [
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "resolution": "4K",
+            },
+            "does not support 4K",
+            id="quote_4k_on_lite",
+        ),
+        pytest.param(
+            "generate_video",
+            {"prompt": "x", "model": "veo-3.1-generate-001", "resolution": "8K"},
+            "Unsupported resolution",
+            id="quote_bogus_resolution",
+        ),
+        pytest.param(
+            "loop_extend",
+            {
+                "video_uri": "file:///x.mp4",
+                "model": "veo-3.1-lite-generate-preview",
+                "times": 2,
+            },
+            "does not support video extension",
+            id="quote_extension_on_lite",
+        ),
+        pytest.param(
+            "loop_extend",
+            {"video_uri": "file:///x.mp4", "times": 2, "aspect_ratio": "21:9"},
+            "Unsupported aspect_ratio",
+            id="quote_bad_aspect",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_dry_run_refuses_what_the_real_run_would_refuse(
+    tool: str, kwargs: dict[str, Any], expected_error: str, tmp_path: Path
+) -> None:
+    """A dry run that quotes an impossible call sends the caller to a
+    guaranteed failure with a price in hand. loop_extend's quote used to sit
+    above the Lite, aspect and bucket checks; generate_video's used to return
+    estimated_cost: null for 4K-on-Lite instead of the impl's error.
+    """
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+    )
+    assert expected_error in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
+    """With an allowlist configured, quoting an extension of a video in a
+    disallowed bucket must fail exactly like running it would."""
+    import src.__main__ as main_mod
+
+    ctx = _video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"trusted"}))
+    denied = json.loads(
+        await main_mod.loop_extend(
+            ctx=ctx, video_uri="gs://evil/x.mp4", times=2, dry_run=True
+        )
+    )
+    assert "not in the allowlist" in denied["error"]
+
+    allowed = json.loads(
+        await main_mod.loop_extend(
+            ctx=ctx, video_uri="gs://trusted/x.mp4", times=2, dry_run=True
+        )
+    )
+    assert allowed["estimated_cost"]["usd"] == pytest.approx(2 * 7 * 0.40)
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "fragment"),
+    [
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "extend_video_uri": "gs://b/v.mp4",
+            },
+            "does not support extend_video",
+            id="lite_extend",
+        ),
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "reference_image_uris": ["a"],
+            },
+            "does not support reference_to_video",
+            id="lite_references",
+        ),
+        pytest.param(
+            "generate_video",
+            {
+                "prompt": "x",
+                "model": "veo-3.1-lite-generate-preview",
+                "image_uri": "a",
+                "last_frame_uri": "b",
+            },
+            "does not support first_last_frame",
+            id="lite_first_last",
+        ),
+        pytest.param(
+            "generate_transition",
+            {
+                "first_frame_uri": "a",
+                "last_frame_uri": "b",
+                "model": "veo-3.1-lite-generate-preview",
+            },
+            "does not support first_last_frame",
+            id="lite_transition",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {
+                "from_clip_uri": "a",
+                "to_clip_uri": "b",
+                "model": "veo-3.1-lite-generate-preview",
+            },
+            "does not support first_last_frame",
+            id="lite_bridge",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_dry_run_refuses_every_lite_restriction(
+    tool: str, kwargs: dict[str, Any], fragment: str, tmp_path: Path
+) -> None:
+    """Live testing found the quote pricing five impossible Lite calls at
+    $0.20-$0.40 apiece. Only the resolution rule was shared with the impl;
+    the generation-mode restrictions were enforced per tool, so a dry run
+    happily priced an extension on a model that cannot extend."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+    )
+    assert fragment in payload["error"]
+
+
+@pytest.mark.parametrize(
+    ("model", "kwargs"),
+    [
+        pytest.param("veo-3.1-lite-generate-preview", {}, id="lite_text_to_video"),
+        pytest.param(
+            "veo-3.1-lite-generate-preview",
+            # gs:// so the image_to_video quote exercises the Lite guard, not
+            # the new local-source refusal; a bare path would now be refused as
+            # outside DATA_FOLDER before the price is returned.
+            {"image_uri": "gs://b/a.png"},
+            id="lite_image_to_video",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_the_lite_guard_does_not_over_reach(
+    model: str, kwargs: dict[str, Any], tmp_path: Path
+) -> None:
+    """Lite genuinely supports text-to-video and image-to-video."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path),
+            prompt="x",
+            model=model,
+            duration_seconds=8,
+            dry_run=True,
+            **kwargs,
+        )
+    )
+    assert payload["estimated_cost"]["usd"] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_omni_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
+    """The omni bucket check sat below the quote, so a dry run priced a
+    delivery to a bucket the real call refuses."""
+    import src.__main__ as main_mod
+
+    ctx = _video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"trusted"}))
+    denied = json.loads(
+        await main_mod.generate_video_omni(
+            ctx=ctx, prompt="x", output_gcs_uri="gs://evil/o.mp4", dry_run=True
+        )
+    )
+    assert "not in the allowlist" in denied["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_loop_extend_dry_run_enforces_the_vertex_gcs_requirement(
+    tmp_path: Path,
+) -> None:
+    """Refused live on Vertex without a GCS target, but priced at $0.70 by the
+    quote — the client and GCS resolution sat below the dry-run branch."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.loop_extend(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            video_uri="file:///x.mp4",
+            times=2,
+            dry_run=True,
+        )
+    )
+    assert "requires output_gcs_uri" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_generate_video_quote_reports_the_duration_it_prices(
+    tmp_path: Path,
+) -> None:
+    """The payload contradicted itself: duration_seconds: 5.0 beside a cost
+    detail reading "4s of video"."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_video_ctx(tmp_path),
+            prompt="x",
+            model="veo-3.1-generate-001",
+            duration_seconds=5,
+            dry_run=True,
+        )
+    )
+    assert payload["requested_duration_seconds"] == 5
+    assert payload["duration_seconds"] == 4
+    assert "4s of video" in payload["estimated_cost"]["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_edit_video_quote_is_an_upper_bound_not_a_guess(
+    tmp_path: Path,
+) -> None:
+    """An edit's rendered length is chosen by the service.
+
+    Live measurement settled a question two rounds of reasoning got wrong in
+    both directions: a 3s source edited with duration_seconds=4 rendered
+    10.01s — neither the source's length nor the request. Google's Omni
+    documentation does not state the rule, so the quote is Omni's maximum.
+    Quoting the source's length under-quoted that render 3.3x, and
+    under-quoting defeats the purpose of a pre-flight.
+    """
+    from src.omni import OMNI_MAX_DURATION_SECONDS
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    (videos_dir / "source.json").write_text(
+        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
+    )
+
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="i-3s",
+            prompt="x",
+            duration_seconds=4,
+            dry_run=True,
+        )
+    )
+    assert payload["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert "upper bound" in payload["duration_source"]
+    # The source length is still reported as context, just not as the basis.
+    assert payload["source_duration_seconds"] == 3
+    # Covers the render that was actually observed and billed.
+    assert payload["estimated_cost"]["usd"] >= 10 * 0.10136 * 0.999
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_edit_video_quote_is_the_same_bound_without_a_known_source(
+    tmp_path: Path,
+) -> None:
+    """The bound does not depend on knowing the source, so a foreign
+    interaction id quotes the same figure rather than a different guess."""
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MAX_DURATION_SECONDS
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="made-up-elsewhere",
+            prompt="x",
+            duration_seconds=10,
+            dry_run=True,
+        )
+    )
+    assert payload["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert "source_duration_seconds" not in payload
+
+
+def test_source_duration_lookup_survives_a_junk_sidecar(tmp_path: Path) -> None:
+    """Media directories accumulate unrelated and half-written files; a bad
+    one must not break the lookup for a good one."""
+    from src.__main__ import _source_duration_for_interaction
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    (videos_dir / "broken.json").write_text("{not json at all")
+    (videos_dir / "unrelated.json").write_text(json.dumps({"kind": "video"}))
+    (videos_dir / "match.json").write_text(
+        json.dumps({"interaction_id": "i-7", "duration_seconds": 6})
+    )
+
+    assert _source_duration_for_interaction(videos_dir, "i-7") == 6.0
+    assert _source_duration_for_interaction(videos_dir, "absent") is None
+    assert _source_duration_for_interaction(tmp_path / "nope", "i-7") is None
+
+
+def test_sidecar_lookup_cannot_be_hung_by_a_non_regular_file(tmp_path: Path) -> None:
+    """A named pipe among the sidecars hung every edit_video quote forever.
+
+    Path.read_text() on a FIFO blocks until someone writes; the media
+    directory is caller-controlled and may sit on a network mount, so the
+    scan opens regular files only. Any real deployment hitting a stale mount
+    entry or a device node had the same failure.
+    """
+    import os
+
+    from src.__main__ import _source_duration_for_interaction
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    (videos_dir / "good.json").write_text(
+        json.dumps({"interaction_id": "i-1", "duration_seconds": 4})
+    )
+    os.mkfifo(videos_dir / "blocking.json")
+
+    # Would never return before the fix.
+    assert _source_duration_for_interaction(videos_dir, "i-1") == 4.0
+    assert _source_duration_for_interaction(videos_dir, "absent") is None
+
+
+def test_sidecar_lookup_skips_implausibly_large_files(tmp_path: Path) -> None:
+    """A manifest is a few hundred bytes. Slurping a multi-megabyte file that
+    happens to end in .json wastes time and memory for nothing."""
+    from src.__main__ import _SIDECAR_MAX_BYTES, _source_duration_for_interaction
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    padding = " " * (_SIDECAR_MAX_BYTES + 1)
+    (videos_dir / "huge.json").write_text(
+        json.dumps({"interaction_id": "i-1", "duration_seconds": 9}) + padding
+    )
+    assert _source_duration_for_interaction(videos_dir, "i-1") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_edit_video_quote_returns_even_when_the_lookup_stalls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quote is advertised as instant, so a slow or stale media mount must
+    degrade to the honest fallback rather than hang the request. One blocked
+    coroutine blocks the whole server."""
+    import src.__main__ as main_mod
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    def slow_lookup(*_args: Any, **_kwargs: Any) -> float | None:
+        # Comfortably past the deadline, but short enough that the worker
+        # finishes during the test: asyncio.to_thread cannot be cancelled, so
+        # a 30s sleep would outlive the event loop and error at teardown.
+        time.sleep(1.0)
+        return 3.0
+
+    monkeypatch.setattr(main_mod, "_source_duration_for_interaction", slow_lookup)
+    monkeypatch.setattr(main_mod, "_SIDECAR_SCAN_TIMEOUT_SECONDS", 0.2)
+
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="i-42",
+            prompt="x",
+            duration_seconds=6,
+            dry_run=True,
+        )
+    )
+    assert payload["dry_run"] is True
+    assert "upper bound" in payload["duration_source"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_edit_video_dry_run_never_touches_the_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload that says "nothing was generated" must not have generated
+    anything — the hang raised a reasonable fear that the quote had started
+    reaching the interactions API and could be billing."""
+    import src.__main__ as main_mod
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    async def must_not_run(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("dry_run must not reach the omni impl")
+
+    monkeypatch.setattr(main_mod, "_omni_generate_and_manifest", must_not_run)
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", must_not_run)
+
+    payload = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path),
+            previous_interaction_id="i-1",
+            prompt="x",
+            dry_run=True,
+        )
+    )
+    assert payload["message"].startswith("Estimate only")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_bridge_quote_reports_that_the_ffmpeg_check_ran(tmp_path: Path) -> None:
+    """A passing environmental check is invisible — it looks exactly like no
+    check at all, which is how two review rounds read it on an
+    ffmpeg-equipped host. The quote now says the check ran."""
+    import src.__main__ as main_mod
+
+    payload = json.loads(
+        await main_mod.generate_bridge(
+            ctx=_video_ctx(tmp_path),
+            # gs:// clips are uncheckable offline and still price; local dummy
+            # paths would now be refused as outside DATA_FOLDER. This test is
+            # about the ffmpeg preflight, not the source scheme.
+            from_clip_uri="gs://b/a.mp4",
+            to_clip_uri="gs://b/b.mp4",
+            dry_run=True,
+        )
+    )
+    assert any("ffmpeg" in check for check in payload["preflight_checks"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_bridge_quote_is_refused_without_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: the check must actually refuse, not merely announce."""
+    import imageio_ffmpeg
+
+    import src.__main__ as main_mod
+
+    def no_ffmpeg() -> str:
+        raise RuntimeError("No ffmpeg exe could be found")
+
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", no_ffmpeg)
+
+    payload = json.loads(
+        await main_mod.generate_bridge(
+            ctx=_video_ctx(tmp_path),
+            from_clip_uri="a",
+            to_clip_uri="b",
+            dry_run=True,
+        )
+    )
+    assert "ffmpeg is required" in payload["error"]
+    assert "estimated_cost" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_edit_video_bills_the_measured_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bill comes from the artifact, not from any inference.
+
+    A real 3s file is rendered for the test, so the measurement path runs for
+    real: the bill is the measured length at metered confidence, whatever was
+    requested, and quote >= bill holds (the quote is the 10s upper bound).
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    rendered = videos_dir / "edited.mp4"
+    subprocess.run(
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=3:size=160x90:rate=24",
+            str(rendered),
+        ],
+        capture_output=True,
+        check=True,
+    )
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": f"file://{rendered}",
+            "interaction_id": "i-new",
+            "model": OMNI_MODEL,
+            "duration_seconds": None,  # an edit never sent one
+            "requested_duration_seconds": kwargs.get("duration_seconds", 6),
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+    ctx = _video_ctx(tmp_path, vertexai=True)
+
+    quote = json.loads(
+        await main_mod.edit_video(
+            ctx=ctx, previous_interaction_id="i-3s", prompt="x", dry_run=True
+        )
+    )
+    billed = json.loads(
+        await main_mod.edit_video(ctx=ctx, previous_interaction_id="i-3s", prompt="x")
+    )
+
+    assert billed["duration_source"] == "measured from the rendered video"
+    assert billed["duration_seconds"] == pytest.approx(3.0, abs=0.2)
+    assert billed["cost"]["is_estimate"] is False
+    assert billed["cost"]["usd"] == pytest.approx(
+        billed["duration_seconds"] * 0.10136, rel=1e-6
+    )
+    # A pre-flight may over-state, never under-state.
+    assert quote["estimated_cost"]["usd"] >= billed["cost"]["usd"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_unmeasurable_edit_bills_the_upper_bound_not_the_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the render cannot be measured (e.g. gs:// delivery), the bill is
+    the service maximum as a labelled estimate.
+
+    The previous fallback billed the SOURCE's sidecar length as though
+    metered — the falsified inherit model resurrected on the one branch
+    measurement cannot reach, under-billing ~3.3x on the two measured data
+    points (3.00s and 3.01s sources both rendered 10.01s).
+    """
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    # A source sidecar exists and says 3s — it must NOT become the bill.
+    (videos_dir / "source.json").write_text(
+        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
+    )
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/edited.mp4",  # unmeasurable from here
+            "interaction_id": "i-new",
+            "model": OMNI_MODEL,
+            "duration_seconds": None,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    billed = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            previous_interaction_id="i-3s",
+            prompt="x",
+        )
+    )
+    assert billed["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert "upper bound" in billed["duration_source"]
+    # A bound is an estimate; presenting it as metered would be a lie.
+    assert billed["cost"]["is_estimate"] is True
+    assert billed["cost"]["usd"] >= OMNI_MAX_DURATION_SECONDS * 0.10136
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_clip_quote_reports_the_ffmpeg_check_when_bridging(
+    tmp_path: Path,
+) -> None:
+    """generate_clip prices bridges through the same ffmpeg primitive as
+    generate_bridge — and is where a missing binary costs most, since the
+    bridges are folded into the estimate. The signal landed on the standalone
+    tool first and not on the composite that needed it."""
+    import src.__main__ as main_mod
+
+    beats = [{"prompt": "b", "duration_seconds": 8}] * 3
+    bridged = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+        )
+    )
+    assert any("ffmpeg" in c for c in bridged["preflight_checks"])
+
+    plain = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+        )
+    )
+    assert plain["preflight_checks"] == []
+
+
+def test_no_surface_claims_an_edit_inherits_the_source_duration() -> None:
+    """The inherit model is falsified and must not survive anywhere.
+
+    A measured 3s source edited with duration_seconds=4 rendered 10.01s, so
+    the length is neither the source's nor the request's. That claim was
+    written into a docstring, a runtime warning, a planner caveat and a
+    fallback string, and each was corrected in a different round because
+    nothing checked them together. This is the check that would have caught
+    all four at once.
+    """
+    import ast
+    import pathlib
+
+    offenders: list[str] = []
+    for path in sorted(pathlib.Path("src").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            # Docstrings and user-facing strings only; comments are exempt
+            # because they may legitimately describe the falsified model.
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            text = " ".join(node.value.lower().split())
+            if "inherit" not in text:
+                continue
+            claims_duration = "duration" in text or "length" in text
+            disclaims = any(
+                phrase in text
+                for phrase in ("not predictable", "chosen by the service")
+            )
+            if claims_duration and not disclaims:
+                offenders.append(f"{path.name}:{node.lineno}: {text[:80]}")
+
+    assert not offenders, "stale inherit-duration claim(s):\n" + "\n".join(offenders)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_an_unmeasurable_fresh_omni_render_prices_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh render delivered to GCS prices the clamped request.
+
+    There are three states here, not two: measured, an edit whose length is
+    unknowable (bills the maximum), and a fresh render that was honoured at
+    its clamped length but never opened. Collapsing the last two made a $0.31
+    render report that it "bills the service maximum as an upper bound" —
+    3x above what it charged, on the line an operator reconciles against.
+    """
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/out.mp4",  # cannot be opened from here
+            "interaction_id": "i1",
+            "model": OMNI_MODEL,
+            "duration_seconds": 3,  # fresh requests ARE honoured
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    r = json.loads(
+        await main_mod.generate_video_omni(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            prompt="x",
+            duration_seconds=3,
+            output_gcs_uri="gs://bucket/out.mp4",
+        )
+    )
+    assert r["duration_seconds"] == 3.0
+    assert "not the length measured" in r["duration_source"]
+    # Priced off 3s, so it must not claim to have billed the 10s maximum.
+    assert r["cost"]["usd"] < 0.4
+    assert "service maximum" not in r["cost"]["detail"]
+    assert "prices the length requested" in r["cost"]["detail"]
+    assert r["cost"]["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60.0)
+async def test_an_animatic_bills_measured_beats_not_the_clamped_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_clip is the one render path that never measured anything.
+
+    Every beat's cost came from the impl's clamped request and was summed with
+    actual=True, so the most expensive tool on the server reported a figure
+    nobody measured as metered — the exact defect measurement was added to
+    kill, surviving in the tool too expensive to live-test.
+    """
+    import subprocess
+
+    import imageio_ffmpeg
+
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    videos = tmp_path / "videos"
+    videos.mkdir(exist_ok=True)
+    rendered = 0
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        nonlocal rendered
+        rendered += 1
+        path = videos / f"beat{rendered}.mp4"
+        # Omni overshoots the clamp; that overshoot is the whole point.
+        subprocess.run(
+            [
+                imageio_ffmpeg.get_ffmpeg_exe(),
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=3.01:size=160x90:rate=100",
+                str(path),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        return {
+            "message": "ok",
+            "video_url": f"file://{path}",
+            "interaction_id": f"i{rendered}",
+            "model": OMNI_MODEL,
+            "duration_seconds": 3,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+    ctx = _video_ctx(tmp_path, vertexai=True)
+    beats = [{"prompt": f"beat {i}", "duration_seconds": 3} for i in range(3)]
+
+    quote = json.loads(
+        await main_mod.generate_clip(ctx=ctx, beats=beats, animatic=True, dry_run=True)
+    )
+    clip = json.loads(await main_mod.generate_clip(ctx=ctx, beats=beats, animatic=True))
+    manifest = clip.get("manifest") or clip
+    segments = manifest["segments"]
+
+    assert [s["duration_seconds"] for s in segments] == [
+        pytest.approx(3.01, abs=0.01)
+    ] * 3
+    assert {s["duration_source"] for s in segments} == {
+        "measured from the rendered video"
+    }
+    # Metered because measured — and above the clamped figure it used to bill.
+    assert manifest["cost"]["is_estimate"] is False
+    assert manifest["cost"]["usd"] > 3 * 3 * 0.10136
+    # The invariant, on the tool where it compounds per beat.
+    assert quote["estimated_cost"]["usd"] >= manifest["cost"]["usd"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_an_animatic_it_cannot_measure_is_not_reported_as_metered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Beats delivered to GCS cannot be opened, so the total is an estimate."""
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MODEL
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/beat.mp4",
+            "interaction_id": "i1",
+            "model": OMNI_MODEL,
+            "duration_seconds": 3,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    clip = json.loads(
+        await main_mod.generate_clip(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=[{"prompt": "b", "duration_seconds": 3}],
+            animatic=True,
+        )
+    )
+    manifest = clip.get("manifest") or clip
+    assert manifest["cost"]["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_billing_upper_bound_is_never_read_back_as_a_source_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound an unmeasurable edit bills must not become a stated fact.
+
+    The omni sidecar is what a later quote reads for source_duration_seconds
+    and what an operator reconciles against, so it carries the cost and the
+    provenance — and a recorded ceiling is refused as a source length rather
+    than laundered into one a hop later.
+    """
+    import src.__main__ as main_mod
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+
+    videos = tmp_path / "videos"
+    videos.mkdir(exist_ok=True)
+    (videos / "source.json").write_text(
+        json.dumps({"interaction_id": "i-3s", "duration_seconds": 3})
+    )
+
+    async def fake_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/edited.mp4",
+            "interaction_id": "i-bound",
+            "model": OMNI_MODEL,
+            "duration_seconds": None,
+            "aspect_ratio": "16:9",
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
+    monkeypatch.setattr(main_mod, "_get_omni_vertex_global_client", lambda: MagicMock())
+
+    edited = json.loads(
+        await main_mod.edit_video(
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            previous_interaction_id="i-3s",
+            prompt="x",
+        )
+    )
+    manifest = edited.get("manifest") or {}
+    assert manifest["duration_source"].startswith("upper bound")
+    assert manifest["cost"]["usd"] == edited["cost"]["usd"]
+
+    # Persist that manifest the way a sidecar would, then ask for the source
+    # length of that interaction: a ceiling is not an answer.
+    (videos / "bound.json").write_text(json.dumps(manifest))
+    assert main_mod._source_duration_for_interaction(videos, "i-bound") is None
+    assert manifest["duration_seconds"] == OMNI_MAX_DURATION_SECONDS

@@ -32,8 +32,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Runtime stage
 FROM python:3.14-alpine
 
-# Apply security patches to fix known vulnerabilities
-RUN apk upgrade --no-cache
+# Apply security patches to fix known vulnerabilities.
+# font-dejavu backs the storyboard renderer: Alpine ships no system fonts, and
+# Pillow's bundled fallback face has no em-dash, so slug lines like
+# "EXT. ALLEY — NIGHT" render as tofu without it. It installs to
+# /usr/share/fonts/dejavu/, which src/storyboard.py already probes.
+#
+# ffmpeg backs generate_bridge and generate_clip(add_bridges=True), which decode
+# frames out of existing videos. imageio-ffmpeg bundles a glibc binary that
+# cannot run on musl, so the dependency alone leaves both paths broken here.
+RUN apk upgrade --no-cache && apk add --no-cache font-dejavu ffmpeg
 
 WORKDIR /app
 
