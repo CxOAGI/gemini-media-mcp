@@ -19,6 +19,8 @@ jobs:
         uses: astral-sh/setup-uv@v5
       - name: Build package
         run: uv build
+      - name: Smoke-test built wheel
+        run: uvx --from ./dist/gemini_media_mcp-*.whl gemini-media-mcp --help
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

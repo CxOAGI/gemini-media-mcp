@@ -6,7 +6,9 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.13"
 dependencies = [
-    "mcp>=1.23.1",
+    # FastMCP moved out of this import path in MCP 2.x. Keep the published
+    # package on the compatible SDK until the server is migrated.
+    "mcp>=1.23.1,<2",
     "google-genai>=2.10.0",
     "pillow>=12.0.0",
     "aiohttp>=3.13.2",
