@@ -4088,9 +4088,17 @@ async def generate_clip(
             bridge when add_bridges is set — and generate nothing. The single
             most useful pre-flight in the server: a clip is the most expensive
             call it can make.
-        animatic: When True, render every beat on the omni draft model (fast,
-            720p) instead of Veo, for a quick storyboard preview of the
-            whole reel before committing to full Veo renders. Bridges are not
+        animatic: When True, render every beat on the omni draft model
+            instead of Veo, for a quick storyboard preview of the whole reel
+            before committing to full Veo renders. 720p unless
+            animatic_resolution says otherwise.
+        animatic_resolution: Resolution for the animatic pass — "360p",
+            "720p" (the default), "1080p" or "4K". Naming one renders the
+            animatic on gemini-omni-1.1-flash, the model that has a resolution
+            parameter. "360p" is about a THIRD of the 720p price, which is
+            what turns the preview from roughly the cost of the delivery
+            render into a real saving: a 5-beat 8s reel is ~$4.09 at 720p and
+            ~$1.36 at 360p. Ignored unless animatic is True. Bridges are not
             available in animatic mode (add_bridges is ignored), and Veo-only
             per-beat controls (seed, negative_prompt) are ignored. Each beat
             is measured from the rendered file, so an animatic's reported cost
@@ -5056,10 +5064,16 @@ async def extend_video_omni(
     COST WARNING. A turn returns the ASSEMBLED clip, not the increment it
     appended — measured: a 3.01s source extended once came back 13.01s. Omni
     bills per second of output, so every turn re-bills all the footage before
-    it and a chain costs quadratically, not linearly: `times=2` from a 3s
-    source bills about 13s + 23s = 36s to produce 20s of new footage. Each
-    turn's `video_url` supersedes the previous one; they are not segments to
-    join.
+    it and a chain costs quadratically, not linearly. From a 3s source:
+
+        turns   billed      360p     720p
+          1      13s       $0.44    $1.32
+          2      36s       $1.22    $3.65
+          3      69s       $2.33    $6.99
+
+    Each turn's `video_url` supersedes the previous one; they are not segments
+    to join. `dry_run` first — the quote is exact once the source's length is
+    known, and this tool measures it.
 
     Args:
         ctx: MCP context with application state

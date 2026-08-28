@@ -288,6 +288,8 @@ Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast
 
 **`gemini-omni-1.1-flash` is now the default.** It was the preview model, on the reasoning that flipping it would move existing callers without asking — but the preview endpoint is **switched off on 2026-09-30**, so defaulting to it meant defaulting new callers onto a model with weeks to live. Pinning `omni_model="gemini-omni-flash-preview"` still works and now warns with that date.
 
+> **Verification status.** Everything below has been exercised against the **Gemini Developer API** only. On Vertex AI none of it is certified: 1.1 is allowlist-gated preview there, and Vertex has no Files API, so `input_video_uri` on `generate_video_omni` and `extend_video_omni` cannot run at all. Treat the upload paths on Vertex as untested rather than working.
+
 **The two backends are on different tracks.** 1.1 is generally available on the Gemini Developer API. On Vertex AI / Gemini Enterprise Agent Platform it is still *Preview*, published as `gemini-omni-1.1-flash-preview` (translated automatically), and preview video models there are allowlist-gated with near-zero default quota — a 429 naming the base model means an allowlist and quota request to your Google Cloud account team, not a wait. Set `GEMINI_API_KEY` to use the GA path, which is also the only backend with the Files API the uploaded-source path needs.
 
 **Parameters:**
@@ -351,11 +353,11 @@ Each turn appends up to 10s, to a **cumulative 40s**. `times` chains that many t
 >
 > **A turn renders the whole assembled clip, not the 10s it appends.** Measured: a **3.01s source extended once returned 13.01s**. Omni bills per second of output, so every turn re-bills all the footage before it:
 >
-> | `times` | turns render | billed | new footage |
-> |---|---|---|---|
-> | 1 | 13.01s | 13.01s | 10s |
-> | 2 | 13.01s + 23.01s | **36.02s** | 20s |
-> | 3 | + 33.01s | **69.03s** | 30s |
+> | `times` | billed | new footage | cost @360p | cost @720p |
+> |---|---|---|---|---|
+> | 1 | 13s | 10s | $0.44 | $1.32 |
+> | 2 | 36s | 20s | $1.22 | $3.65 |
+> | 3 | 69s | 30s | **$2.33** | **$6.99** |
 >
 > Two documented sources pointed the other way — the [API reference](https://ai.google.dev/api/interactions-api) calls `duration` "the length of the generated video files" with a 3–10s range, and Vertex's sample response bills 28,832 video tokens (4.98s) — and neither survived a real render. Always `dry_run` a chain before running it.
 

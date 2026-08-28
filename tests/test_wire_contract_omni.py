@@ -387,7 +387,10 @@ def test_an_edit_does_not_report_a_duration_it_never_sent(
     assert result["requested_duration_seconds"] == 3
     # A 3s source edited with duration_seconds=4 measured 10.01s, so the
     # warning must not promise either the source's length or the request.
-    assert any("chosen by the service" in w for w in result["warnings"])
+    assert any(
+        "sends neither duration_seconds nor aspect_ratio" in w
+        for w in result["warnings"]
+    )
 
 
 @pytest.mark.timeout(20.0)

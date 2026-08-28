@@ -261,7 +261,10 @@ async def test_previous_interaction_id_forwarded(tmp_path: Path) -> None:
     assert "aspect_ratio" not in kwargs["response_format"][0]
     # The warning no longer claims inheritance: measurement showed the
     # rendered length is neither the source's nor the request's.
-    assert any("chosen by the service" in w for w in result["warnings"])
+    assert any(
+        "sends neither duration_seconds nor aspect_ratio" in w
+        for w in result["warnings"]
+    )
     assert result["interaction_id"] == "int-2"
 
 
