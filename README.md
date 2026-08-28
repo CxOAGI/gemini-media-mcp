@@ -7,7 +7,7 @@ Plan, generate, compose, and edit images and video on Google Gemini and Veo 3.1,
 - **Plan:** `plan_generation` ranks tool and model options for an intent with costs, and generates nothing.
 - **Generate:** images with Gemini, video with Veo 3.1, fast video with Omni.
 - **Compose:** storyboards, multi-beat reels, transitions between stills, bridges between clips.
-- **Edit and extend:** conversational video edits, loop and extend.
+- **Edit and extend:** conversational video edits, seamless scene extension, loop and extend.
 - **Cost-aware:** any call runs `dry_run` for a quote; real runs report metered cost and its pricing source.
 
 ## Quick start
@@ -267,36 +267,88 @@ Generate videos using VEO models. Video works on **both** credential modes: Veo 
 
 ### generate_video_omni
 
-Fast conversational video generation via Google's `gemini-omni-flash-preview` (Interactions API). This is the **fast path** — ideal for drafts and rapid iteration. It is not the cheap path: $0.10136/s, a hair above Veo Fast's $0.10/s. The high-fidelity Veo tools remain the path for final renders (1080p/4K, seeds, first/last frame). See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
+Fast conversational video generation through Google's Omni models (Interactions API). This is the **fast path** — ideal for drafts and rapid iteration — and the only family with multi-turn conversational editing. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
+
+Two models, selected with `omni_model`:
+
+| | `gemini-omni-flash-preview` (default) | `gemini-omni-1.1-flash` |
+|---|---|---|
+| Output | 720p / 24fps, fixed | 360p, 720p, 1080p, 4K |
+| Conversational editing | yes | yes |
+| Scene extension | no | yes (`extend_video_omni`) |
+| First/last-frame interpolation | no | yes |
+| Image references | inferred from position | `<IMAGE_REF_N>`, explicit |
+| Video references | no | up to 3 clips × 3s |
+| Native audio | not usable | yes (prompt-directed) |
+| Seed / negative prompt | no | no |
+| Price at 720p | $0.10136/s | $0.10136/s |
+
+Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast's $0.10/s. What 1.1 adds is a genuinely cheap **draft** tier — `resolution="360p"` is about a third of that, and Google says it renders up to 60% faster.
+
+The default stays on the preview model so existing calls render exactly what they always did. Pass `omni_model="gemini-omni-1.1-flash"` for anything in the right-hand column.
 
 **Parameters:**
-- `prompt` (required): Text description of the video
-- `image_uris`: List of image URIs to condition on (optional; **at most 8** — more is rejected, since each is buffered in memory)
-- `input_video_uri`: A video to edit (optional)
+- `prompt` (required): Text description of the video. Timecodes work in plain language (`"[0-3s] a person walks"`), as does audio direction (`"include calm background music"`). If you write your own role tags (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) they are passed through untouched; otherwise the declarations are generated from the media arguments and echoed back as `effective_prompt`
+- `omni_model`: `gemini-omni-flash-preview` (default) or `gemini-omni-1.1-flash`. Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K
+- `image_uris`: Image URIs whose role the model infers — one is a starting frame, several are subject references (optional; **at most 8 images total** — more is rejected, since each is buffered in memory)
+- `first_frame_uri` / `last_frame_uri` (1.1): Keyframe interpolation. `last_frame_uri` requires `first_frame_uri`; the same URI for both makes a seamless loop
+- `reference_image_uris` (1.1): Subject/style references, bound to `<IMAGE_REF_0>`, `<IMAGE_REF_1>`, … in order
+- `reference_video_uris` (1.1): Up to 3 clips of up to 3s each, bound to `<VIDEO_REF_0>`, … for character or object likeness. Audio in a reference clip is ignored
+- `input_video_uri`: A video to edit (optional). On 1.1 a clip too large to inline is uploaded through the Files API automatically (which needs a Gemini API key — Vertex has no Files API)
+- `resolution` (1.1): `360p`, `720p` (default), `1080p` or `4K`. 1080p and 4K are **upscaled** from the base render
 - `aspect_ratio`: `16:9` (default) or `9:16` — **not sent when the request is an edit** (an `input_video_uri` or a `previous_interaction_id` makes it one); the API rejects it on an edit task
 - `duration_seconds`: Video duration, 3–10 (default 6) — likewise **not sent on an edit**, and the rendered length is then chosen by the service: a measured 3s source edited with `duration_seconds=4` came back at 10.01s. On an edit the response reports `duration_seconds: null` and the quote uses omni's 10s maximum as an upper bound
 - `previous_interaction_id`: Continue editing a prior omni result (optional)
 - `timeout_seconds`: Overall deadline for create + polling (default 600). A render typically takes over a minute; raise it for long queues
 
 **Notes:**
-- 720p only, 24fps
-- No `seed` or `negative_prompt` support
-- The response includes an `interaction_id` for multi-turn editing (pass it to `edit_video` or back into `previous_interaction_id`)
+- No `seed` or `negative_prompt` on either model — put negatives in the prompt (`"no dialogue"`, `"no extra sound effects"`)
+- **Large outputs.** A render above 720p, or any extension, exceeds the API's 4 MB inline response limit. On the Gemini API those are requested with `delivery="uri"` and downloaded here automatically (the response says so in a warning); on Vertex AI, pass `output_gcs_uri` to have the service write straight to a bucket you control
+- The response includes an `interaction_id` for multi-turn editing and extension (pass it to `edit_video`, `extend_video_omni`, or back into `previous_interaction_id`)
+- All output carries SynthID watermarking
+
+**Pricing note for the new resolutions.** Google publishes exactly one Omni output-video rate — 5,792 tokens per second *of 720p video* at $17.50/1M tokens. So: 720p is quoted from the pricing page; 360p is quoted at the one-third ratio stated in the [launch post](https://blog.google/innovation-and-ai/technology/developers-tools/build-with-gemini-omni-1-1-flash/), which is not a pricing page; and 1080p/4K are quoted at the published 720p rate because no separate rate exists for an upscaled render. Every estimate says which of those it is in its `source_note`.
 
 ### edit_video
 
 Conversational edit of a previously omni-generated video. Because omni holds the video context server-side (background interactions are retained ~14 days on Vertex AI; longer on the paid Gemini API), you describe **only the change** — no need to re-supply the source video.
 
+Simple instructions edit best: `"Make this video anime"`, `"Make the phone invisible. Keep everything else the same."` Over-describing the scene changes parts you meant to keep.
+
 **Parameters:**
 - `previous_interaction_id` (required): The `interaction_id` from a prior `generate_video_omni` response
 - `prompt` (required): The edit instruction (e.g. `"make the sky stormy"`)
+- `omni_model`: Must be the model that produced `previous_interaction_id` — the interaction's video context lives with it, so an edit cannot switch models mid-conversation
+- `resolution`: `gemini-omni-1.1-flash` only; the resolution to render the edit at
 - `aspect_ratio`: accepted but **never sent** — the API rejects it on an edit task, so it does not change the output
 - `duration_seconds`: accepted but **never sent**, and it does not set the output length. The service picks the rendered length, and it is predictable from neither this value nor the source video: a measured 3s source edited with `duration_seconds=4` rendered 10.01s. The response reports `duration_seconds: null`; a real run bills the length measured from the rendered file, and `dry_run` quotes omni's 10s maximum so a pre-flight never under-states
 - `timeout_seconds`: Overall deadline for the edit render (default 600)
 
+### extend_video_omni
+
+Append a seamless continuation to an existing video (`gemini-omni-1.1-flash` only). Extension is neither editing nor a fresh render: the model reads the **last 10 seconds** of the source as context and generates what happens next, keeping motion, characters and audio coherent across the join. Some of the source's final frames are altered so the transition is invisible.
+
+Two sources, with different rules:
+
+- **`previous_interaction_id`** — a clip this server already rendered. The video context lives on the service, nothing is uploaded, and spoken dialogue may be added in the continuation.
+- **`input_video_uri`** — a clip of your own. It must be **10 seconds or shorter** (checked locally before anything is uploaded), it cannot gain new dialogue if someone is talking in it, and uploading a video to be extended is unavailable in the EEA, Switzerland and the UK.
+
+Each turn appends up to 10s, to a **cumulative 40s**. `times` chains that many turns, threading each result into the next.
+
+**Parameters:**
+- `prompt` (required): How the scene continues — `"Extend this video"`, `"Continue the scene: the camera pans across the mountains"`. Describe the audio if it should change, and say so if you want a cut to a new scene. In a timecode, `0s` is the start of the **new** footage, not of the source
+- `previous_interaction_id` **or** `input_video_uri` (exactly one required)
+- `times`: How many extension turns to chain (default 1, maximum 4). Turns run on the backend that minted the interaction, so a chain never drifts between Vertex AI and the Gemini API mid-way
+- `omni_model`: An interaction cannot change models mid-conversation, so continuing one created on another model is refused rather than sent as a plain edit and billed as an extension
+- `resolution`, `reference_image_uris`, `reference_video_uris`, `output_gcs_uri`, `timeout_seconds`, `dry_run` — as for `generate_video_omni`. References ride along on the first turn, which is where a new character is introduced
+
+**Returns:** JSON with the final `video_url`, the `interaction_id` to keep extending from, `final_duration_seconds` (the finished clip), `completed_turns`, one segment record per turn, and the summed cost. If a turn fails part-way through a chain, the turns that already rendered are still returned with their `interaction_id`, alongside an `error` telling you where to resume — they were billed.
+
+**How this is priced.** A turn renders the *whole growing clip*, not just the tail it appends: the docs cap "a total length of 40s", place a cut 2s into the extension of a 10s source "after 12s", and say "some of the final frames in your input video will be edited". Since Omni bills per second of output, turn 2 costs more than turn 1. A `dry_run` measures the source when it can (a prior interaction's sidecar) and projects each turn's output length from it; when it cannot, it assumes the documented 10s maximum source. `turn_output_seconds` shows the projection and `billed_seconds` its total.
+
 ### loop_extend
 
-Convenience wrapper that extends a Veo-generated video multiple times in one call. Each Veo extension adds ~7s, and can be chained up to 20 times.
+Convenience wrapper that extends a Veo-generated video multiple times in one call. Each Veo extension adds ~7s, and can be chained up to 20 times. This is the **Veo** extension path; `extend_video_omni` is the Omni one, and they are not interchangeable.
 
 **Parameters:**
 - `video_uri` (required): The Veo-generated video to extend
@@ -362,9 +414,11 @@ Same primitive as `generate_transition`, but takes **two clips instead of two st
 There are two video paths, and you choose based on where you are in the workflow:
 
 - **`gemini-omni-flash-preview` (fastest turnaround)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, no negative prompts, no first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video(draft=true)`, and `generate_clip(animatic=true)`.
+- **`gemini-omni-1.1-flash` (fast, and far more controllable)** — everything above plus 360p/1080p/4K output, first/last-frame interpolation, video references, native audio and scene extension. Still no seeds and no negative prompts. Reached by passing `omni_model="gemini-omni-1.1-flash"` to `generate_video_omni` or `edit_video`, and by `extend_video_omni`.
 - **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds for reproducibility, first/last-frame control, reference images, and extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
 
 Typical workflows:
+- **cheap draft → finalize**: run `generate_video_omni(omni_model="gemini-omni-1.1-flash", resolution="360p")` for a preview at roughly a third of the 720p price, then re-run at `720p`/`1080p`/`4K` — or on Veo — once the shot is right.
 - **draft → finalize**: run `generate_video(draft=true)` to preview quickly on omni, then re-run the same prompt with `draft=false` to render the final on Veo.
 - **animatic → final**: run `generate_clip(animatic=true)` to render each beat via `gemini-omni-flash-preview` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` (the default) to commit to full Veo renders.
 
