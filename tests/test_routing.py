@@ -931,7 +931,10 @@ def test_expensive_multi_beat_clips_recommend_an_animatic_first() -> None:
     assert first.params["animatic"] is True
     assert first.params["add_bridges"] is False
     assert second.params.get("animatic") is not True
-    assert OMNI_MODEL in first.rationale
+    # The preview renders on the model with a 360p tier, which is what makes it
+    # cheaper than the delivery render rather than level with it.
+    assert OMNI_1_1_MODEL in first.rationale
+    assert "360p" in first.rationale
 
 
 def test_a_draft_clip_gets_the_animatic_as_the_deliverable() -> None:
@@ -1299,7 +1302,12 @@ def test_a_size_demand_every_survivor_meets_still_resolves_on_budget() -> None:
     assert "4K output" in recommended.rationale
 
 
-def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
+def _omni_animatic_usd(
+    beats: int,
+    beat_seconds: float,
+    model: str = OMNI_1_1_MODEL,
+    resolution: str = "360p",
+) -> float:
     """What an omni animatic of ``beats`` x ``beat_seconds`` really costs.
 
     Computed from the price book rather than restated, so a test cannot pass
@@ -1307,7 +1315,7 @@ def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
     """
     from src.pricing import estimate_video_cost, quote_duration_for
 
-    probe = estimate_video_cost(OMNI_MODEL, beat_seconds, "720p", False)
+    probe = estimate_video_cost(model, beat_seconds, resolution, False)
     assert probe is not None
     # Each render carries one frame of encoder allowance (omni lands ~0.01s
     # over nominal), so the plan's figure is per-render quoted seconds — the
@@ -1315,28 +1323,31 @@ def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
     return (
         probe.breakdown["usd_per_second"]
         * beats
-        * quote_duration_for(OMNI_MODEL, beat_seconds)
+        * quote_duration_for(model, beat_seconds)
     )
 
 
 @pytest.mark.parametrize(
     ("budget", "expected_model", "animatic_is_cheaper"),
     [
-        # Only the standard tier is dearer than the animatic; against Fast the
-        # preview costs slightly more, and against Lite about double.
+        # At 360p on omni 1.1 the preview is a third of omni's own 720p rate,
+        # which puts it under every Veo tier — including Lite, which it used to
+        # cost double. That is the point of previewing at 360p.
         pytest.param("best", VEO, True, id="standard_tier_saves"),
-        pytest.param(None, VEO_FAST, False, id="fast_tier_costs_more"),
-        pytest.param("cheap", VEO_LITE, False, id="lite_tier_costs_double"),
+        pytest.param(None, VEO_FAST, True, id="fast_tier_saves"),
+        pytest.param("cheap", VEO_LITE, True, id="lite_tier_saves"),
     ],
 )
 def test_the_animatic_claims_a_saving_only_when_it_saves(
     budget: str | None, expected_model: str, animatic_is_cheaper: bool
 ) -> None:
-    """The animatic was sold as the cheap preflight for every Veo tier, but
-    omni bills $0.10136/s against Veo Fast's $0.10/s: 3 x 8s beats cost ~$2.45
-    as an animatic (allowance included) and $2.40 as the real render. The step is still worth
-    recommending — it catches a bad creative call before the delivery render —
-    but it may not claim a saving the numbers contradict."""
+    """The rationale may only claim a saving the arithmetic supports.
+
+    It used to oversell an animatic that cost about what the delivery render
+    cost: omni bills $0.10136/s against Veo Fast's $0.10/s, so 3 x 8s beats
+    were ~$2.45 as a preview and $2.40 as the real thing. Previewing at 360p on
+    omni 1.1 is a third of that, so the saving is now real against every tier —
+    and the assertion that it be *stated* only when true is unchanged."""
     plan = plan_generation(
         "a 3 beat reel about coffee",
         RoutingConstraints(
@@ -1356,6 +1367,8 @@ def test_the_animatic_claims_a_saving_only_when_it_saves(
     assert len(plan.workflow) == 2
     animatic = plan.workflow[0]
     assert animatic.params["animatic"] is True
+    # Naming the resolution is what selects the model that has one.
+    assert animatic.params["animatic_resolution"] == "360p"
 
     animatic_usd = _omni_animatic_usd(3, 8.0)
     render_usd = top.cost.usd
@@ -1384,7 +1397,7 @@ def test_the_animatic_makes_no_economic_claim_when_pricing_is_unavailable(
     rationale = plan.workflow[0].rationale
     assert "$" not in rationale
     assert "sav" not in rationale
-    assert OMNI_MODEL in rationale
+    assert OMNI_1_1_MODEL in rationale
 
 
 @pytest.mark.parametrize("backend", ["vertex", "unknown", "gemini_api"])
@@ -1722,3 +1735,100 @@ def test_an_interaction_id_excludes_every_model_that_cannot_read_one() -> None:
     assert all(is_omni_model(route.model) for route in plan.routes)
     veo = {r.model for r in plan.rejected if r.model.startswith("veo")}
     assert veo, "the Veo tiers must be excluded, not merely out-ranked"
+
+
+# ============================================================================
+# Enumeration: a capability nobody can find is not exposed
+# ============================================================================
+
+
+def test_two_stills_offer_the_omni_interpolation_route_with_its_frames() -> None:
+    """1.1 interpolates between a first and last frame; the planner never said so.
+
+    A transition-shaped request produced Veo routes only, because omni was a
+    candidate for four tools and generate_transition was not one of them — so a
+    capability reachable on the tool was undiscoverable through the planner.
+    And routing omni for two stills without EMITTING the stills would hand over
+    a plan that renders something else entirely.
+    """
+    plan = plan_generation(
+        "a smooth transition from sunrise to snowfall",
+        RoutingConstraints(
+            media_kind="video",
+            first_frame_uri="gs://b/a.png",
+            last_frame_uri="gs://b/b.png",
+        ),
+    )
+    omni = [r for r in plan.routes if r.tool == "generate_video_omni"]
+    assert omni, [(r.tool, r.model) for r in plan.routes]
+    route = omni[0]
+    assert route.model == OMNI_1_1_MODEL
+    assert route.params["first_frame_uri"] == "gs://b/a.png"
+    assert route.params["last_frame_uri"] == "gs://b/b.png"
+    assert any("FIRST_FRAME" in caveat for caveat in route.caveats)
+    # Veo still competes; this adds an option rather than replacing one.
+    assert any(r.tool == "generate_transition" for r in plan.routes)
+    # And the preview model is excluded by capability, not merely out-ranked.
+    assert any(
+        r.model == OMNI_MODEL and "first+last-frame" in r.reason for r in plan.rejected
+    )
+
+
+def test_a_dear_single_render_is_offered_a_360p_draft_first() -> None:
+    """ "Draft at 360p, finalize at 4K" is the workflow the tier exists for.
+
+    Nothing enumerated it: plan.workflow was empty for every single-render
+    plan, so the cheapest preview this server can issue was reachable only by
+    a caller who already knew to ask for it.
+    """
+    plan = plan_generation(
+        "a cinematic drone shot over mountains",
+        RoutingConstraints(media_kind="video", resolution="4K"),
+    )
+    assert len(plan.workflow) == 2
+    draft, delivery = plan.workflow
+    assert draft.tool == "generate_video_omni"
+    assert draft.params["omni_model"] == OMNI_1_1_MODEL
+    assert draft.params["resolution"] == "360p"
+    # Reviewed in the deliverable's framing, or the review is of the wrong frame.
+    assert draft.params["aspect_ratio"] == delivery.params["aspect_ratio"]
+    assert "saving ~$" in draft.rationale
+    assert delivery.params.get("resolution") == "4K"
+
+
+def test_the_draft_step_is_not_offered_when_it_would_not_help() -> None:
+    """No preview of a preview, and none where it saves nothing."""
+    # Already a throwaway render.
+    assert (
+        plan_generation(
+            "a clip of a robot",
+            RoutingConstraints(media_kind="video", is_draft=True, resolution="4K"),
+        ).workflow
+        == ()
+    )
+    # A 360p omni render IS the draft; it needs no draft of its own.
+    assert (
+        plan_generation(
+            "a clip of a robot",
+            RoutingConstraints(media_kind="video", resolution="360p"),
+        ).workflow
+        == ()
+    )
+
+
+def test_the_animatic_previews_on_the_model_with_a_360p_tier() -> None:
+    """The saving is the whole reason to recommend the step.
+
+    At 720p on the preview model the animatic cost about what the delivery
+    render cost, and the rationale had to concede it. At 360p it is a third of
+    that, under every Veo tier.
+    """
+    plan = plan_generation(
+        "a 5 beat reel about coffee",
+        RoutingConstraints(media_kind="video", num_beats=5, duration_seconds=8),
+    )
+    animatic = plan.workflow[0]
+    assert animatic.params["animatic"] is True
+    assert animatic.params["animatic_resolution"] == "360p"
+    assert OMNI_1_1_MODEL in animatic.rationale
+    assert "does NOT save money" not in animatic.rationale

@@ -116,6 +116,11 @@ VEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p", "4K")
 # takes a real resolution parameter (OMNI_RESOLUTIONS) on top of this default.
 OMNI_RESOLUTION = OMNI_DEFAULT_RESOLUTION
 
+# Omni 1.1's draft tier: a third of the 720p price, and the cheapest render
+# this server can issue. Named here because the workflow builder recommends it
+# by name as the preview pass.
+OMNI_DRAFT_RESOLUTION = "360p"
+
 # Every resolution some video model here can render, which is what a request
 # is validated against: Veo's three plus omni 1.1's 360p draft tier.
 VIDEO_RESOLUTIONS: tuple[str, ...] = tuple(
@@ -2747,6 +2752,30 @@ def _video_params(
             "duration_seconds": duration,
         }
         spec = omni_spec(model)
+        # Frames the caller supplied, bound to their roles. Emitted here
+        # because a transition-shaped request now reaches this tool: routing
+        # omni for two stills and then dropping the stills would hand over a
+        # plan that renders something else entirely.
+        if spec.supports_keyframes and request.first_frame_uri is not None:
+            params["first_frame_uri"] = request.first_frame_uri
+            if request.last_frame_uri is not None:
+                params["last_frame_uri"] = request.last_frame_uri
+                caveats.append(
+                    "The two stills are bound as <FIRST_FRAME> and "
+                    "<LAST_FRAME>, so omni interpolates between them — the "
+                    "same shape generate_transition renders on Veo. Passing "
+                    "one URI for both loops the clip."
+                )
+        elif (
+            request.has_first_frame
+            and request.has_last_frame
+            and spec.supports_keyframes
+        ):
+            caveats.append(
+                "Add first_frame_uri and last_frame_uri: this route "
+                "interpolates between two stills and the router was given "
+                "neither URI."
+            )
         if spec.supports_resolution:
             if request.resolution is not None:
                 params["resolution"] = request.resolution
@@ -3261,6 +3290,13 @@ def _plan_video(
         "generate_video_omni",
         "edit_video",
         "loop_extend",
+        # Two stills and a prompt is exactly omni 1.1's interpolation, so it
+        # belongs in the running for a transition. The preview model is then
+        # excluded by the first/last-frame capability rule, as it should be.
+        # generate_bridge stays Veo-only: it SAMPLES its endpoints out of two
+        # clips, which is that tool's own decoding work rather than a model
+        # capability.
+        "generate_transition",
     ):
         candidates = sorted(_VIDEO_PROFILES)
     elif tool == "generate_clip":
@@ -3410,6 +3446,8 @@ def _animatic_rationale(
     beats: int,
     animatic_cost: CostEstimateLike | None,
     render_cost: CostEstimateLike | None,
+    model: str = OMNI_MODEL,
+    resolution: str = OMNI_RESOLUTION,
 ) -> str:
     """Explain the animatic preflight without claiming a saving that is not there.
 
@@ -3435,7 +3473,7 @@ def _animatic_rationale(
         show one, an explicit "does not save money" when they do not, and no
         economic claim at all when either side is unpriced.
     """
-    lead = f"Preview all {beats} beats on {OMNI_MODEL} first"
+    lead = f"Preview all {beats} beats on {model} at {resolution} first"
     why = (
         "an animatic surfaces pacing and continuity problems before the "
         "delivery render is paid for."
@@ -3579,6 +3617,82 @@ def _build_workflow(
             ),
         )
 
+    if best.tool in ("generate_video", "generate_video_omni"):
+        # Draft-then-finalize for a single render. Only worth a step when the
+        # delivery render is dear enough that discovering a bad creative call
+        # after paying for it hurts — and only when the preview is genuinely
+        # cheaper, which is exactly what omni 1.1's 360p tier made possible.
+        # A caller who has already said the render is throwaway needs no
+        # preview of a preview.
+        if (
+            request.is_draft
+            or best.model == OMNI_1_1_MODEL
+            and (best.params.get("resolution") == OMNI_DRAFT_RESOLUTION)
+        ):
+            return ()
+        delivery_resolution = best.params.get("resolution") or request.resolution
+        dear = (best.cost is not None and best.cost.usd >= ANIMATIC_MIN_COST_USD) or (
+            delivery_resolution in ("1080p", "4K")
+        )
+        if not dear:
+            return ()
+        draft_params: dict[str, Any] = {
+            "prompt": request.intent,
+            "omni_model": OMNI_1_1_MODEL,
+            "resolution": OMNI_DRAFT_RESOLUTION,
+            "duration_seconds": best.params.get(
+                "duration_seconds", request.clip_duration_seconds
+            ),
+        }
+        if "aspect_ratio" in best.params:
+            # Preview in the deliverable's framing; reviewing the wrong frame
+            # defeats the point.
+            draft_params["aspect_ratio"] = best.params["aspect_ratio"]
+        for frame in ("first_frame_uri", "last_frame_uri"):
+            if frame in best.params:
+                draft_params[frame] = best.params[frame]
+        draft_cost = _estimate_video_cost(
+            OMNI_1_1_MODEL,
+            float(draft_params["duration_seconds"]),
+            OMNI_DRAFT_RESOLUTION,
+            False,
+        )
+        if draft_cost is None or (
+            best.cost is not None and draft_cost.usd >= best.cost.usd
+        ):
+            return ()
+        lead = f"Preview on {OMNI_1_1_MODEL} at {OMNI_DRAFT_RESOLUTION} first"
+        if best.cost is not None:
+            lead += (
+                f" (est. ${draft_cost.usd:.2f} against ${best.cost.usd:.2f} for "
+                f"the delivery render, saving ~${best.cost.usd - draft_cost.usd:.2f})"
+            )
+        return (
+            WorkflowStep(
+                order=1,
+                tool="generate_video_omni",
+                params=draft_params,
+                rationale=(
+                    f"{lead}: 360p is a third of omni's 720p price and the "
+                    "cheapest render available here, so the composition, "
+                    "motion and timing can be judged before the "
+                    f"{delivery_resolution or 'delivery'} render is paid for. "
+                    "Keep the returned interaction_id — the same clip can be "
+                    "edited conversationally or extended from there."
+                ),
+            ),
+            WorkflowStep(
+                order=2,
+                tool=best.tool,
+                params=best.params,
+                rationale=(
+                    "Once the draft reads correctly, render the deliverable on "
+                    f"{best.model}"
+                    + (f" at {delivery_resolution}." if delivery_resolution else ".")
+                ),
+            ),
+        )
+
     if best.tool != "generate_clip":
         return ()
 
@@ -3594,13 +3708,20 @@ def _build_workflow(
     # Bridges are a Veo first/last-frame feature; generate_clip ignores them
     # in animatic mode, so the preview step should not ask for them.
     animatic_params["add_bridges"] = False
+    # Preview at 360p on the model that has resolutions. This is what turns
+    # the animatic from a pass that costs about what the delivery render costs
+    # — which is what its own rationale had to concede — into a third of it.
+    # Naming the resolution is what selects the model; generate_clip's
+    # animatic_resolution is documented that way.
+    animatic_params["animatic_resolution"] = OMNI_DRAFT_RESOLUTION
+    animatic_model = OMNI_1_1_MODEL
     beat_duration = float(best.params["beats"][0].get("duration_seconds", 0.0))
     animatic_cost = _aggregate_video_cost(
-        OMNI_MODEL,
+        animatic_model,
         beat_duration,
         beat_duration * beats,
         beats,
-        OMNI_RESOLUTION,
+        OMNI_DRAFT_RESOLUTION,
         False,
     )
 
@@ -3610,7 +3731,9 @@ def _build_workflow(
         params=animatic_params,
         # Both sides of the comparison come from _aggregate_video_cost:
         # best.cost is the generate_clip route's own aggregate quote.
-        rationale=_animatic_rationale(beats, animatic_cost, best.cost),
+        rationale=_animatic_rationale(
+            beats, animatic_cost, best.cost, animatic_model, OMNI_DRAFT_RESOLUTION
+        ),
     )
     if request.is_draft:
         # The caller already said this render is throwaway, so the animatic is

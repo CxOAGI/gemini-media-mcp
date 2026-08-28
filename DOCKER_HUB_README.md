@@ -145,6 +145,7 @@ Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the p
 | `seed` | integer *optional* | Random seed for reproducibility |
 | `image_uri` | string *optional* | Input image URI for image-to-video generation |
 | `draft` | boolean *optional* | When `true`, routes to `gemini-omni-flash-preview` for a fast 720p draft instead of Veo (default `false`) |
+| `draft_resolution` | string *optional* | Resolution for a `draft=true` pass. Naming one renders the draft on `gemini-omni-1.1-flash`; `360p` is a third of the 720p price |
 
 **Available Models** (no default — `model` must be supplied):
 - `veo-3.1-generate-001` - VEO 3.1 (4/6/8 seconds with audio support)
@@ -176,6 +177,7 @@ Generate a multi-beat short clip — the building block for a reel. One call ren
 | `include_audio` | boolean *optional* | Audio per beat (default `true`; Vertex only) |
 | `add_bridges` | boolean *optional* | Generate a transition between consecutive beats (requires local beat outputs) |
 | `animatic` | boolean *optional* | Render every beat with `gemini-omni-flash-preview` for a fast 720p storyboard preview of the whole reel |
+| `animatic_resolution` | string *optional* | Resolution for the animatic pass. Naming one renders it on `gemini-omni-1.1-flash`; `360p` is a third of the 720p price |
 | `output_gcs_uri` | string *optional* | GCS URI for all outputs |
 
 **Notes:**
