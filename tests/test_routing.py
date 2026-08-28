@@ -11,7 +11,7 @@ from typing import Any, cast
 import pytest
 
 from src.image import _IMAGE_SIZE_SUPPORT, ImageModel, ImageSize
-from src.omni import OMNI_MODEL
+from src.omni import OMNI_1_1_MODEL, OMNI_MODEL, OMNI_MODELS, is_omni_model
 from src.routing import (
     _VIDEO_CAPABILITY_RULES,
     _VIDEO_CAPABILITIES,
@@ -91,8 +91,8 @@ def test_image_profiles_cover_the_live_catalog_exactly() -> None:
 
 
 def test_video_profiles_cover_the_live_catalog_plus_omni() -> None:
-    """Veo models plus omni are routable; capabilities exist for each."""
-    assert set(_VIDEO_PROFILES) == set(LIVE_VIDEO_MODELS) | {OMNI_MODEL}
+    """Veo models plus both omni models are routable; capabilities exist."""
+    assert set(_VIDEO_PROFILES) == set(LIVE_VIDEO_MODELS) | set(OMNI_MODELS)
     assert set(_VIDEO_CAPABILITIES) == set(_VIDEO_PROFILES)
 
 
@@ -674,6 +674,13 @@ _RULE_CASES: tuple[tuple[str, str, RoutingConstraints, str, str], ...] = (
         RoutingConstraints(media_kind="video", resolution="4K"),
         VEO_LITE,
         "cannot produce 4K",
+    ),
+    (
+        "360p_unsupported",
+        "veo has no 360p draft tier",
+        RoutingConstraints(media_kind="video", resolution="360p"),
+        "veo-3.1-fast-generate-001",
+        "360p",
     ),
     (
         "1080p_unsupported",
@@ -1553,3 +1560,161 @@ def test_a_single_render_is_not_described_in_the_plural() -> None:
     top = plan.recommended
     assert top is not None and top.cost is not None
     assert "1 render totalling" in top.cost.detail
+
+
+# ============================================================================
+# gemini-omni-1.1-flash routing
+# ============================================================================
+
+
+def test_the_new_omni_model_is_routable_and_names_itself_in_the_params() -> None:
+    """A route the caller cannot reproduce is worse than no route.
+
+    generate_video_omni defaults to the preview model, so a plan that
+    recommends 1.1 has to emit omni_model or the call it hands over renders
+    on a different model than the one it priced.
+    """
+    plan = plan_generation("a video of a cat", RoutingConstraints(media_kind="video"))
+    omni_routes = [r for r in plan.routes if r.tool == "generate_video_omni"]
+    assert {r.model for r in omni_routes} == set(OMNI_MODELS)
+    for route in omni_routes:
+        assert route.params["omni_model"] == route.model
+
+
+def test_a_360p_request_reaches_only_the_model_that_has_360p() -> None:
+    """360p is 1.1's draft tier alone.
+
+    Veo publishes no 360p output and no 360p rate, and the preview model
+    renders 720p whatever it is asked — so letting either through would quote
+    a render that cannot happen, at a price that is not its own.
+    """
+    plan = plan_generation(
+        "a draft clip of a robot",
+        RoutingConstraints(media_kind="video", resolution="360p"),
+    )
+    assert {route.model for route in plan.routes} == {OMNI_1_1_MODEL}
+    assert plan.routes[0].params["resolution"] == "360p"
+    rejected = {r.model for r in plan.rejected}
+    assert OMNI_MODEL in rejected
+    assert "veo-3.1-fast-generate-001" in rejected
+
+
+def test_the_360p_route_is_the_cheapest_video_render_planned() -> None:
+    """The draft tier's whole point: a third of 720p, under even Veo Lite."""
+    draft = plan_generation(
+        "a clip of a robot",
+        RoutingConstraints(media_kind="video", resolution="360p"),
+    ).routes[0]
+    others = plan_generation(
+        "a clip of a robot", RoutingConstraints(media_kind="video")
+    ).routes
+    assert draft.cost is not None
+    assert all(
+        route.cost is None or draft.cost.usd < route.cost.usd
+        for route in others
+        if route.model != OMNI_1_1_MODEL
+    )
+
+
+def test_extending_from_an_interaction_offers_the_omni_extension_tool() -> None:
+    """ "Make it longer" is an extension, even when an interaction id is present.
+
+    An interaction id is a source, not a verb — omni can both edit AND extend
+    from one. Ranking the id first routed every "extend this, from interaction
+    X" to edit_video, which does not lengthen anything.
+    """
+    plan = plan_generation(
+        "extend this clip by 20 seconds",
+        RoutingConstraints(media_kind="video", previous_interaction_id="int-9"),
+    )
+    omni = [r for r in plan.routes if r.tool == "extend_video_omni"]
+    assert omni, [r.tool for r in plan.routes]
+    assert omni[0].model == OMNI_1_1_MODEL
+    assert omni[0].params["previous_interaction_id"] == "int-9"
+    # 20s of continuation at 10s a turn.
+    assert omni[0].params["times"] == 2
+    # The preview model is excluded by capability, not silently absent.
+    assert any(
+        r.model == OMNI_MODEL and "cannot extend" in r.reason for r in plan.rejected
+    )
+
+
+def test_an_omni_extension_is_capped_at_the_documented_ceiling() -> None:
+    """40s total in 10s steps, so four turns is the most that can be planned."""
+    plan = plan_generation(
+        "extend this clip by 5 minutes",
+        RoutingConstraints(media_kind="video", previous_interaction_id="int-9"),
+    )
+    omni = next(r for r in plan.routes if r.tool == "extend_video_omni")
+    assert omni.params["times"] == 4
+    assert any("40s" in caveat for caveat in omni.caveats)
+
+
+def test_a_plain_edit_still_routes_to_edit_video() -> None:
+    """The extension check must not swallow ordinary conversational edits."""
+    plan = plan_generation(
+        "make the sky stormy", RoutingConstraints(previous_interaction_id="int-1")
+    )
+    assert plan.routes[0].tool == "edit_video"
+
+
+def test_the_extension_route_sends_the_resolution_it_is_priced_at() -> None:
+    """It was the one omni branch that quoted a resolution it never asked for.
+
+    A 360p extension plan handed over params with no `resolution` key at all:
+    running them verbatim renders 720p and bills three times the quote — the
+    under-quote this module's docstring says must never happen.
+    """
+    plan = plan_generation(
+        "extend this clip so it is 30 seconds long",
+        RoutingConstraints(
+            media_kind="video", resolution="360p", previous_interaction_id="abc123"
+        ),
+    )
+    route = next(r for r in plan.routes if r.tool == "extend_video_omni")
+    assert route.params["resolution"] == "360p"
+    assert route.cost is not None
+    assert "@ 360p" in route.cost.detail
+
+
+def test_an_extension_chain_is_priced_at_the_clip_each_turn_renders() -> None:
+    """A turn returns the whole growing clip, not the tail it appends.
+
+    Omni bills per second of output, so a flat "10s a turn" quote under-stated
+    a 4-turn chain by more than 2x.
+    """
+    plan = plan_generation(
+        "extend this clip by 40 seconds",
+        RoutingConstraints(media_kind="video", previous_interaction_id="abc123"),
+    )
+    route = next(r for r in plan.routes if r.tool == "extend_video_omni")
+    turns = route.params["times"]
+    assert route.cost is not None
+    # Turns render 20/30/40/40s off the assumed 10s source, not 10s each.
+    assert route.cost.breakdown["seconds"] > 10 * turns * 2
+    assert any("whole growing clip" in caveat for caveat in route.caveats)
+    # And the assumption behind that projection is stated, not silent.
+    assert any("assumes the" in caveat for caveat in route.caveats)
+
+
+def test_an_interaction_id_excludes_every_model_that_cannot_read_one() -> None:
+    """An interaction id is a source only the omni family can resolve.
+
+    Gating the conversational capability on `tool == "edit_video"` alone let an
+    extension-flavoured request top out with a Veo `loop_extend` route that had
+    silently dropped the interaction id and told the caller to supply a clip
+    they do not have.
+    """
+    plan = plan_generation(
+        "make this clip longer, continue the scene",
+        RoutingConstraints(media_kind="video", previous_interaction_id="abc123"),
+    )
+    top = plan.recommended
+    assert top is not None
+    assert top.tool == "extend_video_omni"
+    assert top.model == OMNI_1_1_MODEL
+    assert top.params["previous_interaction_id"] == "abc123"
+    # No route may survive that cannot use the only source the caller gave.
+    assert all(is_omni_model(route.model) for route in plan.routes)
+    veo = {r.model for r in plan.rejected if r.model.startswith("veo")}
+    assert veo, "the Veo tiers must be excluded, not merely out-ranked"

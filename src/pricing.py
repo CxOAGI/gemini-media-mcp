@@ -39,9 +39,10 @@ than we would like):
   automatically.
 * **Free tier.** There is none for any model in this module: the Gemini
   Developer API pricing page lists "Not available" in the free-tier column
-  for all three image models, all three Veo 3.1 variants and
-  ``gemini-omni-flash-preview``. So a paid-tier price is always the right
-  price here, and there is no free-tier branch to model.
+  for all three image models, all three Veo 3.1 variants and both omni
+  models (``gemini-omni-flash-preview`` and ``gemini-omni-1.1-flash``). So a
+  paid-tier price is always the right price here, and there is no free-tier
+  branch to model.
 * **Audio.** Veo 3.1 publishes a single per-second rate that already
   includes natively generated audio; Google publishes no audio-free
   discount. ``include_audio=False`` therefore does not reduce the estimate —
@@ -72,7 +73,7 @@ translated ID back to the caller, so both spellings resolve to one price.
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, get_args
 
 from .image import (
@@ -81,7 +82,12 @@ from .image import (
     ImageModel,
     RetiredImageModel,
 )
-from .omni import OMNI_MODEL
+from .omni import (
+    OMNI_1_1_MODEL,
+    OMNI_MODEL,
+    OMNI_MODELS,
+    is_omni_model,
+)
 from .video import _GEMINI_API_MODEL_IDS, VideoModel
 
 # Date on which every price in this module was verified against the sources
@@ -92,6 +98,13 @@ PRICING_AS_OF = "2026-08-03"
 PRICING_SOURCES: dict[str, str] = {
     "gemini_api": "https://ai.google.dev/gemini-api/docs/pricing",
     "vertex_ai": "https://cloud.google.com/vertex-ai/generative-ai/pricing",
+    # Not a pricing page, but the only Google source that states how Omni
+    # 1.1's 360p draft tier is charged relative to 720p. Cited on the rate it
+    # backs, so a caller can see exactly which figure rests on it.
+    "omni_1_1_launch": (
+        "https://blog.google/innovation-and-ai/technology/developers-tools/"
+        "build-with-gemini-omni-1-1-flash/"
+    ),
 }
 
 # Every embedded rate below was read from the Gemini Developer API pricing
@@ -99,6 +112,7 @@ PRICING_SOURCES: dict[str, str] = {
 # page (PRICING_SOURCES["vertex_ai"]), which publishes the same numbers.
 _SRC_GEMINI_API = PRICING_SOURCES["gemini_api"]
 _SRC_VERTEX_AI = PRICING_SOURCES["vertex_ai"]
+_SRC_OMNI_1_1_LAUNCH = PRICING_SOURCES["omni_1_1_launch"]
 
 # Per-rate provenance notes. ``source`` answers "where did this number come
 # from?"; these answer the follow-up question a caller on the *other* backend
@@ -216,12 +230,20 @@ class VideoModelPricing:
             publishes token-level billing for the model (Omni does; Veo does
             not).
         tokens_per_second: Video output tokens metered per second, when
-            published.
+            published. Google publishes exactly one such figure per omni model
+            and pins it to 720p ("5,792 tokens per second of 720p video"), so
+            on a model with a real resolution parameter this is the 720p rate
+            specifically, NOT a constant across resolutions — see
+            ``tokens_per_second_by_resolution`` on the published record.
         output_text_usd_per_mtok: USD per 1M text output tokens, when the
             model can also emit text.
         input_usd_per_mtok: USD per 1M input tokens, when published.
         fixed_resolution: Set when the model only ever emits one resolution,
             so a differing request is priced at what is actually rendered.
+        resolution_notes: Per-resolution caveats appended to the estimate's
+            detail. A model whose published rate covers one resolution but
+            whose API accepts four (Omni 1.1) has to say which of its four
+            figures Google actually printed and which were derived.
         source: URL the numbers were read from.
         source_note: Optional one-liner about how far ``source`` can be
             trusted for a caller on the other backend; travels onto every
@@ -237,6 +259,7 @@ class VideoModelPricing:
     output_text_usd_per_mtok: float | None = None
     input_usd_per_mtok: float | None = None
     fixed_resolution: str | None = None
+    resolution_notes: Mapping[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +325,54 @@ _IMAGE_PRICING: dict[str, ImageModelPricing] = {
 _OMNI_VIDEO_TOKENS_PER_SECOND = 5792
 _OMNI_VIDEO_USD_PER_MTOK = 17.50
 
+# Both omni models sit on the same row shape of the pricing page: input $1.50
+# / 1M tokens, text output $9.00, video output $17.50, and the footnote
+# "Billing is based on total output token consumption, calculated at a rate of
+# 5,792 tokens per second of 720p video."
+_OMNI_INPUT_USD_PER_MTOK = 1.50
+_OMNI_OUTPUT_TEXT_USD_PER_MTOK = 9.00
+
+# gemini-omni-1.1-flash's 360p tier. The pricing page publishes ONE token rate
+# and pins it to 720p; the only statement about 360p is in the launch post —
+# "lightweight previews in 360p resolution up to 60% faster and at a third of
+# the cost compared to Omni 1.1's standard 720p resolution". A third is
+# therefore what is quoted, sourced to that post rather than to the pricing
+# page, and said so on every estimate that uses it. The two sources agree in
+# kind: the footnote's "per second of 720p video" only makes sense if the
+# token count moves with resolution.
+_OMNI_360P_COST_DIVISOR = 3.0
+
+
+def _omni_usd_per_second(tokens_per_second: float) -> float:
+    """USD per second of omni output video at a given token rate.
+
+    Derived rather than hard-coded so the per-second and per-token paths can
+    never disagree.
+    """
+    return tokens_per_second * _OMNI_VIDEO_USD_PER_MTOK / _TOKENS_PER_MILLION
+
+
+# Why 1080p and 4K bill at the 720p rate here: both are documented as
+# *upscaled* from the base render, and Google publishes no second token rate
+# for them. Applying the one published figure is the only honest arithmetic
+# available; the estimate says outright that an upscaled render may meter
+# differently, so nobody reads the number as a confirmed tier.
+_OMNI_1_1_UPSCALE_NOTE = (
+    "1080p and 4K are upscaled from the base render and Google publishes no "
+    "separate token rate for them, so this prices them at the published 720p "
+    "rate ({tokens:,} tokens/s). Treat it as the best published figure, not a "
+    "confirmed tier."
+).format(tokens=_OMNI_VIDEO_TOKENS_PER_SECOND)
+
+_OMNI_1_1_360P_NOTE = (
+    "360p is priced at one third of the published 720p token rate. That ratio "
+    "comes from Google's launch post ("
+    + _SRC_OMNI_1_1_LAUNCH
+    + "), not from the pricing page, which publishes only the 720p rate — so "
+    "this figure is the vendor's stated ratio rather than a metered one. The "
+    "real run bills the video output tokens the response reports."
+)
+
 _VIDEO_PRICING: dict[str, VideoModelPricing] = {
     "veo-3.1-generate-001": VideoModelPricing(
         usd_per_second_by_resolution={"720p": 0.40, "1080p": 0.40, "4K": 0.60},
@@ -329,15 +400,13 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
         # Derived rather than hard-coded so the per-second and per-token
         # paths can never disagree.
         usd_per_second_by_resolution={
-            "720p": _OMNI_VIDEO_TOKENS_PER_SECOND
-            * _OMNI_VIDEO_USD_PER_MTOK
-            / _TOKENS_PER_MILLION
+            "720p": _omni_usd_per_second(_OMNI_VIDEO_TOKENS_PER_SECOND)
         },
         audio_included=True,
         output_video_usd_per_mtok=_OMNI_VIDEO_USD_PER_MTOK,
         tokens_per_second=_OMNI_VIDEO_TOKENS_PER_SECOND,
-        output_text_usd_per_mtok=9.00,
-        input_usd_per_mtok=1.50,
+        output_text_usd_per_mtok=_OMNI_OUTPUT_TEXT_USD_PER_MTOK,
+        input_usd_per_mtok=_OMNI_INPUT_USD_PER_MTOK,
         # Omni always renders 720p (see src/omni.py), so any other request is
         # still billed at the 720p rate.
         fixed_resolution="720p",
@@ -350,6 +419,41 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
             "Rates confirmed on the Gemini Developer API pricing page. Neither "
             "page states how omni's token rates apply on the other backend, so "
             "no cross-backend equivalence is claimed."
+        ),
+    ),
+    OMNI_1_1_MODEL: VideoModelPricing(
+        # Same published row as the preview model — input $1.50, text $9.00,
+        # video $17.50 per 1M tokens, 5,792 tokens per second of 720p — but
+        # 1.1 has a real resolution parameter, so the table carries one rate
+        # per resolution instead of a single fixed one. See the notes above
+        # for which of these four figures Google actually printed.
+        usd_per_second_by_resolution={
+            "360p": _omni_usd_per_second(
+                _OMNI_VIDEO_TOKENS_PER_SECOND / _OMNI_360P_COST_DIVISOR
+            ),
+            "720p": _omni_usd_per_second(_OMNI_VIDEO_TOKENS_PER_SECOND),
+            "1080p": _omni_usd_per_second(_OMNI_VIDEO_TOKENS_PER_SECOND),
+            "4K": _omni_usd_per_second(_OMNI_VIDEO_TOKENS_PER_SECOND),
+        },
+        audio_included=True,
+        output_video_usd_per_mtok=_OMNI_VIDEO_USD_PER_MTOK,
+        tokens_per_second=_OMNI_VIDEO_TOKENS_PER_SECOND,
+        output_text_usd_per_mtok=_OMNI_OUTPUT_TEXT_USD_PER_MTOK,
+        input_usd_per_mtok=_OMNI_INPUT_USD_PER_MTOK,
+        # Deliberately unset: unlike the preview model, 1.1 renders what it is
+        # asked for, so there is no substitution to disclose.
+        fixed_resolution=None,
+        resolution_notes={
+            "360p": _OMNI_1_1_360P_NOTE,
+            "1080p": _OMNI_1_1_UPSCALE_NOTE,
+            "4K": _OMNI_1_1_UPSCALE_NOTE,
+        },
+        source=_SRC_GEMINI_API,
+        source_note=(
+            "Rates confirmed on the Gemini Developer API pricing page, which "
+            "lists gemini-omni-1.1-flash at the same token rates as the "
+            "preview model. Neither page states how omni's token rates apply "
+            "on the other backend, so no cross-backend equivalence is claimed."
         ),
     ),
 }
@@ -369,7 +473,7 @@ _VEO_ALLOWED_DURATIONS = (4, 6, 8)
 _VEO_REFERENCE_DURATION = 8  # reference_to_video is 8s only
 _VEO_EXTEND_DURATION = 7  # extend_video outputs exactly 7s
 
-# Omni clamps to [3, 10]s (src/omni.py).
+# Omni clamps to [3, 10]s (src/omni.py) — both models.
 _OMNI_MIN_DURATION = 3
 _OMNI_MAX_DURATION = 10
 
@@ -389,6 +493,8 @@ _IMAGE_SIZE_ALIASES: dict[str, str] = {
 # Resolution spellings seen across src/video.py ("4K"), the Veo docs ("4k")
 # and casual callers.
 _RESOLUTION_ALIASES: dict[str, str] = {
+    # 360p arrived with gemini-omni-1.1-flash's draft tier.
+    "360P": "360p",
     "720P": "720p",
     "1080P": "1080p",
     "4K": "4K",
@@ -464,13 +570,13 @@ def quote_duration_for(model: str, duration_seconds: float) -> float:
     the rendered file and needs no allowance.
 
     Args:
-        model: Model the quote is for; only Omni carries an allowance.
+        model: Model the quote is for; only the Omni models carry one.
         duration_seconds: Nominal duration being quoted.
 
     Returns:
         The duration to price, at or above ``duration_seconds``.
     """
-    if resolve_model_id(model) == OMNI_MODEL:
+    if is_omni_model(resolve_model_id(model)):
         return duration_seconds + OMNI_ENCODER_ALLOWANCE_SECONDS
     return duration_seconds
 
@@ -499,7 +605,7 @@ def snap_video_duration(
     """
     model_id = resolve_model_id(model)
 
-    if model_id == OMNI_MODEL:
+    if is_omni_model(model_id):
         # src/omni.py rounds then clamps into the documented range.
         clamped = round(duration_seconds)
         return max(_OMNI_MIN_DURATION, min(_OMNI_MAX_DURATION, clamped))
@@ -619,7 +725,8 @@ def estimate_video_cost(
     Args:
         model: Veo or Omni model ID; per-backend Veo spellings both work.
         duration_seconds: Requested duration; snapped before pricing.
-        resolution: "720p", "1080p" or "4K" (case-insensitive).
+        resolution: "360p" (gemini-omni-1.1-flash only), "720p", "1080p" or
+            "4K" (case-insensitive).
         include_audio: Kept for interface symmetry and reporting. Veo 3.1 and
             Omni publish a single rate that already includes audio, so this
             does not change the price — only the detail string, so a caller
@@ -703,6 +810,16 @@ def _build_video_estimate(
         detail += "; audio disabled but the published rate bundles audio, so "
         detail += "there is no discount"
 
+    # A rate that is not the one Google printed says so on the figure itself,
+    # not only in the module's comments — this string is what a caller sees
+    # next to the money.
+    resolution_note = pricing.resolution_notes.get(effective_resolution)
+    source_note = pricing.source_note
+    if resolution_note:
+        source_note = (
+            f"{source_note} {resolution_note}" if source_note else resolution_note
+        )
+
     return CostEstimate(
         usd=usd,
         is_estimate=is_estimate,
@@ -714,7 +831,7 @@ def _build_video_estimate(
             "video_usd": usd,
         },
         source=pricing.source,
-        source_note=pricing.source_note,
+        source_note=source_note,
     )
 
 
@@ -961,7 +1078,7 @@ def actual_video_cost(
         include_audio: Whether audio was generated; reporting only, since the
             published rate bundles audio.
         usage_metadata: Optional usage object/dict. Used when the model bills
-            per token (``gemini-omni-flash-preview``).
+            per token (both Omni models do; Veo does not).
         snap_duration: Set True to snap ``duration_seconds`` to what the model
             would really render — only useful if the caller has a *requested*
             rather than an effective duration.
@@ -1275,7 +1392,7 @@ def known_models() -> tuple[str, ...]:
         *get_args(RetiredImageModel),
         *get_args(VideoModel),
         *_GEMINI_API_MODEL_IDS.values(),
-        OMNI_MODEL,
+        *OMNI_MODELS,
     }
     return tuple(sorted(models))
 
@@ -1334,8 +1451,35 @@ def describe_model_pricing(model: str) -> dict[str, Any] | None:
             "usd_per_second": dict(video.usd_per_second_by_resolution),
             "audio_included_in_price": video.audio_included,
             "output_video_usd_per_mtok": video.output_video_usd_per_mtok,
+            # The published scalar is the 720p figure. Emitting it beside
+            # per-resolution dollar rates derived from a different token count
+            # let a caller multiply it out and get 3x what the same dict's own
+            # 360p rate says, so the per-resolution counts are published too
+            # and the two can be reconciled.
             "tokens_per_second": video.tokens_per_second,
+            **(
+                {
+                    "tokens_per_second_by_resolution": {
+                        resolution: usd
+                        * _TOKENS_PER_MILLION
+                        / video.output_video_usd_per_mtok
+                        for resolution, usd in sorted(
+                            video.usd_per_second_by_resolution.items()
+                        )
+                    }
+                }
+                if video.tokens_per_second is not None
+                and video.output_video_usd_per_mtok
+                else {}
+            ),
             "fixed_resolution": video.fixed_resolution,
+            # Only present when some resolution's figure needs a sentence:
+            # an empty dict would read as "all four rates are published".
+            **(
+                {"resolution_notes": dict(video.resolution_notes)}
+                if video.resolution_notes
+                else {}
+            ),
         }
 
     return None

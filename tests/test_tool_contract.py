@@ -818,7 +818,9 @@ async def test_an_input_video_edit_bills_the_upper_bound_when_unmeasurable(
 
     monkeypatch.setattr(main_mod, "generate_video_omni_impl", fake_impl)
     monkeypatch.setattr(
-        main_mod, "_client_for_omni", lambda app_ctx, need_gcs=False: MagicMock()
+        main_mod,
+        "_client_for_omni",
+        lambda app_ctx, need_gcs=False, prefer_backend=None: MagicMock(),
     )
     app_ctx = _make_ctx(tmp_path).request_context.lifespan_context
 

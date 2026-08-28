@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.omni import OMNI_MODEL
+from src.omni import OMNI_MODELS
 from src.routing import (
     MAX_CLIP_BEATS,
     RoutedCall,
@@ -282,14 +282,22 @@ async def test_the_edit_route_quotes_the_same_upper_bound_as_the_tool(
     top = plan.recommended
     assert top is not None
     assert top.tool == "edit_video"
-    assert top.model == OMNI_MODEL
+    # Conversational editing is omni-only; which omni model wins is a ranking
+    # decision, but the emitted params must name the same one the route was
+    # priced for, or the caller's call and the plan's quote describe
+    # different renders.
+    assert top.model in OMNI_MODELS
+    assert top.params["omni_model"] == top.model
     assert top.cost is not None
     assert top.cost.usd == pytest.approx(
         await _tool_quote(top, tmp_path), abs=_PAYLOAD_ROUNDING_USD
     )
     # The route still shows the (unsent) duration, so the quote's basis has
-    # to be stated or the two numbers look like a contradiction.
-    assert any("10s maximum" in caveat for caveat in top.caveats)
+    # to be stated or the two numbers look like a contradiction — including
+    # the one case where the tool quotes HIGHER than the planner, an already-
+    # extended source whose length only the tool can read.
+    assert any("per-render maximum" in caveat for caveat in top.caveats)
+    assert any("quotes higher" in caveat for caveat in top.caveats)
 
 
 _INVARIANT_INTENTS: list[tuple[str, RoutingConstraints | None]] = [

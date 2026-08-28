@@ -627,16 +627,27 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     except Exception:  # pragma: no cover - SDK internals moved
         pytest.skip("google-genai request normalizer not importable at this path")
 
-    from src.omni import _build_create_kwargs
+    from src.omni import (
+        OMNI_1_1_MODEL,
+        OMNI_PREVIEW_MODEL,
+        _build_create_kwargs,
+        _image_part,
+        _inline_video_part,
+    )
+
+    png = b"\x89PNG\r\n\x1a\nrest"
 
     # Variant 1: create task (fresh generation with a reference image + GCS).
     body = _build_create_kwargs(
+        model=OMNI_PREVIEW_MODEL,
         prompt="a marble rolling",
-        image_bytes_list=[b"\x89PNG\r\n\x1a\nrest"],
-        input_video_bytes=None,
+        image_parts=[_image_part(png)],
+        video_parts=[],
         previous_interaction_id=None,
+        task_type="image_to_video",
         aspect_ratio="9:16",
         duration_seconds_int=6,
+        resolution=None,
         output_gcs_uri="gs://bucket/out/",
     )
     # Every key we send is a recognized create-body field (else create() 400s
@@ -648,7 +659,7 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     assert isinstance(out["response_format"], list)
     assert out["response_format"][0]["duration"] == "6s"
     assert out["response_format"][0]["gcs_uri"] == "gs://bucket/out/"
-    # The flat content list is wrapped into a single user_input step.
+    # The preview model keeps the verified text-first ordering.
     assert out["input"][0]["type"] == "user_input"
     kinds = [p["type"] for p in out["input"][0]["content"]]
     assert kinds == ["text", "image"]
@@ -656,12 +667,15 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     # Variant 2: conversational edit turn — no generation_config (conflicts
     # with previous_interaction_id) and no duration/aspect (inherited).
     edit_body = _build_create_kwargs(
+        model=OMNI_PREVIEW_MODEL,
         prompt="make the sky stormy",
-        image_bytes_list=None,
-        input_video_bytes=None,
+        image_parts=[],
+        video_parts=[],
         previous_interaction_id="int-1",
+        task_type="edit",
         aspect_ratio="16:9",
         duration_seconds_int=6,
+        resolution=None,
         output_gcs_uri=None,
     )
     assert set(edit_body) <= _CREATE_BODY_KEYS
@@ -669,3 +683,52 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     assert "generation_config" not in edit_out
     assert edit_out["previous_interaction_id"] == "int-1"
     assert edit_out["response_format"] == [{"type": "video"}]
+
+    # Variant 3: gemini-omni-1.1-flash keyframe interpolation at 4K. The
+    # resolution must survive the SDK's typed response_format (older SDKs
+    # silently drop it), the API spelling is lowercase "4k", and the media
+    # parts lead the prompt the way every 1.1 example shows.
+    keyframe_body = _build_create_kwargs(
+        model=OMNI_1_1_MODEL,
+        prompt="[# Sources <FIRST_FRAME>@Image1 <LAST_FRAME>@Image2] sunrise to dusk",
+        image_parts=[_image_part(png), _image_part(png)],
+        video_parts=[],
+        previous_interaction_id=None,
+        # Interpolation maps to no documented task, so none is sent.
+        task_type=None,
+        aspect_ratio="16:9",
+        duration_seconds_int=8,
+        resolution="4K",
+        output_gcs_uri=None,
+        media_before_text=True,
+    )
+    assert set(keyframe_body) <= _CREATE_BODY_KEYS
+    keyframe_out = _normalize_create_body(dict(keyframe_body))
+    assert "generation_config" not in keyframe_out
+    assert keyframe_out["response_format"][0]["resolution"] == "4k"
+    assert keyframe_out["response_format"][0]["duration"] == "8s"
+    assert [p["type"] for p in keyframe_out["input"][0]["content"]] == [
+        "image",
+        "image",
+        "text",
+    ]
+
+    # Variant 4: an uploaded-video extension. The task travels, and the
+    # continuation carries neither duration nor aspect ratio.
+    extend_body = _build_create_kwargs(
+        model=OMNI_1_1_MODEL,
+        prompt="Continue the scene.",
+        image_parts=[],
+        video_parts=[_inline_video_part(b"\x00\x00\x00\x18ftypmp42" + b"x" * 16)],
+        previous_interaction_id=None,
+        task_type="extend",
+        aspect_ratio="16:9",
+        duration_seconds_int=6,
+        resolution="360p",
+        output_gcs_uri=None,
+        media_before_text=True,
+    )
+    assert set(extend_body) <= _CREATE_BODY_KEYS
+    extend_out = _normalize_create_body(dict(extend_body))
+    assert extend_out["generation_config"]["video_config"]["task"] == "extend"
+    assert extend_out["response_format"] == [{"type": "video", "resolution": "360p"}]

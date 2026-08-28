@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from src.image import _MODEL_SHUTDOWNS
-from src.omni import OMNI_MODEL
+from src.omni import OMNI_1_1_MODEL, OMNI_MODEL, OMNI_PREVIEW_MODEL
 from src.pricing import (
     _IMAGE_PRICING,
     _VIDEO_PRICING,
@@ -92,7 +92,15 @@ def test_pricing_as_of_is_an_iso_date() -> None:
 def test_every_source_is_an_official_google_url() -> None:
     for url in PRICING_SOURCES.values():
         assert url.startswith("https://")
-        assert "google.dev" in url or "cloud.google.com" in url
+        # blog.google carries the Omni 1.1 launch post, the only Google source
+        # that states the 360p tier's ratio to 720p. Still first-party, so it
+        # belongs here — the point of the check is that no rate is sourced to
+        # a third-party summary.
+        assert (
+            "google.dev" in url
+            or "cloud.google.com" in url
+            or url.startswith("https://blog.google/")
+        )
 
     for pricing in (*_IMAGE_PRICING.values(), *_VIDEO_PRICING.values()):
         assert pricing.source in PRICING_SOURCES.values()
@@ -127,7 +135,8 @@ def test_known_models_includes_current_retired_and_video_ids() -> None:
     assert "veo-3.1-generate-001" in models
     # Gemini-API Veo spelling, which generate_video reports back to callers.
     assert "veo-3.1-generate-preview" in models
-    assert OMNI_MODEL in models
+    assert OMNI_PREVIEW_MODEL in models
+    assert OMNI_1_1_MODEL in models
 
 
 def test_priced_models_are_the_canonical_ids_only() -> None:
@@ -135,7 +144,8 @@ def test_priced_models_are_the_canonical_ids_only() -> None:
         "gemini-3-pro-image",
         "gemini-3.1-flash-image",
         "gemini-3.1-flash-lite-image",
-        OMNI_MODEL,
+        OMNI_1_1_MODEL,
+        OMNI_PREVIEW_MODEL,
         "veo-3.1-fast-generate-001",
         "veo-3.1-generate-001",
         "veo-3.1-lite-generate-preview",
