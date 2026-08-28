@@ -451,10 +451,14 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
         },
         source=_SRC_GEMINI_API,
         source_note=(
-            "Rates confirmed on the Gemini Developer API pricing page, which "
-            "lists gemini-omni-1.1-flash at the same token rates as the "
-            "preview model. Neither page states how omni's token rates apply "
-            "on the other backend, so no cross-backend equivalence is claimed."
+            "Rates re-read on 2026-08-28, after the 2026-08-27 GA release, on "
+            "the Gemini Developer API pricing page: gemini-omni-1.1-flash "
+            "carries the same published token rates as the preview model "
+            "($1.50 input, $9.00 text output, $17.50 video output per 1M "
+            "tokens, 5,792 tokens per second of 720p). PRICING_AS_OF predates "
+            "GA and covers the rest of the table, not this row. Neither page "
+            "states how omni's token rates apply on the other backend, so no "
+            "cross-backend equivalence is claimed."
         ),
     ),
 }

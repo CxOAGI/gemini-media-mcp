@@ -36,7 +36,7 @@ from .image import generate_image as generate_image_impl
 from .omni import (
     OMNI_1_1_MODEL,
     OMNI_MAX_DURATION_SECONDS,
-    OMNI_MODEL,
+    DEFAULT_OMNI_MODEL,
     OMNI_MODELS,
     is_omni_model,
     normalize_omni_resolution,
@@ -377,7 +377,7 @@ async def _omni_generate_and_manifest(
     ctx: Context[ServerSession, AppContext],
     *,
     prompt: str,
-    model: str = OMNI_MODEL,
+    model: str = DEFAULT_OMNI_MODEL,
     image_bytes_list: list[bytes] | None = None,
     first_frame_bytes: bytes | None = None,
     last_frame_bytes: bytes | None = None,
@@ -795,7 +795,7 @@ def _omni_preview_model(resolution: str | None) -> tuple[str, str | None]:
     costs" into a real saving on a 20-beat reel.
     """
     if resolution is None:
-        return OMNI_MODEL, None
+        return DEFAULT_OMNI_MODEL, None
     spec = _validate_omni_model(OMNI_1_1_MODEL)
     return OMNI_1_1_MODEL, _validate_omni_resolution(spec, resolution)
 
@@ -4414,7 +4414,7 @@ async def generate_clip(
 async def generate_video_omni(
     ctx: Context[ServerSession, AppContext],
     prompt: str,
-    omni_model: str = OMNI_MODEL,
+    omni_model: str = DEFAULT_OMNI_MODEL,
     image_uris: list[str] | None = None,
     first_frame_uri: str | None = None,
     last_frame_uri: str | None = None,
@@ -4724,7 +4724,7 @@ async def edit_video(
     ctx: Context[ServerSession, AppContext],
     previous_interaction_id: str,
     prompt: str,
-    omni_model: str = OMNI_MODEL,
+    omni_model: str = DEFAULT_OMNI_MODEL,
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
     resolution: str | None = None,

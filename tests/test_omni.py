@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from src.omni import OMNI_MODEL, generate_video_omni
+from src.omni import OMNI_MODEL, OMNI_PREVIEW_MODEL, generate_video_omni
 
 # ============================================================================
 # Test Doubles
@@ -140,6 +140,7 @@ async def test_inline_video_written_and_request_shape(tmp_path: Path) -> None:
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="a marble rolling",
         videos_dir=videos_dir,
         aspect_ratio="9:16",
@@ -177,6 +178,7 @@ async def test_images_become_input_parts_and_task_types(tmp_path: Path) -> None:
     client = FakeGenaiClient(interactions=interactions)
     await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
         image_bytes_list=[png],
@@ -193,6 +195,7 @@ async def test_images_become_input_parts_and_task_types(tmp_path: Path) -> None:
     client2 = FakeGenaiClient(interactions=interactions2)
     await generate_video_omni(
         client=client2,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
         image_bytes_list=[png, jpg],
@@ -216,6 +219,7 @@ async def test_input_video_inlined_and_edit_task(tmp_path: Path) -> None:
     mp4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
     await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="edit this",
         videos_dir=videos_dir,
         input_video_bytes=mp4,
@@ -242,6 +246,7 @@ async def test_previous_interaction_id_forwarded(tmp_path: Path) -> None:
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="make it stormy",
         videos_dir=videos_dir,
         previous_interaction_id="int-1",
@@ -292,6 +297,7 @@ async def test_background_polling_until_completed(
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
     )
@@ -314,6 +320,7 @@ async def test_terminal_status_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="status 'failed'"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
+            model=OMNI_PREVIEW_MODEL,
             prompt="p",
             videos_dir=videos_dir,
         )
@@ -345,6 +352,7 @@ async def test_polling_timeout_raises(
     with pytest.raises(TimeoutError, match="timed out"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
+            model=OMNI_PREVIEW_MODEL,
             prompt="p",
             videos_dir=videos_dir,
             timeout_seconds=0,
@@ -377,6 +385,7 @@ async def test_steps_fallback_when_no_output_video(tmp_path: Path) -> None:
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
     )
@@ -399,6 +408,7 @@ async def test_uri_delivery_downloads_via_files(tmp_path: Path) -> None:
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
     )
@@ -417,6 +427,7 @@ async def test_no_video_anywhere_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="no inline video data and no file URI"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
+            model=OMNI_PREVIEW_MODEL,
             prompt="p",
             videos_dir=videos_dir,
         )
@@ -437,6 +448,7 @@ async def test_invalid_aspect_ratio_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Unsupported aspect_ratio"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
+            model=OMNI_PREVIEW_MODEL,
             prompt="p",
             videos_dir=videos_dir,
             aspect_ratio="1:1",
@@ -454,6 +466,7 @@ async def test_duration_sent_as_seconds_string(tmp_path: Path) -> None:
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
         duration_seconds=8.0,
@@ -475,6 +488,7 @@ async def test_duration_clamped_with_warning(tmp_path: Path) -> None:
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
         duration_seconds=15.0,
@@ -509,6 +523,7 @@ async def test_gcs_delivery_sets_format_and_passes_uri_through(tmp_path: Path) -
 
     result = await generate_video_omni(
         client=client,  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
         output_gcs_uri="gs://out/",
@@ -601,6 +616,7 @@ async def test_unknown_image_input_raises_in_generate(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Unrecognized image"):
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
+            model=OMNI_PREVIEW_MODEL,
             prompt="p",
             videos_dir=videos_dir,
             image_bytes_list=[b"bogus-bytes"],

@@ -497,6 +497,7 @@ async def test_a_resolution_on_the_preview_model_is_an_error_not_a_720p_render(
         await generate_video_omni(
             ctx=_ctx(tmp_path),
             prompt="a robot",
+            omni_model=OMNI_PREVIEW_MODEL,
             resolution="4K",
             dry_run=True,
         )
@@ -1029,8 +1030,10 @@ def test_a_declared_reference_is_never_demoted_to_a_first_frame() -> None:
     assert task(reference_image_count=2) == "reference_to_video"
     assert task(reference_video_count=1) == "reference_to_video"
     assert task(has_first_frame=True) == "image_to_video"
-    # Mixed and interpolated roles still map to no documented task.
-    assert task(has_first_frame=True, has_last_frame=True) is None
+    # Interpolation has a documented task after all — the GA release note
+    # names image_to_video for "up to 2 images". Genuinely mixed roles still
+    # map to none.
+    assert task(has_first_frame=True, has_last_frame=True) == "image_to_video"
     assert task(has_first_frame=True, reference_image_count=1) is None
     # The inferred-role path the preview model uses is untouched.
     assert task(inferred_image_count=0) == "text_to_video"
@@ -1892,13 +1895,15 @@ async def test_a_fresh_1_1_render_carries_no_duration_caveat(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_naming_a_draft_resolution_selects_the_model_that_has_one(
+async def test_a_draft_resolution_changes_what_the_draft_costs(
     tmp_path: Path,
 ) -> None:
     """generate_video(draft=True) was locked to the preview model's 720p.
 
     So the cheapest render this server can issue was unreachable from the
-    draft shortcut — the one place a caller most wants it.
+    draft shortcut — the one place a caller most wants it. The default omni
+    model has resolutions now, so this is no longer about which model runs;
+    it is about 360p being a third of the bill.
     """
     from src.__main__ import generate_video
 
@@ -1921,7 +1926,7 @@ async def test_naming_a_draft_resolution_selects_the_model_that_has_one(
             dry_run=True,
         )
     )
-    assert at_720["model"] == OMNI_PREVIEW_MODEL
+    assert at_720["model"] == OMNI_1_1_MODEL
     assert at_720["resolution"] == "720p"
     assert at_360["model"] == OMNI_1_1_MODEL
     assert at_360["resolution"] == "360p"
@@ -1957,7 +1962,7 @@ async def test_an_animatic_can_preview_the_whole_reel_at_360p(
             dry_run=True,
         )
     )
-    assert at_720["model"] == OMNI_PREVIEW_MODEL
+    assert at_720["model"] == OMNI_1_1_MODEL
     assert at_360["model"] == OMNI_1_1_MODEL
     assert at_360["estimated_cost"]["usd"] == pytest.approx(
         at_720["estimated_cost"]["usd"] / 3.0, abs=1e-6
@@ -2033,3 +2038,110 @@ async def test_the_animatic_resolution_reaches_the_beat_renders(
     # And the segment records what rendered, so the clip total prices 360p.
     segment = payload["segments"][0]
     assert segment["resolution"] == "360p"
+
+
+# ============================================================================
+# The GA release notes (2026-08-27)
+# ============================================================================
+
+
+def test_resolution_stays_in_response_format_despite_the_release_note() -> None:
+    """The note calls it a "new `resolution` parameter in `video_config`".
+
+    Three generated or executable sources disagree, and they win: the task
+    guide's runnable sample, the Interactions API reference schema, and
+    google-genai's own types — where VideoConfig has exactly one field and
+    VideoResponseFormat is the one carrying `resolution`. Moving it would put
+    the field somewhere the SDK drops on serialization, which is the silent
+    720p-render/4K-bill failure this module exists to prevent.
+    """
+    from google.genai._gaos.types.interactions.videoconfig import (  # pyright: ignore[reportMissingImports]
+        VideoConfig,
+    )
+    from google.genai._gaos.types.interactions.videoresponseformat import (  # pyright: ignore[reportMissingImports]
+        VideoResponseFormat,
+    )
+
+    assert set(VideoConfig.model_fields) == {"task"}
+    assert "resolution" in VideoResponseFormat.model_fields
+
+
+def test_interpolation_uses_the_task_the_release_note_names() -> None:
+    """ "Generate a video transitioning between two images using the
+    image_to_video task with up to 2 images." The task guide describes
+    interpolation without naming a task, which is why this was sending none.
+    """
+    from src.omni import _select_task_type  # pyright: ignore[reportPrivateUsage]
+
+    assert (
+        _select_task_type(
+            previous_interaction_id=None,
+            input_video_bytes=None,
+            has_first_frame=True,
+            has_last_frame=True,
+        )
+        == "image_to_video"
+    )
+
+
+def test_the_deprecated_model_says_when_it_stops() -> None:
+    """A caller who reads a warning has time to move.
+
+    gemini-omni-flash-preview is switched off on 2026-09-30, so it can no
+    longer be the silent default and cannot be pinned without being told.
+    """
+    from src.omni import (
+        DEFAULT_OMNI_MODEL,
+        OMNI_PREVIEW_SUNSET,
+    )
+
+    assert DEFAULT_OMNI_MODEL == OMNI_1_1_MODEL, "the default must be the GA model"
+    assert OMNI_PREVIEW_SUNSET == "2026-09-30"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_pinning_the_deprecated_model_warns_with_its_end_date(
+    tmp_path: Path,
+) -> None:
+    import src.omni as omni
+
+    client = MagicMock()
+    client._api_client.vertexai = False
+    client.interactions.create.return_value = {
+        "id": "i-1",
+        "status": "completed",
+        "steps": [
+            {"content": [{"type": "video", "mime_type": "video/mp4", "data": "AAAA"}]}
+        ],
+    }
+
+    result = await omni.generate_video_omni(
+        client=client,
+        prompt="a robot",
+        videos_dir=tmp_path,
+        model=OMNI_PREVIEW_MODEL,
+    )
+    warnings = result.get("warnings") or []
+    assert any("2026-09-30" in w for w in warnings), warnings
+    assert any(OMNI_1_1_MODEL in w for w in warnings), warnings
+    # And the GA model carries no such warning.
+    fresh = await omni.generate_video_omni(
+        client=client, prompt="a robot", videos_dir=tmp_path, model=OMNI_1_1_MODEL
+    )
+    assert not any("deprecated" in w for w in fresh.get("warnings") or [])
+
+
+def test_an_extension_turn_is_quoted_at_the_documented_increment() -> None:
+    """The launch post says 10-second increments; the reference says 3-10s.
+
+    They differ by 2x in the direction a pre-flight may not err, so a request
+    for a shorter turn is still quoted at the increment.
+    """
+    from src.omni import omni_extension_output_lengths
+
+    spec = omni_spec(OMNI_1_1_MODEL)
+    assert omni_extension_output_lengths(spec, 10.0, 3, 5.0) == [10.0, 10.0, 10.0]
+    assert omni_extension_output_lengths(spec, 10.0, 3) == [10.0, 10.0, 10.0]
+    # The cumulative ceiling still clamps the last turn.
+    assert omni_extension_output_lengths(spec, 35.0, 4) == [5.0]
