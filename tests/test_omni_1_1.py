@@ -546,17 +546,16 @@ async def test_extend_needs_exactly_one_source(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_extend_quotes_each_turn_at_the_footage_it_appends(
+async def test_extend_quotes_each_turn_at_the_assembled_clip(
     tmp_path: Path,
 ) -> None:
-    """A turn renders the continuation, not the assembled clip.
+    """A turn renders the ASSEMBLED clip, so every turn re-bills the rest.
 
-    Two Google sources settle it: the Interactions API reference gives
-    `duration` — "the length of the generated video files" — a 3-10s range and
-    Vertex's extend request sends it alongside `"task": "extend"`; and the
-    documented sample response for an omni extension bills 28,832 video output
-    tokens, which is 4.98s at the published 5,792 tokens/s. An earlier reading
-    had this growing with the clip and over-quoted a chain up to 4x.
+    MEASURED: a 3.01s source extended once returned 13.01s. Two documentary
+    readings said otherwise — `duration` is "the length of the generated video
+    files" (3-10s), and Vertex's sample response bills 28,832 video tokens,
+    i.e. 4.98s — and neither survived a real render. Quoting the increment
+    under-billed a 2-turn chain 36s against a 20s quote.
     """
     from src.__main__ import extend_video_omni
     from src.pricing import estimate_video_cost
@@ -571,9 +570,11 @@ async def test_extend_quotes_each_turn_at_the_footage_it_appends(
         )
     )
     assert payload["times"] == 3
-    # Each turn appends its own duration; nothing grows.
-    assert payload["turn_output_seconds"] == [10.0, 10.0, 10.0]
-    assert payload["appended_seconds"] == 30.0
+    # Source unknown here, so the documented 10s maximum is assumed: the turns
+    # render 20s, 30s and 40s of assembled clip.
+    assert payload["turn_output_seconds"] == [20.0, 30.0, 40.0]
+    assert payload["billed_seconds"] == 90.0
+    assert payload["assembled_seconds"] == 40.0
     assert payload["cumulative_cap_seconds"] == 40
 
     # Priced at the published 720p rate, per turn, each carrying the one-frame
@@ -587,9 +588,11 @@ async def test_extend_quotes_each_turn_at_the_footage_it_appends(
     assert probe is not None
     rate = probe.breakdown["usd_per_second"]
     assert payload["estimated_cost"]["usd"] == pytest.approx(
-        sum((n + OMNI_ENCODER_ALLOWANCE_SECONDS) * rate for n in (10, 10, 10)),
+        sum((n + OMNI_ENCODER_ALLOWANCE_SECONDS) * rate for n in (20, 30, 40)),
         abs=1e-6,
     )
+    # The increment-only quote this replaced would have been ~3x under.
+    assert payload["estimated_cost"]["usd"] > 3 * 10 * rate * 2.5
 
 
 @pytest.mark.asyncio
@@ -627,9 +630,10 @@ async def test_a_measured_source_bounds_how_many_turns_fit(
         )
     )
     assert payload["source_duration_seconds"] == 35.0
-    # 35s + 5s reaches the 40s ceiling; the other three turns have no room.
-    assert payload["turn_output_seconds"] == [5.0]
+    # 35s + 10s clamps at the 40s ceiling; the other three turns have no room.
+    assert payload["turn_output_seconds"] == [40.0]
     assert payload["planned_turns"] == 1
+    assert payload["assembled_seconds"] == 40.0
     assert payload["appended_seconds"] == 5.0
 
 
@@ -728,9 +732,9 @@ async def test_extend_chains_each_turn_into_the_next(
     # every turn after the first was recorded as an edit of a chain the caller
     # had asked to extend.
     assert all(call["task"] == "extend" for call in calls)
-    # Both turns pass the requested per-turn duration; the impl sends it only
-    # where the API accepts it (an uploaded extension, not a multi-turn one).
-    assert all(call["duration_seconds"] == 10.0 for call in calls)
+    # No turn carries a duration: the service rejects it on an extend request
+    # and the increment is fixed, so there is nothing to send.
+    assert all(call["duration_seconds"] is None for call in calls)
     assert payload["interaction_id"] == "i-2"
     assert len(payload["segments"]) == 2
 
@@ -1206,17 +1210,18 @@ async def test_a_mid_chain_failure_keeps_the_turns_already_billed(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_the_chain_reports_the_footage_it_appended(
+async def test_the_chain_separates_billed_assembled_and_appended(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each turn returns the segment it appends, so the totals sum.
+    """Three different numbers, because a turn renders the assembled clip.
 
-    What it must NOT claim is an assembled clip length: the source is never
-    part of any response, so the server cannot report one.
+    Summing the turns and calling it "appended" overstated a 2-turn chain off
+    a 3s source as 36s of new footage when it made 20s — and 36s is the BILL,
+    which is the number that has to be right.
     """
     from src.__main__ import extend_video_omni
 
-    lengths = iter([10.0, 10.0])
+    lengths = iter([13.0, 23.0])
 
     async def mock_impl(**kwargs: Any) -> dict[str, Any]:
         out = tmp_path / "videos" / f"{next(iter(['a']))}.mp4"
@@ -1243,9 +1248,10 @@ async def test_the_chain_reports_the_footage_it_appended(
             times=2,
         )
     )
-    assert payload["appended_seconds"] == 20.0
-    assert "final_duration_seconds" not in payload
+    assert payload["billed_seconds"] == 36.0
+    assert payload["assembled_seconds"] == 23.0
     assert payload["completed_turns"] == 2
+    assert "final_duration_seconds" not in payload
 
 
 @pytest.mark.asyncio
@@ -1516,11 +1522,11 @@ def test_an_unmeasurable_extension_is_bounded_by_what_it_can_render() -> None:
     one_one = omni_spec(OMNI_1_1_MODEL)
     preview = omni_spec(OMNI_PREVIEW_MODEL)
 
-    # A turn renders the continuation only, so its own output cannot exceed
-    # the per-render maximum however long the source is.
-    assert omni_continuation_upper_bound(one_one, "extend", 10.0) == 10.0
-    assert omni_continuation_upper_bound(one_one, "extend", 35.0) == 10.0
-    assert omni_continuation_upper_bound(one_one, "extend", None) == 10.0
+    # A turn renders the assembled clip, so the bound is source + one
+    # increment, and the documented ceiling when the source is unknown.
+    assert omni_continuation_upper_bound(one_one, "extend", 10.0) == 20.0
+    assert omni_continuation_upper_bound(one_one, "extend", 35.0) == 40.0
+    assert omni_continuation_upper_bound(one_one, "extend", None) == 40.0
     assert omni_continuation_upper_bound(one_one, "edit", 3.0) == 10.0
     assert omni_continuation_upper_bound(one_one, "edit", 30.0) == 30.0
     assert omni_continuation_upper_bound(one_one, "edit", None) == 10.0
@@ -1531,10 +1537,10 @@ def test_an_unmeasurable_extension_is_bounded_by_what_it_can_render() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_an_unmeasurable_extension_bills_one_render(
+async def test_an_unmeasurable_extension_bills_the_assembled_ceiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rule above, reached through the tool: one turn, one continuation."""
+    """The rule above, reached through the tool: not one 10s increment."""
     from src.__main__ import extend_video_omni
 
     async def mock_impl(**kwargs: Any) -> dict[str, Any]:
@@ -1562,7 +1568,7 @@ async def test_an_unmeasurable_extension_bills_one_render(
         )
     )
     segment = payload["segments"][0]
-    assert segment["duration_seconds"] == 10.0
+    assert segment["duration_seconds"] == 40.0
     assert "upper bound" in segment["duration_source"]
 
 
@@ -2132,16 +2138,169 @@ async def test_pinning_the_deprecated_model_warns_with_its_end_date(
     assert not any("deprecated" in w for w in fresh.get("warnings") or [])
 
 
-def test_an_extension_turn_is_quoted_at_the_documented_increment() -> None:
-    """The launch post says 10-second increments; the reference says 3-10s.
+def test_a_chain_grows_from_its_source_and_reproduces_the_measurement() -> None:
+    """The projection has to land on the one figure that was measured.
 
-    They differ by 2x in the direction a pre-flight may not err, so a request
-    for a shorter turn is still quoted at the increment.
+    3.01s source, one turn, 13.01s output. Everything else follows from that:
+    the turns grow, the sum is what is billed, and the ceiling is on the
+    assembled clip rather than on the footage added.
     """
+    from src.omni import (
+        omni_extension_appended_seconds,
+        omni_extension_output_lengths,
+    )
+
+    spec = omni_spec(OMNI_1_1_MODEL)
+    assert omni_extension_output_lengths(spec, 3.01, 1) == [13.01]
+    two = omni_extension_output_lengths(spec, 3.01, 2)
+    assert two == pytest.approx([13.01, 23.01])
+    # The bill for 20s of new footage is 36s of rendered output.
+    assert sum(two) == pytest.approx(36.02)
+    assert omni_extension_appended_seconds(3.01, two) == pytest.approx(20.0)
+    # The ceiling is on the assembled clip, so a long source leaves one turn.
+    assert omni_extension_output_lengths(spec, 35.0, 4) == [40.0]
+    # A per-turn duration is not a thing the service accepts; passing one
+    # cannot change the projection.
+    assert omni_extension_output_lengths(spec, 10.0, 2, 5.0) == [20.0, 30.0]
+
+
+# ============================================================================
+# Live-test findings (measured, 2026-08-28)
+# ============================================================================
+
+
+def test_the_quote_covers_the_measured_bill_for_the_reported_render() -> None:
+    """The exact case that broke the invariant: 3.01s source -> 13.01s output.
+
+    Reported quote $0.3393 against a $0.4396 bill at 360p. The quote priced the
+    10s increment; the service billed the assembled clip.
+    """
+    from src.pricing import actual_video_cost
     from src.omni import omni_extension_output_lengths
 
     spec = omni_spec(OMNI_1_1_MODEL)
-    assert omni_extension_output_lengths(spec, 10.0, 3, 5.0) == [10.0, 10.0, 10.0]
-    assert omni_extension_output_lengths(spec, 10.0, 3) == [10.0, 10.0, 10.0]
-    # The cumulative ceiling still clamps the last turn.
-    assert omni_extension_output_lengths(spec, 35.0, 4) == [5.0]
+    projected = omni_extension_output_lengths(spec, 3.01, 1)
+    assert projected == [13.01]
+
+    billed = actual_video_cost(
+        OMNI_1_1_MODEL, 13.01, "360p", False, snap_duration=False
+    )
+    quoted = actual_video_cost(
+        OMNI_1_1_MODEL, 13.01 + (1.0 / 24), "360p", False, snap_duration=False
+    )
+    assert billed is not None and quoted is not None
+    assert quoted.usd >= billed.usd, "a quote may over-state, never under"
+    # And the figure that was wrong is now unreachable from the projection.
+    assert quoted.usd == pytest.approx(0.4410, abs=5e-4)
+
+
+def test_the_snapping_price_path_no_longer_clamps_an_extension() -> None:
+    """estimate_video_cost clamps omni to [3, 10] — right for a fresh render.
+
+    An extension's output legitimately exceeds it, and clamping there reported
+    $0.3393 for a render that billed $0.4396: a silent 30% under-quote on the
+    one path that runs past the range.
+    """
+    from src.pricing import actual_video_cost, estimate_video_cost
+
+    metered = actual_video_cost(
+        OMNI_1_1_MODEL, 13.01, "360p", False, snap_duration=False
+    )
+    extend_mode = estimate_video_cost(
+        OMNI_1_1_MODEL, 13.01, "360p", False, generation_mode="extend_video"
+    )
+    fresh = estimate_video_cost(OMNI_1_1_MODEL, 13.01, "360p", False)
+    assert metered is not None and extend_mode is not None and fresh is not None
+    assert extend_mode.usd >= metered.usd
+    # A fresh render still clamps, because the API clamps it too.
+    assert fresh.usd < metered.usd
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_the_extension_dry_run_uses_the_source_it_already_measured(
+    tmp_path: Path,
+) -> None:
+    """The source length was in hand and discarded, which caused the under-quote."""
+    from src.__main__ import extend_video_omni
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    (tmp_path / "videos" / "prior.json").write_text(
+        json.dumps(
+            {
+                "interaction_id": "i-src",
+                "duration_seconds": 3.01,
+                "duration_source": "measured from the rendered video",
+            }
+        )
+    )
+    payload = json.loads(
+        await extend_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            previous_interaction_id="i-src",
+            times=2,
+            resolution="360p",
+            dry_run=True,
+        )
+    )
+    assert payload["source_duration_seconds"] == 3.01
+    assert payload["turn_output_seconds"] == pytest.approx([13.01, 23.01])
+    assert payload["billed_seconds"] == pytest.approx(36.02)
+    assert payload["assembled_seconds"] == pytest.approx(23.01)
+    # 20s of new footage for a 36s bill — the compounding, stated.
+    assert payload["appended_seconds"] == pytest.approx(20.0)
+    assert "re-bills" in payload["duration_source"]
+
+
+def test_a_measured_frame_size_names_its_resolution_tier() -> None:
+    """`rendered_resolution` was a request echo with no way to check it.
+
+    Omni's per-second rate differs threefold across tiers, so "the request said
+    360p" is not evidence the bill is a 360p bill.
+    """
+    from src.video_utils import classify_video_resolution
+
+    assert classify_video_resolution((640, 360)) == "360p"
+    # Portrait classifies the same: the tier is pixels per frame.
+    assert classify_video_resolution((360, 640)) == "360p"
+    assert classify_video_resolution((3840, 2160)) == "4K"
+    # Nothing near a tier is claimed as one.
+    assert classify_video_resolution((500, 890)) is None
+    assert classify_video_resolution(None) is None
+
+
+def test_a_timeout_names_the_render_it_abandoned() -> None:
+    """A render that outlives the deadline is billed and keeps going.
+
+    Without the id in the message the spend cannot be retrieved, resumed or
+    reconciled — and a host ceiling shorter than timeout_seconds makes that the
+    common case. The default sits under the usual ceiling for the same reason.
+    """
+    from src.omni import OMNI_DEFAULT_TIMEOUT_SECONDS
+
+    assert OMNI_DEFAULT_TIMEOUT_SECONDS < 240, "must fit a ~4 minute host ceiling"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(15.0)
+async def test_a_timeout_after_create_carries_the_interaction_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.omni as omni
+
+    monkeypatch.setattr(omni, "_POLL_INTERVAL", 0)
+
+    client = MagicMock()
+    client._api_client.vertexai = False
+    client.interactions.create.return_value = {"id": "i-abandoned", "status": "queued"}
+    client.interactions.get.return_value = {"id": "i-abandoned", "status": "queued"}
+
+    with pytest.raises(TimeoutError, match="i-abandoned"):
+        _ = await omni.generate_video_omni(
+            client=client,
+            prompt="a robot",
+            videos_dir=tmp_path,
+            model=OMNI_1_1_MODEL,
+            timeout_seconds=1,
+        )

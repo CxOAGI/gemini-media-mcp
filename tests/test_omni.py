@@ -747,12 +747,6 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     assert set(extend_body) <= _CREATE_BODY_KEYS
     extend_out = _normalize_create_body(dict(extend_body))
     assert extend_out["generation_config"]["video_config"]["task"] == "extend"
-    # Vertex's documented extend request carries all four fields.
-    assert extend_out["response_format"] == [
-        {
-            "type": "video",
-            "aspect_ratio": "16:9",
-            "duration": "6s",
-            "resolution": "360p",
-        }
-    ]
+    # An extend rejects aspect_ratio (live 400) and duration goes with it, so
+    # only the resolution rides alongside the type.
+    assert extend_out["response_format"] == [{"type": "video", "resolution": "360p"}]

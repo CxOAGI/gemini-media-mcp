@@ -2643,7 +2643,13 @@ def _video_params(
             # seconds they already have.
             wanted = request.total_duration_seconds - spec.max_uploaded_source_seconds
         times = max(1, math.ceil((wanted or step) / step))
-        ceiling = int(spec.max_extended_seconds // spec.extension_step_seconds)
+        # How many turns actually FIT, given the source this planner has to
+        # assume. Capping at max_extended/step alone planned a fourth turn
+        # that had no room and was priced as three — the plan and its own
+        # quote disagreeing about how many renders it was recommending.
+        ceiling = max(
+            1, len(omni_extension_output_lengths(spec, None, spec.max_extended_seconds))
+        )
         if times > ceiling:
             caveats.append(
                 f"{times} extension turns would be needed but omni caps a clip "
@@ -2680,12 +2686,13 @@ def _video_params(
             "multi-turn source has no such limit."
         )
         caveats.append(
-            "Each turn returns the footage it appends, not the assembled "
-            "clip, so the response is a sequence of segments to join "
-            f"downstream. The planner cannot see the source's length, so it "
-            f"does not know how many turns fit under the "
-            f"{spec.max_extended_seconds}s total; the tool's own dry_run "
-            "measures the source and says."
+            "Each turn renders the ASSEMBLED clip, not the increment it "
+            "appends, so every turn re-bills the footage before it and the "
+            "cost grows quadratically in `times` — measured: a 3.01s source "
+            "extended once returned 13.01s. The planner cannot see the "
+            f"source's length, so it assumes the documented "
+            f"{spec.max_uploaded_source_seconds:g}s maximum; the tool's own "
+            "dry_run measures it and quotes lower."
         )
     elif tool in ("generate_transition", "generate_bridge"):
         params = {
@@ -2964,20 +2971,13 @@ def _video_cost(
 
     if tool == "extend_video_omni":
         # Every turn is its own interaction and its own render, and each
-        # renders the CONTINUATION it appends — 3-10s, set by duration — not
-        # the whole growing clip. The Interactions API reference gives
-        # duration's range for exactly this request, and the documented sample
-        # response bills 28,832 video tokens, which is 4.98s at the published
-        # rate. The source length is not knowable here, so the projection does
-        # not clamp against the cumulative ceiling; the tool's own dry_run
-        # measures the source and does.
+        # renders the ASSEMBLED clip — measured: a 3.01s source extended once
+        # returned 13.01s — so every turn re-bills the footage before it. The
+        # source length is not knowable here, so the documented maximum is
+        # assumed; a shorter real source quotes lower, and assuming one would
+        # under-quote. The tool's own dry_run measures it and is sharper.
         turns = int(params.get("times", 1))
-        lengths = omni_extension_output_lengths(
-            omni_spec(model),
-            None,
-            turns,
-            params.get("duration_seconds"),
-        )
+        lengths = omni_extension_output_lengths(omni_spec(model), None, turns)
         if not lengths:
             return None
         return _aggregate_video_cost(

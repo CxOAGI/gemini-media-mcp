@@ -613,8 +613,10 @@ def snap_video_duration(
     Args:
         model: Model ID (superseded/aliased spellings are resolved first).
         duration_seconds: Requested duration.
-        generation_mode: One of ``src.video``'s modes; only
-            ``reference_to_video`` and ``extend_video`` override the snap.
+        generation_mode: One of ``src.video``'s modes.
+            ``reference_to_video`` and ``extend_video`` override the Veo snap,
+            and ``extend_video`` also lifts Omni's per-render clamp, since an
+            extension's output is the assembled clip rather than one render.
 
     Returns:
         The effective duration in whole seconds.
@@ -622,6 +624,13 @@ def snap_video_duration(
     model_id = resolve_model_id(model)
 
     if is_omni_model(model_id):
+        if generation_mode == "extend_video":
+            # An extension renders the ASSEMBLED clip, which legitimately runs
+            # past the per-render maximum — measured: a 3.01s source came back
+            # 13.01s, and a chain reaches 40s. Clamping it to 10 here reported
+            # $0.3393 for a render that billed $0.4396, a silent 30%
+            # under-quote on the one path that exceeds the range.
+            return max(_OMNI_MIN_DURATION, round(duration_seconds))
         # src/omni.py rounds then clamps into the documented range.
         clamped = round(duration_seconds)
         return max(_OMNI_MIN_DURATION, min(_OMNI_MAX_DURATION, clamped))

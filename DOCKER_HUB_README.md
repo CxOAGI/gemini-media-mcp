@@ -293,7 +293,6 @@ Append a seamless continuation to an existing video (`gemini-omni-1.1-flash` onl
 | `previous_interaction_id` | string *optional* | A clip this server rendered. Nothing is uploaded and dialogue may be added |
 | `input_video_uri` | string *optional* | A clip of your own — 10s or shorter on the Gemini API, 30s on Vertex AI (checked locally against the right one). Give exactly one of these two |
 | `times` | integer *optional* | Extension turns to chain (default 1, maximum 4 — each appends up to `duration_seconds`, to a cumulative 40s counting the source) |
-| `duration_seconds` | number *optional* | Footage each turn appends, 3-10s (default 10). Sent only when extending an uploaded video |
 | `resolution` | string *optional* | `360p`, `720p` (default), `1080p` or `4K` |
 | `reference_image_uris` / `reference_video_uris` | array *optional* | References for introducing a new character or object; they ride along on the first turn |
 | `timeout_seconds` | integer *optional* | Deadline for EACH turn (default 600) |
@@ -301,7 +300,7 @@ Append a seamless continuation to an existing video (`gemini-omni-1.1-flash` onl
 **Notes:**
 - Extension appends to the END of a clip only; prepending or extending the middle is not supported
 - Extending an *uploaded* video is unavailable in the EEA, Switzerland and the UK; extending a model-generated one works everywhere
-- Each turn returns the footage it appends, not the assembled clip, so the segments are an ordered list to join downstream and each is billed at its own 3-10s. A `dry_run` measures the source when it can and reports how many turns fit under the 40s total as `planned_turns` / `turn_output_seconds`
+- **Cost grows quadratically.** A turn renders the whole assembled clip, not the 10s it appends (measured: a 3.01s source extended once returned 13.01s), so every turn re-bills the footage before it: `times=2` from a 3s source bills ~36s to make 20s of new footage. Each turn's `video_url` supersedes the previous one. Always `dry_run` a chain first
 - A chain that fails part-way still returns the turns that rendered, with the `interaction_id` to resume from
 
 *This tool may perform destructive updates.*
