@@ -94,7 +94,13 @@ from .video import _GEMINI_API_MODEL_IDS, VideoModel
 # Date on which every price in this module was verified against the sources
 # below. Bump it (and re-check the tables) whenever these are refreshed —
 # callers surface it so a stale figure is visible rather than silent.
-PRICING_AS_OF = "2026-08-03"
+#
+# Re-read in full on 2026-08-28, the day after gemini-omni-1.1-flash went GA
+# and republished the video table: all three image rows, all three Veo tiers
+# and both omni rows still carry the figures below. Anything automated reads
+# THIS field, so a per-record note claiming a later verification than this
+# date is a contradiction, not a refinement — bump here or not at all.
+PRICING_AS_OF = "2026-08-28"
 
 PRICING_SOURCES: dict[str, str] = {
     "gemini_api": "https://ai.google.dev/gemini-api/docs/pricing",
@@ -358,11 +364,16 @@ def _omni_usd_per_second(tokens_per_second: float) -> float:
 # for them. Applying the one published figure is the only honest arithmetic
 # available; the estimate says outright that an upscaled render may meter
 # differently, so nobody reads the number as a confirmed tier.
+# STANDING EXPOSURE, re-check whenever PRICING_AS_OF moves: if Google ever
+# publishes a separate upscale rate, every 1080p and 4K omni quote is wrong by
+# the delta, silently and in the under-quoting direction if the tier is dearer.
+# There is no way to detect that from here — only the pricing page says.
 _OMNI_1_1_UPSCALE_NOTE = (
     "1080p and 4K are upscaled from the base render and Google publishes no "
     "separate token rate for them, so this prices them at the published 720p "
     "rate ({tokens:,} tokens/s). Treat it as the best published figure, not a "
-    "confirmed tier."
+    "confirmed tier: if a separate upscale rate is ever published, this quote "
+    "is wrong by the difference."
 ).format(tokens=_OMNI_VIDEO_TOKENS_PER_SECOND)
 
 _OMNI_1_1_360P_NOTE = (
@@ -451,14 +462,12 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
         },
         source=_SRC_GEMINI_API,
         source_note=(
-            "Rates re-read on 2026-08-28, after the 2026-08-27 GA release, on "
-            "the Gemini Developer API pricing page: gemini-omni-1.1-flash "
-            "carries the same published token rates as the preview model "
-            "($1.50 input, $9.00 text output, $17.50 video output per 1M "
-            "tokens, 5,792 tokens per second of 720p). PRICING_AS_OF predates "
-            "GA and covers the rest of the table, not this row. Neither page "
-            "states how omni's token rates apply on the other backend, so no "
-            "cross-backend equivalence is claimed."
+            "Confirmed on the Gemini Developer API pricing page: "
+            "gemini-omni-1.1-flash carries the same published token rates as "
+            "the preview model ($1.50 input, $9.00 text output, $17.50 video "
+            "output per 1M tokens, 5,792 tokens per second of 720p). Neither "
+            "page states how omni's token rates apply on the other backend, "
+            "so no cross-backend equivalence is claimed."
         ),
     ),
 }

@@ -2472,3 +2472,83 @@ async def test_the_pre_flight_refuses_an_over_length_local_source(
     )
     assert "10s or shorter" in payload["error"]
     assert "estimated_cost" not in payload
+
+
+def test_the_documented_chain_costs_are_the_ones_that_will_be_billed() -> None:
+    """The docstring quotes dollars, so the dollars have to stay true.
+
+    A cost table in prose rots silently; this is what stops it. Figures are
+    for a 3s source, which is the measured case.
+    """
+    from src.omni import omni_extension_output_lengths
+    from src.pricing import actual_video_cost
+
+    spec = omni_spec(OMNI_1_1_MODEL)
+    expected = {
+        ("360p", 1): 0.44,
+        ("360p", 2): 1.22,
+        ("360p", 3): 2.33,
+        ("720p", 1): 1.32,
+        ("720p", 2): 3.65,
+        ("720p", 3): 6.99,
+    }
+    for (resolution, turns), documented in expected.items():
+        billed = sum(omni_extension_output_lengths(spec, 3.0, turns))
+        cost = actual_video_cost(
+            OMNI_1_1_MODEL, billed, resolution, False, snap_duration=False
+        )
+        assert cost is not None
+        assert cost.usd == pytest.approx(documented, abs=0.005), (
+            resolution,
+            turns,
+            cost.usd,
+        )
+
+
+def test_the_pricing_date_does_not_contradict_its_own_records() -> None:
+    """Anything automated reads PRICING_AS_OF, not the prose beside it.
+
+    A per-record note claiming a later verification than the field is a
+    contradiction, not a refinement.
+    """
+    import re
+
+    from src.pricing import PRICING_AS_OF, _VIDEO_PRICING
+
+    for model, record in _VIDEO_PRICING.items():
+        for text in (record.source_note or "", *record.resolution_notes.values()):
+            for found in re.findall(r"\b20\d\d-\d\d-\d\d\b", text):
+                assert found <= PRICING_AS_OF, (
+                    f"{model} cites {found}, after PRICING_AS_OF {PRICING_AS_OF}"
+                )
+
+
+def test_one_suppression_gets_one_explanation() -> None:
+    """Two messages named different reasons for the same suppressed fields.
+
+    Both reasons are real; emitting one or the other read as though one were a
+    guess. The single message names the branch that applies and both verified
+    rejections.
+    """
+    import inspect
+
+    import src.omni as omni
+
+    source = inspect.getsource(omni.generate_video_omni)
+    assert "sends neither duration_seconds nor aspect_ratio" in source
+    # Both live 400s are quoted, so neither reads as inference.
+    assert "Duration cannot be set in response format for edit task" in source
+    assert "Aspect ratio cannot be set in response format for extend task" in source
+
+
+def test_the_animatic_resolution_knob_is_documented_where_it_is_used() -> None:
+    """An undocumented parameter hides a 3x saving from anyone reading Args."""
+    import inspect
+
+    import src.__main__ as server
+
+    doc = inspect.getdoc(server.generate_clip) or ""
+    assert "animatic_resolution:" in doc, "the parameter is missing from Args"
+    assert "360p" in doc
+    # And the animatic description must not still assert a flat 720p.
+    assert "animatic_resolution says otherwise" in doc

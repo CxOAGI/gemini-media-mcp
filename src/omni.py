@@ -1339,15 +1339,22 @@ async def generate_video_omni(
         # consequence for the caller is the same: the length is the service's
         # and is NOT predictable from the request or from the source — a
         # measured 3s source edited with duration_seconds=4 rendered 10.01s.
+        # One message for one behaviour. Two were emitted before, naming
+        # different reasons for the same pair of suppressed fields, which read
+        # as though one of them were a guess. Both reasons are real and both
+        # are stated, with the one that applies here named first.
         why = (
-            "a turn continuing a previous interaction cannot declare its task, "
-            "so neither field is risked"
+            "this turn continues a previous interaction, so it cannot declare "
+            "its task and the service infers one"
             if previous_interaction_id is not None
-            else "the API rejects duration on an edit task"
+            else "this is an edit task"
         )
         warnings.append(
-            f"This request does not send duration_seconds or aspect_ratio — "
-            f"{why} — so the rendered length is chosen by the service. The "
+            "This request sends neither duration_seconds nor aspect_ratio: "
+            f"{why}, and a continuation rejects both — live-verified as "
+            '"Duration cannot be set in response format for edit task" and '
+            '"Aspect ratio cannot be set in response format for extend task". '
+            "The rendered length is therefore the service's choice. The "
             "response reports the duration measured from the rendered file, or "
             "a labelled upper bound when the render is delivered somewhere it "
             "cannot be opened to measure (a gs:// URI)."
