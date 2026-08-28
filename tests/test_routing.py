@@ -1842,3 +1842,177 @@ def test_the_animatic_previews_on_the_model_with_a_360p_tier() -> None:
     assert animatic.params["animatic_resolution"] == "360p"
     assert OMNI_1_1_MODEL in animatic.rationale
     assert "does NOT save money" not in animatic.rationale
+
+
+# ============================================================================
+# Planner defects found by live harness testing
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "a cinematic drone shot over a coastline",
+        "a drone shot",
+        "a tracking shot of a runner",
+        "slow motion water droplet",
+        "an establishing shot of the city",
+        "the camera pans across a desk",
+    ],
+)
+def test_camera_vocabulary_settles_a_brief_that_names_no_medium(intent: str) -> None:
+    """ "A cinematic drone shot over a coastline" planned as an IMAGE.
+
+    The video vocabulary had no cinematography in it, so a brief written the
+    way a director writes one matched nothing at all.
+    """
+    assert plan_generation(intent).media_kind == "video"
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "a cinematic portrait of a chef",
+        "a wide shot photo of the logo",
+        "a poster with a drone shot aesthetic",
+        "a photograph, cinematic lighting",
+        "a product shot with cinematic lighting",
+    ],
+)
+def test_camera_vocabulary_does_not_overrule_someone_who_said_photo(
+    intent: str,
+) -> None:
+    """Camera words sit in the weaker tier for exactly this reason.
+
+    A strong video hit wins outright over an image word, so putting
+    "cinematic" there would have turned every cinematic still into a video.
+    """
+    assert plan_generation(intent).media_kind == "image"
+
+
+def test_a_transition_brief_excludes_models_that_cannot_interpolate() -> None:
+    """The module docstring names this as an example it catches.
+
+    It ranked Veo 3.1 Lite anyway: the need was keyed on the chosen tool, and
+    with no endpoint URIs yet — which is how an agent asks before it has the
+    stills — the tool was generate_video and nothing needed anything.
+    """
+    plan = plan_generation("a smooth transition from sunrise to snowfall")
+    rejected = {r.model for r in plan.rejected}
+    assert VEO_LITE in rejected, [r.model for r in plan.routes]
+    assert OMNI_MODEL in rejected, "the preview model cannot interpolate either"
+    assert all(
+        "first+last-frame" in r.reason
+        for r in plan.rejected
+        if r.model in (VEO_LITE, OMNI_MODEL)
+    )
+
+
+def test_the_missing_endpoint_conflict_is_a_sentence() -> None:
+    """It read "but only neither frame is available"."""
+    both = plan_generation("a smooth transition from sunrise to snowfall")
+    detail = next(
+        c.detail
+        for c in both.conflicts
+        if c.code == "transition_requires_two_endpoints"
+    )
+    assert "but neither frame is available" in detail
+    assert "only neither" not in detail
+
+    one = plan_generation("a crossfade", RoutingConstraints(first_frame_uri="a"))
+    detail = next(
+        c.detail for c in one.conflicts if c.code == "transition_requires_two_endpoints"
+    )
+    assert "only the first frame is available" in detail
+
+
+def test_a_brief_naming_a_prior_interaction_excludes_veo() -> None:
+    """loop_extend needs a Veo video_uri and cannot take an interaction_id.
+
+    It out-ranked the omni route 0.5875 to 0.5425 on a brief that says the
+    source IS an interaction, so the top-ranked route could not run at all.
+    """
+    plan = plan_generation(
+        "continuing from the interaction I already rendered, make it longer"
+    )
+    top = plan.recommended
+    assert top is not None
+    assert top.tool == "extend_video_omni"
+    assert all(is_omni_model(route.model) for route in plan.routes)
+    assert any(r.model.startswith("veo") for r in plan.rejected)
+
+
+def test_a_file_based_extension_still_offers_veo() -> None:
+    """The interaction signal must not exclude Veo from ordinary extensions."""
+    plan = plan_generation(
+        "make this clip longer",
+        RoutingConstraints(media_kind="video", source_video_uri="file:///d/a.mp4"),
+    )
+    assert any(r.tool == "loop_extend" for r in plan.routes)
+
+
+def test_a_deprecated_model_never_outranks_its_replacement() -> None:
+    """They scored level, so the dying endpoint was offered as an equal choice.
+
+    33 days from shutdown at the time this was found.
+    """
+    plan = plan_generation("a video of a cat", RoutingConstraints(media_kind="video"))
+    omni = [r for r in plan.routes if is_omni_model(r.model)]
+    assert [r.model for r in omni][0] == OMNI_1_1_MODEL
+    deprecated = next(r for r in omni if r.model == OMNI_MODEL)
+    assert any("deprecated" in c and "2026-09-30" in c for c in deprecated.caveats)
+    # The GA model carries no such caveat.
+    ga = next(r for r in omni if r.model == OMNI_1_1_MODEL)
+    assert not any("deprecated" in c for c in ga.caveats)
+
+
+def test_the_deprecation_demotion_is_what_orders_a_tie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercised with synthetic ids, because the real pair cannot show it.
+
+    "gemini-omni-1.1-flash" already sorts before "gemini-omni-flash-preview",
+    so for the only model deprecated today the model-ID tie-break reaches the
+    right answer on its own and the demotion is a no-op — a plan-level
+    assertion passes with it removed. It is defensive code for the next
+    deprecation, whose id may sort the other way, so it is tested the only way
+    that can fail: with ids where alphabetical order is wrong.
+    """
+    import src.routing as routing
+    from src.routing import ModelProfile, RoutedCall, _rank
+
+    deprecated, replacement = "aaa-old-model", "zzz-new-model"
+    monkeypatch.setattr(routing, "DEPRECATED_VIDEO_MODELS", {deprecated: "2026-09-30"})
+
+    def profile(model: str) -> ModelProfile:
+        return ModelProfile(
+            model=model,
+            media_kind="video",
+            cost_index=0.5,
+            fidelity_index=0.5,
+            speed_index=0.5,
+            text_rendering_index=0.0,
+            summary=model,
+        )
+
+    # Alphabetically the deprecated id comes FIRST, so only the demotion can
+    # put the replacement on top.
+    assert deprecated < replacement
+    routes = [
+        RoutedCall(
+            tool="generate_video_omni",
+            model=m,
+            params={},
+            score=0.5,
+            rationale="",
+            caveats=(),
+            cost=None,
+        )
+        for m in (deprecated, replacement)
+    ]
+    profiles = {deprecated: profile(deprecated), replacement: profile(replacement)}
+    # Identical fidelity, identical score: the only separator left is the
+    # shutdown date.
+    ranked = _rank(routes, profiles)
+    assert ranked[0].model == replacement
+    assert ranked[1].model == deprecated
