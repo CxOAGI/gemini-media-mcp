@@ -39,7 +39,15 @@ from .omni import (
 from .omni import (
     _SUPPORTED_ASPECT_RATIOS as OMNI_ASPECT_RATIOS,  # pyright: ignore[reportPrivateUsage]
 )
-from .omni import OMNI_MODEL
+from .omni import (
+    OMNI_1_1_MODEL,
+    OMNI_DEFAULT_RESOLUTION,
+    OMNI_MODEL,
+    OMNI_RESOLUTIONS,
+    is_omni_model,
+    omni_extension_output_lengths,
+    omni_spec,
+)
 from .video import (
     _CANONICAL_VIDEO_MODEL_IDS,  # pyright: ignore[reportPrivateUsage]
     _VEO_LITE_MODELS,  # pyright: ignore[reportPrivateUsage]
@@ -58,6 +66,7 @@ ToolName = Literal[
     "generate_storyboard",
     "generate_video",
     "generate_video_omni",
+    "extend_video_omni",
     "generate_clip",
     "generate_transition",
     "generate_bridge",
@@ -102,8 +111,16 @@ VEO_MAX_EXTENDED_SECONDS = (
 # Veo output resolutions (src/video.py validates against exactly this set).
 VEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p", "4K")
 
-# Omni renders 720p/24fps only — there is no resolution control at all.
-OMNI_RESOLUTION = "720p"
+# What an omni render comes back as when nothing asks otherwise, and the only
+# thing gemini-omni-flash-preview can produce at all. gemini-omni-1.1-flash
+# takes a real resolution parameter (OMNI_RESOLUTIONS) on top of this default.
+OMNI_RESOLUTION = OMNI_DEFAULT_RESOLUTION
+
+# Every resolution some video model here can render, which is what a request
+# is validated against: Veo's three plus omni 1.1's 360p draft tier.
+VIDEO_RESOLUTIONS: tuple[str, ...] = tuple(
+    dict.fromkeys((*VEO_RESOLUTIONS, *OMNI_RESOLUTIONS))
+)
 
 # Aspect ratios the video path accepts. src/video.py hard-errors on anything
 # else, and omni documents the same pair.
@@ -357,6 +374,10 @@ class VideoCapabilities:
     supports_reference_images: bool
     supports_4k: bool
     supports_1080p: bool
+    # Omni 1.1's draft tier. Veo publishes no 360p rate and src/video.py
+    # rejects the value, so a 360p ask has to exclude every Veo model rather
+    # than reach one and be dropped (or, worse, be quoted at the 720p rate).
+    supports_360p: bool
     supports_seed: bool
     supports_negative_prompt: bool
     supports_audio: bool
@@ -416,6 +437,28 @@ _VIDEO_PROFILES: dict[str, ModelProfile] = {
         text_rendering_index=0.0,
         summary="fastest 720p/24fps drafts with conversational editing",
     ),
+    OMNI_1_1_MODEL: ModelProfile(
+        model=OMNI_1_1_MODEL,
+        media_kind="video",
+        # Identical published token rate to the preview model at 720p
+        # ($0.10136/s), so it sits on exactly the same rung — the index tracks
+        # real $/s at 720p and nothing else, which is what keeps a
+        # budget=cheap request from ranking a dearer route as the cheap one.
+        # Its 360p draft tier IS a third of that ($0.0338/s), the cheapest
+        # video render in the catalog, but that is a resolution the caller
+        # chooses per call, not a property of the model's standing.
+        cost_index=0.27,
+        # Above the preview model on every axis that is not price: real 1080p
+        # and 4K output, keyframe interpolation, video references and native
+        # audio. Below full-fat Veo, which is still the finishing renderer.
+        fidelity_index=0.65,
+        speed_index=0.95,
+        text_rendering_index=0.0,
+        summary=(
+            "fast 360p-4K renders with conversational editing, video "
+            "extension, keyframe interpolation and video references"
+        ),
+    ),
     "veo-3.1-lite-generate-preview": ModelProfile(
         model="veo-3.1-lite-generate-preview",
         media_kind="video",
@@ -456,11 +499,37 @@ _VIDEO_CAPABILITIES: dict[str, VideoCapabilities] = {
         supports_reference_images=True,
         supports_4k=False,
         supports_1080p=False,
+        supports_360p=False,
         supports_seed=False,
         supports_negative_prompt=False,
         # 720p preview renders carry no usable audio track; Veo is the model
         # family with native audio.
         supports_audio=False,
+        supports_conversational_edit=True,
+        gemini_api_only=False,
+        min_duration_seconds=float(OMNI_MIN_DURATION),
+        max_duration_seconds=float(OMNI_MAX_DURATION),
+    ),
+    # Omni 1.1: everything the preview model does, plus the four capabilities
+    # that used to force a Veo route — resolution control up to 4K, video
+    # extension, first/last-frame interpolation and native audio — while
+    # keeping conversational editing, which no Veo tier has. Still no seed and
+    # no negative_prompt: the reference lists both as unsupported, along with
+    # system instructions, temperature and top_p.
+    OMNI_1_1_MODEL: VideoCapabilities(
+        supports_first_last_frame=True,
+        supports_extension=True,
+        supports_reference_images=True,
+        supports_4k=True,
+        supports_1080p=True,
+        supports_360p=True,
+        supports_seed=False,
+        supports_negative_prompt=False,
+        # 1.1 generates an audio track natively ("The model generates a video
+        # with audio based on your text description") and the prompt guide has
+        # a section on directing it. What it has no switch for is turning it
+        # OFF — a caveat, not a reason to exclude it when audio is wanted.
+        supports_audio=True,
         supports_conversational_edit=True,
         gemini_api_only=False,
         min_duration_seconds=float(OMNI_MIN_DURATION),
@@ -474,6 +543,7 @@ _VIDEO_CAPABILITIES: dict[str, VideoCapabilities] = {
         supports_reference_images=False,
         supports_4k=False,
         supports_1080p=True,
+        supports_360p=False,
         supports_seed=True,
         supports_negative_prompt=True,
         # Lite generates audio like the other Veo tiers; what it cannot do is
@@ -495,6 +565,7 @@ _FULL_VEO_CAPABILITIES = VideoCapabilities(
     supports_reference_images=True,
     supports_4k=True,
     supports_1080p=True,
+    supports_360p=False,
     supports_seed=True,
     supports_negative_prompt=True,
     # Veo 3.1 generates audio natively. On Vertex it is switchable via the
@@ -1356,7 +1427,8 @@ class RoutingConstraints:
         is_iterating: The caller is refining an existing result.
         needs_seed: Reproducibility via a fixed seed is required.
         needs_negative_prompt: A negative prompt is required.
-        resolution: Exact video resolution ("720p"/"1080p"/"4K").
+        resolution: Exact video resolution ("360p"/"720p"/"1080p"/"4K");
+            360p exists on gemini-omni-1.1-flash only.
         num_images: How many images to generate (cost estimation only).
         pinned_model: A model the caller insists on. Rules still apply, but a
             violation is reported as a conflict rather than a quiet swap.
@@ -1417,10 +1489,10 @@ class RoutingConstraints:
                 f"Unsupported image_size '{self.image_size}'. "
                 f"Supported values are {', '.join(IMAGE_SIZES)}."
             )
-        if self.resolution is not None and self.resolution not in VEO_RESOLUTIONS:
+        if self.resolution is not None and self.resolution not in VIDEO_RESOLUTIONS:
             raise ValueError(
                 f"Unsupported resolution '{self.resolution}'. "
-                f"Supported values are {', '.join(VEO_RESOLUTIONS)}."
+                f"Supported values are {', '.join(VIDEO_RESOLUTIONS)}."
             )
         for name in ("num_reference_images", "num_beats", "num_images"):
             value = getattr(self, name)
@@ -2136,6 +2208,7 @@ class VideoNeeds:
     reference_images: bool
     four_k: bool
     hd_1080p: bool
+    draft_360p: bool
     seed: bool
     negative_prompt: bool
     audio: bool
@@ -2201,6 +2274,19 @@ _VIDEO_CAPABILITY_RULES: tuple[_CapabilityRule, ...] = (
         capability_attr="supports_4k",
         reason="{model} excluded: cannot produce 4K video",
         resolution="Request 4K on veo-3.1-fast-generate-001 or veo-3.1-generate-001.",
+    ),
+    _CapabilityRule(
+        code="360p_unsupported",
+        need_attr="draft_360p",
+        capability_attr="supports_360p",
+        reason=(
+            "{model} excluded: 360p is gemini-omni-1.1-flash's draft tier; "
+            "this model publishes neither the output nor a rate for it"
+        ),
+        resolution=(
+            "Render the 360p draft on gemini-omni-1.1-flash via "
+            "generate_video_omni, then finalize at 720p or above."
+        ),
     ),
     _CapabilityRule(
         code="1080p_unsupported",
@@ -2271,11 +2357,18 @@ def _capability_rejection(
 def _duration_rejection(model: str, needs: VideoNeeds) -> str | None:
     """Return a reason when the clip length is outside the model's range.
 
-    Omni is the only model with a real range here (3-10s); Veo snaps instead
-    of failing, so a Veo mismatch is a caveat rather than a rejection.
+    The omni models are the only ones with a real range here (3-10s); Veo
+    snaps instead of failing, so a Veo mismatch is a caveat rather than a
+    rejection.
     """
     capabilities = _VIDEO_CAPABILITIES.get(model)
-    if capabilities is None or model != OMNI_MODEL:
+    if capabilities is None or not is_omni_model(model):
+        return None
+    if needs.extension:
+        # An extension's per-turn length is the service's choice, not the
+        # caller's, and the duration on the request describes the FINISHED
+        # clip. Measuring a 30s target against omni's 10s per-render cap
+        # rejected the one model that can actually reach 30s by extending.
         return None
     duration = needs.clip_duration_seconds
     if duration < capabilities.min_duration_seconds:
@@ -2354,13 +2447,20 @@ def _select_video_tool(request: ResolvedRequest) -> ToolName:
     """Pick the tool for a video request.
 
     The ladder is ordered by how specific the signal is, most specific first:
-    an interaction id can only mean an edit; frames can only mean a
-    transition; and so on down to plain text-to-video.
+    "make it longer" can only mean an extension; an interaction id otherwise
+    means an edit; frames can only mean a transition; and so on down to plain
+    text-to-video.
+
+    Extension outranks the interaction id because an interaction id is a
+    source, not a verb — omni can both edit AND extend from one, and "extend
+    this clip" asked for the latter. Ranking the id first routed every
+    "make it longer, from interaction X" to edit_video, which does not
+    lengthen anything.
     """
-    if request.previous_interaction_id is not None:
-        return "edit_video"
     if request.needs_extension:
         return "loop_extend"
+    if request.previous_interaction_id is not None:
+        return "edit_video"
     if request.has_first_frame and request.has_last_frame:
         # Bridges and transitions are the same Veo primitive; the difference
         # is only whether the endpoints are stills or clips to sample.
@@ -2376,12 +2476,18 @@ def _route_tool(tool: ToolName, model: str) -> ToolName:
     """Return the tool a given model is actually reached through.
 
     Omni never runs behind the Veo-shaped tools: it is called via
-    generate_video_omni (or edit_video, which is omni-only by definition), so
-    the emitted parameters match the signature the caller will use.
+    generate_video_omni (or edit_video, which is omni-only by definition, or
+    extend_video_omni for a continuation), so the emitted parameters match the
+    signature the caller will use.
     """
     if tool == "edit_video":
         return "edit_video"
-    if model == OMNI_MODEL:
+    if is_omni_model(model):
+        # Extension is its own verb on omni: it appends to existing footage
+        # rather than rendering a new clip, and loop_extend is Veo's chaining
+        # tool, which cannot drive an interaction.
+        if tool == "loop_extend":
+            return "extend_video_omni"
         return "generate_video_omni"
     return tool
 
@@ -2397,10 +2503,19 @@ def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
         reference_images=request.num_reference_images > 0,
         four_k=request.resolution == "4K" or request.needs_4k,
         hd_1080p=request.resolution == "1080p",
+        draft_360p=request.resolution == "360p",
         seed=request.needs_seed,
         negative_prompt=request.needs_negative_prompt,
         audio=request.needs_audio,
-        conversational_edit=tool == "edit_video",
+        # An interaction id is a source only the omni family can read, so
+        # ANY route built on one needs the conversational capability — not
+        # just edit_video. Keying on the tool alone let an extension-flavoured
+        # request ("make this longer, continue the scene, from interaction X")
+        # top out with a Veo loop_extend route that had silently dropped the
+        # id and told the caller to supply a clip they do not have.
+        conversational_edit=(
+            tool == "edit_video" or request.previous_interaction_id is not None
+        ),
         clip_duration_seconds=request.clip_duration_seconds,
     )
 
@@ -2426,7 +2541,7 @@ def _video_params(
         aspect_ratio = "9:16" if tool == "generate_clip" else "16:9"
 
     duration = request.clip_duration_seconds
-    if model != OMNI_MODEL:
+    if not is_omni_model(model):
         snapped = _snap_veo_duration(duration)
         if float(snapped) != duration:
             caveats.append(
@@ -2440,9 +2555,21 @@ def _video_params(
         params = {
             "previous_interaction_id": request.previous_interaction_id,
             "prompt": request.intent,
+            # Emitted so the call runs on the model this route was priced
+            # for. Both omni models quote identically at 720p, but the plan
+            # naming one and the tool defaulting to the other is exactly the
+            # drift this pass-through exists to prevent.
+            "omni_model": model,
             "aspect_ratio": aspect_ratio,
             "duration_seconds": duration,
         }
+        if omni_spec(model).supports_resolution and request.resolution is not None:
+            params["resolution"] = request.resolution
+        caveats.append(
+            "omni_model must be the model that produced "
+            "previous_interaction_id — the interaction's video context lives "
+            "with it, so an edit cannot switch models mid-conversation."
+        )
         caveats.append(
             "An edit does not send duration or aspect ratio — the API rejects "
             "them on an edit task — and the rendered length is chosen by the "
@@ -2450,9 +2577,13 @@ def _video_params(
             "Cost is measured from the rendered file; a quote is an upper bound."
         )
         caveats.append(
-            f"The quote is Omni's {OMNI_MAX_DURATION:g}s maximum, the same "
-            "upper bound edit_video's own dry_run reports — not the "
-            f"{duration:g}s above, which is never sent."
+            f"The quote is Omni's {OMNI_MAX_DURATION:g}s per-render maximum, "
+            "the same upper bound edit_video's own dry_run reports for a clip "
+            f"this planner cannot measure — not the {duration:g}s above, which "
+            "is never sent. If the interaction is a clip you already extended "
+            f"past {OMNI_MAX_DURATION:g}s, the tool's dry_run reads its real "
+            "length from the sidecar and quotes higher; this figure assumes a "
+            "single-render source."
         )
     elif tool == "loop_extend":
         times = 1
@@ -2495,6 +2626,63 @@ def _video_params(
                 "On Vertex AI, extension requires output_gcs_uri — the combined "
                 "video exceeds the inline response limit."
             )
+    elif tool == "extend_video_omni":
+        spec = omni_spec(model)
+        step = float(spec.extension_step_seconds)
+        wanted = request.added_duration_seconds
+        if wanted is None and request.total_duration_seconds is not None:
+            # A total was named instead of a delta. Omni extends footage that
+            # already exists, so what has to be rendered is the difference
+            # above the source — measured from the longest source omni will
+            # take, rather than from zero, which would bill the caller for
+            # seconds they already have.
+            wanted = request.total_duration_seconds - spec.max_uploaded_source_seconds
+        times = max(1, math.ceil((wanted or step) / step))
+        ceiling = int(spec.max_extended_seconds // spec.extension_step_seconds)
+        if times > ceiling:
+            caveats.append(
+                f"{times} extension turns would be needed but omni caps a clip "
+                f"at {spec.max_extended_seconds}s in "
+                f"{spec.extension_step_seconds}s steps; planned at the "
+                f"{ceiling}-turn maximum."
+            )
+        params = {
+            "prompt": request.intent,
+            "omni_model": model,
+            "times": min(times, ceiling),
+        }
+        if spec.supports_resolution and request.resolution is not None:
+            # Priced at request.resolution below, so it has to be SENT. It was
+            # the one omni branch that quoted a resolution its own params
+            # never asked for: a 360p plan handed over params that render 720p
+            # and bill 3x the quote.
+            params["resolution"] = request.resolution
+        if request.previous_interaction_id is not None:
+            params["previous_interaction_id"] = request.previous_interaction_id
+        elif request.source_video_uri is not None:
+            params["input_video_uri"] = request.source_video_uri
+        else:
+            caveats.append(
+                "Add previous_interaction_id (a clip this server generated) or "
+                "input_video_uri (a clip to upload): extend_video_omni needs "
+                "existing footage to continue."
+            )
+        caveats.append(
+            f"Each turn appends up to {spec.extension_step_seconds}s using the "
+            f"last {spec.extension_step_seconds}s of the source as context, to "
+            f"a cumulative {spec.max_extended_seconds}s. An uploaded source "
+            f"must be {spec.max_uploaded_source_seconds:g}s or shorter; a "
+            "multi-turn source has no such limit."
+        )
+        caveats.append(
+            "Each turn renders the whole growing clip, not just the appended "
+            "tail, so the turns get longer and dearer as the chain runs. The "
+            f"planner cannot see the source's length, so it assumes the "
+            f"{spec.max_uploaded_source_seconds:g}s maximum — the assumption "
+            "that quotes lowest. Raise `times` if your source is shorter and "
+            "you want the full length; the tool's own dry_run measures the "
+            "source and gives the exact figure."
+        )
     elif tool in ("generate_transition", "generate_bridge"):
         params = {
             "prompt": request.intent,
@@ -2555,13 +2743,37 @@ def _video_params(
     elif tool == "generate_video_omni":
         params = {
             "prompt": request.intent,
+            "omni_model": model,
             "aspect_ratio": aspect_ratio,
             "duration_seconds": duration,
         }
-        caveats.append(
-            "Omni output is 720p/24fps with no seed or negative_prompt; keep the "
-            "returned interaction_id to edit it conversationally."
-        )
+        spec = omni_spec(model)
+        if spec.supports_resolution:
+            if request.resolution is not None:
+                params["resolution"] = request.resolution
+            caveats.append(
+                f"{model} renders {'/'.join(spec.resolutions)} (1080p and 4K "
+                "upscaled from the base render) and has no seed or "
+                "negative_prompt; keep the returned interaction_id to edit or "
+                "extend it conversationally."
+            )
+            if request.resolution in (None, OMNI_RESOLUTION):
+                # The one saving worth naming unprompted: a 360p pass is a
+                # third of the 720p price, which makes it the cheapest video
+                # render this server can issue.
+                caveats.append(
+                    "resolution='360p' renders a draft at a third of the 720p "
+                    "price (Google's launch post; the pricing page publishes "
+                    "only the 720p rate) — the cheapest preview available here."
+                )
+        else:
+            caveats.append(
+                f"{model} output is {spec.rendered_resolution}/24fps with no "
+                "seed or negative_prompt; keep the returned interaction_id to "
+                "edit it conversationally. Pass "
+                f"omni_model='{OMNI_1_1_MODEL}' for resolution control, video "
+                "extension and first/last-frame interpolation."
+            )
     else:  # generate_video
         params = {
             "prompt": request.intent,
@@ -2602,7 +2814,7 @@ def _video_params(
             )
 
     if (
-        model != OMNI_MODEL
+        not is_omni_model(model)
         and request.backend == "gemini_api"
         and not request.needs_audio
     ):
@@ -2702,6 +2914,15 @@ def _video_cost(
     same parameters, and must never under-state — a planner that disagrees
     with the tool it is recommending is worse than no quote at all.
     """
+
+    # What an omni route is actually rendered at: the preview model has no
+    # resolution parameter, so a 4K ask cannot reach it and must not be priced
+    # as if it had; 1.1 renders what it is given.
+    def _omni_resolution(candidate: str) -> str:
+        if not omni_spec(candidate).supports_resolution:
+            return OMNI_RESOLUTION
+        return request.resolution or OMNI_RESOLUTION
+
     if tool == "edit_video":
         # An edit's rendered length is chosen by the service: two measurements
         # showed it rendering at Omni's maximum regardless of the source, and
@@ -2710,13 +2931,38 @@ def _video_cost(
         # is the one thing a pre-flight may not do. include_audio mirrors the
         # tool's own call so the two quotes are identical down to the detail.
         return _estimate_video_cost(
-            OMNI_MODEL, float(OMNI_MAX_DURATION), OMNI_RESOLUTION, False
+            model, float(OMNI_MAX_DURATION), _omni_resolution(model), False
+        )
+
+    if tool == "extend_video_omni":
+        # Every turn is its own interaction and its own render, and an
+        # extension returns the whole growing clip rather than the appended
+        # tail — so turn 2 renders (and bills) longer than turn 1. Quoting
+        # every turn at the 10s step under-quoted a 4-turn chain 2.6x. The
+        # source length is not knowable here, so the documented maximum is
+        # assumed, matching what the tool's own dry_run does when it cannot
+        # measure the source either.
+        turns = int(params.get("times", 1))
+        lengths = omni_extension_output_lengths(omni_spec(model), None, turns)
+        if not lengths:
+            return None
+        return _aggregate_video_cost(
+            model,
+            lengths[0],
+            sum(lengths),
+            len(lengths),
+            _omni_resolution(model),
+            request.needs_audio,
         )
 
     resolution = (
-        OMNI_RESOLUTION
-        if model == OMNI_MODEL or tool in FIXED_720P_TOOLS
-        else (request.resolution or "720p")
+        _omni_resolution(model)
+        if is_omni_model(model)
+        else (
+            OMNI_RESOLUTION
+            if tool in FIXED_720P_TOOLS
+            else (request.resolution or "720p")
+        )
     )
     duration = float(params.get("duration_seconds", request.clip_duration_seconds))
 
@@ -2753,7 +2999,7 @@ def _video_cost(
             times,
             # Extended output is 720p regardless of what the base clip asked
             # for (documented on loop_extend).
-            OMNI_RESOLUTION if model == OMNI_MODEL else "720p",
+            OMNI_RESOLUTION,
             request.needs_audio,
         )
 
@@ -3002,8 +3248,15 @@ def _plan_video(
         )
 
     # Candidate models for the chosen tool. Omni is only ever a candidate for
-    # the tools that actually run it.
-    if tool in ("generate_video", "generate_video_omni", "edit_video"):
+    # the tools that actually run it — including loop_extend, which _route_tool
+    # turns into extend_video_omni for an omni model (the preview model is
+    # then rejected by the extension capability rule, as it should be).
+    if tool in (
+        "generate_video",
+        "generate_video_omni",
+        "edit_video",
+        "loop_extend",
+    ):
         candidates = sorted(_VIDEO_PROFILES)
     elif tool == "generate_clip":
         # generate_clip's animatic mode runs on omni, but that is a preview

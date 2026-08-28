@@ -49,6 +49,38 @@ def measure_video_duration(path: Path) -> float | None:
     return None
 
 
+def measure_video_duration_bytes(data: bytes, extension: str = ".mp4") -> float | None:
+    """Read an in-memory clip's duration in seconds, or None.
+
+    The same probe as ``measure_video_duration`` for a video that has not been
+    written to disk — an input the caller handed us, which the omni tools have
+    to measure BEFORE spending anything on it: Google documents a 10s ceiling
+    on an uploaded edit/extension source and a 3s ceiling on a video
+    reference, and both are properties of the bytes, not of the request.
+
+    Never raises, for the same reason: a probe failure must degrade to "length
+    unknown" rather than refuse a clip that may well be fine.
+
+    Args:
+        data: Raw video bytes.
+        extension: Container hint for the decoder (".mp4", ".mov", ".webm").
+
+    Returns:
+        Duration in seconds, or None when it cannot be determined.
+    """
+    try:
+        import imageio.v3 as iio
+
+        meta = iio.immeta(BytesIO(data), extension=extension, plugin="FFMPEG")
+    except Exception:
+        logger.debug("Could not probe duration of an in-memory clip", exc_info=True)
+        return None
+    duration = meta.get("duration")
+    if isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0:
+        return float(duration)
+    return None
+
+
 def assert_frame_decoding_available() -> None:
     """Raise if no usable ffmpeg binary is present.
 
