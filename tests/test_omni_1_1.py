@@ -2552,3 +2552,138 @@ def test_the_animatic_resolution_knob_is_documented_where_it_is_used() -> None:
     assert "360p" in doc
     # And the animatic description must not still assert a flat 720p.
     assert "animatic_resolution says otherwise" in doc
+
+
+# ============================================================================
+# generate_video pre-flight parity, found by live harness testing
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_gcs_output_on_the_gemini_api_is_refused_by_the_quote_too(
+    tmp_path: Path,
+) -> None:
+    """The docstring says it "is rejected" there. The quote priced it anyway.
+
+    A clean $0.40 estimate, no warning, no warnings field — for a call the
+    real path refuses. Same defect class as the over-length extension source:
+    a documented rejection that the pre-flight did not apply.
+    """
+    from src.__main__ import generate_video
+
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="x",
+            model="veo-3.1-fast-generate-001",
+            output_gcs_uri="gs://bucket/out/",
+            dry_run=True,
+        )
+    )
+    assert "requires Vertex AI mode" in payload["error"]
+    assert "estimated_cost" not in payload, "quoted a call the render refuses"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_the_reported_model_matches_the_cost_it_is_quoted_at(
+    tmp_path: Path,
+) -> None:
+    """Two fields in one response named different models.
+
+    `model` said veo-3.1-fast-generate-preview while `cost.detail` beside it
+    said -001, and `model` is the field a caller reads.
+    """
+    from src.__main__ import generate_video
+
+    for requested in ("veo-3.1-fast-generate-001", "veo-3.1-generate-001"):
+        payload = json.loads(
+            await generate_video(
+                ctx=_ctx(tmp_path), prompt="x", model=requested, dry_run=True
+            )
+        )
+        reported = payload["model"]
+        detail = payload["estimated_cost"]["detail"]
+        assert reported == requested, f"{requested} came back as {reported}"
+        assert reported in detail, f"{reported} not named in {detail!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_preview_spelling_fed_back_resolves_to_its_canonical_name(
+    tmp_path: Path,
+) -> None:
+    """The round-trip the -preview spellings are accepted for still works."""
+    from src.__main__ import generate_video
+
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="x",
+            model="veo-3.1-fast-generate-preview",
+            dry_run=True,
+        )
+    )
+    assert payload["model"] == "veo-3.1-fast-generate-001"
+    assert payload["model"] in payload["estimated_cost"]["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_clip_segments_carry_measured_resolution_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clip renders many files at once, so an unverified echo hides best here.
+
+    Segments carried duration_source but not resolution_source, leaving
+    "resolution": "360p" as exactly the request echo that was fixed everywhere
+    else — and omni's rate differs threefold across tiers, so every beat would
+    be mispriced together.
+    """
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import generate_clip
+
+    frames = [
+        np.full((360, 640, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 2)
+    ]
+    buf = BytesIO()
+    iio.imwrite(buf, frames, extension=".mp4", fps=24)
+    rendered = buf.getvalue()
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        out = tmp_path / "videos" / "beat.mp4"
+        out.write_bytes(rendered)
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": "i-1",
+            "model": OMNI_1_1_MODEL,
+            "task": "text_to_video",
+            "duration_seconds": 2,
+            "aspect_ratio": "9:16",
+            "resolution": "360p",
+            "rendered_resolution": "360p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+
+    payload = json.loads(
+        await generate_clip(
+            ctx=_ctx(tmp_path),
+            beats=[{"prompt": "beat 1", "duration_seconds": 2}],
+            animatic=True,
+            animatic_resolution="360p",
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    segment = payload["segments"][0]
+    assert segment["resolution_source"] == "measured from the rendered video"
+    # Encoders align to a macro-block size, so a 360p render can measure 368
+    # tall. Classifying by tier rather than by an exact height is what makes
+    # the measurement usable at all.
+    width, height = segment["rendered_dimensions"]
+    assert width == 640 and 360 <= height <= 376, segment["rendered_dimensions"]
+    assert segment["resolution"] == "360p"

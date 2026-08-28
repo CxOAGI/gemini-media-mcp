@@ -57,7 +57,6 @@ from .video import (
     _VEO_LITE_MODELS,
     TranslatedVideoModel,
     VideoModel,
-    resolve_served_video_model,
     validate_video_request_inputs,
 )
 from .video import generate_video as generate_video_impl
@@ -3291,6 +3290,21 @@ async def generate_video(
                 has_extend=bool(extend_video_uri),
             )
 
+        # Resolved BEFORE the dry_run branch, so a quote applies every
+        # rejection the render applies. GCS output is Vertex-only and an
+        # explicit output_gcs_uri on the Gemini API is documented as rejected —
+        # but the check lived past the dry_run return, so a quote priced a call
+        # the real path refuses, with no warning and no warnings field at all.
+        # Same defect class as the over-length extension source.
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = bool(getattr(video_client._api_client, "vertexai", False))
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+
         if dry_run:
             # Draft mode routes to omni, which serves a plain text/image
             # request and snaps on its own [3, 10]s clamp — the Veo modes
@@ -3340,10 +3354,16 @@ async def generate_video(
             if draft:
                 est_model, draft_res = _omni_preview_model(draft_resolution)
             else:
-                est_model = resolve_served_video_model(
-                    str(model),
-                    getattr(app_ctx.client._api_client, "vertexai", False),
-                )
+                # The id that will actually be BILLED, which is the same
+                # resolver cost.detail uses — so the two can never name
+                # different models in one response. Reporting the served
+                # spelling here did exactly that: "model" said
+                # veo-3.1-fast-generate-preview while the detail beside it
+                # said -001. It also folds a -preview id the caller fed back
+                # from a previous response onto its canonical name.
+                from .pricing import resolve_model_id
+
+                est_model = resolve_model_id(str(model))
             est_res = (draft_res or "720p") if draft else (resolution or "720p")
             # Report the duration that will actually render. Returning the
             # request beside a price for the snapped value (5s quoted as "4s
@@ -3523,18 +3543,12 @@ async def generate_video(
         # Resolve the client up front: Veo Lite (and pure Gemini-API
         # deployments) route to the Gemini API, which does not support GCS
         # output. GCS behavior below depends on which backend is used.
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        # video_client / is_vertex_client / gcs_uri are resolved in the
+        # pre-flight above, so the quote and the render cannot disagree about
+        # the destination.
 
         # Combine explicit output_gcs_uri with the env default, validate the
         # allowlist, and apply the non-Vertex drop/raise gating.
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
-
         if extend_video_uri:
             # extend_video_uri is handed straight to the API as a video
             # source; a gs:// value must pass the same allowlist as every
@@ -4393,15 +4407,42 @@ async def generate_clip(
             # measured as though it were metered.
             beat_duration = float(beat_result.get("duration_seconds") or duration)
             beat_duration_source: str | None = None
+            beat_resolution_source: str | None = None
+            beat_dimensions: list[int] | None = None
+            beat_resolution = (
+                str(beat_result.get("rendered_resolution") or "720p")
+                if animatic
+                else "720p"
+            )
             if animatic:
                 beat_url_now = beat_result.get("video_url") or ""
                 if isinstance(beat_url_now, str) and beat_url_now.startswith("file://"):
+                    beat_path = Path(beat_url_now[7:])
                     measured_beat = await _probe_media(
-                        measure_video_duration, Path(beat_url_now[7:])
+                        measure_video_duration, beat_path
                     )
                     if measured_beat is not None:
                         beat_duration = measured_beat
                         beat_duration_source = "measured from the rendered video"
+                    # The resolution needs measuring for the same reason the
+                    # duration does, and more so here: a clip renders many
+                    # files in one call, so an unverified echo is the cheapest
+                    # place for a silent resolution regression to hide — and
+                    # the per-second rate differs threefold across omni's
+                    # tiers, so every beat would be mispriced together.
+                    size = await _probe_media(measure_video_dimensions, beat_path)
+                    if size is not None:
+                        beat_dimensions = list(size)
+                        classified = classify_video_resolution(size)
+                        if classified is not None:
+                            if classified != beat_resolution:
+                                clip_warnings.append(
+                                    f"Beat {idx} requested {beat_resolution} but "
+                                    f"rendered {classified} ({size[0]}x{size[1]}); "
+                                    "the cost prices what rendered."
+                                )
+                            beat_resolution = classified
+                            beat_resolution_source = "measured from the rendered video"
 
             beat_manifest = {
                 "kind": "beat",
@@ -4409,11 +4450,18 @@ async def generate_clip(
                 "prompt": prompt,
                 "model": beat_model,
                 # generate_clip takes no resolution parameter, so a Veo beat
-                # is always 720p; an animatic beat is whatever omni rendered.
-                "resolution": (
-                    str(beat_result.get("rendered_resolution") or "720p")
+                # is always 720p; an animatic beat is whatever omni MEASURED.
+                "resolution": beat_resolution,
+                "resolution_source": beat_resolution_source
+                or (
+                    "the request: the rendered file could not be opened to measure it"
                     if animatic
-                    else "720p"
+                    else "fixed: generate_clip takes no resolution parameter"
+                ),
+                **(
+                    {"rendered_dimensions": beat_dimensions}
+                    if beat_dimensions is not None
+                    else {}
                 ),
                 "aspect_ratio": aspect_ratio,
                 "duration_seconds": beat_duration,

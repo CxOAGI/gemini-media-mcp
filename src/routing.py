@@ -43,6 +43,8 @@ from .omni import (
     OMNI_1_1_MODEL,
     OMNI_DEFAULT_RESOLUTION,
     OMNI_MODEL,
+    OMNI_PREVIEW_MODEL,
+    OMNI_PREVIEW_SUNSET,
     OMNI_RESOLUTIONS,
     is_omni_model,
     omni_extension_output_lengths,
@@ -82,6 +84,11 @@ ToolName = Literal[
 LIVE_IMAGE_MODELS: tuple[str, ...] = get_args(ImageModel)
 LIVE_VIDEO_MODELS: tuple[str, ...] = get_args(VideoModel)
 IMAGE_SIZES: tuple[str, ...] = get_args(ImageSize)
+
+# Video models with a published end date, and when they stop. A route on one
+# of these is still offered — pinning it works until the date — but it is
+# demoted below any equally-scored replacement and says when it stops.
+DEPRECATED_VIDEO_MODELS: dict[str, str] = {OMNI_PREVIEW_MODEL: OMNI_PREVIEW_SUNSET}
 
 # Tool defaults, mirrored from src/__main__.py so a route that matches the
 # documented default can say so (and win ties against equally-scored models).
@@ -654,7 +661,9 @@ _IMAGE_TERMS: frozenset[str] = frozenset(
         "photo",
         "photograph",
         "picture",
+        "portrait",
         "poster",
+        "product shot",
         "render",
         "sticker",
         "thumbnail",
@@ -877,6 +886,66 @@ _BEST_TERMS: frozenset[str] = frozenset(
         "production ready",
         "production-ready",
         "top quality",
+    }
+)
+
+# Camera and cinematography vocabulary. Deliberately NOT in _VIDEO_TERMS: a
+# strong video hit wins outright over an image word, and "a cinematic portrait"
+# or "a wide shot of the logo" are stills. These sit in the weaker tier with
+# transitions and runtimes — enough to settle a brief that names no medium at
+# all ("a cinematic drone shot over a coastline", which planned as an IMAGE),
+# and not enough to overrule someone who said "photo".
+#
+# Every entry is a phrase rather than a bare word for the same reason: "shot"
+# alone matches "a shot of espresso" and "headshot".
+_CAMERA_TERMS: frozenset[str] = frozenset(
+    {
+        "aerial shot",
+        "camera move",
+        "camera moves",
+        "camera pan",
+        "camera pans",
+        "cinematic",
+        "close-up shot",
+        "continuous shot",
+        "crane shot",
+        "dolly in",
+        "dolly out",
+        "dolly shot",
+        "drone shot",
+        "establishing shot",
+        "handheld shot",
+        "one take",
+        "pans across",
+        "pov shot",
+        "single take",
+        "slow motion",
+        "slow-motion",
+        "tracking shot",
+        "unbroken shot",
+        "zoom in",
+        "zoom out",
+    }
+)
+
+# Phrases that name the SOURCE of a continuation as a prior interaction
+# rather than a file. Only omni can resolve one: loop_extend needs a Veo
+# video_uri and cannot take an interaction_id, so a brief that says "continuing
+# from the interaction I already rendered" was ranking a top route that could
+# not run at all.
+_INTERACTION_SOURCE_TERMS: frozenset[str] = frozenset(
+    {
+        "already rendered",
+        "already generated",
+        "interaction",
+        "interaction_id",
+        "i just generated",
+        "i just made",
+        "i just rendered",
+        "previous interaction",
+        "previously generated",
+        "the clip you made",
+        "the video you made",
     }
 )
 
@@ -1227,6 +1296,7 @@ class IntentSignals:
     wants_extension: bool = False
     wants_audio: bool = False
     wants_transition: bool = False
+    names_interaction_source: bool = False
     wants_bridge: bool = False
     wants_reference_consistency: bool = False
     wants_seed: bool = False
@@ -1276,6 +1346,8 @@ def infer_signals(intent: str) -> IntentSignals:
     cheap_hits = _matched_terms(text, _CHEAP_TERMS)
     best_hits = _matched_terms(text, _BEST_TERMS)
     transition_hits = _matched_terms(text, _TRANSITION_TERMS)
+    camera_hits = _matched_terms(text, _CAMERA_TERMS)
+    interaction_hits = _matched_terms(text, _INTERACTION_SOURCE_TERMS)
     bridge_hits = _matched_terms(text, _BRIDGE_TERMS)
     reference_hits = _matched_terms(text, _REFERENCE_TERMS)
     seed_hits = _matched_terms(text, _SEED_TERMS)
@@ -1314,7 +1386,13 @@ def infer_signals(intent: str) -> IntentSignals:
         media_kind = "video"
     elif image_hits:
         media_kind = "image"
-    elif transition_hits or bridge_hits or extension_hits or duration is not None:
+    elif (
+        transition_hits
+        or bridge_hits
+        or extension_hits
+        or camera_hits
+        or duration is not None
+    ):
         media_kind = "video"
 
     aspect_ratio: str | None = None
@@ -1335,6 +1413,7 @@ def infer_signals(intent: str) -> IntentSignals:
         sorted(
             set(
                 video_hits
+                + camera_hits
                 + image_hits
                 + text_hits
                 + highres_hits
@@ -1372,6 +1451,7 @@ def infer_signals(intent: str) -> IntentSignals:
         wants_extension=bool(extension_hits),
         wants_audio=bool(audio_hits),
         wants_transition=bool(transition_hits),
+        names_interaction_source=bool(interaction_hits),
         wants_bridge=bool(bridge_hits),
         wants_reference_consistency=bool(reference_hits) or reference_count is not None,
         wants_seed=bool(seed_hits),
@@ -1558,6 +1638,7 @@ class ResolvedRequest:
     extension_implied: bool
     wants_bridge: bool
     wants_transition: bool
+    names_interaction_source: bool
     wants_gcs_output: bool
     wants_storyboard: bool
     num_beats: int
@@ -1780,6 +1861,7 @@ def resolve_request(
         ),
         wants_bridge=signals.wants_bridge,
         wants_transition=signals.wants_transition,
+        names_interaction_source=signals.names_interaction_source,
         wants_gcs_output=bool(wants_gcs_output),
         wants_storyboard=signals.wants_storyboard,
         num_beats=int(num_beats),
@@ -1978,15 +2060,25 @@ def _rank(
 ) -> tuple[RoutedCall, ...]:
     """Order routes best-first, deterministically.
 
-    Ties break on fidelity (the more capable model is the safer default when
-    the score cannot separate them) and then on the model ID, so the ordering
-    is a total order that never depends on insertion or set iteration order.
+    Ties break first on whether the model has a published shutdown date — a
+    deprecated model scored level with its GA replacement was being offered as
+    an equal choice, which is how a caller ends up building on an endpoint
+    with weeks left — then on fidelity (the more capable model is the safer
+    default when the score cannot separate them) and then on the model ID, so
+    the ordering is a total order that never depends on insertion or set
+    iteration order.
     """
 
-    def sort_key(route: RoutedCall) -> tuple[float, float, str, str]:
+    def sort_key(route: RoutedCall) -> tuple[float, bool, float, str, str]:
         profile = profiles.get(route.model)
         fidelity = profile.fidelity_index if profile else 0.0
-        return (-route.score, -fidelity, route.model, route.tool)
+        return (
+            -route.score,
+            route.model in DEPRECATED_VIDEO_MODELS,
+            -fidelity,
+            route.model,
+            route.tool,
+        )
 
     return tuple(sorted(routes, key=sort_key))
 
@@ -2499,8 +2591,17 @@ def _route_tool(tool: ToolName, model: str) -> ToolName:
 
 def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
     """Translate the resolved request plus chosen tool into hard requirements."""
-    first_last = tool in ("generate_transition", "generate_bridge") or (
-        request.has_first_frame and request.has_last_frame
+    # A brief that ASKS for a transition needs first/last-frame support
+    # whether or not the endpoint URIs have been handed over yet. Keying this
+    # on the chosen tool alone meant "a smooth transition from sunrise to
+    # snowfall" — with no URIs, which is how an agent asks before it has the
+    # stills — selected generate_video, needed nothing, and ranked Veo 3.1
+    # Lite: the exact example this module's docstring gives for a request it
+    # catches "before you pay for the failure".
+    first_last = (
+        tool in ("generate_transition", "generate_bridge")
+        or (request.has_first_frame and request.has_last_frame)
+        or request.wants_transition
     )
     return VideoNeeds(
         first_last_frame=first_last,
@@ -2519,7 +2620,11 @@ def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
         # top out with a Veo loop_extend route that had silently dropped the
         # id and told the caller to supply a clip they do not have.
         conversational_edit=(
-            tool == "edit_video" or request.previous_interaction_id is not None
+            tool == "edit_video"
+            or request.previous_interaction_id is not None
+            # A brief that names a prior interaction as its source needs a
+            # model that can read one, even before the id has been supplied.
+            or request.names_interaction_source
         ),
         clip_duration_seconds=request.clip_duration_seconds,
     )
@@ -2861,6 +2966,16 @@ def _video_params(
     # Lite is published on the Gemini Developer API only, so the server routes
     # it through a Gemini API client even in Vertex mode — which also means
     # its audio is always on and its output can never go to GCS.
+    sunset = DEPRECATED_VIDEO_MODELS.get(model)
+    if sunset:
+        caveats.append(
+            f"{model} is deprecated: its endpoint is switched off on {sunset}. "
+            "It ranks below any equally-scored replacement and should not be "
+            f"built on. The GA successor is {OMNI_1_1_MODEL}, which renders "
+            "the same 720p at the same published rate and adds resolution "
+            "control, video extension and first/last-frame interpolation."
+        )
+
     if model in _VEO_LITE_MODELS:
         caveats.append(
             f"{model} is served by the Gemini Developer API only; GEMINI_API_KEY "
@@ -3239,14 +3354,16 @@ def _plan_video(
             if tool in ("generate_transition", "generate_bridge")
             else ("generate_bridge" if request.wants_bridge else "generate_transition")
         )
+        if request.has_first_frame:
+            missing = "only the first frame is available"
+        elif request.has_last_frame:
+            missing = "only the last frame is available"
+        else:
+            missing = "neither frame is available"
         conflicts.append(
             RoutingConflict(
                 code="transition_requires_two_endpoints",
-                detail=(
-                    f"{named_tool} needs both endpoints, but only "
-                    f"{'a first' if request.has_first_frame else 'a last' if request.has_last_frame else 'neither'} "
-                    "frame is available."
-                ),
+                detail=f"{named_tool} needs both endpoints, but {missing}.",
                 resolution=(
                     "Supply first_frame_uri and last_frame_uri (or two clip URIs "
                     "for generate_bridge)."
