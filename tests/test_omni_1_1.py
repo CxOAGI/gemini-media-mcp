@@ -1883,3 +1883,153 @@ async def test_a_fresh_1_1_render_carries_no_duration_caveat(
     )
     assert result["duration_seconds"] == 6
     assert not any("never duration" in w for w in result.get("warnings") or [])
+
+
+# ============================================================================
+# The 360p tier reaches the composite tools
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_naming_a_draft_resolution_selects_the_model_that_has_one(
+    tmp_path: Path,
+) -> None:
+    """generate_video(draft=True) was locked to the preview model's 720p.
+
+    So the cheapest render this server can issue was unreachable from the
+    draft shortcut — the one place a caller most wants it.
+    """
+    from src.__main__ import generate_video
+
+    at_720 = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="a robot",
+            model="veo-3.1-fast-generate-001",
+            draft=True,
+            dry_run=True,
+        )
+    )
+    at_360 = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="a robot",
+            model="veo-3.1-fast-generate-001",
+            draft=True,
+            draft_resolution="360p",
+            dry_run=True,
+        )
+    )
+    assert at_720["model"] == OMNI_PREVIEW_MODEL
+    assert at_720["resolution"] == "720p"
+    assert at_360["model"] == OMNI_1_1_MODEL
+    assert at_360["resolution"] == "360p"
+    assert at_360["estimated_cost"]["usd"] == pytest.approx(
+        at_720["estimated_cost"]["usd"] / 3.0, abs=1e-6
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_animatic_can_preview_the_whole_reel_at_360p(
+    tmp_path: Path,
+) -> None:
+    """A 20-beat animatic at 720p costs about what the Veo render costs.
+
+    At 360p it is a third — which is what makes the preview worth recommending
+    rather than merely worth explaining.
+    """
+    from src.__main__ import generate_clip
+
+    beats = [{"prompt": f"beat {i}", "duration_seconds": 8} for i in range(5)]
+    at_720 = json.loads(
+        await generate_clip(
+            ctx=_ctx(tmp_path), beats=beats, animatic=True, dry_run=True
+        )
+    )
+    at_360 = json.loads(
+        await generate_clip(
+            ctx=_ctx(tmp_path),
+            beats=beats,
+            animatic=True,
+            animatic_resolution="360p",
+            dry_run=True,
+        )
+    )
+    assert at_720["model"] == OMNI_PREVIEW_MODEL
+    assert at_360["model"] == OMNI_1_1_MODEL
+    assert at_360["estimated_cost"]["usd"] == pytest.approx(
+        at_720["estimated_cost"]["usd"] / 3.0, abs=1e-6
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_draft_resolution_the_model_cannot_render_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Refused, not silently rendered at something else and billed for it."""
+    from src.__main__ import generate_video
+
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="a robot",
+            model="veo-3.1-fast-generate-001",
+            draft=True,
+            draft_resolution="8K",
+            dry_run=True,
+        )
+    )
+    assert "Unsupported resolution '8K'" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_the_animatic_resolution_reaches_the_beat_renders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quote that promises 360p and a render that sends 720p bill differently.
+
+    The dry_run path and the render path read the resolution separately, so a
+    test that only priced the quote would pass while every beat came back at
+    the default and cost three times what was quoted.
+    """
+    from src.__main__ import generate_clip
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        out = tmp_path / "videos" / f"beat{len(calls)}.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": f"i-{len(calls)}",
+            "model": OMNI_1_1_MODEL,
+            "task": "text_to_video",
+            "duration_seconds": 4,
+            "aspect_ratio": "9:16",
+            "resolution": "360p",
+            "rendered_resolution": "360p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+
+    payload = json.loads(
+        await generate_clip(
+            ctx=_ctx(tmp_path),
+            beats=[{"prompt": "beat 1", "duration_seconds": 4}],
+            animatic=True,
+            animatic_resolution="360p",
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert calls, "the animatic never rendered"
+    assert calls[0]["model"] == OMNI_1_1_MODEL
+    assert calls[0]["resolution"] == "360p"
+    # And the segment records what rendered, so the clip total prices 360p.
+    segment = payload["segments"][0]
+    assert segment["resolution"] == "360p"

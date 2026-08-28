@@ -782,6 +782,24 @@ def _validate_aspect_ratio(aspect_ratio: str) -> None:
 MAX_OMNI_INPUT_IMAGES = 8
 
 
+def _omni_preview_model(resolution: str | None) -> tuple[str, str | None]:
+    """The (model, resolution) a draft or animatic pass should render at.
+
+    Asking for a resolution at all means asking for the model that HAS one, so
+    naming a resolution implies gemini-omni-1.1-flash. Leaving it unset keeps
+    the preview model and its fixed 720p, which is what every existing caller
+    gets — this is the one knob, not a second model argument to keep in sync.
+
+    360p is the point of the knob: it is a third of the 720p price, which is
+    what turns a preview pass from "costs about what the delivery render
+    costs" into a real saving on a 20-beat reel.
+    """
+    if resolution is None:
+        return OMNI_MODEL, None
+    spec = _validate_omni_model(OMNI_1_1_MODEL)
+    return OMNI_1_1_MODEL, _validate_omni_resolution(spec, resolution)
+
+
 def _omni_backend_is_vertex(
     app_ctx: AppContext, need_gcs: bool = False, prefer_backend: str | None = None
 ) -> bool:
@@ -2108,7 +2126,7 @@ def _assemble_clip_manifest(
             _video_cost_estimate(
                 seg.get("model", beat_model),
                 float(seg.get("duration_seconds") or 0),
-                resolution="720p",
+                resolution=str(seg.get("resolution") or "720p"),
                 include_audio=bool(seg.get("audio_enabled", include_audio)),
                 actual=_segment_is_metered(seg),
                 presnapped=not _segment_is_metered(seg),
@@ -3006,6 +3024,7 @@ async def generate_video(
     extend_video_uri: str | None = None,
     output_gcs_uri: str | None = None,
     draft: bool = False,
+    draft_resolution: str | None = None,
     dry_run: bool = False,
 ) -> str:
     """Generate a video using Google VEO models.
@@ -3061,6 +3080,11 @@ async def generate_video(
             estimate for the call that would run (the omni draft price when
             draft=True). Free and instant. A real run reports the actual
             cost, derived from the effective duration the API rendered.
+        draft_resolution: Resolution for a `draft=True` pass. Naming one
+            renders the draft on gemini-omni-1.1-flash, which is the model
+            with a resolution parameter; "360p" is about a third of the 720p
+            price and the cheapest preview this server can render. Left unset,
+            the draft keeps the preview model's fixed 720p.
         draft: When True, route to gemini-omni-flash for a fast 720p draft
             instead of Veo, then re-run with draft=False to finalize.
             Faster, but NOT cheaper than veo-3.1-fast-generate-001: omni is
@@ -3159,14 +3183,15 @@ async def generate_video(
             # caller who pinned (or fed back) a `-preview` id saw the quote say
             # `-preview` while the render reported the resolved `-001` name.
             # Resolve it the way the impl does for the primary backend.
+            draft_res: str | None = None
             if draft:
-                est_model = OMNI_MODEL
+                est_model, draft_res = _omni_preview_model(draft_resolution)
             else:
                 est_model = resolve_served_video_model(
                     str(model),
                     getattr(app_ctx.client._api_client, "vertexai", False),
                 )
-            est_res = "720p" if draft else (resolution or "720p")
+            est_res = (draft_res or "720p") if draft else (resolution or "720p")
             # Report the duration that will actually render. Returning the
             # request beside a price for the snapped value (5s quoted as "4s
             # of video") made the payload contradict itself.
@@ -3267,14 +3292,17 @@ async def generate_video(
             extra: dict[str, Any] = {"draft": True}
             if ignored:
                 extra["ignored_veo_params"] = ignored
-            await ctx.info("Generating draft with gemini-omni-flash")
+            draft_model, draft_res = _omni_preview_model(draft_resolution)
+            await ctx.info(f"Generating draft with {draft_model}")
             result = await _omni_generate_and_manifest(
                 app_ctx,
                 ctx,
                 prompt=draft_prompt,
+                model=draft_model,
                 image_bytes_list=draft_image_bytes,
                 aspect_ratio=aspect_ratio,
                 duration_seconds=duration_seconds,
+                resolution=draft_res,
                 manifest_extra=extra,
             )
             if ignored:
@@ -3864,6 +3892,7 @@ async def generate_clip(
     add_bridges: bool = False,
     output_gcs_uri: str | None = None,
     animatic: bool = False,
+    animatic_resolution: str | None = None,
     dry_run: bool = False,
 ) -> str:
     """Generate a multi-beat short clip — the building block for a reel / short.
@@ -3944,7 +3973,8 @@ async def generate_clip(
     errors: list[dict[str, Any]] = []
     clip_warnings: list[str] = []
     total_duration = 0.0
-    beat_model = OMNI_MODEL if animatic else model
+    animatic_model, animatic_res = _omni_preview_model(animatic_resolution)
+    beat_model = animatic_model if animatic else model
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
@@ -4033,12 +4063,12 @@ async def generate_clip(
             preflight.append("ffmpeg available for frame decoding (bridges)")
 
         if dry_run:
-            est_model = OMNI_MODEL if animatic else model
+            est_model = animatic_model if animatic else model
             beat_costs = [
                 _video_cost_estimate(
                     est_model,
                     float(b.get("duration_seconds", 4.0)),
-                    resolution="720p",
+                    resolution=(animatic_res or "720p") if animatic else "720p",
                     include_audio=include_audio and not animatic,
                 )
                 for b in beats
@@ -4153,13 +4183,19 @@ async def generate_clip(
                     dropped_warning = _animatic_beat_dropped_warning(beat, idx)
                     if dropped_warning:
                         clip_warnings.append(dropped_warning)
+                    omni_client = _client_for_omni(app_ctx)
                     beat_result = await generate_video_omni_impl(
-                        client=_client_for_omni(app_ctx),
+                        client=omni_client,
                         prompt=beat_prompt,
                         videos_dir=app_ctx.videos_dir,
+                        model=animatic_model,
                         image_bytes_list=[image_bytes] if image_bytes else None,
                         aspect_ratio=aspect_ratio,
                         duration_seconds=duration,
+                        resolution=animatic_res,
+                        allow_uri_delivery=not getattr(
+                            omni_client._api_client, "vertexai", False
+                        ),
                         log_callback=ctx.info,
                     )
                 else:
@@ -4211,6 +4247,13 @@ async def generate_clip(
                 "index": idx,
                 "prompt": prompt,
                 "model": beat_model,
+                # generate_clip takes no resolution parameter, so a Veo beat
+                # is always 720p; an animatic beat is whatever omni rendered.
+                "resolution": (
+                    str(beat_result.get("rendered_resolution") or "720p")
+                    if animatic
+                    else "720p"
+                ),
                 "aspect_ratio": aspect_ratio,
                 "duration_seconds": beat_duration,
                 "seed": None if animatic else seed,
