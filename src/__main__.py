@@ -328,6 +328,55 @@ def _get_omni_vertex_global_client() -> genai.Client:
     return _omni_vertex_global_client
 
 
+def _omni_backend_choice(
+    app_ctx: AppContext,
+    *,
+    need_gcs: bool = False,
+    prefer_backend: str | None = None,
+) -> str:
+    """Which backend an omni call will use: "vertex" or "gemini_api".
+
+    The DECISION, split out from the construction it used to be entangled
+    with. Pre-flights need the answer to apply the right backend's documented
+    limits, and asking for it by building a client meant a yes/no question
+    could construct a Vertex client on the event loop — credential resolution
+    and all, which can reach for the metadata server, and which is not
+    memoized when it fails, so every subsequent call retries and blocks again.
+    A blocked event loop hangs every request in the process, not just this one.
+
+    See _client_for_omni for what each branch means.
+    """
+    primary_is_vertex = bool(getattr(app_ctx.client._api_client, "vertexai", False))
+    if prefer_backend == "vertex" and primary_is_vertex:
+        return "vertex"
+    if prefer_backend == "gemini_api":
+        if app_ctx.gemini_api_client is not None:
+            return "gemini_api"
+        if not primary_is_vertex:
+            return "gemini_api"
+    if need_gcs and primary_is_vertex:
+        return "vertex"
+    if app_ctx.gemini_api_client is not None:
+        return "gemini_api"
+    if primary_is_vertex:
+        return "vertex"
+    return "gemini_api"
+
+
+def _omni_backend_is_vertex(
+    app_ctx: AppContext, need_gcs: bool = False, prefer_backend: str | None = None
+) -> bool:
+    """Whether the call this pre-flight is checking will run on Vertex AI.
+
+    Reads the same decision the client picker reads, without building
+    anything — see _omni_backend_choice.
+    """
+    return (
+        _omni_backend_choice(app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend)
+        == "vertex"
+    )
+
+
 def _client_for_omni(
     app_ctx: AppContext,
     *,
@@ -359,20 +408,13 @@ def _client_for_omni(
     the call is left to fail with the service's own error rather than one this
     function invents.
     """
-    primary_is_vertex = getattr(app_ctx.client._api_client, "vertexai", False)
-    if prefer_backend == "vertex" and primary_is_vertex:
-        return _get_omni_vertex_global_client()
-    if prefer_backend == "gemini_api":
-        if app_ctx.gemini_api_client is not None:
-            return app_ctx.gemini_api_client
-        if not primary_is_vertex:
-            return app_ctx.client
-    if need_gcs and primary_is_vertex:
+    if (
+        _omni_backend_choice(app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend)
+        == "vertex"
+    ):
         return _get_omni_vertex_global_client()
     if app_ctx.gemini_api_client is not None:
         return app_ctx.gemini_api_client
-    if primary_is_vertex:
-        return _get_omni_vertex_global_client()
     return app_ctx.client
 
 
@@ -515,7 +557,7 @@ async def _omni_generate_and_manifest(
     video_url = result.get("video_url") or ""
     if isinstance(video_url, str) and video_url.startswith("file://"):
         rendered_path = Path(video_url[7:])
-        measured = await asyncio.to_thread(measure_video_duration, rendered_path)
+        measured = await _probe_media(measure_video_duration, rendered_path)
         if measured is not None:
             effective_duration = measured
             duration_source = "measured from the rendered video"
@@ -524,7 +566,7 @@ async def _omni_generate_and_manifest(
         # indistinguishable from a report of what rendered, while omni's
         # per-second rate differs threefold across its tiers. One extra probe
         # on a file already open turns the billing basis into evidence.
-        size = await asyncio.to_thread(measure_video_dimensions, rendered_path)
+        size = await _probe_media(measure_video_dimensions, rendered_path)
         if size is not None:
             result["rendered_dimensions"] = list(size)
             classified = classify_video_resolution(size)
@@ -712,7 +754,7 @@ def _draft_ignored_veo_params(
     output_gcs_uri: str | None,
     include_audio: bool,
 ) -> list[str]:
-    """Veo-only params gemini-omni-flash drops on a draft render.
+    """Veo-only params the omni draft model drops on a draft render.
 
     Shared by generate_video's dry_run and real draft paths so a quote
     discloses exactly the ignored paid parameters the real run reports —
@@ -744,15 +786,13 @@ def _draft_ignored_veo_params(
 
 def _draft_ignored_warning(ignored: list[str]) -> str:
     """The single warning line naming the Veo-only params a draft dropped."""
-    return "draft mode (gemini-omni-flash) ignored Veo-only params: " + ", ".join(
-        ignored
-    )
+    return "draft mode (omni) ignored Veo-only params: " + ", ".join(ignored)
 
 
 def _animatic_mode_warnings(
     *, add_bridges: bool, output_gcs_uri: str | None, include_audio: bool
 ) -> list[str]:
-    """Clip-level params gemini-omni-flash drops in animatic mode.
+    """Clip-level params the omni animatic model drops in animatic mode.
 
     Shared by generate_clip's dry_run and real run so a quote discloses the
     ignored inputs (add_bridges, output_gcs_uri, include_audio) the render
@@ -772,7 +812,7 @@ def _animatic_mode_warnings(
     if include_audio:
         warnings.append(
             "include_audio is ignored in animatic mode "
-            "(gemini-omni-flash previews carry no controllable audio)."
+            "(omni previews carry no controllable audio)."
         )
     return warnings
 
@@ -831,20 +871,6 @@ def _omni_preview_model(resolution: str | None) -> tuple[str, str | None]:
     return OMNI_1_1_MODEL, _validate_omni_resolution(spec, resolution)
 
 
-def _omni_backend_is_vertex(
-    app_ctx: AppContext, need_gcs: bool = False, prefer_backend: str | None = None
-) -> bool:
-    """Whether the client this call will use runs in Vertex AI mode.
-
-    Asked by the pre-flights, which have to apply the right backend's
-    documented limits BEFORE the call is made. Resolved through
-    _client_for_omni itself so the answer cannot drift from the client that
-    actually gets used.
-    """
-    client = _client_for_omni(app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend)
-    return bool(getattr(client._api_client, "vertexai", False))
-
-
 async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[str]:
     """Warn about reference clips longer than the documented ceiling.
 
@@ -861,7 +887,7 @@ async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[
     """
     warnings: list[str] = []
     for index, clip in enumerate(clips):
-        measured = await asyncio.to_thread(measure_video_duration_bytes, clip)
+        measured = await _probe_media(measure_video_duration_bytes, clip)
         if measured is not None and measured > spec.max_reference_video_seconds:
             warnings.append(
                 f"reference_video_uris[{index}] is {measured:.2f}s, over the "
@@ -886,8 +912,9 @@ async def _check_omni_source_video(
 
     A model that documents no such ceiling gets no check. Reading the absent
     value as a limit of zero seconds refused EVERY input video on
-    gemini-omni-flash-preview — which is the default model, and whose
-    input_video_uri path had always worked — with "must be 0s or shorter".
+    gemini-omni-flash-preview — which was the default model at the time, and
+    whose input_video_uri path had always worked — with "must be 0s or
+    shorter".
 
     The ceiling itself is the BACKEND's: the Developer API documents 10s "when
     uploading", Vertex documents 1-30s for the same operation. Applying the
@@ -899,7 +926,7 @@ async def _check_omni_source_video(
     limit = omni_source_limit_seconds(spec, vertexai=vertexai)
     if not limit:
         return []
-    measured = await asyncio.to_thread(measure_video_duration_bytes, data)
+    measured = await _probe_media(measure_video_duration_bytes, data)
     if measured is not None and measured > limit:
         raise ValueError(
             f"The source video is {measured:.2f}s. An UPLOADED video to edit "
@@ -1049,6 +1076,32 @@ def _omni_billed_resolution(spec: Any, resolution: str | None) -> str:
     if not spec.supports_resolution:
         return spec.rendered_resolution
     return resolution or spec.rendered_resolution
+
+
+async def _fetch_local_omni_source(
+    ctx: Context[ServerSession, AppContext],
+    uri: str,
+) -> bytes | None:
+    """Read a LOCAL omni source for a pre-flight, or None.
+
+    A dry run is documented as free, instant and offline, so it reads a
+    file:// source the caller already has and leaves gs:// and http(s):// to
+    the real run. Never raises: a quote that cannot open the file falls back
+    to the documented maximum and says so, rather than failing a call that
+    generates nothing.
+    """
+    if not uri.startswith("file://"):
+        return None
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        return await fetch(
+            uri,
+            allowed_dir=app_ctx.data_folder,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+    except Exception:
+        logger.debug("Could not read %s for a pre-flight", uri, exc_info=True)
+        return None
 
 
 async def _fetch_omni_media(
@@ -1708,6 +1761,75 @@ _SIDECAR_SCAN_TIMEOUT_SECONDS = 5.0
 _PROBE_EXECUTOR_MAX_WORKERS = 4
 _probe_executor: ThreadPoolExecutor | None = None
 _probe_executor_lock = threading.Lock()
+
+# Media probes get their own pool for the same reason, one step further out.
+# Each one shells out to ffmpeg through imageio; a malformed or half-written
+# file, a stalled mount or a container under memory pressure can leave that
+# subprocess unreaped and the worker parked, and a parked worker cannot be
+# cancelled. Run on asyncio.to_thread — which is what these did — they draw on
+# the loop's single shared default executor, the same twelve threads every
+# fetch, every image render and every frame extraction also use, so a burst of
+# probes can starve work that has nothing to do with media at all.
+#
+# Sized above the probe pool because probes are per-CALL (one duration, one
+# dimension, one per reference clip) rather than per-request, and a chained
+# extension issues several in a row.
+_MEDIA_PROBE_MAX_WORKERS = 6
+_MEDIA_PROBE_TIMEOUT_SECONDS = 30.0
+_media_probe_executor: ThreadPoolExecutor | None = None
+_media_probe_lock = threading.Lock()
+
+
+def _get_media_probe_executor() -> ThreadPoolExecutor:
+    """Return the process-wide media-probe pool, created on first use."""
+    global _media_probe_executor
+    with _media_probe_lock:
+        if _media_probe_executor is None:
+            _media_probe_executor = ThreadPoolExecutor(
+                max_workers=_MEDIA_PROBE_MAX_WORKERS,
+                thread_name_prefix="media-probe",
+            )
+        return _media_probe_executor
+
+
+async def _decode_media(func: Any, /, *args: Any) -> Any:
+    """Run one ffmpeg-backed DECODE off the loop, bounded and deadlined.
+
+    Same pool as _probe_media, opposite error contract: frame extraction has
+    no honest "not measured" answer — a bridge without its endpoints is not a
+    degraded bridge, it is a different render — so a failure propagates to the
+    per-beat handler that already knows what to do with it.
+    """
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(_get_media_probe_executor(), func, *args),
+        timeout=_MEDIA_PROBE_TIMEOUT_SECONDS,
+    )
+
+
+async def _probe_media(func: Any, /, *args: Any) -> Any:
+    """Run one ffmpeg-backed probe off the loop, bounded and deadlined.
+
+    Returns None on timeout rather than raising: every caller of these probes
+    already treats "not measured" as a legitimate answer and reports it as
+    such, so a slow probe degrades the provenance of a figure instead of
+    failing a render that has already been paid for.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_get_media_probe_executor(), func, *args),
+            timeout=_MEDIA_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            "Media probe %s timed out or failed after %.0fs; continuing without "
+            "a measurement",
+            getattr(func, "__name__", func),
+            _MEDIA_PROBE_TIMEOUT_SECONDS,
+            exc_info=True,
+        )
+        return None
 
 
 def _get_probe_executor() -> ThreadPoolExecutor:
@@ -3116,7 +3238,7 @@ async def generate_video(
             with a resolution parameter; "360p" is about a third of the 720p
             price and the cheapest preview this server can render. Left unset,
             the draft keeps the preview model's fixed 720p.
-        draft: When True, route to gemini-omni-flash for a fast 720p draft
+        draft: When True, route to the omni draft model for a fast draft
             instead of Veo, then re-run with draft=False to finalize.
             Faster, but NOT cheaper than veo-3.1-fast-generate-001: omni is
             $0.10136/s against Fast's $0.10/s. The saving is real only against
@@ -3462,7 +3584,7 @@ async def generate_video(
         # figure that cannot drift from the request or a stale record.
         rendered_url = result.get("video_url") or ""
         if isinstance(rendered_url, str) and rendered_url.startswith("file://"):
-            measured = await asyncio.to_thread(
+            measured = await _probe_media(
                 measure_video_duration, Path(rendered_url[7:])
             )
             if measured is not None:
@@ -3833,8 +3955,8 @@ async def generate_bridge(
             )
 
         await ctx.info("Extracting bridge frames")
-        first_frame_png = await asyncio.to_thread(extract_frame_png, from_bytes, "end")
-        last_frame_png = await asyncio.to_thread(extract_frame_png, to_bytes, "start")
+        first_frame_png = await _decode_media(extract_frame_png, from_bytes, "end")
+        last_frame_png = await _decode_media(extract_frame_png, to_bytes, "start")
 
         gcs_uri = _resolve_video_gcs(
             output_gcs_uri,
@@ -3966,7 +4088,7 @@ async def generate_clip(
             bridge when add_bridges is set — and generate nothing. The single
             most useful pre-flight in the server: a clip is the most expensive
             call it can make.
-        animatic: When True, render every beat with gemini-omni-flash (fast,
+        animatic: When True, render every beat on the omni draft model (fast,
             720p) instead of Veo, for a quick storyboard preview of the
             whole reel before committing to full Veo renders. Bridges are not
             available in animatic mode (add_bridges is ignored), and Veo-only
@@ -4266,7 +4388,7 @@ async def generate_clip(
             if animatic:
                 beat_url_now = beat_result.get("video_url") or ""
                 if isinstance(beat_url_now, str) and beat_url_now.startswith("file://"):
-                    measured_beat = await asyncio.to_thread(
+                    measured_beat = await _probe_media(
                         measure_video_duration, Path(beat_url_now[7:])
                     )
                     if measured_beat is not None:
@@ -4323,10 +4445,10 @@ async def generate_clip(
 
                 if cur_bytes is not None:
                     try:
-                        end_frame = await asyncio.to_thread(
+                        end_frame = await _decode_media(
                             extract_frame_png, prev_video_bytes, "end"
                         )
-                        start_frame = await asyncio.to_thread(
+                        start_frame = await _decode_media(
                             extract_frame_png, cur_bytes, "start"
                         )
                         await ctx.info(f"Generating bridge before beat {idx + 1}")
@@ -4466,13 +4588,16 @@ async def generate_video_omni(
     family with conversational multi-turn editing. Neither model supports
     seeds or negative prompts (put negatives in the prompt: "no dialogue").
 
-    Two models, and the second is the one with the controls:
+    Two models, and the default is the one with the controls:
 
-    * `gemini-omni-flash-preview` (default) — 720p/24fps, nothing else.
-    * `gemini-omni-1.1-flash` — 360p/720p/1080p/4K output, first/last-frame
-      interpolation, image AND video references, native audio, and video
-      extension (see extend_video_omni). A 360p pass costs about a third of
-      720p, which makes it the cheapest preview this server can render.
+    * `gemini-omni-1.1-flash` (default) — 360p/720p/1080p/4K output,
+      first/last-frame interpolation, image and video references, native
+      audio, and video extension (see extend_video_omni).
+    * `gemini-omni-flash-preview` — 720p/24fps and nothing else. Deprecated;
+      its endpoint is switched off on 2026-09-30.
+
+    A 360p pass costs about a third of 720p, which makes it the cheapest
+    preview this server can render.
 
     Args:
         ctx: MCP context with application state
@@ -4483,9 +4608,10 @@ async def generate_video_omni(
             `effective_prompt`. Timecodes work in plain language
             ("[0-3s] a person walks"), as does audio direction ("include calm
             background music").
-        omni_model: "gemini-omni-flash-preview" (default) or
-            "gemini-omni-1.1-flash". Arguments the chosen model cannot honor
-            are refused, never dropped.
+        omni_model: "gemini-omni-1.1-flash" (default) or the deprecated
+            "gemini-omni-flash-preview", whose endpoint is switched off on
+            2026-09-30. Arguments the chosen model cannot honor are refused,
+            never dropped.
         image_uris: Optional input images whose role the model infers — one is
             treated as a starting frame, several as subject references
             (gs://, http(s)://, file:// within DATA_FOLDER). Cannot be combined
@@ -5060,6 +5186,28 @@ async def extend_video_omni(
                 input_video_uri, app_ctx.data_folder, "input_video_uri"
             )
             source_duration = prior.duration_seconds
+            if source_duration is None and input_video_uri:
+                # An uploaded source's length is the base every turn is billed
+                # on, and it is sitting in a local file the quote can open.
+                # Assuming the documented maximum instead quoted $0.6771 for a
+                # render that billed $0.4396 — over-stating, so the invariant
+                # held, but by 54% on a figure that was free to measure. Only
+                # local sources: a quote does not download a remote one.
+                source_bytes = await _fetch_local_omni_source(ctx, input_video_uri)
+                if source_bytes is not None:
+                    source_duration = await _probe_media(
+                        measure_video_duration_bytes, source_bytes
+                    )
+                    if source_duration is not None:
+                        # And a source the real run would refuse must not be
+                        # quoted as if it would run.
+                        _ = await _check_omni_source_video(
+                            spec,
+                            source_bytes,
+                            vertexai=_omni_backend_is_vertex(
+                                app_ctx, bool(output_gcs_uri), prior.backend
+                            ),
+                        )
             # Each turn renders the ASSEMBLED clip, so the source is the base
             # every turn is billed on top of and the chain stops when it
             # reaches the documented ceiling.
@@ -5140,7 +5288,7 @@ async def extend_video_omni(
                     ),
                 )
             )
-            source_duration = await asyncio.to_thread(
+            source_duration = await _probe_media(
                 measure_video_duration_bytes, input_video_bytes
             )
         else:

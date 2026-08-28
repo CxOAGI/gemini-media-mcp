@@ -2304,3 +2304,171 @@ async def test_a_timeout_after_create_carries_the_interaction_id(
             model=OMNI_1_1_MODEL,
             timeout_seconds=1,
         )
+
+
+# ============================================================================
+# Wedge hardening and pre-flight accuracy
+# ============================================================================
+
+
+def test_asking_which_backend_never_builds_a_client() -> None:
+    """A yes/no question must not construct a Vertex client on the event loop.
+
+    Client construction resolves credentials, which can reach for the metadata
+    server, and a failed construction is not memoized — so every subsequent
+    call retries and blocks again. A blocked event loop hangs every request in
+    the process, not just the one that asked.
+    """
+    import src.__main__ as server
+
+    built: list[str] = []
+
+    def _explode() -> Any:  # pragma: no cover - must never run
+        built.append("constructed")
+        raise AssertionError("a pre-flight built a client")
+
+    original = server._get_omni_vertex_global_client
+    server._get_omni_vertex_global_client = _explode  # pyright: ignore[reportAttributeAccessIssue]
+    try:
+        vertex_primary = MagicMock()
+        vertex_primary._api_client.vertexai = True
+        app = MagicMock()
+        app.client = vertex_primary
+        app.gemini_api_client = None
+
+        assert server._omni_backend_is_vertex(app) is True
+        assert server._omni_backend_is_vertex(app, True) is True
+        assert server._omni_backend_is_vertex(app, False, "gemini_api") is True
+    finally:
+        server._get_omni_vertex_global_client = original  # pyright: ignore[reportAttributeAccessIssue]
+    assert built == [], "the pre-flight constructed a client"
+
+
+def test_the_backend_decision_and_the_client_picker_cannot_disagree() -> None:
+    """Splitting them is only safe while they read the same rule."""
+    import src.__main__ as server
+
+    gemini = MagicMock()
+    gemini._api_client.vertexai = False
+    vertex_primary = MagicMock()
+    vertex_primary._api_client.vertexai = True
+    global_vertex = MagicMock()
+    global_vertex._api_client.vertexai = True
+
+    original = server._omni_vertex_global_client
+    server._omni_vertex_global_client = global_vertex
+    try:
+        for primary, api_client in (
+            (vertex_primary, gemini),
+            (vertex_primary, None),
+            (gemini, None),
+            (gemini, gemini),
+        ):
+            app = MagicMock()
+            app.client = primary
+            app.gemini_api_client = api_client
+            for need_gcs in (False, True):
+                for prefer in (None, "vertex", "gemini_api"):
+                    decided = server._omni_backend_choice(
+                        app, need_gcs=need_gcs, prefer_backend=prefer
+                    )
+                    client = server._client_for_omni(
+                        app, need_gcs=need_gcs, prefer_backend=prefer
+                    )
+                    actual = (
+                        "vertex"
+                        if getattr(client._api_client, "vertexai", False)
+                        else "gemini_api"
+                    )
+                    assert decided == actual, (primary, api_client, need_gcs, prefer)
+    finally:
+        server._omni_vertex_global_client = original
+
+
+def test_no_ffmpeg_work_runs_on_the_shared_default_executor() -> None:
+    """asyncio.to_thread draws on the loop's single shared pool.
+
+    That is the same twelve threads every fetch, image render and frame
+    extraction use, and a worker blocked in a subprocess cannot be cancelled —
+    which this module's own comment says wedges the whole server. Media work
+    gets its own bounded pool.
+    """
+    import re
+
+    # Scanned across line breaks: ruff wraps these calls, so a line-by-line
+    # grep silently misses `asyncio.to_thread(\n    measure_video_duration, ...)`
+    # — which is the exact shape they are written in.
+    source = Path("src/__main__.py").read_text()
+    offenders = re.findall(
+        r"asyncio\.to_thread\(\s*(measure_\w+|extract_frame\w*)", source
+    )
+    assert offenders == [], offenders
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_local_extend_source_is_measured_by_the_pre_flight(
+    tmp_path: Path,
+) -> None:
+    """The quote was assuming the documented maximum for a file it could open.
+
+    $0.6771 quoted against $0.4396 billed — over-stating, so the invariant
+    held, but by 54% on a figure that was free to measure.
+    """
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import extend_video_omni
+
+    frames = [
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 3)
+    ]
+    buf = BytesIO()
+    iio.imwrite(buf, frames, extension=".mp4", fps=24)
+    source = tmp_path / "three.mp4"
+    source.write_bytes(buf.getvalue())
+
+    payload = json.loads(
+        await extend_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            input_video_uri=f"file://{source}",
+            resolution="360p",
+            dry_run=True,
+        )
+    )
+    assert payload["source_duration_seconds"] == pytest.approx(3.0, abs=0.2)
+    # 3s source + one 10s increment, not the 10s-maximum assumption.
+    assert payload["turn_output_seconds"][0] == pytest.approx(13.0, abs=0.2)
+    assert payload["assembled_seconds"] == pytest.approx(13.0, abs=0.2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_the_pre_flight_refuses_an_over_length_local_source(
+    tmp_path: Path,
+) -> None:
+    """A quote must not price a call the real run refuses."""
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import extend_video_omni
+
+    frames = [
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 13)
+    ]
+    buf = BytesIO()
+    iio.imwrite(buf, frames, extension=".mp4", fps=24)
+    source = tmp_path / "thirteen.mp4"
+    source.write_bytes(buf.getvalue())
+
+    payload = json.loads(
+        await extend_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            input_video_uri=f"file://{source}",
+            dry_run=True,
+        )
+    )
+    assert "10s or shorter" in payload["error"]
+    assert "estimated_cost" not in payload
