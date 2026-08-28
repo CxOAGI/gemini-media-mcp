@@ -289,7 +289,7 @@ The default stays on the preview model so existing calls render exactly what the
 
 **Parameters:**
 - `prompt` (required): Text description of the video. Timecodes work in plain language (`"[0-3s] a person walks"`), as does audio direction (`"include calm background music"`). If you write your own role tags (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) they are passed through untouched; otherwise the declarations are generated from the media arguments and echoed back as `effective_prompt`
-- `omni_model`: `gemini-omni-flash-preview` (default) or `gemini-omni-1.1-flash`. Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K
+- `omni_model`: `gemini-omni-flash-preview` (default) or `gemini-omni-1.1-flash`. Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K. Pass the Gemini-API spelling on either backend: Vertex AI publishes 1.1 as `gemini-omni-1.1-flash-preview` and the translation is automatic, with the canonical ID reported back and the served one alongside it as `served_model`
 - `image_uris`: Image URIs whose role the model infers — one is a starting frame, several are subject references (optional; **at most 8 images total** — more is rejected, since each is buffered in memory)
 - `first_frame_uri` / `last_frame_uri` (1.1): Keyframe interpolation. `last_frame_uri` requires `first_frame_uri`; the same URI for both makes a seamless loop
 - `reference_image_uris` (1.1): Subject/style references, bound to `<IMAGE_REF_0>`, `<IMAGE_REF_1>`, … in order
@@ -331,7 +331,7 @@ Append a seamless continuation to an existing video (`gemini-omni-1.1-flash` onl
 Two sources, with different rules:
 
 - **`previous_interaction_id`** — a clip this server already rendered. The video context lives on the service, nothing is uploaded, and spoken dialogue may be added in the continuation.
-- **`input_video_uri`** — a clip of your own. It must be **10 seconds or shorter** (checked locally before anything is uploaded), it cannot gain new dialogue if someone is talking in it, and uploading a video to be extended is unavailable in the EEA, Switzerland and the UK.
+- **`input_video_uri`** — a clip of your own. It must be **10 seconds or shorter on the Gemini API, 30 on Vertex AI** (the two backends document different ceilings; checked locally against the right one before anything is uploaded), it cannot gain new dialogue if someone is talking in it, and uploading a video to be extended is unavailable in the EEA, Switzerland and the UK.
 
 Each turn appends up to 10s, to a **cumulative 40s**. `times` chains that many turns, threading each result into the next.
 
@@ -339,12 +339,13 @@ Each turn appends up to 10s, to a **cumulative 40s**. `times` chains that many t
 - `prompt` (required): How the scene continues — `"Extend this video"`, `"Continue the scene: the camera pans across the mountains"`. Describe the audio if it should change, and say so if you want a cut to a new scene. In a timecode, `0s` is the start of the **new** footage, not of the source
 - `previous_interaction_id` **or** `input_video_uri` (exactly one required)
 - `times`: How many extension turns to chain (default 1, maximum 4). Turns run on the backend that minted the interaction, so a chain never drifts between Vertex AI and the Gemini API mid-way
+- `duration_seconds`: How much footage each turn appends, 3–10s (default 10). Sent only when extending an **uploaded** video — a turn continuing a previous interaction cannot declare its task, so the service picks the length there
 - `omni_model`: An interaction cannot change models mid-conversation, so continuing one created on another model is refused rather than sent as a plain edit and billed as an extension
 - `resolution`, `reference_image_uris`, `reference_video_uris`, `output_gcs_uri`, `timeout_seconds`, `dry_run` — as for `generate_video_omni`. References ride along on the first turn, which is where a new character is introduced
 
-**Returns:** JSON with the final `video_url`, the `interaction_id` to keep extending from, `final_duration_seconds` (the finished clip), `completed_turns`, one segment record per turn, and the summed cost. If a turn fails part-way through a chain, the turns that already rendered are still returned with their `interaction_id`, alongside an `error` telling you where to resume — they were billed.
+**Returns:** JSON with the last turn's `video_url`, the `interaction_id` to keep extending from, `appended_seconds`, `completed_turns`, one segment record per turn, and the summed cost. Each turn returns the footage it **appends**, not the assembled clip, so the segments are an ordered list to join downstream — the same shape `generate_clip` produces for a multi-beat reel. If a turn fails part-way through a chain, the turns that already rendered are still returned with their `interaction_id`, alongside an `error` telling you where to resume — they were billed.
 
-**How this is priced.** A turn renders the *whole growing clip*, not just the tail it appends: the docs cap "a total length of 40s", place a cut 2s into the extension of a 10s source "after 12s", and say "some of the final frames in your input video will be edited". Since Omni bills per second of output, turn 2 costs more than turn 1. A `dry_run` measures the source when it can (a prior interaction's sidecar) and projects each turn's output length from it; when it cannot, it assumes the documented 10s maximum source. `turn_output_seconds` shows the projection and `billed_seconds` its total.
+**How this is priced.** A turn renders only the footage it appends, so each is billed at its own 3–10s — not at the assembled length. The [Interactions API reference](https://ai.google.dev/api/interactions-api) gives `duration` as "the length of the generated video files" with a 3–10s range, Vertex's own extend request sends exactly that field, and its documented sample response bills 28,832 video output tokens — 4.98s at the published 5,792 tokens/s. That also makes the two published caps consistent: a source of up to 30s plus an appended 10s is the documented 40s total. A `dry_run` measures the source when it can (a prior interaction's sidecar) and reports how many turns actually fit under that 40s ceiling in `planned_turns` and `turn_output_seconds`.
 
 ### loop_extend
 

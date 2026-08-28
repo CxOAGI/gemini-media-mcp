@@ -2675,13 +2675,12 @@ def _video_params(
             "multi-turn source has no such limit."
         )
         caveats.append(
-            "Each turn renders the whole growing clip, not just the appended "
-            "tail, so the turns get longer and dearer as the chain runs. The "
-            f"planner cannot see the source's length, so it assumes the "
-            f"{spec.max_uploaded_source_seconds:g}s maximum — the assumption "
-            "that quotes lowest. Raise `times` if your source is shorter and "
-            "you want the full length; the tool's own dry_run measures the "
-            "source and gives the exact figure."
+            "Each turn returns the footage it appends, not the assembled "
+            "clip, so the response is a sequence of segments to join "
+            f"downstream. The planner cannot see the source's length, so it "
+            f"does not know how many turns fit under the "
+            f"{spec.max_extended_seconds}s total; the tool's own dry_run "
+            "measures the source and says."
         )
     elif tool in ("generate_transition", "generate_bridge"):
         params = {
@@ -2935,15 +2934,21 @@ def _video_cost(
         )
 
     if tool == "extend_video_omni":
-        # Every turn is its own interaction and its own render, and an
-        # extension returns the whole growing clip rather than the appended
-        # tail — so turn 2 renders (and bills) longer than turn 1. Quoting
-        # every turn at the 10s step under-quoted a 4-turn chain 2.6x. The
-        # source length is not knowable here, so the documented maximum is
-        # assumed, matching what the tool's own dry_run does when it cannot
-        # measure the source either.
+        # Every turn is its own interaction and its own render, and each
+        # renders the CONTINUATION it appends — 3-10s, set by duration — not
+        # the whole growing clip. The Interactions API reference gives
+        # duration's range for exactly this request, and the documented sample
+        # response bills 28,832 video tokens, which is 4.98s at the published
+        # rate. The source length is not knowable here, so the projection does
+        # not clamp against the cumulative ceiling; the tool's own dry_run
+        # measures the source and does.
         turns = int(params.get("times", 1))
-        lengths = omni_extension_output_lengths(omni_spec(model), None, turns)
+        lengths = omni_extension_output_lengths(
+            omni_spec(model),
+            None,
+            turns,
+            params.get("duration_seconds"),
+        )
         if not lengths:
             return None
         return _aggregate_video_cost(

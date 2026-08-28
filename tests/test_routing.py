@@ -1677,12 +1677,16 @@ def test_the_extension_route_sends_the_resolution_it_is_priced_at() -> None:
     assert "@ 360p" in route.cost.detail
 
 
-def test_an_extension_chain_is_priced_at_the_clip_each_turn_renders() -> None:
-    """A turn returns the whole growing clip, not the tail it appends.
+def test_an_extension_chain_is_priced_at_the_footage_each_turn_appends() -> None:
+    """A turn returns the continuation, not the assembled clip.
 
-    Omni bills per second of output, so a flat "10s a turn" quote under-stated
-    a 4-turn chain by more than 2x.
+    Confirmed by the Interactions API reference (`duration` is "the length of
+    the generated video files", 3-10s, and Vertex's extend request sends it)
+    and by the documented sample response, which bills 28,832 video tokens —
+    4.98s at the published rate.
     """
+    from src.pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
     plan = plan_generation(
         "extend this clip by 40 seconds",
         RoutingConstraints(media_kind="video", previous_interaction_id="abc123"),
@@ -1690,11 +1694,11 @@ def test_an_extension_chain_is_priced_at_the_clip_each_turn_renders() -> None:
     route = next(r for r in plan.routes if r.tool == "extend_video_omni")
     turns = route.params["times"]
     assert route.cost is not None
-    # Turns render 20/30/40/40s off the assumed 10s source, not 10s each.
-    assert route.cost.breakdown["seconds"] > 10 * turns * 2
-    assert any("whole growing clip" in caveat for caveat in route.caveats)
-    # And the assumption behind that projection is stated, not silent.
-    assert any("assumes the" in caveat for caveat in route.caveats)
+    # Every turn appends the 10s maximum, plus one encoder frame each.
+    assert route.cost.breakdown["seconds"] == pytest.approx(
+        turns * (10.0 + OMNI_ENCODER_ALLOWANCE_SECONDS)
+    )
+    assert any("footage it appends" in caveat for caveat in route.caveats)
 
 
 def test_an_interaction_id_excludes_every_model_that_cannot_read_one() -> None:
