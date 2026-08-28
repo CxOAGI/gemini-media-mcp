@@ -342,13 +342,24 @@ Each turn appends up to 10s, to a **cumulative 40s**. `times` chains that many t
 - `prompt` (required): How the scene continues — `"Extend this video"`, `"Continue the scene: the camera pans across the mountains"`. Describe the audio if it should change, and say so if you want a cut to a new scene. In a timecode, `0s` is the start of the **new** footage, not of the source
 - `previous_interaction_id` **or** `input_video_uri` (exactly one required)
 - `times`: How many extension turns to chain (default 1, maximum 4). Turns run on the backend that minted the interaction, so a chain never drifts between Vertex AI and the Gemini API mid-way
-- `duration_seconds`: How much footage each turn appends, 3–10s (default 10). Sent only when extending an **uploaded** video — a turn continuing a previous interaction cannot declare its task, so the service picks the length there
 - `omni_model`: An interaction cannot change models mid-conversation, so continuing one created on another model is refused rather than sent as a plain edit and billed as an extension
 - `resolution`, `reference_image_uris`, `reference_video_uris`, `output_gcs_uri`, `timeout_seconds`, `dry_run` — as for `generate_video_omni`. References ride along on the first turn, which is where a new character is introduced
 
-**Returns:** JSON with the last turn's `video_url`, the `interaction_id` to keep extending from, `appended_seconds`, `completed_turns`, one segment record per turn, and the summed cost. Each turn returns the footage it **appends**, not the assembled clip, so the segments are an ordered list to join downstream — the same shape `generate_clip` produces for a multi-beat reel. If a turn fails part-way through a chain, the turns that already rendered are still returned with their `interaction_id`, alongside an `error` telling you where to resume — they were billed.
+**Returns:** JSON with the last turn's `video_url`, the `interaction_id` to keep extending from, `billed_seconds`, `assembled_seconds`, `appended_seconds`, `completed_turns`, one segment record per turn, and the summed cost. Each turn's `video_url` **supersedes** the previous one — they are not segments to join. If a turn fails part-way through a chain, the turns that already rendered are still returned with their `interaction_id`, alongside an `error` telling you where to resume — they were billed.
 
-**How this is priced.** A turn renders only the footage it appends, so each is billed at its own 3–10s — not at the assembled length. The [Interactions API reference](https://ai.google.dev/api/interactions-api) gives `duration` as "the length of the generated video files" with a 3–10s range, Vertex's own extend request sends exactly that field, and its documented sample response bills 28,832 video output tokens — 4.98s at the published 5,792 tokens/s. That also makes the two published caps consistent: a source of up to 30s plus an appended 10s is the documented 40s total. A `dry_run` measures the source when it can (a prior interaction's sidecar) and reports how many turns actually fit under that 40s ceiling in `planned_turns` and `turn_output_seconds`.
+> ### ⚠️ Extension cost grows quadratically
+>
+> **A turn renders the whole assembled clip, not the 10s it appends.** Measured: a **3.01s source extended once returned 13.01s**. Omni bills per second of output, so every turn re-bills all the footage before it:
+>
+> | `times` | turns render | billed | new footage |
+> |---|---|---|---|
+> | 1 | 13.01s | 13.01s | 10s |
+> | 2 | 13.01s + 23.01s | **36.02s** | 20s |
+> | 3 | + 33.01s | **69.03s** | 30s |
+>
+> Two documented sources pointed the other way — the [API reference](https://ai.google.dev/api/interactions-api) calls `duration` "the length of the generated video files" with a 3–10s range, and Vertex's sample response bills 28,832 video tokens (4.98s) — and neither survived a real render. Always `dry_run` a chain before running it.
+
+A `dry_run` needs the source's length to be right, and gets it from the sidecar of a prior interaction or by measuring an uploaded clip. When it has neither it assumes the documented maximum, because assuming a shorter source is the one direction a quote may not err in. It reports `turn_output_seconds`, `billed_seconds`, `assembled_seconds` and `planned_turns` separately, since those are four different numbers.
 
 ### loop_extend
 

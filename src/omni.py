@@ -215,23 +215,27 @@ def _strips_output_spec(
 ) -> bool:
     """Whether this request must leave ``aspect_ratio`` and ``duration`` off.
 
-    Not "is it a continuation". Two narrower facts:
+    Every continuation must. Three separate live 400s say so:
 
-    * an ``edit`` rejects duration outright — live-verified, "Duration cannot
-      be set in response format for edit task" — and the source already fixes
-      the ratio;
+    * an ``edit`` rejects duration — "Duration cannot be set in response
+      format for edit task";
+    * an ``extend`` rejects aspect ratio — "Aspect ratio cannot be set in
+      response format for extend task". Vertex's own documented
+      extend-videos request DOES send both fields, so the documentation and
+      the service disagree and the service wins. ``duration`` is stripped
+      there too: its own acceptance was masked behind the aspect-ratio
+      rejection, and the launch post describes extension as fixed 10-second
+      increments, so there is nothing for it to control and everything to
+      lose by sending it;
     * a turn carrying ``previous_interaction_id`` cannot say which task it is
-      (the API rejects a task alongside it), so the service infers one. Infer
-      "edit" and duration is rejected; there is no way to tell from here which
-      it will pick, so neither field is risked.
+      (the API rejects a task alongside it), so the service infers one and
+      there is no way to tell from here which of the two rejections applies.
 
-    An ``extend`` with an uploaded source is neither: Vertex's own
-    extend-videos request sends `aspect_ratio` and `duration` in
-    response_format alongside `"task": "extend"`, and the reference gives
-    duration's range as 3-10s. Stripping them there threw away the only
-    control the caller has over how much footage each turn appends.
+    An earlier version of this function narrowed to the edit case alone on
+    the strength of Vertex's sample request, which 400s every uploaded
+    extension.
     """
-    return previous_interaction_id is not None or task_type == _TASK_EDIT
+    return previous_interaction_id is not None or task_type in _CONTINUATION_TASKS
 
 
 @dataclass(frozen=True)
@@ -439,6 +443,14 @@ def _delivered_video_cap(spec: OmniModelSpec) -> int:
 # — comfortably inside the JSON payload limits — while leaving the short
 # clips omni actually takes on the simpler inline path.
 _MAX_INLINE_VIDEO_BYTES = 8 * 1024 * 1024
+
+# Default deadline for a whole interaction (create + polling). Deliberately
+# under the ~4 minute ceiling common MCP hosts impose on a single tool call: a
+# render that outlives the HOST's limit is billed with no result, no id and no
+# way to retrieve or cancel it, so the spend cannot be reconciled at all. Under
+# this limit the call returns a TimeoutError naming the interaction_id instead,
+# which is recoverable. Raise it only if the host's own ceiling is higher.
+OMNI_DEFAULT_TIMEOUT_SECONDS = 210
 
 # Interval (seconds) between polls of an in-flight background interaction.
 _POLL_INTERVAL = 5
@@ -1157,7 +1169,7 @@ async def generate_video_omni(
     resolution: str | None = None,
     output_gcs_uri: str | None = None,
     allow_uri_delivery: bool = False,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     log_callback: LogCallback | None = None,
 ) -> dict[str, Any]:
     """Generate, edit or extend a video with one of the Omni models.
@@ -1375,17 +1387,38 @@ async def generate_video_omni(
 
     expired = f"Omni video interaction timed out after {timeout_seconds}s."
 
+    def _timed_out(interaction_id: Any = None) -> TimeoutError:
+        """A timeout that carries the interaction id, when there is one.
+
+        The render keeps going on the service and gets billed whether or not
+        this process is still waiting. Without the id in the message a caller
+        who times out has no way to retrieve it, resume from it, or reconcile
+        the charge — the spend simply vanishes. An MCP host with a shorter
+        ceiling than timeout_seconds makes this the common case, not the edge.
+        """
+        if interaction_id:
+            return TimeoutError(
+                f"{expired} The render is still in progress on the service and "
+                f"will be billed: interaction_id={interaction_id}. Poll or "
+                "continue from that id rather than re-rendering."
+            )
+        return TimeoutError(expired)
+
+    # Set as soon as create returns, so every timeout after that point can
+    # name the render it abandoned.
+    interaction_id: Any = None
+
     async def _run_within_deadline(func: Any, /, **kwargs: Any) -> Any:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            raise TimeoutError(expired)
+            raise _timed_out(interaction_id)
         # run_off_loop, not asyncio.to_thread: a timed-out call cannot be
         # cancelled, and abandoning it on the loop's shared default executor
         # burns a worker that every other request also draws from.
         return await run_off_loop(
             functools.partial(func, **kwargs),
             timeout=remaining,
-            message=expired,
+            message=str(_timed_out(interaction_id)),
         )
 
     def _deadline_expired() -> bool:
@@ -1463,7 +1496,7 @@ async def generate_video_omni(
     last_logged_at = loop.time()
     while status in _IN_FLIGHT_STATUSES:
         if _deadline_expired():
-            raise TimeoutError(expired)
+            raise _timed_out(interaction_id)
         if log_callback and (
             status != logged_status
             or loop.time() - last_logged_at >= _POLL_LOG_INTERVAL_SECONDS
@@ -1558,58 +1591,71 @@ def omni_extension_output_lengths(
     times: int,
     per_turn_seconds: float | None = None,
 ) -> list[float]:
-    """OUTPUT length of each turn of an extension chain.
+    """Billable OUTPUT length of each turn of an extension chain.
 
-    A turn returns the CONTINUATION, not the whole growing clip. Two Google
-    sources settle it: the Interactions API reference gives ``duration`` — "the
-    length of the generated video files" — a range of 3 to 10 seconds, and
-    Vertex's extend-videos request sends exactly that field alongside
-    ``"task": "extend"``; and the documented sample response for an omni
-    extension bills 28,832 video output tokens, which at the published 5,792
-    tokens per second is 4.98s of video, not a whole extended clip.
+    MEASURED: a 3.01s source extended once returned a 13.01s file. A turn
+    renders the ASSEMBLED clip — the source plus the appended increment — not
+    the increment alone. Omni bills per second of output, so each turn of a
+    chain re-bills every second that came before it, and the cost grows
+    quadratically in the number of turns rather than linearly.
 
-    That also makes the two published caps consistent: an input of up to 30s
-    plus an appended 10s is the documented 40s total.
-
-    An earlier reading had this growing (source + N steps) on the strength of
-    a timecode example in the prompt guide, which turns out to describe the
-    ASSEMBLED timeline rather than one response. It over-quoted a chain by up
-    to 4x.
+    That measurement overrules two documentary readings that pointed the other
+    way, and both are recorded here because they are the trap: the Interactions
+    API reference calls ``duration`` "the length of the generated video files"
+    with a 3-10s range, and Vertex's documented sample response for an omni
+    extension bills 28,832 video output tokens, which is 4.98s at the
+    published rate. Neither survives a real render.
 
     Args:
         spec: The model's capability record.
-        source_seconds: Length of the clip being extended, when known. Used
-            only to stop projecting past the cumulative ceiling.
+        source_seconds: Length of the clip being extended. This is now
+            load-bearing, not decorative: it is the base every turn is billed
+            on top of. None falls back to the longest source the model
+            documents accepting, because assuming a SHORTER source than the
+            real one under-quotes, which is the one direction a pre-flight
+            may not err in.
         times: How many turns are planned.
-        per_turn_seconds: The duration each turn requests; defaults to the
-            documented maximum, which is what quotes highest.
+        per_turn_seconds: Ignored, kept for call-site compatibility. The
+            launch post describes extension as fixed 10-second increments and
+            the service rejects a duration on an extend request anyway.
 
     Returns:
-        One output length per turn, in order.
+        The assembled length after each turn, in order — which is what each
+        turn bills.
     """
-    # Quoted at the STEP, never at a shorter requested duration. The launch
-    # post says extension happens "in 10-second increments", while the API
-    # reference gives duration a 3-10s range — so a caller asking for 5s may
-    # get 10s of billable footage, and the two readings differ by 2x in the
-    # direction a pre-flight may not err. Taking the larger costs an over-quote
-    # at worst; taking the smaller under-bills every short-step chain.
-    requested = float(per_turn_seconds or spec.extension_step_seconds or _MAX_DURATION)
-    step = max(requested, float(spec.extension_step_seconds or _MIN_DURATION))
-    step = min(max(step, float(_MIN_DURATION)), float(_MAX_DURATION))
+    del per_turn_seconds  # the service picks the increment; see above
+    step = float(spec.extension_step_seconds or _MAX_DURATION)
     ceiling = float(spec.max_extended_seconds or _MAX_DURATION)
-    assembled = float(source_seconds) if source_seconds is not None else 0.0
+    assembled = (
+        float(source_seconds)
+        if source_seconds is not None
+        else float(spec.max_uploaded_source_seconds or 0.0)
+    )
     lengths: list[float] = []
     for _ in range(max(0, times)):
-        # Each turn appends `step` seconds of new footage until the assembled
-        # clip reaches the documented ceiling; a turn with no room left
-        # appends nothing and is not billed for anything either.
-        remaining = ceiling - assembled
-        if remaining <= 0:
+        if assembled >= ceiling:
+            # The documented ceiling is on the assembled clip, so a chain that
+            # has reached it has nothing left to render and nothing to bill.
             break
-        appended = min(step, remaining)
-        assembled += appended
-        lengths.append(appended)
+        assembled = min(assembled + step, ceiling)
+        lengths.append(assembled)
     return lengths
+
+
+def omni_extension_appended_seconds(
+    source_seconds: float | None, turn_outputs: list[float]
+) -> float | None:
+    """New footage a chain produced, given each turn's assembled length.
+
+    The turns' own lengths cannot be summed to get this: every one of them
+    contains all the footage before it. The answer is the last turn's length
+    minus the source, and it is unknowable without the source — reporting a
+    sum as "appended" overstated a 2-turn chain off a 3s source as 36s of new
+    footage when it made 20s.
+    """
+    if not turn_outputs or source_seconds is None:
+        return None
+    return max(0.0, turn_outputs[-1] - float(source_seconds))
 
 
 def omni_continuation_upper_bound(
@@ -1636,9 +1682,12 @@ def omni_continuation_upper_bound(
     """
     ceiling = float(spec.max_extended_seconds or _MAX_DURATION)
     if task == _TASK_EXTEND and spec.supports_extend:
-        # A turn renders the continuation only, so its own output cannot
-        # exceed the per-render maximum however long the source is.
-        return float(_MAX_DURATION)
+        # A turn renders the assembled clip (measured: a 3.01s source came
+        # back 13.01s), so the bound is the source plus one increment, and the
+        # documented ceiling when the source is unknown.
+        if source_seconds is None:
+            return ceiling
+        return min(source_seconds + spec.extension_step_seconds, ceiling)
     # An edit re-renders the clip it is given, and the per-render maximum is
     # what the one measurement in hand showed it producing (a 3s source
     # rendered 10.01s). A source longer than that is only reachable by

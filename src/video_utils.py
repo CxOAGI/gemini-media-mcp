@@ -49,6 +49,75 @@ def measure_video_duration(path: Path) -> float | None:
     return None
 
 
+def measure_video_dimensions(path: Path) -> tuple[int, int] | None:
+    """Read a rendered file's real (width, height), or None.
+
+    The counterpart to measure_video_duration, and needed for the same reason:
+    a response that echoes the resolution it ASKED for cannot be told apart
+    from one reporting what rendered. Omni bills per second and the per-second
+    rate differs threefold across its resolution tiers, so "the request said
+    360p" is not evidence the bill is a 360p bill.
+
+    Never raises: a probe failure degrades to "not measured" rather than
+    failing a render that already succeeded.
+
+    Args:
+        path: A local video file.
+
+    Returns:
+        (width, height) in pixels, or None when it cannot be determined.
+    """
+    try:
+        import imageio.v3 as iio
+
+        meta = iio.immeta(path, plugin="FFMPEG")
+    except Exception:
+        logger.debug("Could not probe dimensions of %s", path, exc_info=True)
+        return None
+    size = meta.get("size")
+    if (
+        isinstance(size, (tuple, list))
+        and len(size) == 2
+        and all(isinstance(v, int) and v > 0 for v in size)
+    ):
+        return (int(size[0]), int(size[1]))
+    return None
+
+
+# Nominal frame heights of the resolutions omni can emit, used to name what a
+# measured height actually is. Tolerant bands, because a container may report a
+# height a few pixels off a nominal one (encoder alignment) and an aspect ratio
+# of 9:16 swaps the axes.
+_RESOLUTION_HEIGHTS: tuple[tuple[str, int], ...] = (
+    ("360p", 360),
+    ("720p", 720),
+    ("1080p", 1080),
+    ("4K", 2160),
+)
+
+
+def classify_video_resolution(size: tuple[int, int] | None) -> str | None:
+    """Name the resolution tier a measured (width, height) falls in, or None.
+
+    Uses the SHORTER side, so a 9:16 portrait render classifies the same as
+    the 16:9 landscape one — the tier is about pixel count per frame, and omni
+    prices it that way.
+    """
+    if size is None:
+        return None
+    short_side = min(size)
+    best: tuple[str, int] | None = None
+    for name, nominal in _RESOLUTION_HEIGHTS:
+        if best is None or abs(short_side - nominal) < abs(short_side - best[1]):
+            best = (name, nominal)
+    if best is None:
+        return None
+    # Only claim a tier when the measurement is genuinely near it; a 500px
+    # render belongs to neither 360p nor 720p and saying otherwise would be
+    # inventing evidence.
+    return best[0] if abs(short_side - best[1]) <= best[1] * 0.15 else None
+
+
 def measure_video_duration_bytes(data: bytes, extension: str = ".mp4") -> float | None:
     """Read an in-memory clip's duration in seconds, or None.
 

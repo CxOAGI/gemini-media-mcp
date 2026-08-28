@@ -581,16 +581,17 @@ def test_reference_videos_are_numbered_after_the_source_video(
 
 
 @pytest.mark.timeout(20.0)
-def test_an_uploaded_extension_sends_its_task_duration_and_aspect_ratio(
+def test_an_uploaded_extension_sends_its_task_and_nothing_optional(
     tmp_path: Path, no_poll_delay: None
 ) -> None:
-    """An uploaded extension carries the full output spec.
+    """An extension rejects aspect_ratio, live-verified.
 
-    Vertex's own extend-videos request sends `aspect_ratio` and `duration` in
-    response_format alongside `"task": "extend"`, and the Interactions API
-    reference gives duration's range as 3-10s — "the length of the generated
-    video files". Withholding them threw away the only control a caller has
-    over how much footage each turn appends.
+    "Aspect ratio cannot be set in response format for extend task" — a real
+    400, against Vertex's own documented extend request, which sends both
+    aspect_ratio and duration. The service wins. `duration` goes too: its
+    acceptance was masked behind the aspect-ratio rejection, and the launch
+    post describes extension as fixed 10s increments, so there is nothing for
+    it to control and a 400 to lose.
     """
     stub = _OmniStub()
     videos_dir = tmp_path / "videos"
@@ -609,16 +610,11 @@ def test_an_uploaded_extension_sends_its_task_duration_and_aspect_ratio(
 
     created = stub.created()
     assert created["generation_config"]["video_config"]["task"] == "extend"
-    assert stub.response_format() == {
-        "type": "video",
-        "aspect_ratio": "16:9",
-        "duration": "8s",
-        "resolution": "720p",
-    }
+    assert stub.response_format() == {"type": "video", "resolution": "720p"}
     assert result["task"] == "extend"
-    # Sent, so reportable as fact rather than as None.
-    assert result["duration_seconds"] == 8
-    assert result["aspect_ratio"] == "16:9"
+    # Neither was sent, so neither can be reported as fact.
+    assert result["duration_seconds"] is None
+    assert result["aspect_ratio"] is None
 
 
 @pytest.mark.timeout(20.0)

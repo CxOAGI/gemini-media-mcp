@@ -35,11 +35,13 @@ from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import (
     OMNI_1_1_MODEL,
+    OMNI_DEFAULT_TIMEOUT_SECONDS,
     OMNI_MAX_DURATION_SECONDS,
     DEFAULT_OMNI_MODEL,
     OMNI_MODELS,
     is_omni_model,
     normalize_omni_resolution,
+    omni_extension_appended_seconds,
     omni_extension_output_lengths,
     omni_continuation_upper_bound,
     omni_source_limit_seconds,
@@ -61,7 +63,9 @@ from .video import (
 from .video import generate_video as generate_video_impl
 from .video_utils import (
     assert_frame_decoding_available,
+    classify_video_resolution,
     extract_frame_png,
+    measure_video_dimensions,
     measure_video_duration,
     measure_video_duration_bytes,
 )
@@ -391,7 +395,7 @@ async def _omni_generate_and_manifest(
     resolution: str | None = None,
     output_gcs_uri: str | None = None,
     prefer_backend: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     manifest_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the omni impl and attach a sidecar manifest, returning the result.
@@ -507,12 +511,33 @@ async def _omni_generate_and_manifest(
     )
     duration_source: str | None = None
 
+    resolution_source: str | None = None
     video_url = result.get("video_url") or ""
     if isinstance(video_url, str) and video_url.startswith("file://"):
-        measured = await asyncio.to_thread(measure_video_duration, Path(video_url[7:]))
+        rendered_path = Path(video_url[7:])
+        measured = await asyncio.to_thread(measure_video_duration, rendered_path)
         if measured is not None:
             effective_duration = measured
             duration_source = "measured from the rendered video"
+        # The resolution needs the same treatment the duration got, and for a
+        # sharper reason: `rendered_resolution` was an echo of the REQUEST,
+        # indistinguishable from a report of what rendered, while omni's
+        # per-second rate differs threefold across its tiers. One extra probe
+        # on a file already open turns the billing basis into evidence.
+        size = await asyncio.to_thread(measure_video_dimensions, rendered_path)
+        if size is not None:
+            result["rendered_dimensions"] = list(size)
+            classified = classify_video_resolution(size)
+            if classified is not None:
+                requested_res = result.get("rendered_resolution")
+                result["rendered_resolution"] = classified
+                resolution_source = "measured from the rendered video"
+                if requested_res and requested_res != classified:
+                    result.setdefault("warnings", []).append(
+                        f"Requested {requested_res} but the render measured "
+                        f"{classified} ({size[0]}x{size[1]}). The cost below "
+                        "prices what rendered, not what was asked for."
+                    )
 
     # An edit is any turn that continues existing footage — a prior
     # interaction OR an input video — mirroring omni's own _select_task_type.
@@ -562,6 +587,11 @@ async def _omni_generate_and_manifest(
             "asked for, not the length measured"
         )
 
+    if resolution_source is None:
+        resolution_source = (
+            "the request: the rendered file could not be opened to measure it"
+        )
+    result["resolution_source"] = resolution_source
     duration_is_measured = duration_source == "measured from the rendered video"
     if effective_duration is not None:
         result["duration_seconds"] = effective_duration
@@ -614,6 +644,7 @@ async def _omni_generate_and_manifest(
         "backend": "vertex" if client_is_vertex else "gemini_api",
         "aspect_ratio": aspect_ratio,
         "resolution": result.get("rendered_resolution"),
+        "resolution_source": result.get("resolution_source"),
         "duration_seconds": result.get("duration_seconds", duration_seconds),
         "interaction_id": result.get("interaction_id"),
         "previous_interaction_id": previous_interaction_id,
@@ -4426,7 +4457,7 @@ async def generate_video_omni(
     resolution: str | None = None,
     previous_interaction_id: str | None = None,
     output_gcs_uri: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
 ) -> str:
     """Generate a video fast with an Omni model (Interactions API).
@@ -4488,8 +4519,14 @@ async def generate_video_omni(
             configured (GCS_ALLOWED_BUCKETS / VIDEO_GCS_BUCKET); with no
             allowlist set the server warns and defers to ambient
             credentials, so a dry run quotes rather than refusing.
-        timeout_seconds: Overall deadline for the render (create + polling).
-            Generation typically takes over a minute; raise for long queues.
+        timeout_seconds: Overall deadline for the render (create + polling),
+            default 210s. Generation typically takes over a minute. The default
+            sits under the ~4 minute ceiling common MCP hosts put on one tool
+            call, deliberately: a render that outlives the HOST's limit is
+            billed with no result and no interaction_id, so the spend cannot be
+            reconciled. Under this limit the call fails with a TimeoutError
+            naming the interaction_id, which is recoverable. Raise it only if
+            your host waits longer.
 
         dry_run: When True, return only the cost estimate for the clamped
             duration and generate nothing.
@@ -4728,7 +4765,7 @@ async def edit_video(
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
     resolution: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
 ) -> str:
     """Conversationally edit a video generated by an Omni model.
@@ -4762,7 +4799,8 @@ async def edit_video(
             Omni documentation does not state the rule.
         resolution: gemini-omni-1.1-flash only. The output resolution to
             render the edit at; omitted keeps the service default.
-        timeout_seconds: Overall deadline for the edit render (default 600)
+        timeout_seconds: Overall deadline for the edit render, default 210s
+            — see generate_video_omni on why it sits under the host ceiling
         dry_run: When True, return only the cost estimate and generate
             nothing. Because the rendered length is unpredictable, the quote
             is Omni's 10s maximum as an upper bound — a pre-flight may
@@ -4863,12 +4901,11 @@ async def extend_video_omni(
     input_video_uri: str | None = None,
     omni_model: str = OMNI_1_1_MODEL,
     times: int = 1,
-    duration_seconds: float = 10.0,
     resolution: str | None = None,
     reference_image_uris: list[str] | None = None,
     reference_video_uris: list[str] | None = None,
     output_gcs_uri: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
 ) -> str:
     """Append a seamless continuation to an existing video (Omni 1.1 only).
@@ -4887,12 +4924,16 @@ async def extend_video_omni(
       it cannot gain new dialogue if someone is talking in it, and uploading it
       to be extended is unavailable in the EEA, Switzerland and the UK.
 
-    Each turn appends 3-10s, to a cumulative 40s counting the source. `times`
-    chains that many turns, threading each result into the next.
+    Each turn appends a fixed 10s, to a cumulative 40s counting the source.
+    `times` chains that many turns, threading each result into the next.
 
-    Each turn returns the footage it APPENDS, not the assembled clip, so the
-    response is an ordered list of segments to join downstream — the same shape
-    generate_clip produces for a multi-beat reel.
+    COST WARNING. A turn returns the ASSEMBLED clip, not the increment it
+    appended — measured: a 3.01s source extended once came back 13.01s. Omni
+    bills per second of output, so every turn re-bills all the footage before
+    it and a chain costs quadratically, not linearly: `times=2` from a 3s
+    source bills about 13s + 23s = 36s to produce 20s of new footage. Each
+    turn's `video_url` supersedes the previous one; they are not segments to
+    join.
 
     Args:
         ctx: MCP context with application state
@@ -4908,23 +4949,30 @@ async def extend_video_omni(
             previous_interaction_id.
         omni_model: Defaults to gemini-omni-1.1-flash, the only model with
             video extension.
-        times: How many extension turns to chain (default 1). Each appends up
-            to `duration_seconds`; the documented ceiling is a 40s finished
-            clip, counting the source.
-        duration_seconds: How much footage each turn appends, 3-10s (default
-            10). Only sent when extending an UPLOADED video: a turn continuing
-            a previous interaction cannot declare its task, so the service
-            picks the length there.
+        times: How many extension turns to chain (default 1). Each appends a
+            fixed 10s increment; the documented ceiling is a 40s finished
+            clip, counting the source. There is no per-turn duration
+            parameter: the service rejects `duration` on an extend request and
+            the launch post describes extension as fixed 10s increments.
         resolution: "360p", "720p" (default), "1080p" or "4K".
         reference_image_uris: Optional references bound to `<IMAGE_REF_0>`, …
             for introducing a new character or object into the continuation.
         reference_video_uris: Optional likeness references, up to 3 clips of
             up to 3s each, bound to `<VIDEO_REF_0>`, …
         output_gcs_uri: Optional gs:// destination (Vertex only).
-        timeout_seconds: Deadline for EACH extension turn (default 600).
-        dry_run: When True, return only the cost estimate. The rendered length
-            of a continuation is the service's choice, so every turn is quoted
-            at Omni's 10s maximum — an upper bound, never an under-quote.
+        timeout_seconds: Deadline for EACH extension turn, default 210s. A
+            chain of turns can still exceed a host's ceiling in total; each
+            completed turn is returned as it finishes, so a cut-off chain is
+            resumable from the last interaction_id.
+        dry_run: When True, return only the cost estimate. A turn renders the
+            assembled clip, so the quote is the source plus one 10s increment
+            per turn, summed across turns. It needs the source's length to be
+            right: measured from the bytes for an uploaded clip, read from the
+            sidecar for a prior interaction, and assumed to be the documented
+            maximum when neither is available — because assuming a shorter
+            source than the real one is the one direction a quote may not err
+            in. An earlier version promised "Omni's 10s maximum, an upper
+            bound, never an under-quote" and a 3.01s source rendered 13.01s.
 
     Returns:
         JSON with the final video_url, the interaction_id to keep extending
@@ -4959,7 +5007,6 @@ async def extend_video_omni(
                 "upload)."
             )
 
-        _validate_duration_seconds(duration_seconds)
         max_turns = spec.max_extended_seconds // spec.extension_step_seconds
         if not isinstance(times, int) or isinstance(times, bool) or times < 1:
             raise ValueError(f"times must be an integer >= 1, got {times!r}.")
@@ -5013,35 +5060,41 @@ async def extend_video_omni(
                 input_video_uri, app_ctx.data_folder, "input_video_uri"
             )
             source_duration = prior.duration_seconds
-            # Each turn renders the footage it appends, and the chain stops
-            # when the assembled clip reaches the documented ceiling.
-            turn_lengths = omni_extension_output_lengths(
-                spec, source_duration, times, duration_seconds
-            )
+            # Each turn renders the ASSEMBLED clip, so the source is the base
+            # every turn is billed on top of and the chain stops when it
+            # reaches the documented ceiling.
+            turn_lengths = omni_extension_output_lengths(spec, source_duration, times)
+            appended = omni_extension_appended_seconds(source_duration, turn_lengths)
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
                 "model": spec.model,
                 "resolution": billed_resolution,
                 "times": times,
-                # New footage across the whole chain. Each turn returns the
-                # segment it appends, so this is the sum — and it is NOT the
-                # assembled clip's length, which also contains the source.
-                "appended_seconds": sum(turn_lengths),
+                # Each turn renders the assembled clip, so these three are
+                # different numbers and conflating them was the under-quote:
+                # what gets BILLED is the sum of the assembled lengths, what
+                # the caller ENDS UP WITH is the last one, and what is NEW is
+                # only the growth over the source.
+                "billed_seconds": sum(turn_lengths),
+                "assembled_seconds": turn_lengths[-1] if turn_lengths else 0.0,
                 "turn_output_seconds": turn_lengths,
                 "planned_turns": len(turn_lengths),
+                **({"appended_seconds": appended} if appended is not None else {}),
                 "duration_source": (
-                    f"projection: each turn appends up to {duration_seconds:g}s "
-                    "and returns that footage alone, so a turn is priced at "
-                    "what it appends"
+                    "projection: a turn renders the ASSEMBLED clip, not the "
+                    f"{spec.extension_step_seconds}s it appends (measured: a "
+                    "3.01s source came back 13.01s), so every turn re-bills "
+                    "the footage before it"
                     + (
                         f" (source measured at {source_duration:g}s, leaving "
                         f"room for {len(turn_lengths)} turn(s) under omni's "
                         f"{spec.max_extended_seconds}s total)."
                         if source_duration is not None
                         else " (the source's length is not known here, so the "
-                        f"{spec.max_extended_seconds}s total is not projected "
-                        "against)."
+                        f"documented {spec.max_uploaded_source_seconds:g}s "
+                        "maximum is assumed — a shorter real source would "
+                        "quote lower, and assuming one would under-quote)."
                     )
                     + " The real run reports the measured length of each turn."
                 ),
@@ -5108,6 +5161,14 @@ async def extend_video_omni(
         pending_video: bytes | None = input_video_bytes
 
         def _payload(cancelled: bool = False) -> dict[str, Any]:
+            chain_appended = omni_extension_appended_seconds(
+                source_duration,
+                [
+                    float(seg["duration_seconds"])
+                    for seg in segments
+                    if isinstance(seg.get("duration_seconds"), (int, float))
+                ],
+            )
             """Assemble the response from whatever turns have completed.
 
             Built as a closure so a cancellation or a mid-chain failure can
@@ -5131,13 +5192,23 @@ async def extend_video_omni(
                 "resolution": billed_resolution,
                 "times": times,
                 "completed_turns": done,
-                # New footage across the completed turns. Each turn returns
-                # the segment it appends, so this sums; it is NOT the
-                # assembled clip's length, which also contains the source.
-                "appended_seconds": sum(
+                # Three different numbers, because a turn renders the
+                # assembled clip: billed is the sum of what each turn
+                # rendered, assembled is the last one (what the caller has),
+                # and appended is only the growth over the source — which is
+                # unknowable without the source, so it is omitted rather than
+                # guessed. Reporting the sum as "appended" overstated a 2-turn
+                # chain off a 3s source as 36s of new footage when it made 20s.
+                "billed_seconds": sum(
                     float(seg["duration_seconds"])
                     for seg in segments
                     if isinstance(seg.get("duration_seconds"), (int, float))
+                ),
+                "assembled_seconds": final.get("duration_seconds"),
+                **(
+                    {"appended_seconds": chain_appended}
+                    if chain_appended is not None
+                    else {}
                 ),
                 "segments": segments,
                 "cost": _sum_omni_segment_costs(
@@ -5182,7 +5253,7 @@ async def extend_video_omni(
                     # into its own sidecar — and its warning text — labelled as
                     # an edit of a chain the caller had asked to extend.
                     task="extend",
-                    duration_seconds=duration_seconds,
+                    duration_seconds=None,
                     resolution=normalized_resolution,
                     output_gcs_uri=output_gcs_uri if turn == times else None,
                     prefer_backend=chain_backend,

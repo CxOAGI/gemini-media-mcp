@@ -1652,14 +1652,19 @@ def test_extending_from_an_interaction_offers_the_omni_extension_tool() -> None:
     )
 
 
-def test_an_omni_extension_is_capped_at_the_documented_ceiling() -> None:
-    """40s total in 10s steps, so four turns is the most that can be planned."""
+def test_an_omni_extension_is_capped_at_the_turns_that_actually_fit() -> None:
+    """The 40s ceiling is on the ASSEMBLED clip, so the source eats into it.
+
+    The planner cannot see the source and has to assume the documented 10s
+    maximum, which leaves room for three 10s turns, not four. Planning a
+    fourth priced three and told the caller to run four.
+    """
     plan = plan_generation(
         "extend this clip by 5 minutes",
         RoutingConstraints(media_kind="video", previous_interaction_id="int-9"),
     )
     omni = next(r for r in plan.routes if r.tool == "extend_video_omni")
-    assert omni.params["times"] == 4
+    assert omni.params["times"] == 3
     assert any("40s" in caveat for caveat in omni.caveats)
 
 
@@ -1690,14 +1695,15 @@ def test_the_extension_route_sends_the_resolution_it_is_priced_at() -> None:
     assert "@ 360p" in route.cost.detail
 
 
-def test_an_extension_chain_is_priced_at_the_footage_each_turn_appends() -> None:
-    """A turn returns the continuation, not the assembled clip.
+def test_an_extension_chain_is_priced_at_the_clip_each_turn_assembles() -> None:
+    """A turn renders the ASSEMBLED clip, so the turns grow and so does the bill.
 
-    Confirmed by the Interactions API reference (`duration` is "the length of
-    the generated video files", 3-10s, and Vertex's extend request sends it)
-    and by the documented sample response, which bills 28,832 video tokens —
-    4.98s at the published rate.
+    MEASURED: a 3.01s source extended once returned 13.01s. Pricing the 10s
+    increment instead under-billed a 2-turn chain 36s against a 20s quote.
+    The planner cannot see the source, so it assumes the documented maximum —
+    assuming a shorter one would under-quote.
     """
+    from src.omni import omni_extension_output_lengths, omni_spec
     from src.pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
 
     plan = plan_generation(
@@ -1707,11 +1713,15 @@ def test_an_extension_chain_is_priced_at_the_footage_each_turn_appends() -> None
     route = next(r for r in plan.routes if r.tool == "extend_video_omni")
     turns = route.params["times"]
     assert route.cost is not None
-    # Every turn appends the 10s maximum, plus one encoder frame each.
+    expected = omni_extension_output_lengths(omni_spec(route.model), None, turns)
+    # The plan may not ask for more turns than it prices.
+    assert len(expected) == turns, f"planned {turns} turns, priced {len(expected)}"
     assert route.cost.breakdown["seconds"] == pytest.approx(
-        turns * (10.0 + OMNI_ENCODER_ALLOWANCE_SECONDS)
+        sum(expected) + turns * OMNI_ENCODER_ALLOWANCE_SECONDS
     )
-    assert any("footage it appends" in caveat for caveat in route.caveats)
+    # Growing, not flat — the defect this replaced quoted turns * 10s.
+    assert sum(expected) > 10.0 * turns
+    assert any("re-bills" in caveat for caveat in route.caveats)
 
 
 def test_an_interaction_id_excludes_every_model_that_cannot_read_one() -> None:
