@@ -384,7 +384,7 @@ def test_an_edit_does_not_report_a_duration_it_never_sent(
     assert result["requested_duration_seconds"] == 3
     # A 3s source edited with duration_seconds=4 measured 10.01s, so the
     # warning must not promise either the source's length or the request.
-    assert any("predictable" in w for w in result["warnings"])
+    assert any("chosen by the service" in w for w in result["warnings"])
 
 
 @pytest.mark.timeout(20.0)
@@ -576,14 +576,16 @@ def test_reference_videos_are_numbered_after_the_source_video(
 
 
 @pytest.mark.timeout(20.0)
-def test_an_uploaded_extension_sends_the_task_and_nothing_else(
+def test_an_uploaded_extension_sends_its_task_duration_and_aspect_ratio(
     tmp_path: Path, no_poll_delay: None
 ) -> None:
-    """An extension is a continuation: no duration, no aspect ratio.
+    """An uploaded extension carries the full output spec.
 
-    "A prompt plus a video" is otherwise an edit, so the task is what makes it
-    an extension at all — and the service, not the caller, chooses how long
-    the appended clip is.
+    Vertex's own extend-videos request sends `aspect_ratio` and `duration` in
+    response_format alongside `"task": "extend"`, and the Interactions API
+    reference gives duration's range as 3-10s — "the length of the generated
+    video files". Withholding them threw away the only control a caller has
+    over how much footage each turn appends.
     """
     stub = _OmniStub()
     videos_dir = tmp_path / "videos"
@@ -602,11 +604,16 @@ def test_an_uploaded_extension_sends_the_task_and_nothing_else(
 
     created = stub.created()
     assert created["generation_config"]["video_config"]["task"] == "extend"
-    assert stub.response_format() == {"type": "video", "resolution": "720p"}
+    assert stub.response_format() == {
+        "type": "video",
+        "aspect_ratio": "16:9",
+        "duration": "8s",
+        "resolution": "720p",
+    }
     assert result["task"] == "extend"
-    assert result["duration_seconds"] is None
-    assert result["aspect_ratio"] is None
-    assert any("Extension requests do not send" in w for w in result["warnings"])
+    # Sent, so reportable as fact rather than as None.
+    assert result["duration_seconds"] == 8
+    assert result["aspect_ratio"] == "16:9"
 
 
 @pytest.mark.timeout(20.0)
@@ -635,6 +642,10 @@ def test_a_multi_turn_extension_cannot_send_a_task(
     created = stub.created()
     assert "generation_config" not in created
     assert created["previous_interaction_id"] == "i-0"
+    # A turn that cannot declare its task cannot risk duration either: the
+    # service infers the task, and an inferred "edit" rejects the field.
+    assert "duration" not in stub.response_format()
+    assert "aspect_ratio" not in stub.response_format()
     assert result["duration_seconds"] is None
 
 

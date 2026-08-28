@@ -85,7 +85,8 @@ from .image import (
 from .omni import (
     OMNI_1_1_MODEL,
     OMNI_MODEL,
-    OMNI_MODELS,
+    OMNI_MODEL_ALIASES,
+    canonical_omni_model,
     is_omni_model,
 )
 from .video import _GEMINI_API_MODEL_IDS, VideoModel
@@ -465,6 +466,17 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
 _VIDEO_MODEL_ALIASES: dict[str, str] = {
     api_id: canonical for canonical, api_id in _GEMINI_API_MODEL_IDS.items()
 }
+
+# Omni splits the same way: Vertex serves 1.1 as `gemini-omni-1.1-flash-preview`
+# and the Developer API as the bare name. Both spellings must price
+# identically, or a render reported back by Vertex looks like an unknown model.
+_VIDEO_MODEL_ALIASES.update(
+    {
+        alias: canonical_omni_model(alias)
+        for alias in OMNI_MODEL_ALIASES
+        if canonical_omni_model(alias) != alias
+    }
+)
 
 # Durations Veo actually accepts, mirroring src/video.py. Anything else is
 # snapped to the nearest of these, so an estimate matches the clip that is
@@ -1392,7 +1404,7 @@ def known_models() -> tuple[str, ...]:
         *get_args(RetiredImageModel),
         *get_args(VideoModel),
         *_GEMINI_API_MODEL_IDS.values(),
-        *OMNI_MODELS,
+        *OMNI_MODEL_ALIASES,
     }
     return tuple(sorted(models))
 

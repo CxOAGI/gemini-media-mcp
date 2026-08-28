@@ -42,6 +42,7 @@ from .omni import (
     normalize_omni_resolution,
     omni_extension_output_lengths,
     omni_continuation_upper_bound,
+    omni_source_limit_seconds,
     omni_spec,
     validate_omni_request,
     wants_uri_delivery,
@@ -781,6 +782,20 @@ def _validate_aspect_ratio(aspect_ratio: str) -> None:
 MAX_OMNI_INPUT_IMAGES = 8
 
 
+def _omni_backend_is_vertex(
+    app_ctx: AppContext, need_gcs: bool = False, prefer_backend: str | None = None
+) -> bool:
+    """Whether the client this call will use runs in Vertex AI mode.
+
+    Asked by the pre-flights, which have to apply the right backend's
+    documented limits BEFORE the call is made. Resolved through
+    _client_for_omni itself so the answer cannot drift from the client that
+    actually gets used.
+    """
+    client = _client_for_omni(app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend)
+    return bool(getattr(client._api_client, "vertexai", False))
+
+
 async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[str]:
     """Warn about reference clips longer than the documented ceiling.
 
@@ -808,7 +823,9 @@ async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[
     return warnings
 
 
-async def _check_omni_source_video(spec: Any, data: bytes) -> list[str]:
+async def _check_omni_source_video(
+    spec: Any, data: bytes, *, vertexai: bool = False
+) -> list[str]:
     """Refuse an uploaded source longer than omni will accept; else warn-free.
 
     "Input videos for editing and extension must be 10 seconds or less when
@@ -823,17 +840,23 @@ async def _check_omni_source_video(spec: Any, data: bytes) -> list[str]:
     gemini-omni-flash-preview — which is the default model, and whose
     input_video_uri path had always worked — with "must be 0s or shorter".
 
+    The ceiling itself is the BACKEND's: the Developer API documents 10s "when
+    uploading", Vertex documents 1-30s for the same operation. Applying the
+    stricter figure to both refused a legitimate 20s Vertex source.
+
     Returns an empty list; it exists to raise, and returns a warning list so
     the call sites read like the other pre-flights.
     """
-    if not spec.max_uploaded_source_seconds:
+    limit = omni_source_limit_seconds(spec, vertexai=vertexai)
+    if not limit:
         return []
     measured = await asyncio.to_thread(measure_video_duration_bytes, data)
-    if measured is not None and measured > spec.max_uploaded_source_seconds:
+    if measured is not None and measured > limit:
         raise ValueError(
             f"The source video is {measured:.2f}s. An UPLOADED video to edit "
-            f"or extend must be {spec.max_uploaded_source_seconds:g}s or "
-            "shorter. Extend a clip this server generated instead (pass its "
+            f"or extend must be {limit:g}s or shorter on "
+            f"{'Vertex AI' if vertexai else 'the Gemini Developer API'}. "
+            "Extend a clip this server generated instead (pass its "
             "previous_interaction_id, which has no such limit), or trim the "
             "source first."
         )
@@ -4603,7 +4626,11 @@ async def generate_video_omni(
             # uploaded through the Files API and rejected by the service for a
             # limit that was measurable from the bytes before any of that.
             extra_warnings.extend(
-                await _check_omni_source_video(spec, input_video_bytes)
+                await _check_omni_source_video(
+                    spec,
+                    input_video_bytes,
+                    vertexai=_omni_backend_is_vertex(app_ctx, bool(output_gcs_uri)),
+                )
             )
 
         await ctx.info(f"Generating video with {spec.model}")
@@ -4793,6 +4820,7 @@ async def extend_video_omni(
     input_video_uri: str | None = None,
     omni_model: str = OMNI_1_1_MODEL,
     times: int = 1,
+    duration_seconds: float = 10.0,
     resolution: str | None = None,
     reference_image_uris: list[str] | None = None,
     reference_video_uris: list[str] | None = None,
@@ -4816,8 +4844,12 @@ async def extend_video_omni(
       it cannot gain new dialogue if someone is talking in it, and uploading it
       to be extended is unavailable in the EEA, Switzerland and the UK.
 
-    Each turn appends up to 10s, to a cumulative 40s. `times` chains that many
-    turns, threading each result into the next.
+    Each turn appends 3-10s, to a cumulative 40s counting the source. `times`
+    chains that many turns, threading each result into the next.
+
+    Each turn returns the footage it APPENDS, not the assembled clip, so the
+    response is an ordered list of segments to join downstream — the same shape
+    generate_clip produces for a multi-beat reel.
 
     Args:
         ctx: MCP context with application state
@@ -4833,8 +4865,13 @@ async def extend_video_omni(
             previous_interaction_id.
         omni_model: Defaults to gemini-omni-1.1-flash, the only model with
             video extension.
-        times: How many extension turns to chain (default 1). Each adds up to
-            10s; the documented ceiling is a 40s finished clip.
+        times: How many extension turns to chain (default 1). Each appends up
+            to `duration_seconds`; the documented ceiling is a 40s finished
+            clip, counting the source.
+        duration_seconds: How much footage each turn appends, 3-10s (default
+            10). Only sent when extending an UPLOADED video: a turn continuing
+            a previous interaction cannot declare its task, so the service
+            picks the length there.
         resolution: "360p", "720p" (default), "1080p" or "4K".
         reference_image_uris: Optional references bound to `<IMAGE_REF_0>`, …
             for introducing a new character or object into the continuation.
@@ -4879,6 +4916,7 @@ async def extend_video_omni(
                 "upload)."
             )
 
+        _validate_duration_seconds(duration_seconds)
         max_turns = spec.max_extended_seconds // spec.extension_step_seconds
         if not isinstance(times, int) or isinstance(times, bool) or times < 1:
             raise ValueError(f"times must be an integer >= 1, got {times!r}.")
@@ -4932,37 +4970,37 @@ async def extend_video_omni(
                 input_video_uri, app_ctx.data_folder, "input_video_uri"
             )
             source_duration = prior.duration_seconds
-            # Each turn renders the whole clip it is growing, not just the new
-            # tail, so the turns get longer and cost more as the chain runs.
-            turn_lengths = omni_extension_output_lengths(spec, source_duration, times)
+            # Each turn renders the footage it appends, and the chain stops
+            # when the assembled clip reaches the documented ceiling.
+            turn_lengths = omni_extension_output_lengths(
+                spec, source_duration, times, duration_seconds
+            )
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
                 "model": spec.model,
                 "resolution": billed_resolution,
                 "times": times,
-                # The finished clip's projected length, which is the LAST
-                # turn's output — not a sum, which would count the source once
-                # per turn.
-                "duration_seconds": turn_lengths[-1] if turn_lengths else 0.0,
-                "billed_seconds": sum(turn_lengths),
+                # New footage across the whole chain. Each turn returns the
+                # segment it appends, so this is the sum — and it is NOT the
+                # assembled clip's length, which also contains the source.
+                "appended_seconds": sum(turn_lengths),
                 "turn_output_seconds": turn_lengths,
+                "planned_turns": len(turn_lengths),
                 "duration_source": (
-                    "projection: an extension returns the whole growing clip "
-                    "rather than the appended tail, and the service chooses "
-                    f"how much it appends, so each of the {times} turn(s) is "
-                    f"quoted at the source plus up to "
-                    f"{spec.extension_step_seconds}s per turn, clamped at "
-                    f"omni's {spec.max_extended_seconds}s ceiling"
+                    f"projection: each turn appends up to {duration_seconds:g}s "
+                    "and returns that footage alone, so a turn is priced at "
+                    "what it appends"
                     + (
-                        f" (source measured at {source_duration:g}s)."
+                        f" (source measured at {source_duration:g}s, leaving "
+                        f"room for {len(turn_lengths)} turn(s) under omni's "
+                        f"{spec.max_extended_seconds}s total)."
                         if source_duration is not None
-                        else f" (source length unknown here, so the documented "
-                        f"{spec.max_uploaded_source_seconds:g}s maximum is "
-                        "assumed). "
+                        else " (the source's length is not known here, so the "
+                        f"{spec.max_extended_seconds}s total is not projected "
+                        "against)."
                     )
-                    + " Every turn is billed separately; the real run reports "
-                    "the measured length of each."
+                    + " The real run reports the measured length of each turn."
                 ),
                 "cumulative_cap_seconds": spec.max_extended_seconds,
             }
@@ -4997,7 +5035,15 @@ async def extend_video_omni(
             await _omni_reference_video_warnings(spec, reference_video_bytes)
         )
         if input_video_bytes is not None:
-            warnings.extend(await _check_omni_source_video(spec, input_video_bytes))
+            warnings.extend(
+                await _check_omni_source_video(
+                    spec,
+                    input_video_bytes,
+                    vertexai=_omni_backend_is_vertex(
+                        app_ctx, bool(output_gcs_uri), prior.backend
+                    ),
+                )
+            )
             source_duration = await asyncio.to_thread(
                 measure_video_duration_bytes, input_video_bytes
             )
@@ -5042,14 +5088,14 @@ async def extend_video_omni(
                 "resolution": billed_resolution,
                 "times": times,
                 "completed_turns": done,
-                # The finished clip's own length, measured from the last
-                # turn's render. NOT a sum over the turns: an extension
-                # returns the whole growing clip, not just the new tail
-                # ("some of the final frames in your input video will be
-                # edited", and a cut 2s into the extension of a 10s source
-                # lands at 12s), so adding the turns up counted the source
-                # once per turn.
-                "final_duration_seconds": final.get("duration_seconds"),
+                # New footage across the completed turns. Each turn returns
+                # the segment it appends, so this sums; it is NOT the
+                # assembled clip's length, which also contains the source.
+                "appended_seconds": sum(
+                    float(seg["duration_seconds"])
+                    for seg in segments
+                    if isinstance(seg.get("duration_seconds"), (int, float))
+                ),
                 "segments": segments,
                 "cost": _sum_omni_segment_costs(
                     segments, model=spec.model, resolution=billed_resolution
@@ -5093,7 +5139,7 @@ async def extend_video_omni(
                     # into its own sidecar — and its warning text — labelled as
                     # an edit of a chain the caller had asked to extend.
                     task="extend",
-                    duration_seconds=None,
+                    duration_seconds=duration_seconds,
                     resolution=normalized_resolution,
                     output_gcs_uri=output_gcs_uri if turn == times else None,
                     prefer_backend=chain_backend,

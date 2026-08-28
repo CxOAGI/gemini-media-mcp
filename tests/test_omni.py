@@ -256,7 +256,7 @@ async def test_previous_interaction_id_forwarded(tmp_path: Path) -> None:
     assert "aspect_ratio" not in kwargs["response_format"][0]
     # The warning no longer claims inheritance: measurement showed the
     # rendered length is neither the source's nor the request's.
-    assert any("predictable" in w for w in result["warnings"])
+    assert any("chosen by the service" in w for w in result["warnings"])
     assert result["interaction_id"] == "int-2"
 
 
@@ -731,4 +731,12 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     assert set(extend_body) <= _CREATE_BODY_KEYS
     extend_out = _normalize_create_body(dict(extend_body))
     assert extend_out["generation_config"]["video_config"]["task"] == "extend"
-    assert extend_out["response_format"] == [{"type": "video", "resolution": "360p"}]
+    # Vertex's documented extend request carries all four fields.
+    assert extend_out["response_format"] == [
+        {
+            "type": "video",
+            "aspect_ratio": "16:9",
+            "duration": "6s",
+            "resolution": "360p",
+        }
+    ]

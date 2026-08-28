@@ -545,17 +545,17 @@ async def test_extend_needs_exactly_one_source(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_extend_quotes_each_turn_at_the_clip_it_will_render(
+async def test_extend_quotes_each_turn_at_the_footage_it_appends(
     tmp_path: Path,
 ) -> None:
-    """A turn renders the whole growing clip, not the tail it appends.
+    """A turn renders the continuation, not the assembled clip.
 
-    Three statements in the reference agree on this: the cap is on "a total
-    length of 40s"; a cut 2s into the extension of a 10s source lands "after
-    12s"; and "some of the final frames in your input video will be edited",
-    which the output can only contain if it contains the input. Omni bills per
-    second of OUTPUT, so quoting every turn at the 10s step under-quoted a
-    chain badly — and under-quoting is the one thing a pre-flight may not do.
+    Two Google sources settle it: the Interactions API reference gives
+    `duration` — "the length of the generated video files" — a 3-10s range and
+    Vertex's extend request sends it alongside `"task": "extend"`; and the
+    documented sample response for an omni extension bills 28,832 video output
+    tokens, which is 4.98s at the published 5,792 tokens/s. An earlier reading
+    had this growing with the clip and over-quoted a chain up to 4x.
     """
     from src.__main__ import extend_video_omni
     from src.pricing import estimate_video_cost
@@ -570,12 +570,9 @@ async def test_extend_quotes_each_turn_at_the_clip_it_will_render(
         )
     )
     assert payload["times"] == 3
-    # Source unknown here, so the documented 10s maximum is assumed: the turns
-    # render 20s, 30s and 40s, and the finished clip is the LAST of those —
-    # not the 90s a sum would report.
-    assert payload["turn_output_seconds"] == [20.0, 30.0, 40.0]
-    assert payload["duration_seconds"] == 40.0
-    assert payload["billed_seconds"] == 90.0
+    # Each turn appends its own duration; nothing grows.
+    assert payload["turn_output_seconds"] == [10.0, 10.0, 10.0]
+    assert payload["appended_seconds"] == 30.0
     assert payload["cumulative_cap_seconds"] == 40
 
     # Priced at the published 720p rate, per turn, each carrying the one-frame
@@ -589,23 +586,20 @@ async def test_extend_quotes_each_turn_at_the_clip_it_will_render(
     assert probe is not None
     rate = probe.breakdown["usd_per_second"]
     assert payload["estimated_cost"]["usd"] == pytest.approx(
-        sum((n + OMNI_ENCODER_ALLOWANCE_SECONDS) * rate for n in (20, 30, 40)),
+        sum((n + OMNI_ENCODER_ALLOWANCE_SECONDS) * rate for n in (10, 10, 10)),
         abs=1e-6,
     )
-    # The flat "10s a turn" quote this replaced would have been ~3x under.
-    assert payload["estimated_cost"]["usd"] > 3 * 10 * rate * 2.5
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_a_measured_source_sharpens_the_extension_quote(
+async def test_a_measured_source_bounds_how_many_turns_fit(
     tmp_path: Path,
 ) -> None:
-    """A shorter known source means shorter renders, so a lower honest quote.
+    """The 40s ceiling counts the source, so a long source leaves fewer turns.
 
-    The projection is only pessimistic while the source's length is unknown;
-    once a sidecar names it, the quote follows the clip that will really be
-    rendered.
+    Extending a 35s clip has room for one 5s turn, not four 10s ones — and
+    quoting four would bill for footage the service will not produce.
     """
     from src.__main__ import extend_video_omni
 
@@ -615,8 +609,8 @@ async def test_a_measured_source_sharpens_the_extension_quote(
         json.dumps(
             {
                 "kind": "omni_video",
-                "interaction_id": "i-short",
-                "duration_seconds": 4.0,
+                "interaction_id": "i-long",
+                "duration_seconds": 35.0,
                 "duration_source": "measured from the rendered video",
             }
         )
@@ -626,14 +620,16 @@ async def test_a_measured_source_sharpens_the_extension_quote(
         await extend_video_omni(
             ctx=_ctx(tmp_path),
             prompt="Continue the scene.",
-            previous_interaction_id="i-short",
-            times=2,
+            previous_interaction_id="i-long",
+            times=4,
             dry_run=True,
         )
     )
-    assert payload["source_duration_seconds"] == 4.0
-    assert payload["turn_output_seconds"] == [14.0, 24.0]
-    assert payload["duration_seconds"] == 24.0
+    assert payload["source_duration_seconds"] == 35.0
+    # 35s + 5s reaches the 40s ceiling; the other three turns have no room.
+    assert payload["turn_output_seconds"] == [5.0]
+    assert payload["planned_turns"] == 1
+    assert payload["appended_seconds"] == 5.0
 
 
 @pytest.mark.asyncio
@@ -731,8 +727,9 @@ async def test_extend_chains_each_turn_into_the_next(
     # every turn after the first was recorded as an edit of a chain the caller
     # had asked to extend.
     assert all(call["task"] == "extend" for call in calls)
-    # Neither turn sends a duration: the service chooses.
-    assert all(call["duration_seconds"] is None for call in calls)
+    # Both turns pass the requested per-turn duration; the impl sends it only
+    # where the API accepts it (an uploaded extension, not a multi-turn one).
+    assert all(call["duration_seconds"] == 10.0 for call in calls)
     assert payload["interaction_id"] == "i-2"
     assert len(payload["segments"]) == 2
 
@@ -1206,14 +1203,17 @@ async def test_a_mid_chain_failure_keeps_the_turns_already_billed(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_the_chain_reports_the_finished_length_not_a_sum(
+async def test_the_chain_reports_the_footage_it_appended(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each turn returns the whole growing clip, so summing counts the source
-    once per turn. A 2-turn chain off a 10s source is a 30s clip, not 50s."""
+    """Each turn returns the segment it appends, so the totals sum.
+
+    What it must NOT claim is an assembled clip length: the source is never
+    part of any response, so the server cannot report one.
+    """
     from src.__main__ import extend_video_omni
 
-    lengths = iter([20.0, 30.0])
+    lengths = iter([10.0, 10.0])
 
     async def mock_impl(**kwargs: Any) -> dict[str, Any]:
         out = tmp_path / "videos" / f"{next(iter(['a']))}.mp4"
@@ -1240,8 +1240,9 @@ async def test_the_chain_reports_the_finished_length_not_a_sum(
             times=2,
         )
     )
-    assert payload["final_duration_seconds"] == 30.0
-    assert "appended_seconds" not in payload
+    assert payload["appended_seconds"] == 20.0
+    assert "final_duration_seconds" not in payload
+    assert payload["completed_turns"] == 2
 
 
 @pytest.mark.asyncio
@@ -1512,9 +1513,11 @@ def test_an_unmeasurable_extension_is_bounded_by_what_it_can_render() -> None:
     one_one = omni_spec(OMNI_1_1_MODEL)
     preview = omni_spec(OMNI_PREVIEW_MODEL)
 
-    assert omni_continuation_upper_bound(one_one, "extend", 10.0) == 20.0
-    assert omni_continuation_upper_bound(one_one, "extend", 35.0) == 40.0
-    assert omni_continuation_upper_bound(one_one, "extend", None) == 40.0
+    # A turn renders the continuation only, so its own output cannot exceed
+    # the per-render maximum however long the source is.
+    assert omni_continuation_upper_bound(one_one, "extend", 10.0) == 10.0
+    assert omni_continuation_upper_bound(one_one, "extend", 35.0) == 10.0
+    assert omni_continuation_upper_bound(one_one, "extend", None) == 10.0
     assert omni_continuation_upper_bound(one_one, "edit", 3.0) == 10.0
     assert omni_continuation_upper_bound(one_one, "edit", 30.0) == 30.0
     assert omni_continuation_upper_bound(one_one, "edit", None) == 10.0
@@ -1525,10 +1528,10 @@ def test_an_unmeasurable_extension_is_bounded_by_what_it_can_render() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_an_unmeasurable_extension_bills_more_than_one_render(
+async def test_an_unmeasurable_extension_bills_one_render(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The rule above, reached through the tool: a gs:// extension is not 10s."""
+    """The rule above, reached through the tool: one turn, one continuation."""
     from src.__main__ import extend_video_omni
 
     async def mock_impl(**kwargs: Any) -> dict[str, Any]:
@@ -1556,7 +1559,7 @@ async def test_an_unmeasurable_extension_bills_more_than_one_render(
         )
     )
     segment = payload["segments"][0]
-    assert segment["duration_seconds"] == 40.0
+    assert segment["duration_seconds"] == 10.0
     assert "upper bound" in segment["duration_source"]
 
 
@@ -1719,3 +1722,164 @@ def test_the_download_cap_clears_what_the_new_model_can_emit() -> None:
 
     assert _delivered_video_cap(omni_spec(OMNI_PREVIEW_MODEL)) == 50 * 1024 * 1024
     assert _delivered_video_cap(omni_spec(OMNI_1_1_MODEL)) > 200 * 1024 * 1024
+
+
+# ============================================================================
+# Facts confirmed against Google's own reference pages
+# ============================================================================
+
+
+def test_the_model_is_spelled_differently_on_each_backend() -> None:
+    """Vertex publishes 1.1 as `gemini-omni-1.1-flash-preview`.
+
+    Confirmed on four Gemini Enterprise Agent Platform model pages
+    (generate-videos-from-text / -from-an-image / -from-references and
+    extend-videos), none of which lists the bare name. Sending the Developer
+    API spelling to Vertex reaches no model at all — the same split
+    src/video.py already carries for Veo.
+    """
+    from src.omni import canonical_omni_model, served_omni_model
+
+    assert (
+        served_omni_model(OMNI_1_1_MODEL, vertexai=True)
+        == "gemini-omni-1.1-flash-preview"
+    )
+    assert served_omni_model(OMNI_1_1_MODEL, vertexai=False) == OMNI_1_1_MODEL
+    # The preview model is spelled the same on both.
+    assert served_omni_model(OMNI_PREVIEW_MODEL, vertexai=True) == OMNI_PREVIEW_MODEL
+    # And a Vertex ID coming back resolves to the same spec, so it still routes.
+    assert canonical_omni_model("gemini-omni-1.1-flash-preview") == OMNI_1_1_MODEL
+    assert is_omni_model("gemini-omni-1.1-flash-preview")
+    assert omni_spec("gemini-omni-1.1-flash-preview").model == OMNI_1_1_MODEL
+
+
+def test_the_vertex_spelling_prices_as_the_same_model() -> None:
+    """Otherwise a render reported back by Vertex looks unpriced."""
+    from src.pricing import estimate_video_cost, resolve_model_id, unpriced_models
+
+    assert resolve_model_id("gemini-omni-1.1-flash-preview") == OMNI_1_1_MODEL
+    served = estimate_video_cost("gemini-omni-1.1-flash-preview", 6, "360p")
+    canonical = estimate_video_cost(OMNI_1_1_MODEL, 6, "360p")
+    assert served is not None and canonical is not None
+    assert served.usd == pytest.approx(canonical.usd)
+    assert unpriced_models() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_the_served_model_goes_on_the_wire_and_is_reported_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wire gets the backend's spelling; the result keeps the canonical one.
+
+    Swapping the reported ID would break every downstream lookup keyed on it
+    (pricing, sidecars, a follow-up call); not swapping the wire one would
+    reach no model.
+    """
+    import src.omni as omni
+
+    sent: dict[str, Any] = {}
+
+    client = MagicMock()
+    client._api_client.vertexai = True
+
+    def create(**kwargs: Any) -> Any:
+        sent.update(kwargs)
+        return {
+            "id": "i-1",
+            "status": "completed",
+            "steps": [
+                {
+                    "content": [
+                        {"type": "video", "mime_type": "video/mp4", "data": "AAAA"}
+                    ]
+                }
+            ],
+        }
+
+    client.interactions.create = create
+
+    result = await omni.generate_video_omni(
+        client=client, prompt="a robot", videos_dir=tmp_path, model=OMNI_1_1_MODEL
+    )
+    assert sent["model"] == "gemini-omni-1.1-flash-preview"
+    assert result["model"] == OMNI_1_1_MODEL
+    assert result["served_model"] == "gemini-omni-1.1-flash-preview"
+
+
+def test_the_uploaded_source_ceiling_is_the_backends() -> None:
+    """10s on the Developer API "when uploading"; 1-30s on Vertex.
+
+    Reading the stricter figure onto both refused a legitimate 20s Vertex
+    source before anything was even sent.
+    """
+    from src.omni import omni_source_limit_seconds
+
+    one_one = omni_spec(OMNI_1_1_MODEL)
+    assert omni_source_limit_seconds(one_one, vertexai=False) == 10.0
+    assert omni_source_limit_seconds(one_one, vertexai=True) == 30.0
+    # The preview model documents no ceiling at all, on either backend.
+    preview = omni_spec(OMNI_PREVIEW_MODEL)
+    assert omni_source_limit_seconds(preview, vertexai=False) == 0.0
+    assert omni_source_limit_seconds(preview, vertexai=True) == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_20s_source_is_accepted_on_vertex_and_refused_on_the_dev_api(
+    tmp_path: Path,
+) -> None:
+    """The two backends' limits, reached through the real check."""
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import _check_omni_source_video
+
+    frames = [
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 20)
+    ]
+    buf = BytesIO()
+    iio.imwrite(buf, frames, extension=".mp4", fps=24)
+    clip = buf.getvalue()
+    spec = omni_spec(OMNI_1_1_MODEL)
+
+    assert await _check_omni_source_video(spec, clip, vertexai=True) == []
+    with pytest.raises(ValueError, match="10s or shorter"):
+        _ = await _check_omni_source_video(spec, clip, vertexai=False)
+
+
+def test_duration_is_no_longer_warned_about() -> None:
+    """The Interactions API reference documents it, so the caveat was wrong.
+
+    It lists `duration` among VideoResponseFormat's fields ("integers between
+    3 and 10, followed by 's'"), and Vertex's extend request sends it.
+    """
+    assert omni_spec(OMNI_1_1_MODEL).duration_is_documented
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_fresh_1_1_render_carries_no_duration_caveat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.omni as omni
+
+    client = MagicMock()
+    client._api_client.vertexai = False
+    client.interactions.create.return_value = {
+        "id": "i-1",
+        "status": "completed",
+        "steps": [
+            {"content": [{"type": "video", "mime_type": "video/mp4", "data": "AAAA"}]}
+        ],
+    }
+
+    result = await omni.generate_video_omni(
+        client=client,
+        prompt="a robot",
+        videos_dir=tmp_path,
+        model=OMNI_1_1_MODEL,
+        duration_seconds=6,
+    )
+    assert result["duration_seconds"] == 6
+    assert not any("never duration" in w for w in result.get("warnings") or [])
