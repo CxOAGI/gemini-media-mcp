@@ -286,7 +286,9 @@ Two models, selected with `omni_model`:
 
 Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast's $0.10/s. What 1.1 adds is a genuinely cheap **draft** tier — `resolution="360p"` is about a third of that, and Google says it renders up to 60% faster.
 
-The default stays on the preview model so existing calls render exactly what they always did. Pass `omni_model="gemini-omni-1.1-flash"` for anything in the right-hand column.
+**`gemini-omni-1.1-flash` is now the default.** It was the preview model, on the reasoning that flipping it would move existing callers without asking — but the preview endpoint is **switched off on 2026-09-30**, so defaulting to it meant defaulting new callers onto a model with weeks to live. Pinning `omni_model="gemini-omni-flash-preview"` still works and now warns with that date.
+
+**The two backends are on different tracks.** 1.1 is generally available on the Gemini Developer API. On Vertex AI / Gemini Enterprise Agent Platform it is still *Preview*, published as `gemini-omni-1.1-flash-preview` (translated automatically), and preview video models there are allowlist-gated with near-zero default quota — a 429 naming the base model means an allowlist and quota request to your Google Cloud account team, not a wait. Set `GEMINI_API_KEY` to use the GA path, which is also the only backend with the Files API the uploaded-source path needs.
 
 **Parameters:**
 - `prompt` (required): Text description of the video. Timecodes work in plain language (`"[0-3s] a person walks"`), as does audio direction (`"include calm background music"`). If you write your own role tags (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) they are passed through untouched; otherwise the declarations are generated from the media arguments and echoed back as `effective_prompt`

@@ -152,7 +152,10 @@ def test_the_interaction_is_created_as_a_background_render(
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    result = _run(stub, videos_dir)
+    # Named explicitly: this test pins the PREVIEW model's verified request
+    # shape, and the default moved to 1.1 when the preview endpoint got a
+    # shutdown date.
+    result = _run(stub, videos_dir, model=OMNI_MODEL)
 
     created = stub.created()
     assert created["model"] == OMNI_MODEL
@@ -475,15 +478,17 @@ def test_no_resolution_asked_means_no_resolution_sent(
 
 
 @pytest.mark.timeout(20.0)
-def test_keyframe_interpolation_sends_both_frames_in_order_and_no_task(
+def test_keyframe_interpolation_sends_both_frames_in_order(
     tmp_path: Path, no_poll_delay: None
 ) -> None:
     """First/last-frame interpolation is positional, so order is the contract.
 
     The role prefix names the images by position (@Image1, @Image2), so a
     reordering of the parts would silently swap the start and end of the
-    video. No task is sent: the documented task list has no entry for
-    interpolation, and image_to_video would describe a different render.
+    video. The task IS image_to_video: the GA release note says so outright
+    ("Generate a video transitioning between two images using the
+    image_to_video task with up to 2 images"), where the task guide describes
+    interpolation without naming one.
     """
     stub = _OmniStub()
     videos_dir = tmp_path / "videos"
@@ -499,7 +504,7 @@ def test_keyframe_interpolation_sends_both_frames_in_order_and_no_task(
     )
 
     created = stub.created()
-    assert "generation_config" not in created
+    assert created["generation_config"]["video_config"]["task"] == "image_to_video"
     content = created["input"][0]["content"]
     # 1.1's own examples put the media ahead of the prompt.
     assert [part["type"] for part in content] == ["image", "image", "text"]
@@ -510,7 +515,7 @@ def test_keyframe_interpolation_sends_both_frames_in_order_and_no_task(
     assert "sunrise to snowfall" in text
     # The rewritten prompt travels back, so nothing was changed invisibly.
     assert result["effective_prompt"] == text
-    assert result["task"] is None
+    assert result["task"] == "image_to_video"
 
 
 @pytest.mark.timeout(20.0)
@@ -662,7 +667,7 @@ def test_the_preview_model_still_puts_its_text_first(
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    _ = _run(stub, videos_dir, image_bytes_list=[_PNG])
+    _ = _run(stub, videos_dir, model=OMNI_MODEL, image_bytes_list=[_PNG])
 
     content = stub.created()["input"][0]["content"]
     assert [part["type"] for part in content] == ["text", "image"]

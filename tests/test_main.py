@@ -3643,7 +3643,9 @@ async def test_generate_clip_animatic_uses_omni_and_skips_bridges(
         )
     )
     assert result["animatic"] is True
-    assert result["model"] == "gemini-omni-flash-preview"
+    # The animatic previews on whatever the omni default is, and that moved
+    # to the GA model when the preview endpoint got a shutdown date.
+    assert result["model"] == "gemini-omni-1.1-flash"
     beat_segs = [s for s in result["segments"] if s.get("kind") == "beat"]
     assert len(beat_segs) == 2
     assert all(s["generation_mode"] == "animatic" for s in beat_segs)
@@ -4961,7 +4963,7 @@ async def test_clip_dry_run_prices_beats_and_bridges(
     # Two 4s bridge renders on the fast tier.
     assert bridged["bridge_count"] == 2
     assert bridged["estimated_cost"]["usd"] == pytest.approx(3 * 0.8 + 2 * 0.4)
-    assert animatic["model"] == "gemini-omni-flash-preview"
+    assert animatic["model"] == "gemini-omni-1.1-flash"
     # Writing this test surfaced the real economics: omni ($0.10136/s) is
     # price-PARITY with the fast tier ($0.10/s), not cheaper. The animatic's
     # value against the default model is avoiding a wasted full render, and

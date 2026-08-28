@@ -44,7 +44,17 @@ generate videos" REST reference and the Interactions API docs:
     live-verified here;
   * ``generation_config={'video_config': {'task': ...}}`` carries the task
     type (text_to_video / image_to_video / reference_to_video / edit, plus
-    extend on 1.1);
+    extend on 1.1) — and NOTHING ELSE. The GA release note of 2026-08-27
+    describes resolution as a "new ``resolution`` parameter in
+    ``video_config``"; that is loose prose in a hand-written note. Three
+    generated or executable sources say response_format: the task guide's
+    own runnable sample, the Interactions API reference schema, and
+    google-genai's types, where ``VideoConfig`` has exactly one field
+    (``task``) and ``VideoResponseFormat`` is the one carrying
+    ``resolution``. Moving it would put the field somewhere the SDK drops on
+    serialization, which is the silent 720p-render/4K-bill failure this
+    module already guards against. Do not move it without a live 4K render
+    proving the note right;
   * ``background=True`` runs the (minute-plus) render asynchronously; the
     interaction id is polled until ``status == 'completed'``;
   * a finished interaction carries the clip in a ``model_output`` step's
@@ -89,12 +99,25 @@ LogCallback = Callable[[str], Awaitable[None]]
 OMNI_PREVIEW_MODEL = "gemini-omni-flash-preview"
 OMNI_1_1_MODEL = "gemini-omni-1.1-flash"
 
-# The model every omni entry point still defaults to. Kept at the preview ID
-# on purpose: 1.1 is the better model, but flipping the default would move
-# every existing caller onto a different render (and a different set of
-# accepted request fields) without them asking. It is one keyword away.
+# "The existing gemini-omni-flash-preview endpoint will be deprecated on
+# September 30, 2026" — Gemini API release notes, 2026-08-27. Surfaced on
+# every call that still pins it, because a caller who reads a warning has time
+# to move and a caller who reads nothing does not.
+OMNI_PREVIEW_SUNSET = "2026-09-30"
+
+# Kept as the preview model's name, not as "the default" — it is imported all
+# over the tree as an identity (which price, which capability set) and renaming
+# it would churn every call site for nothing.
 OMNI_MODEL = OMNI_PREVIEW_MODEL
-DEFAULT_OMNI_MODEL = OMNI_PREVIEW_MODEL
+
+# What every omni entry point defaults to. This WAS the preview model, on the
+# reasoning that flipping it would move existing callers onto a different
+# render without asking. The deprecation settles it the other way: the preview
+# endpoint is switched off on OMNI_PREVIEW_SUNSET, so defaulting to it means
+# defaulting new callers onto a model with weeks to live, and 1.1 is GA on the
+# Gemini Developer API at the same published 720p rate with strictly more
+# capability. Pinning the old model still works, and now says when it stops.
+DEFAULT_OMNI_MODEL = OMNI_1_1_MODEL
 
 OMNI_MODELS: tuple[str, ...] = (OMNI_PREVIEW_MODEL, OMNI_1_1_MODEL)
 
@@ -764,6 +787,15 @@ def _select_task_type(
         return requested_task
     declared_references = reference_image_count + reference_video_count
     if has_last_frame:
+        # The GA release note names the task for this outright: "Interpolation
+        # (first + last frame): Generate a video transitioning between two
+        # images using the image_to_video task with up to 2 images." An
+        # earlier reading of the task guide alone — which describes
+        # interpolation without naming a task — concluded there was none and
+        # sent no task at all, leaving the model to infer the mode from the
+        # role tags.
+        if not declared_references:
+            return _TASK_IMAGE_TO_VIDEO
         return None
     if has_first_frame and declared_references:
         return None
@@ -1200,6 +1232,19 @@ async def generate_video_omni(
     warnings: list[str] = []
     spec = omni_spec(model)
 
+    if spec.model == OMNI_PREVIEW_MODEL:
+        # A caller who reads this has time to move; one who reads nothing gets
+        # a dead endpoint. Said on every call rather than once at startup,
+        # because the pin that matters is the one in the call.
+        warnings.append(
+            f"{OMNI_PREVIEW_MODEL} is deprecated and its endpoint is switched "
+            f"off on {OMNI_PREVIEW_SUNSET}. Pass model='{OMNI_1_1_MODEL}' — it "
+            "is generally available on the Gemini Developer API at the same "
+            "published 720p rate, and adds resolution control, video "
+            "extension and first/last-frame interpolation. On Vertex AI it is "
+            "still Preview and may need an allowlist request."
+        )
+
     # Aspect ratio is a hard error rather than a silent coercion, matching
     # the style in src/video.py.
     if aspect_ratio not in _SUPPORTED_ASPECT_RATIOS:
@@ -1542,7 +1587,14 @@ def omni_extension_output_lengths(
     Returns:
         One output length per turn, in order.
     """
-    step = float(per_turn_seconds or spec.extension_step_seconds or _MAX_DURATION)
+    # Quoted at the STEP, never at a shorter requested duration. The launch
+    # post says extension happens "in 10-second increments", while the API
+    # reference gives duration a 3-10s range — so a caller asking for 5s may
+    # get 10s of billable footage, and the two readings differ by 2x in the
+    # direction a pre-flight may not err. Taking the larger costs an over-quote
+    # at worst; taking the smaller under-bills every short-step chain.
+    requested = float(per_turn_seconds or spec.extension_step_seconds or _MAX_DURATION)
+    step = max(requested, float(spec.extension_step_seconds or _MIN_DURATION))
     step = min(max(step, float(_MIN_DURATION)), float(_MAX_DURATION))
     ceiling = float(spec.max_extended_seconds or _MAX_DURATION)
     assembled = float(source_seconds) if source_seconds is not None else 0.0
