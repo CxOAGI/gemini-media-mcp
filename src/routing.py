@@ -43,6 +43,7 @@ from .omni import (
 from .omni import (
     OMNI_1_1_MODEL,
     OMNI_DEFAULT_RESOLUTION,
+    omni_preview_is_sunset,
     OMNI_MODEL,
     OMNI_PREVIEW_MODEL,
     OMNI_PREVIEW_SUNSET,
@@ -3560,6 +3561,21 @@ def _plan_video(
     exclusion_fixes: list[str] = []
     for model in candidates:
         profile = _VIDEO_PROFILES[model]
+
+        sunset = DEPRECATED_VIDEO_MODELS.get(model)
+        if sunset and omni_preview_is_sunset():
+            # Demoted until the day; excluded from it. A plan that offers a
+            # switched-off endpoint, however low it ranks, is a plan with a
+            # route that cannot run.
+            rejected.append(
+                RejectedRoute(
+                    model=model,
+                    reason=f"{model} excluded: its endpoint was switched off on {sunset}.",
+                    tool=_route_tool(tool, model),
+                )
+            )
+            exclusion_fixes.append(f"Use {OMNI_1_1_MODEL}, the GA successor.")
+            continue
 
         capability_hit = _capability_rejection(model, needs)
         duration_reason = _duration_rejection(model, needs)
