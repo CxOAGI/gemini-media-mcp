@@ -143,13 +143,18 @@ _LITE_UNSUPPORTED_MODES = ("extend_video", "reference_to_video", "first_last_fra
 # generate_bridge) and extend_video comes back "encodedVideo isn't supported by
 # this model" (loop_extend). The identical calls succeed on Vertex.
 #
-# Only these two are listed because only these two were proven. Veo on this
-# backend is reported to be text-to-video only, but image_to_video and
-# reference_to_video were not exercised, and refusing a mode that in fact works
-# is worse than letting a free 400 come back — so those two warn instead of
-# raising. See _GEMINI_API_LIKELY_UNSUPPORTED_MODES.
-_GEMINI_API_UNSUPPORTED_MODES = ("first_last_frame", "extend_video")
-_GEMINI_API_LIKELY_UNSUPPORTED_MODES = ("image_to_video", "reference_to_video")
+# reference_to_video joined these after a live test: it does not answer with a
+# usable error at all, just an empty result the tool surfaced as "No videos
+# returned", and it appears to have billed for the attempt — the worst possible
+# failure shape, and the one most worth gating. image_to_video was tested in the
+# same round and RENDERS FINE, so the caution once emitted for it is gone: this
+# backend is not "text-to-video only", and a warning that fires on a working
+# call is noise that teaches callers to ignore warnings.
+_GEMINI_API_UNSUPPORTED_MODES = (
+    "first_last_frame",
+    "extend_video",
+    "reference_to_video",
+)
 
 _GEMINI_API_MODE_ERRORS = {
     "first_last_frame": (
@@ -157,6 +162,10 @@ _GEMINI_API_MODE_ERRORS = {
     ),
     "extend_video": (
         'the service answers "encodedVideo isn\'t supported by this model"'
+    ),
+    "reference_to_video": (
+        "the service returns an empty result with no usable error, and bills "
+        "for the attempt"
     ),
 }
 
@@ -458,15 +467,6 @@ async def generate_video(
         generation_mode=generation_mode,
         backend="vertex" if is_vertexai else "gemini_api",
     )
-    for likely in _GEMINI_API_LIKELY_UNSUPPORTED_MODES:
-        if not is_vertexai and generation_mode == likely:
-            # Not proven, so not refused — but a caller should not learn this
-            # from an opaque 400 when the server can see it coming.
-            warnings.append(
-                f"Veo on the Gemini Developer API is reported to support "
-                f"text-to-video only, and this is a {generation_mode} render. "
-                "If it fails, the same call works on Vertex AI."
-            )
 
     # Prepare image inputs
     first_frame_input: types.Image | None = None

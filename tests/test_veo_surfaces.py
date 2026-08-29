@@ -1052,3 +1052,147 @@ async def test_a_remotely_delivered_chain_is_never_reported_as_metered(
     assert cost, payload
     assert cost["is_estimate"] is True, cost
     assert "FLOOR" in manifest.get("duration_source", "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_remote_delivery_still_projects_from_a_local_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real run must never report less than its own pre-flight.
+
+    Identical call, local 4s source: the dry run measured it and quoted 11.0s,
+    then the real run delivered to GCS, could not open the turns, and fell all
+    the way back to appended-only — $0.70 against its own $1.10 quote. Only
+    the OUTPUT went remote; the source was still sitting there.
+    """
+    from src.__main__ import loop_extend
+
+    src_video = tmp_path / "videos" / "src.mp4"
+    _write_video(src_video, 1280, 720, frames=96)  # 4.0s
+
+    async def gcs_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "video_url": "gs://bkt/out/ext.mp4",
+            "model": kwargs.get("model"),
+            "duration_seconds": 7,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", gcs_impl)
+    ctx = _ctx(
+        tmp_path, vertexai=True, bucket="gs://bkt/out/", allowed=frozenset({"bkt"})
+    )
+    kwargs: dict[str, Any] = dict(
+        prompt="c", video_uri=f"file://{src_video}", model=VEO_FAST, times=1
+    )
+    quote = json.loads(await loop_extend(ctx=ctx, dry_run=True, **kwargs))
+    real = json.loads(await loop_extend(ctx=ctx, **kwargs))
+    manifest = real.get("manifest") or {}
+
+    assert quote["billed_seconds"] == pytest.approx(11.0, abs=0.2)
+    assert manifest["billed_seconds"] == pytest.approx(quote["billed_seconds"], abs=0.2)
+    assert manifest["duration_source"].startswith("PROJECTED")
+    # Projected is not metered, however good the projection is.
+    assert manifest["cost"]["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+@pytest.mark.parametrize("vertexai", [False, True])
+async def test_one_response_names_one_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vertexai: bool
+) -> None:
+    """`model` and `cost.detail` must never name different models.
+
+    The impl returns the SERVED id — the Gemini API is fed `-preview`
+    spellings — and reporting that beside a cost line priced on the canonical
+    name put two model names in one response. This was fixed once for the
+    quote and grew back on the rendered path, which is why it is settled in
+    one place now rather than per tool.
+    """
+    from src.__main__ import generate_video
+    from src.video import _GEMINI_API_MODEL_IDS  # pyright: ignore[reportPrivateUsage]
+
+    out = tmp_path / "videos" / "m.mp4"
+
+    async def veo_impl(**kwargs: Any) -> dict[str, Any]:
+        _write_video(out, 1280, 720)
+        served = _GEMINI_API_MODEL_IDS.get(kwargs["model"], kwargs["model"])
+        return {"video_url": f"file://{out}", "model": served, "duration_seconds": 4}
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", veo_impl)
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path, vertexai=vertexai), prompt="x", model=VEO_FAST
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["model"] == VEO_FAST
+    assert payload["model"] in payload["cost"]["detail"]
+    assert "-preview" not in payload["cost"]["detail"]
+    if payload.get("served_model"):
+        # The wire spelling is kept, not dropped.
+        assert payload["served_model"].endswith("-preview")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_reference_images_are_refused_on_the_gemini_api(
+    tmp_path: Path,
+) -> None:
+    """It returned an empty result with no usable error, and billed for it.
+
+    "No videos returned" told a caller nothing, cost roughly $0.80, and left
+    reference_to_video looking like a transient failure rather than a mode
+    this backend does not serve.
+    """
+    from src.__main__ import generate_video
+
+    _, image = _seed_media(tmp_path)
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="x",
+            model=VEO_FAST,
+            reference_image_uris=[image],
+            dry_run=True,
+        )
+    )
+    assert "estimated_cost" not in payload
+    assert "reference_to_video" in payload["error"]
+    assert "Vertex AI" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_image_to_video_is_not_warned_about_on_the_gemini_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It renders fine there, and a warning on a working call is noise.
+
+    The caution was written when the backend was believed text-to-video only.
+    It was not, and warnings that fire on success teach callers to skip them.
+    """
+    from src.__main__ import generate_video
+
+    _, image = _seed_media(tmp_path)
+    out = tmp_path / "videos" / "i2v.mp4"
+
+    async def veo_impl(**kwargs: Any) -> dict[str, Any]:
+        _write_video(out, 1280, 720)
+        return {
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model"),
+            "duration_seconds": 4,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", veo_impl)
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path), prompt="x", model=VEO_FAST, image_uri=image
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert not [w for w in payload.get("warnings", []) if "text-to-video only" in w], (
+        payload.get("warnings")
+    )
