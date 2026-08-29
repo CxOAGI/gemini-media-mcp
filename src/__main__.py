@@ -327,6 +327,76 @@ def _get_omni_vertex_global_client() -> genai.Client:
     return _omni_vertex_global_client
 
 
+def _stamp_provenance(
+    payload: dict[str, Any],
+    *,
+    backend: str | None = None,
+    duration_source: str | None = None,
+    resolution_source: str | None = None,
+) -> dict[str, Any]:
+    """Fill in the provenance fields a response is required to carry.
+
+    Three fields are meant to be uniform across every media response —
+    `backend`, `duration_source`, `resolution_source` — because a number
+    without a source cannot be told apart from a measured one, and the backend
+    is the question a whole debugging session went to answer. They were being
+    added tool by tool, which is how `backend` ended up on exactly one of
+    eight. Setting them in one place means a new tool gets the contract for
+    free instead of having to remember it.
+
+    Existing values always win: a caller that has MEASURED something has said
+    something stronger than this default can.
+    """
+    if backend is not None:
+        payload.setdefault("backend", backend)
+    if duration_source is not None and "duration_seconds" in payload:
+        payload.setdefault("duration_source", duration_source)
+    if resolution_source is not None and "resolution" in payload:
+        payload.setdefault("resolution_source", resolution_source)
+    return payload
+
+
+# What a dry run's numbers are, in one phrase: nothing has rendered, so every
+# figure in the payload is a projection of the call that would be made.
+DRY_RUN_PROVENANCE = "the request: a dry run renders nothing to measure"
+
+
+def _backend_of(app_ctx: AppContext, model: str | None) -> str:
+    """Which backend a model would run on, without building a client.
+
+    Covers both families, because `backend` is meant to be on every media
+    response and a caller should not have to know which family a model belongs
+    to in order to read it. Never raises: a model this cannot place is
+    reported as the primary client's own mode rather than failing a response
+    that is otherwise complete.
+    """
+    name = str(model or "")
+    if is_omni_model(name):
+        return _omni_backend_choice(app_ctx)
+    try:
+        # Defer to the real routing rule rather than restating it here; a
+        # second copy of "which client serves Lite" is a copy that drifts.
+        client = _client_for_video_model(app_ctx, name)
+    except RuntimeError:
+        # No client serves this model on this deployment. The call itself
+        # refuses with the actionable message; report where it would have run.
+        client = app_ctx.client
+    return "vertex" if getattr(client._api_client, "vertexai", False) else "gemini_api"
+
+
+def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
+    """Serialize a tool response, stamping the provenance it must carry.
+
+    `backend` belongs on every media response — it is the question a whole
+    debugging session went to answer — and adding it tool by tool is how it
+    ended up on one of eight. Routed through here it cannot be forgotten.
+    """
+    return json.dumps(
+        _stamp_provenance(payload, backend=_backend_of(app_ctx, payload.get("model"))),
+        indent=2,
+    )
+
+
 def _omni_backend_choice(
     app_ctx: AppContext,
     *,
@@ -2603,7 +2673,7 @@ async def generate_image(
             if warnings:
                 payload["warnings"] = warnings
                 await _emit_warnings(ctx, warnings)
-            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+            return [TextContent(type="text", text=_respond(app_ctx, payload))]
 
         image_bytes = None
         if image_uri:
@@ -3012,7 +3082,7 @@ async def generate_storyboard(
                 # model reroute understated what the real run discloses.
                 for warning in plan_warnings:
                     await ctx.warning(warning)
-            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+            return [TextContent(type="text", text=_respond(app_ctx, payload))]
 
         from .storyboard import StoryboardFrame, render_sheet_preview, write_storyboard
 
@@ -3432,7 +3502,7 @@ async def generate_video(
                 )
                 payload["warnings"] = [warning]
                 await _emit_warnings(ctx, [warning])
-            return json.dumps(payload, indent=2)
+            return _respond(app_ctx, payload)
 
         # Draft mode: hand off to the fast omni path. Omni supports only a
         # text prompt + optional input image(s), so Veo-only controls are
@@ -3738,7 +3808,8 @@ async def generate_transition(
             # uncheckable offline and still price.
             _assert_local_source(first_frame_uri, data_dir, "first_frame_uri")
             _assert_local_source(last_frame_uri, data_dir, "last_frame_uri")
-            return json.dumps(
+            return _respond(
+                app_ctx,
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
@@ -3755,7 +3826,6 @@ async def generate_transition(
                         generation_mode="first_last_frame",
                     ),
                 },
-                indent=2,
             )
 
         # Resolve the client up front so GCS gating can see which backend is
@@ -3937,7 +4007,8 @@ async def generate_bridge(
             # identical to no check at all — which is exactly how a reviewer
             # on an ffmpeg-equipped host read it.
             preflight = ["ffmpeg available for frame decoding"]
-            return json.dumps(
+            return _respond(
+                app_ctx,
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
@@ -3955,7 +4026,6 @@ async def generate_bridge(
                         generation_mode="first_last_frame",
                     ),
                 },
-                indent=2,
             )
 
         # Resolve the client up front so GCS gating can see which backend is
@@ -4329,7 +4399,7 @@ async def generate_clip(
                 if dry_warnings:
                     dry_payload["warnings"] = dry_warnings
                     await _emit_warnings(ctx, dry_warnings)
-            return json.dumps(dry_payload, indent=2)
+            return _respond(app_ctx, dry_payload)
 
         # Resolve the client ONCE, before the beat loop. If the model can't be
         # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY, or omni
@@ -4636,7 +4706,7 @@ async def generate_clip(
         # params, GCS notices) onto the notification channel, not just the JSON
         # manifest — an agent watching the stream saw none of them before.
         await _emit_warnings(ctx, clip_warnings)
-        return json.dumps(clip_manifest, indent=2)
+        return _respond(app_ctx, clip_manifest)
     except asyncio.CancelledError:
         # A cancellation is a BaseException, so the handler below never saw
         # it: a client that disconnected after five beats had rendered took
@@ -4856,7 +4926,8 @@ async def generate_video_omni(
                     else None
                 )
                 quoted = omni_continuation_upper_bound(spec, "edit", prior_duration)
-                return json.dumps(
+                return _respond(
+                    app_ctx,
                     {
                         "dry_run": True,
                         "message": "Estimate only — nothing was generated",
@@ -4879,12 +4950,12 @@ async def generate_video_omni(
                         ),
                         **({"warnings": gcs_warnings} if gcs_warnings else {}),
                     },
-                    indent=2,
                 )
             # A fresh render honours the clamped request; mirror the impl's
             # clamp so the quote matches what it will bill.
             clamped = min(10, max(3, round(duration_seconds)))
-            return json.dumps(
+            return _respond(
+                app_ctx,
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
@@ -4904,7 +4975,6 @@ async def generate_video_omni(
                     ),
                     **({"warnings": gcs_warnings} if gcs_warnings else {}),
                 },
-                indent=2,
             )
 
         image_bytes_list = [
@@ -5103,7 +5173,7 @@ async def edit_video(
                 include_audio=False,
                 presnapped=True,
             )
-            return json.dumps(payload, indent=2)
+            return _respond(app_ctx, payload)
 
         await ctx.info(f"Editing video (interaction {previous_interaction_id})")
         result = await _omni_generate_and_manifest(
@@ -5374,7 +5444,7 @@ async def extend_video_omni(
             # Emitted last, so the cap warning added above reaches the
             # notification channel and not just the quote body.
             await _emit_warnings(ctx, warnings)
-            return json.dumps(payload, indent=2)
+            return _respond(app_ctx, payload)
 
         reference_image_bytes = [
             await _fetch_omni_media(ctx, uri, "reference_image_uri")
@@ -5568,7 +5638,7 @@ async def extend_video_omni(
 
         payload = _payload()
         await _emit_warnings(ctx, warnings)
-        return json.dumps(payload, indent=2)
+        return _respond(app_ctx, payload)
     except Exception as e:
         await ctx.error(f"Video extension failed: {e}")
         logger.exception("Tool error")
@@ -5662,7 +5732,8 @@ async def loop_extend(
             # allowlist-checked above and still prices.
             _assert_local_source(video_uri, data_dir, "video_uri")
             # Each extension is a ~7s Veo render billed like any other.
-            return json.dumps(
+            return _respond(
+                app_ctx,
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
@@ -5677,7 +5748,6 @@ async def loop_extend(
                         presnapped=True,  # 7s steps must not re-snap to 8
                     ),
                 },
-                indent=2,
             )
 
         # Validate the initial gs:// source against the allowlist (intermediate

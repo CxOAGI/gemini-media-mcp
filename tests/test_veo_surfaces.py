@@ -524,3 +524,103 @@ def test_a_multi_shot_brief_mentioning_transitions_still_routes_to_clip() -> Non
         "a 3 shot commercial with crossfade transitions, 24 seconds total"
     )
     assert plan.routes[0].tool == "generate_clip"
+
+
+def _seed_media(tmp_path: Path) -> tuple[str, str]:
+    """A real mp4 and png on disk, since several tools probe their sources."""
+    import imageio.v3 as iio
+    import numpy as np
+
+    for sub in ("images", "videos"):
+        (tmp_path / sub).mkdir(exist_ok=True)
+    mp4 = tmp_path / "videos" / "seed.mp4"
+    iio.imwrite(
+        mp4,
+        [np.full((64, 64, 3), (i * 5) % 256, dtype=np.uint8) for i in range(48)],
+        extension=".mp4",
+        fps=24,
+    )
+    png = tmp_path / "images" / "a.png"
+    png.write_bytes(
+        bytes.fromhex(
+            "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+            "1f15c4890000000a49444154789c6360000002000100ffff030000060005"
+            "57bfabd40000000049454e44ae426082"
+        )
+    )
+    return f"file://{mp4}", f"file://{png}"
+
+
+def _render_tool_calls(video: str, image: str) -> dict[str, dict[str, Any]]:
+    return {
+        "generate_video": dict(prompt="x", model=VEO_FAST),
+        "generate_video_omni": dict(prompt="x"),
+        "edit_video": dict(prompt="x", previous_interaction_id="i-1"),
+        "extend_video_omni": dict(prompt="c", previous_interaction_id="i-1"),
+        "generate_clip": dict(
+            beats=[{"prompt": "a"}, {"prompt": "b"}], model=VEO_FAST, add_bridges=True
+        ),
+        "generate_transition": dict(
+            prompt="x", first_frame_uri=image, last_frame_uri=image, model=VEO_FAST
+        ),
+        "loop_extend": dict(prompt="c", video_uri=video, model=VEO_FAST, times=1),
+        "generate_storyboard": dict(shots=[{"prompt": "a"}, {"prompt": "b"}]),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60.0)
+@pytest.mark.parametrize("vertexai", [False, True])
+async def test_every_render_tool_reports_its_backend(
+    tmp_path: Path, vertexai: bool
+) -> None:
+    """`backend` is a contract, not a per-tool courtesy.
+
+    It was added one tool at a time and reached exactly one of eight. A
+    caller cannot reconcile a bill, or reproduce a render, without knowing
+    which API served it — and "check the field" is useless advice if seven
+    tools omit it. Sweeping every tool at once is the only version of this
+    check that stays true as tools are added.
+    """
+    import src.__main__ as main_mod
+
+    video, image = _seed_media(tmp_path)
+    expected = "vertex" if vertexai else "gemini_api"
+    missing: list[str] = []
+    for tool, kwargs in _render_tool_calls(video, image).items():
+        # A bucket, because Vertex refuses to extend without a destination;
+        # on the Gemini API the env default is dropped rather than rejected.
+        raw = await getattr(main_mod, tool)(
+            ctx=_ctx(
+                tmp_path,
+                vertexai=vertexai,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
+            dry_run=True,
+            **kwargs,
+        )
+        text = raw if isinstance(raw, str) else raw[0].text
+        payload = json.loads(text)
+        assert "error" not in payload, f"{tool}: {payload['error']}"
+        if payload.get("backend") != expected:
+            missing.append(f"{tool}: {payload.get('backend')!r} != {expected!r}")
+    assert not missing, "tools not reporting their backend:\n" + "\n".join(missing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_planning_does_not_claim_a_backend_it_never_calls(
+    tmp_path: Path,
+) -> None:
+    """The contract is "every response that renders", not "every response".
+
+    plan_generation recommends a tool; it places no call. Stamping a backend
+    on it would report a decision that was never made — the same class of
+    error as a quoted number with no source, pointed the other way.
+    """
+    from src.__main__ import plan_generation
+
+    result = await plan_generation(ctx=_ctx(tmp_path), intent="a 5 second clip")
+    payload = json.loads(result[0].text)
+    assert "backend" not in payload
