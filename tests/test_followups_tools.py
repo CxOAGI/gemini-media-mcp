@@ -181,7 +181,15 @@ async def test_loop_extend_emits_warnings_to_channel(
 ) -> None:
     from src.__main__ import loop_extend
 
-    ctx = _ctx(_app_ctx(tmp_path))
+    # Vertex: Veo refuses extension on the Gemini Developer API outright
+    # ("encodedVideo isn't supported by this model"), so a chain cannot reach
+    # the point of emitting anything there. What this test is about — a
+    # warning from a chained impl reaching the notification channel — is not
+    # about a backend, so it runs where the chain can run.
+    app_ctx = _app_ctx(tmp_path, vertexai=True)
+    object.__setattr__(app_ctx, "video_gcs_bucket", "gs://bkt/out/")
+    object.__setattr__(app_ctx, "allowed_gcs_buckets", frozenset({"bkt"}))
+    ctx = _ctx(app_ctx)
     src_video = tmp_path / "videos" / "src.mp4"
     src_video.write_bytes(b"mp4")
     out = tmp_path / "videos" / "ext.mp4"

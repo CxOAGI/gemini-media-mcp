@@ -55,9 +55,11 @@ from .omni import generate_video_omni as generate_video_omni_impl
 from .video import (
     _MAX_REFERENCE_IMAGES,
     _VEO_LITE_MODELS,
+    VEO_EXTENSION_STEP_SECONDS,
     TranslatedVideoModel,
     VideoModel,
     validate_video_request_inputs,
+    veo_extension_output_lengths,
 )
 from .video import generate_video as generate_video_impl
 from .video_utils import (
@@ -459,6 +461,26 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
     ended up on one of eight. Routed through here it cannot be forgotten.
     """
     quote = bool(payload.get("dry_run"))
+    # "We are on Vertex" is not a whole-server statement, and reading it as one
+    # cost several rounds of confusion: omni prefers the Gemini API whenever a
+    # key is configured, because 1.1 is GA there and allowlist-gated Preview on
+    # Vertex, while Veo stays on the primary client. Say so on the response
+    # where the two disagree, rather than leaving a reader to infer a bug.
+    model_name = str(payload.get("model") or "")
+    if is_omni_model(model_name) and "backend_note" not in payload:
+        primary = (
+            "vertex"
+            if getattr(app_ctx.client._api_client, "vertexai", False)
+            else "gemini_api"
+        )
+        if _backend_of(app_ctx, model_name) != primary:
+            payload["backend_note"] = (
+                "Omni runs on the Gemini API even though this server's primary "
+                f"client is {primary}: omni 1.1 is GA on the Gemini API and "
+                "allowlist-gated Preview on Vertex. Veo tools in the same "
+                f"session report {primary}. This split is deliberate, not a "
+                "misconfiguration."
+            )
     return json.dumps(
         _stamp_provenance(
             payload,
@@ -2442,6 +2464,7 @@ def _assemble_loop_extend_manifest(
     include_audio: bool,
     warnings: list[str],
     resolution: str = "720p",
+    turn_seconds: list[float] | None = None,
 ) -> dict[str, Any]:
     """Build loop_extend's manifest for the extensions that actually ran.
 
@@ -2462,15 +2485,49 @@ def _assemble_loop_extend_manifest(
         "extension_steps": list(steps),
     }
     manifest["resolution"] = resolution
+    # MEASURED: a Veo turn renders and bills the ASSEMBLED clip, so the chain
+    # costs the sum of the turn outputs. Billing len(steps)*7 charged only the
+    # appended footage and under-billed a single 4s-source extension by 57%.
+    measured = [t for t in (turn_seconds or []) if t is not None]
+    everything_measured = len(measured) == len(steps) and bool(steps)
+    billed = (
+        sum(measured)
+        if everything_measured
+        else len(steps) * VEO_EXTENSION_STEP_SECONDS
+    )
+    manifest["billed_seconds"] = round(billed, 3)
+    manifest["appended_seconds"] = len(steps) * VEO_EXTENSION_STEP_SECONDS
+    if everything_measured:
+        manifest["turn_output_seconds"] = [round(t, 3) for t in measured]
+        manifest["duration_source"] = "measured from each rendered turn"
+    else:
+        # A GCS-delivered chain was never opened, so this is a FLOOR: the
+        # appended footage only, with every turn's re-billed assembly missing.
+        # Asserting is_estimate=False on it claimed a metered figure for a
+        # file that was never read.
+        manifest["duration_source"] = (
+            "FLOOR, not a metered figure: the chain was delivered remotely and "
+            "not opened, and a Veo turn bills the assembled clip rather than "
+            "the footage it appends. The true bill is higher by the source's "
+            "length charged once per turn."
+        )
+        warnings.append(
+            "This cost is a FLOOR. The chain was delivered remotely, so its "
+            "turns could not be measured, and Veo bills each turn's assembled "
+            "length rather than the 7s it appends."
+        )
     cost = _video_cost(
         served_model,
-        float(len(steps) * 7),
+        float(billed),
         # Priced at what the assembled clip measured, not at an assumption.
         # The tool cannot request a resolution, which says nothing about what
         # Veo handed back.
         resolution=resolution,
         include_audio=include_audio,
-        actual=True,
+        # Only a fully measured chain is a metered figure; anything else stays
+        # an estimate, which is what is_estimate exists to say.
+        actual=everything_measured,
+        presnapped=not everything_measured,
     )
     if cost:
         manifest["cost"] = cost
@@ -3460,7 +3517,16 @@ async def generate_video(
                     quoted_mode = "image_to_video"
                 else:
                     quoted_mode = "text_to_video"
-                validate_render_options(model, resolution, quoted_mode)
+                # The backend is as much a constraint as the model: Veo on
+                # the Gemini Developer API refuses every mode that conditions
+                # on existing footage, and this quote used to price those
+                # calls cleanly while reporting that very backend beside them.
+                validate_render_options(
+                    model,
+                    resolution,
+                    quoted_mode,
+                    backend=_backend_of(app_ctx, str(model)),
+                )
 
                 # Refuse a local source the real run would reject, so a quote
                 # does not price a render that cannot fetch its inputs. AFTER
@@ -3878,7 +3944,11 @@ async def generate_transition(
             # enforced it on the quote path.
             from .video import validate_render_options
 
-            validate_render_options(model, generation_mode="first_last_frame")
+            validate_render_options(
+                model,
+                generation_mode="first_last_frame",
+                backend=_backend_of(app_ctx, model),
+            )
 
             # Refuse a local frame the real run would reject, so a quote does
             # not price a transition that cannot fetch its frames. After
@@ -4104,7 +4174,11 @@ async def generate_bridge(
             # enforced it on the quote path.
             from .video import validate_render_options
 
-            validate_render_options(model, generation_mode="first_last_frame")
+            validate_render_options(
+                model,
+                generation_mode="first_last_frame",
+                backend=_backend_of(app_ctx, model),
+            )
 
             # Refuse a local clip the real run would reject, so a quote does not
             # price a bridge that cannot render. After validate_render_options so
@@ -5818,6 +5892,16 @@ async def loop_extend(
 
         if model in _VEO_LITE_MODELS:
             raise ValueError("Veo 3.1 Lite does not support video extension.")
+        # Extension is one of the modes Veo refuses on the Gemini Developer
+        # API. Checked here, before the quote, so a dry run cannot price a
+        # chain that cannot run — the same rule the model restriction follows.
+        from .video import validate_render_options
+
+        validate_render_options(
+            model,
+            generation_mode="extend_video",
+            backend=_backend_of(app_ctx, str(model)),
+        )
         _validate_aspect_ratio(aspect_ratio)
 
         if video_uri.startswith("gs://"):
@@ -5856,7 +5940,11 @@ async def loop_extend(
                 source_seconds = await _probe_media(
                     measure_video_duration_bytes, source_bytes
                 )
-            # Each extension is a ~7s Veo render billed like any other.
+            # MEASURED: a 4.0s source extended once returned 11.0s and billed
+            # 11s. Each turn re-bills the assembly, so the chain costs the SUM
+            # of the turn outputs, not the footage it added.
+            turn_lengths = veo_extension_output_lengths(source_seconds, times)
+            appended = times * VEO_EXTENSION_STEP_SECONDS
             quote: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
@@ -5864,33 +5952,79 @@ async def loop_extend(
                 "resolution": "720p",
                 "resolution_source": "fixed: loop_extend takes no resolution parameter",
                 "times": times,
-                "added_seconds": times * 7,
-                "estimated_cost": _video_cost(
+                # Three different numbers, and conflating them was the bug:
+                # what is BILLED is the sum of the assembled lengths, what the
+                # caller ENDS UP WITH is the last one, and what is NEW is only
+                # the footage the chain appended.
+                "appended_seconds": appended,
+                "added_seconds": appended,  # retained: prior name for appended
+            }
+            if turn_lengths:
+                quote["source_duration_seconds"] = round(source_seconds or 0.0, 3)
+                quote["source_duration_source"] = "measured from the local source"
+                quote["billed_seconds"] = round(sum(turn_lengths), 3)
+                quote["assembled_seconds"] = turn_lengths[-1]
+                quote["final_duration_seconds"] = turn_lengths[-1]
+                quote["turn_output_seconds"] = turn_lengths
+                quote["estimated_cost"] = _video_cost(
                     model,
-                    float(times * 7),
+                    float(sum(turn_lengths)),
                     resolution="720p",
                     include_audio=include_audio,
-                    presnapped=True,  # 7s steps must not re-snap to 8
-                ),
-            }
-            if source_seconds is not None:
-                quote["source_duration_seconds"] = round(source_seconds, 3)
-                quote["source_duration_source"] = "measured from the local source"
-                quote["final_duration_seconds"] = round(source_seconds + times * 7, 3)
+                    presnapped=True,  # measured lengths must not re-snap
+                )
+                quote["duration_source"] = (
+                    f"projection from a measured {source_seconds:g}s source: a "
+                    "Veo turn renders the ASSEMBLED clip, not the "
+                    f"{VEO_EXTENSION_STEP_SECONDS:g}s it appends (measured: a "
+                    "4.0s source came back 11.0s billed at 11s), so every turn "
+                    "re-bills the footage before it and the cost grows "
+                    "quadratically in `times`."
+                )
+                if times > 1:
+                    step_warnings.append(
+                        f"This chain bills {sum(turn_lengths):g}s to append "
+                        f"{appended:g}s: each turn re-renders everything before "
+                        f"it. Cost grows with times squared — {times} turns is "
+                        f"{sum(turn_lengths) / appended:.1f}x the appended "
+                        "footage, and 20 turns off this source would bill "
+                        f"{sum(veo_extension_output_lengths(source_seconds, 20)):g}s."
+                    )
             else:
+                # No honest point estimate exists without the source length,
+                # and quoting the floor as if it were the price is the bug
+                # this whole path just had. Say so instead.
                 quote["source_duration_seconds"] = None
                 quote["source_duration_source"] = (
                     "not measured: the source is remote, so a dry run — which "
                     "is documented as offline — does not download it"
                 )
-            quote["duration_source"] = (
-                "projection: each of the "
-                f"{times} extension(s) is priced as a 7s Veo render. Unlike "
-                "omni, whose turns were MEASURED to re-bill the assembled "
-                "clip, this assumes Veo bills only the appended footage — "
-                "reconcile against a real bill before trusting a long chain, "
-                "because if Veo re-bills the assembly this under-states."
-            )
+                quote["billed_seconds"] = None
+                quote["minimum_billed_seconds"] = appended
+                quote["estimated_cost_is_floor"] = True
+                quote["estimated_cost"] = _video_cost(
+                    model,
+                    float(appended),
+                    resolution="720p",
+                    include_audio=include_audio,
+                    presnapped=True,
+                )
+                quote["duration_source"] = (
+                    "FLOOR, not an estimate: a Veo turn re-bills the assembled "
+                    "clip, so the true cost is this plus the source's length "
+                    f"charged once per turn ({times}x). The source is remote "
+                    "and a dry run does not download it, so its length is "
+                    "unknown here. Re-quote against a local copy for a real "
+                    "number."
+                )
+                step_warnings.append(
+                    "loop_extend cost for a remote source is a FLOOR, not an "
+                    f"estimate: add {times}x the source's length to it. A "
+                    "local source is measured and quoted exactly."
+                )
+            if step_warnings:
+                quote["warnings"] = list(step_warnings)
+                await _emit_warnings(ctx, step_warnings)
             return _respond(app_ctx, quote)
 
         # Validate the initial gs:// source against the allowlist (intermediate
@@ -5935,6 +6069,20 @@ async def loop_extend(
         if facts.duration_source:
             result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
             result["duration_source"] = "measured from the assembled video"
+        # Every turn is billed at its OWN assembled length, so the chain's cost
+        # needs all of them, not just the one the caller keeps.
+        turn_seconds: list[float] = []
+        for step_url in steps:
+            if not (isinstance(step_url, str) and step_url.startswith("file://")):
+                turn_seconds = []
+                break
+            step_measured = await _probe_media(
+                measure_video_duration, Path(step_url[7:])
+            )
+            if step_measured is None:
+                turn_seconds = []
+                break
+            turn_seconds.append(step_measured)
         result.setdefault(
             "duration_source",
             "not measured: the assembled video was delivered to GCS, which a "
@@ -5957,7 +6105,11 @@ async def loop_extend(
             include_audio=include_audio,
             warnings=step_warnings,
             resolution=str(result.get("resolution") or "720p"),
+            turn_seconds=turn_seconds,
         )
+        for key in ("billed_seconds", "appended_seconds", "turn_output_seconds"):
+            if key in manifest:
+                result[key] = manifest[key]
         if manifest.get("cost"):
             result["cost"] = manifest["cost"]
         if manifest.get("warnings"):

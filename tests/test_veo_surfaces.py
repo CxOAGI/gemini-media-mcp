@@ -31,6 +31,13 @@ VEO_FAST = "veo-3.1-fast-generate-001"
 VEO = "veo-3.1-generate-001"
 VEO_LITE = "veo-3.1-lite-generate-preview"
 
+# Veo serves these modes only on Vertex. MEASURED: the Gemini Developer API
+# answers "Your use case is currently not supported" for first/last-frame and
+# "encodedVideo isn't supported by this model" for extension.
+_VERTEX_ONLY_TOOLS = frozenset(
+    {"generate_transition", "generate_bridge", "loop_extend"}
+)
+
 
 def _ctx(
     tmp_path: Path,
@@ -588,6 +595,11 @@ async def test_every_render_tool_reports_its_backend(
     expected = "vertex" if vertexai else "gemini_api"
     missing: list[str] = []
     for tool, kwargs in _render_tool_calls(video, image).items():
+        if not vertexai and tool in _VERTEX_ONLY_TOOLS:
+            # Veo refuses these on the Gemini Developer API, so there is no
+            # response to stamp — the refusal is the correct behaviour and is
+            # covered by test_a_gemini_api_quote_refuses_a_mode_veo_cannot_serve.
+            continue
         # A bucket, because Vertex refuses to extend without a destination;
         # on the Gemini API the env default is dropped rather than rejected.
         raw = await getattr(main_mod, tool)(
@@ -676,6 +688,8 @@ async def test_every_rendered_response_reports_backend_and_sources(
     expected = "vertex" if vertexai else "gemini_api"
     bad: list[str] = []
     for tool, kwargs in calls.items():
+        if not vertexai and tool in _VERTEX_ONLY_TOOLS:
+            continue
         raw = await getattr(main_mod, tool)(
             ctx=_ctx(
                 tmp_path,
@@ -713,7 +727,16 @@ async def test_a_loop_extend_quote_measures_the_source_it_can_open(
     video, _ = _seed_media(tmp_path)
     payload = json.loads(
         await loop_extend(
-            ctx=_ctx(tmp_path), prompt="c", video_uri=video, model=VEO, dry_run=True
+            ctx=_ctx(
+                tmp_path,
+                vertexai=True,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
+            prompt="c",
+            video_uri=video,
+            model=VEO,
+            dry_run=True,
         )
     )
     assert "error" not in payload, payload.get("error")
@@ -737,7 +760,12 @@ async def test_a_loop_extend_quote_says_why_a_remote_source_is_unmeasured(
 
     payload = json.loads(
         await loop_extend(
-            ctx=_ctx(tmp_path, allowed=frozenset({"bkt"})),
+            ctx=_ctx(
+                tmp_path,
+                vertexai=True,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
             prompt="c",
             video_uri="gs://bkt/in.mp4",
             model=VEO,
@@ -867,3 +895,160 @@ async def test_an_unmeasurable_veo_render_says_its_resolution_is_assumed(
     assert "error" not in payload, payload.get("error")
     assert payload["resolution"] == "720p"
     assert payload["resolution_source"].startswith("assumed:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "mode"),
+    [
+        (
+            "generate_transition",
+            {"first_frame_uri": None, "last_frame_uri": None},
+            "first_last_frame",
+        ),
+        (
+            "generate_bridge",
+            {"from_clip_uri": None, "to_clip_uri": None},
+            "first_last_frame",
+        ),
+        ("loop_extend", {"video_uri": None}, "extend_video"),
+    ],
+)
+async def test_a_gemini_api_quote_refuses_a_mode_veo_cannot_serve(
+    tmp_path: Path, tool: str, kwargs: dict[str, Any], mode: str
+) -> None:
+    """A quote must never price a call the backend cannot run.
+
+    MEASURED against the live service: on the Gemini Developer API, Veo
+    refuses every mode that conditions on existing footage. These three tools
+    were returning a clean price AND the very backend that made the call
+    impossible, in the same response — the signal was already in hand and
+    simply was not wired to a gate.
+    """
+    import src.__main__ as main_mod
+
+    video, image = _seed_media(tmp_path)
+    filled = {k: (video if "clip" in k or "video" in k else image) for k in kwargs}
+    payload = json.loads(
+        await getattr(main_mod, tool)(
+            ctx=_ctx(tmp_path), prompt="x", model=VEO_FAST, dry_run=True, **filled
+        )
+    )
+    assert "estimated_cost" not in payload, f"{tool} priced an impossible call"
+    assert mode in payload["error"]
+    assert "Vertex AI" in payload["error"]
+
+
+def test_the_planner_does_not_route_to_a_tool_this_backend_refuses() -> None:
+    """plan_generation ranked generate_transition top on a backend that 400s.
+
+    The planner already had a backend field and backend-specific rules, so
+    the mechanism existed; this mode simply was not among them.
+    """
+    from src.routing import RoutingConstraints, plan_generation
+
+    intent = "a crossfade between these two frames"
+    blocked = plan_generation(intent, RoutingConstraints(backend="gemini_api"))
+    codes = [c.code for c in blocked.conflicts]
+    assert "veo_mode_unsupported_on_gemini_api" in codes
+    conflict = next(
+        c for c in blocked.conflicts if c.code == "veo_mode_unsupported_on_gemini_api"
+    )
+    assert "Vertex AI" in conflict.resolution
+
+    # And the same brief on Vertex must stay clean, or the gate is just noise.
+    allowed = plan_generation(intent, RoutingConstraints(backend="vertex"))
+    assert "veo_mode_unsupported_on_gemini_api" not in [
+        c.code for c in allowed.conflicts
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+@pytest.mark.parametrize(
+    ("times", "expected_seconds"), [(1, 9.0), (2, 25.0), (3, 48.0)]
+)
+async def test_a_loop_extend_quote_bills_every_turns_assembled_length(
+    tmp_path: Path, times: int, expected_seconds: float
+) -> None:
+    """MEASURED: a 4.0s source extended once rendered 11s and billed 11s.
+
+    Veo re-bills the assembled clip on every turn, exactly as omni does, so
+    turn i outputs source + 7i and the chain costs the SUM of those lengths.
+    Quoting `times * 7` charged only the appended footage: 57% under on a
+    single extension, and an order of magnitude on a long chain ($56 quoted
+    against $620 actual at veo-3.1-generate-001 rates).
+
+    Pricing the FINAL length instead would fix times=1 and still under-quote
+    every chain, which is why this is parametrized past 1.
+    """
+    from src.__main__ import loop_extend
+
+    video, _ = _seed_media(tmp_path)  # 48 frames at 24fps = 2.0s
+    payload = json.loads(
+        await loop_extend(
+            ctx=_ctx(
+                tmp_path,
+                vertexai=True,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
+            prompt="c",
+            video_uri=video,
+            model=VEO,
+            times=times,
+            dry_run=True,
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["billed_seconds"] == pytest.approx(expected_seconds, abs=0.2)
+    # The appended footage is what it is NOT: conflating them was the bug.
+    assert payload["appended_seconds"] == times * 7
+    assert payload["estimated_cost"]["usd"] == pytest.approx(
+        expected_seconds * 0.40, abs=0.1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_remotely_delivered_chain_is_never_reported_as_metered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A GCS-delivered render can never be is_estimate: false.
+
+    The chain returned is_estimate: false for a delivery the server never
+    opened — wrong twice over, since the basis was also the appended footage
+    rather than the assembled length.
+    """
+    from src.__main__ import loop_extend
+
+    async def gcs_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "video_url": "gs://bkt/out/ext.mp4",
+            "model": kwargs.get("model"),
+            "duration_seconds": 7,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", gcs_impl)
+
+    payload = json.loads(
+        await loop_extend(
+            ctx=_ctx(
+                tmp_path,
+                vertexai=True,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
+            prompt="c",
+            video_uri="gs://bkt/in.mp4",
+            model=VEO,
+            times=1,
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    manifest = payload.get("manifest") or {}
+    cost = payload.get("cost") or manifest.get("cost") or {}
+    assert cost, payload
+    assert cost["is_estimate"] is True, cost
+    assert "FLOOR" in manifest.get("duration_source", "")

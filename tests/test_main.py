@@ -2170,6 +2170,7 @@ def _video_ctx(
     tmp_path: Path,
     allowed_gcs_buckets: frozenset[str] = frozenset(),
     vertexai: bool = False,
+    video_gcs_bucket: str | None = None,
 ) -> MagicMock:
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
@@ -2189,6 +2190,7 @@ def _video_ctx(
         videos_dir=videos_dir,
         client=client,
         allowed_gcs_buckets=allowed_gcs_buckets,
+        video_gcs_bucket=video_gcs_bucket,
     )
     return ctx
 
@@ -2596,6 +2598,26 @@ async def test_generate_video_extend_requires_gcs_output(
 # ============================================================================
 # Regression tests for the post-review fixes
 # ============================================================================
+
+
+def _vertex_app_ctx(tmp_path: Path) -> Any:
+    """AppContext on Vertex, with a destination so extension can run.
+
+    Veo serves extension and first/last-frame only on Vertex (measured: the
+    Gemini Developer API answers "encodedVideo isn't supported by this model").
+    A test whose subject is chaining or warning propagation is not a test about
+    a backend, so it belongs on the one where the mode exists.
+    """
+    client = MagicMock()
+    client._api_client.vertexai = True
+    return AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=client,
+        video_gcs_bucket="gs://bkt/out/",
+        allowed_gcs_buckets=frozenset({"bkt"}),
+    )
 
 
 def _gemini_api_app_ctx(tmp_path: Path, video_gcs_bucket: str | None = None) -> Any:
@@ -3664,7 +3686,7 @@ async def test_loop_extend_chains_extensions(
     (tmp_path / "images").mkdir()
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    ctx = _ctx_wrapping(_vertex_app_ctx(tmp_path))
 
     extend_uris: list[str] = []
     n = {"i": 0}
@@ -3846,7 +3868,7 @@ async def test_loop_extend_passes_audio_and_propagates_warnings(
     (tmp_path / "images").mkdir()
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    ctx = _ctx_wrapping(_vertex_app_ctx(tmp_path))
 
     audio_flags: list[bool] = []
     n = {"i": 0}
@@ -3876,7 +3898,10 @@ async def test_loop_extend_passes_audio_and_propagates_warnings(
         )
     )
     assert audio_flags == [True, True]
-    assert result["warnings"] == ["same warning each step"]
+    # Containment, not equality: the test's fake steps are not measurable
+    # files, so the chain also (correctly) labels its cost a floor. What this
+    # test is about is that the impl's own warning survives the chain.
+    assert "same warning each step" in result["warnings"]
 
 
 def test_client_for_omni_routing(
@@ -4921,8 +4946,19 @@ async def test_video_dry_runs_quote_without_spending(
     for impl in ("generate_video_impl", "generate_video_omni_impl"):
         monkeypatch.setattr(main_mod, impl, must_not_spend)
 
+    # Lite is served only by the Gemini API; first/last-frame and extension
+    # only by Vertex. One shared backend cannot serve both, so the case decides.
+    on_vertex = "lite" not in json.dumps(kwargs).lower()
     payload = json.loads(
-        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+        await getattr(main_mod, tool)(
+            ctx=_video_ctx(
+                tmp_path,
+                vertexai=on_vertex,
+                video_gcs_bucket="gs://bkt/out/" if on_vertex else None,
+            ),
+            dry_run=True,
+            **kwargs,
+        )
     )
     assert payload["dry_run"] is True
     assert payload["estimated_cost"]["usd"] == pytest.approx(expected_usd)
@@ -5068,8 +5104,19 @@ async def test_dry_run_refuses_what_the_real_run_would_refuse(
     """
     import src.__main__ as main_mod
 
+    # Lite is served only by the Gemini API; first/last-frame and extension
+    # only by Vertex. One shared backend cannot serve both, so the case decides.
+    on_vertex = "lite" not in json.dumps(kwargs).lower()
     payload = json.loads(
-        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+        await getattr(main_mod, tool)(
+            ctx=_video_ctx(
+                tmp_path,
+                vertexai=on_vertex,
+                video_gcs_bucket="gs://bkt/out/" if on_vertex else None,
+            ),
+            dry_run=True,
+            **kwargs,
+        )
     )
     assert expected_error in payload["error"]
 
@@ -5081,7 +5128,12 @@ async def test_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
     disallowed bucket must fail exactly like running it would."""
     import src.__main__ as main_mod
 
-    ctx = _video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"trusted"}))
+    ctx = _video_ctx(
+        tmp_path,
+        vertexai=True,
+        video_gcs_bucket="gs://trusted/out/",
+        allowed_gcs_buckets=frozenset({"trusted"}),
+    )
     denied = json.loads(
         await main_mod.loop_extend(
             ctx=ctx, video_uri="gs://evil/x.mp4", times=2, dry_run=True
@@ -5459,7 +5511,7 @@ async def test_bridge_quote_reports_that_the_ffmpeg_check_ran(tmp_path: Path) ->
 
     payload = json.loads(
         await main_mod.generate_bridge(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True, video_gcs_bucket="gs://bkt/out/"),
             # gs:// clips are uncheckable offline and still price; local dummy
             # paths would now be refused as outside DATA_FOLDER. This test is
             # about the ffmpeg preflight, not the source scheme.

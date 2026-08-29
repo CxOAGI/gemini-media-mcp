@@ -137,6 +137,29 @@ def _prepare_image_input(image_bytes: bytes) -> types.Image:
 # image-to-video only.
 _LITE_UNSUPPORTED_MODES = ("extend_video", "reference_to_video", "first_last_frame")
 
+# MEASURED against the live service: on the Gemini Developer API, Veo refuses
+# every mode that conditions on existing footage. first_last_frame comes back
+# "Your use case is currently not supported" (generate_transition,
+# generate_bridge) and extend_video comes back "encodedVideo isn't supported by
+# this model" (loop_extend). The identical calls succeed on Vertex.
+#
+# Only these two are listed because only these two were proven. Veo on this
+# backend is reported to be text-to-video only, but image_to_video and
+# reference_to_video were not exercised, and refusing a mode that in fact works
+# is worse than letting a free 400 come back — so those two warn instead of
+# raising. See _GEMINI_API_LIKELY_UNSUPPORTED_MODES.
+_GEMINI_API_UNSUPPORTED_MODES = ("first_last_frame", "extend_video")
+_GEMINI_API_LIKELY_UNSUPPORTED_MODES = ("image_to_video", "reference_to_video")
+
+_GEMINI_API_MODE_ERRORS = {
+    "first_last_frame": (
+        'the service answers "Your use case is currently not supported"'
+    ),
+    "extend_video": (
+        'the service answers "encodedVideo isn\'t supported by this model"'
+    ),
+}
+
 # Veo 3.1 accepts at most this many reference images; extras are not sent.
 _MAX_REFERENCE_IMAGES = 3
 
@@ -213,6 +236,7 @@ def validate_render_options(
     model: str,
     resolution: str | None = None,
     generation_mode: str | None = None,
+    backend: str | None = None,
 ) -> None:
     """Raise for a model/resolution/mode combination Veo cannot render.
 
@@ -221,6 +245,11 @@ def validate_render_options(
     single-source rule as resolve_image_model on the image side. Every Lite
     restriction lives here; enforcing them per tool is what let a dry run
     price an extension on a model that cannot extend.
+
+    ``backend`` extends that rule from the model to the deployment. Veo on the
+    Gemini Developer API refuses every mode that conditions on existing
+    footage, and the tools were quoting those calls cleanly — printing the very
+    backend that made them impossible in the same response as the price.
     """
     if resolution is not None:
         valid_resolutions = ("720p", "1080p", "4K")
@@ -243,6 +272,20 @@ def validate_render_options(
             f"Model {model} does not support {generation_mode}. "
             "Veo 3.1 Lite supports only text-to-video and image-to-video; "
             "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+        )
+    if (
+        backend == "gemini_api"
+        and generation_mode is not None
+        and generation_mode in _GEMINI_API_UNSUPPORTED_MODES
+    ):
+        detail = _GEMINI_API_MODE_ERRORS.get(generation_mode, "")
+        raise ValueError(
+            f"Veo cannot render {generation_mode} on the Gemini Developer API"
+            + (f": {detail}" if detail else "")
+            + ". This mode works on Vertex AI — configure Vertex credentials "
+            "(GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, with "
+            "output_gcs_uri or VIDEO_GCS_BUCKET for delivery) and retry. "
+            "Text-to-video works on this backend."
         )
 
 
@@ -410,7 +453,20 @@ async def generate_video(
     # extension, reference images, or first/last-frame control — fail fast
     # with a clear message instead of an opaque API error. Shared with the
     # tools' dry_run quotes so both refuse the same combinations.
-    validate_render_options(model, generation_mode=generation_mode)
+    validate_render_options(
+        model,
+        generation_mode=generation_mode,
+        backend="vertex" if is_vertexai else "gemini_api",
+    )
+    for likely in _GEMINI_API_LIKELY_UNSUPPORTED_MODES:
+        if not is_vertexai and generation_mode == likely:
+            # Not proven, so not refused — but a caller should not learn this
+            # from an opaque 400 when the server can see it coming.
+            warnings.append(
+                f"Veo on the Gemini Developer API is reported to support "
+                f"text-to-video only, and this is a {generation_mode} render. "
+                "If it fails, the same call works on Vertex AI."
+            )
 
     # Prepare image inputs
     first_frame_input: types.Image | None = None
@@ -664,3 +720,38 @@ async def generate_video(
         result["warnings"] = warnings
 
     return result
+
+
+VEO_EXTENSION_STEP_SECONDS = 7.0
+# Veo caps a chain at 20 extensions; the tool exposes the same range.
+VEO_MAX_EXTENSIONS = 20
+
+
+def veo_extension_output_lengths(
+    source_seconds: float | None,
+    times: int,
+    step: float = VEO_EXTENSION_STEP_SECONDS,
+) -> list[float]:
+    """Billable OUTPUT length of each turn of a Veo extension chain.
+
+    MEASURED: a 4.0s source extended once returned an 11.0s file billed at
+    11s, not at the 7s it appended. Veo re-bills the assembled clip on every
+    turn, exactly as omni was measured to do, so turn i outputs
+    ``source + step*i`` and the cost of a chain grows QUADRATICALLY in the
+    number of turns.
+
+    This was quoted as ``times * 7`` — the appended footage alone — which
+    under-billed a single extension of a 4s source by 57% and a 20-turn chain
+    by an order of magnitude ($56 quoted against $620 actual on
+    veo-3.1-generate-001). The three numbers are distinct and conflating them
+    is the whole bug: what gets BILLED is the sum of these lengths, what the
+    caller ENDS UP WITH is the last one, and what is NEW is only ``times *
+    step``.
+
+    Returns [] when the source length is unknown, because there is no honest
+    point estimate without it — the caller must say so rather than quoting the
+    floor as if it were the price.
+    """
+    if source_seconds is None or source_seconds <= 0:
+        return []
+    return [round(source_seconds + step * i, 3) for i in range(1, times + 1)]
