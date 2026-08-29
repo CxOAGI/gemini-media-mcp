@@ -468,7 +468,9 @@ async def test_references_with_frames_raise_and_name_both(
 async def test_extra_reference_images_warn(videos_dir: Path) -> None:
     """Truncating to three references is reported, not silent."""
     result = await generate_video(
-        client=FakeVeoClient(),  # type: ignore[arg-type]
+        client=FakeVeoClient(
+            vertexai=True,
+        ),  # type: ignore[arg-type]
         prompt="a clip",
         videos_dir=videos_dir,
         model="veo-3.1-generate-001",

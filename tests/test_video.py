@@ -825,7 +825,7 @@ async def test_generate_video_reference_images(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -858,7 +858,7 @@ async def test_generate_video_reference_images_limited_to_3(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -1233,7 +1233,7 @@ async def test_generate_video_reference_duration_forced_to_8(tmp_path: Path) -> 
     videos_dir.mkdir()
 
     gen_result = await generate_video(
-        client=_basic_client(),  # type: ignore[arg-type]
+        client=_basic_client(vertexai=True),  # type: ignore[arg-type]
         prompt="Reference",
         videos_dir=videos_dir,
         model="veo-3.1-generate-001",

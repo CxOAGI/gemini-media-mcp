@@ -461,6 +461,20 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
     ended up on one of eight. Routed through here it cannot be forgotten.
     """
     quote = bool(payload.get("dry_run"))
+    # One response, one model name. The impl returns the SERVED id — the
+    # Gemini API is fed `-preview` spellings, Vertex `-001` — and reporting
+    # that beside a cost line priced on the canonical name had two fields
+    # naming different models. The quote was fixed for this once and the
+    # rendered path grew it back, so it is settled here instead of per tool.
+    # The served spelling is kept, not dropped: it is what went on the wire.
+    raw_model = payload.get("model")
+    if isinstance(raw_model, str) and raw_model:
+        from .pricing import resolve_model_id
+
+        canonical = resolve_model_id(raw_model)
+        if canonical != raw_model:
+            payload["model"] = canonical
+            payload.setdefault("served_model", raw_model)
     # "We are on Vertex" is not a whole-server statement, and reading it as one
     # cost several rounds of confusion: omni prefers the Gemini API whenever a
     # key is configured, because 1.1 is GA there and allowlist-gated Preview on
@@ -2465,6 +2479,7 @@ def _assemble_loop_extend_manifest(
     warnings: list[str],
     resolution: str = "720p",
     turn_seconds: list[float] | None = None,
+    source_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Build loop_extend's manifest for the extensions that actually ran.
 
@@ -2490,31 +2505,47 @@ def _assemble_loop_extend_manifest(
     # appended footage and under-billed a single 4s-source extension by 57%.
     measured = [t for t in (turn_seconds or []) if t is not None]
     everything_measured = len(measured) == len(steps) and bool(steps)
-    billed = (
-        sum(measured)
-        if everything_measured
-        else len(steps) * VEO_EXTENSION_STEP_SECONDS
-    )
+    # Three tiers, best evidence first. The projection matters because only the
+    # OUTPUT of a GCS-delivered chain is out of reach: a local source still
+    # pins every turn's length, and dropping to the appended-only floor made
+    # the real run report less than its own pre-flight quote.
+    projected = veo_extension_output_lengths(source_seconds, len(steps))
+    if everything_measured:
+        billed = sum(measured)
+    elif projected:
+        billed = sum(projected)
+    else:
+        billed = len(steps) * VEO_EXTENSION_STEP_SECONDS
     manifest["billed_seconds"] = round(billed, 3)
     manifest["appended_seconds"] = len(steps) * VEO_EXTENSION_STEP_SECONDS
     if everything_measured:
         manifest["turn_output_seconds"] = [round(t, 3) for t in measured]
         manifest["duration_source"] = "measured from each rendered turn"
+    elif projected:
+        manifest["turn_output_seconds"] = projected
+        manifest["duration_source"] = (
+            "PROJECTED from a measured "
+            f"{source_seconds:g}s source: the chain was delivered remotely so "
+            "its turns could not be opened, but a Veo turn renders the "
+            "assembled clip, so turn i is the source plus "
+            f"{VEO_EXTENSION_STEP_SECONDS:g}s per turn. This is the same "
+            "figure the pre-flight quoted."
+        )
     else:
-        # A GCS-delivered chain was never opened, so this is a FLOOR: the
-        # appended footage only, with every turn's re-billed assembly missing.
+        # Neither the turns nor the source could be opened, so this is the
+        # appended footage alone, with every turn's re-billed assembly missing.
         # Asserting is_estimate=False on it claimed a metered figure for a
         # file that was never read.
         manifest["duration_source"] = (
             "FLOOR, not a metered figure: the chain was delivered remotely and "
-            "not opened, and a Veo turn bills the assembled clip rather than "
-            "the footage it appends. The true bill is higher by the source's "
-            "length charged once per turn."
+            "not opened, its source is remote too, and a Veo turn bills the "
+            "assembled clip rather than the footage it appends. The true bill "
+            "is higher by the source's length charged once per turn."
         )
         warnings.append(
-            "This cost is a FLOOR. The chain was delivered remotely, so its "
-            "turns could not be measured, and Veo bills each turn's assembled "
-            "length rather than the 7s it appends."
+            "This cost is a FLOOR. Neither the chain nor its source could be "
+            "measured, and Veo bills each turn's assembled length rather than "
+            f"the {VEO_EXTENSION_STEP_SECONDS:g}s it appends."
         )
     cost = _video_cost(
         served_model,
@@ -6069,6 +6100,18 @@ async def loop_extend(
         if facts.duration_source:
             result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
             result["duration_source"] = "measured from the assembled video"
+        # The pre-flight measured this source and projected 11.0s; the real
+        # run then delivered to GCS, could not open the turns, and fell all
+        # the way back to appended-only — reporting a cost BELOW its own quote
+        # for the identical call. Only the OUTPUT went remote. The source is
+        # still local and still measurable, so the floor is the projection,
+        # not the appended footage.
+        source_bytes = await _fetch_local_source(ctx, video_uri)
+        source_seconds = (
+            await _probe_media(measure_video_duration_bytes, source_bytes)
+            if source_bytes is not None
+            else None
+        )
         # Every turn is billed at its OWN assembled length, so the chain's cost
         # needs all of them, not just the one the caller keeps.
         turn_seconds: list[float] = []
@@ -6106,6 +6149,7 @@ async def loop_extend(
             warnings=step_warnings,
             resolution=str(result.get("resolution") or "720p"),
             turn_seconds=turn_seconds,
+            source_seconds=source_seconds,
         )
         for key in ("billed_seconds", "appended_seconds", "turn_output_seconds"):
             if key in manifest:
