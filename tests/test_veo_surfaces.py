@@ -1056,7 +1056,7 @@ async def test_a_remotely_delivered_chain_is_never_reported_as_metered(
     cost = payload.get("cost") or manifest.get("cost") or {}
     assert cost, payload
     assert cost["is_estimate"] is True, cost
-    assert "FLOOR" in manifest.get("duration_source", "")
+    assert "FLOOR" in manifest.get("billed_seconds_source", "")
 
 
 @pytest.mark.asyncio
@@ -1096,7 +1096,7 @@ async def test_a_remote_delivery_still_projects_from_a_local_source(
 
     assert quote["billed_seconds"] == pytest.approx(11.0, abs=0.2)
     assert manifest["billed_seconds"] == pytest.approx(quote["billed_seconds"], abs=0.2)
-    assert manifest["duration_source"].startswith("PROJECTED")
+    assert manifest["billed_seconds_source"].startswith("PROJECTED")
     # Projected is not metered, however good the projection is.
     assert manifest["cost"]["is_estimate"] is True
 

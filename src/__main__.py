@@ -1278,6 +1278,46 @@ async def _probe_local_video_seconds(
     return await _probe_media(measure_video_duration, path)
 
 
+async def _extension_source_seconds(
+    ctx: Context[ServerSession, AppContext],
+    uri: str | None,
+    *,
+    allow_remote: bool,
+) -> float | None:
+    """Length of an extension source, or None.
+
+    Local always. Remote only on a REAL run: a dry run is documented free,
+    instant and offline, so it does not download — but a real run is already
+    committing to a render, and a capped read of the source is the difference
+    between a labelled floor and a projection. On Vertex this is the common
+    case, not an edge one: extension REQUIRES a GCS destination there, so the
+    source is usually gs:// too, and quoting the appended 7s against a 4s
+    source under-states the bill by 57%.
+
+    Never raises: a source that cannot be read falls back to the floor.
+    """
+    if not uri:
+        return None
+    local = await _probe_local_video_seconds(ctx, uri)
+    if local is not None or not allow_remote or uri.startswith("file://"):
+        return local
+    app_ctx = ctx.request_context.lifespan_context
+    try:
+        data = await fetch(
+            uri,
+            allowed_dir=app_ctx.data_folder,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+    except Exception:
+        logger.debug(
+            "Could not read %s to measure an extension source", uri, exc_info=True
+        )
+        return None
+    if data is None:
+        return None
+    return await _probe_media(measure_video_duration_bytes, data)
+
+
 async def _fetch_local_source(
     ctx: Context[ServerSession, AppContext],
     uri: str,
@@ -2667,7 +2707,7 @@ def _assemble_loop_extend_manifest(
     manifest["appended_seconds"] = billing.appended_seconds
     if billing.turn_output_seconds:
         manifest["turn_output_seconds"] = billing.turn_output_seconds
-    manifest["duration_source"] = billing.duration_source
+    manifest["billed_seconds_source"] = billing.duration_source
     if billing.warning:
         warnings.append(billing.warning)
     cost = _video_cost(
@@ -2859,9 +2899,12 @@ async def generate_image(
             actual cost, derived from the token counts the API metered.
             Note: a quote covers output tokens only. Input tokens are not
             knowable before the call, so a multi-turn edit (which resends the
-            conversation via thought_signature_url) costs slightly more than
-            quoted — measured at ~1% on a real edit, 1527 input tokens against
-            14 for a fresh call. The real run reports the metered figure.
+            conversation via thought_signature_url) costs more than quoted.
+            How much more is not stated here: an earlier note put it near
+            one percent, and that cannot be squared with what the signatures
+            were later measured to weigh (1.6-2.8 MB), so the figure is
+            withdrawn rather than repeated. The real run reports the metered
+            input and output counts.
 
     Returns:
         Two content blocks: a JPEG preview of the image, then JSON with
@@ -3766,7 +3809,12 @@ async def generate_video(
                 if ext_billing.turn_output_seconds:
                     payload["turn_output_seconds"] = ext_billing.turn_output_seconds
                     payload["duration_seconds"] = ext_billing.turn_output_seconds[-1]
-                payload["duration_source"] = ext_billing.duration_source
+                payload["billed_seconds_source"] = ext_billing.duration_source
+                if ext_billing.turn_output_seconds:
+                    payload["duration_source"] = (
+                        "projected: an extension renders the assembled clip "
+                        "(source + ~7s)"
+                    )
                 payload["estimated_cost"] = _video_cost(
                     est_model,
                     float(ext_billing.billed_seconds),
@@ -4018,7 +4066,10 @@ async def generate_video(
         # A non-extension render is metered when it was measured; only an
         # extension can be a projection, and the billing helper says which.
         extension_metered = True
-        if result.get("generation_mode") == "extend_video":
+        # Keyed on the REQUEST, not on the impl echoing generation_mode back:
+        # a caller who passed extend_video_uri is extending, and the billing
+        # rule must not hinge on a field the response might omit.
+        if extend_video_uri:
             # An extension is billed on the assembled clip, not on the footage
             # it appends — the same rule loop_extend applies, which this path
             # did not. It billed 7s, asserted is_estimate=False for a file it
@@ -4031,21 +4082,42 @@ async def generate_video(
                     if veo_facts.duration_source and veo_facts.duration_seconds
                     else None
                 ),
-                source_seconds=await _probe_local_video_seconds(ctx, extend_video_uri),
+                source_seconds=await _extension_source_seconds(
+                    ctx, extend_video_uri, allow_remote=True
+                ),
             )
             extension_metered = billing.is_metered
             result["billed_seconds"] = billing.billed_seconds
             result["appended_seconds"] = billing.appended_seconds
             if billing.turn_output_seconds:
                 result["turn_output_seconds"] = billing.turn_output_seconds
-            result["duration_source"] = billing.duration_source
+                if not veo_facts.duration_source:
+                    # The delivered clip is the ASSEMBLED one. The impl reports
+                    # the 7s it was asked to append, which is neither what was
+                    # delivered nor what is billed, and labelling that number
+                    # with the projection described a length it did not hold.
+                    result["duration_seconds"] = billing.turn_output_seconds[-1]
+                    result["duration_source"] = (
+                        "projected: an extension delivers the assembled clip "
+                        "(source + ~7s), and this one was delivered remotely "
+                        "so it could not be measured"
+                    )
+            result["billed_seconds_source"] = billing.duration_source
             if billing.warning:
                 result.setdefault("warnings", []).append(billing.warning)
         result.setdefault(
             "duration_source",
-            "the snapped request: Veo renders exactly the length it is sent",
+            # The snapped-request rule is TEXT-TO-VIDEO's. Asserting it over an
+            # extension is the one place it is known to be false: an extension
+            # delivers the assembled clip, not the length it was sent. When
+            # nothing could be measured, say that rather than borrow a rule.
+            "not measured: the render was delivered remotely, and an extension "
+            "delivers the assembled clip (source + ~7s) rather than the length "
+            "it was sent, so its length is not known here"
+            if extend_video_uri
+            else "the snapped request: Veo renders exactly the length it is sent",
         )
-        is_extension = result.get("generation_mode") == "extend_video"
+        is_extension = bool(extend_video_uri)
         raw_billed = (
             result.get("billed_seconds")
             if is_extension
@@ -6164,7 +6236,9 @@ async def loop_extend(
         ctx: MCP context with application state
         video_uri: URI of the existing Veo video to extend (gs://, file://)
         prompt: What the continuation should depict
-        times: Number of ~7s extensions to chain (1-20)
+        times: Number of ~7s extensions to chain (1-20). Each turn APPENDS
+            ~7s but BILLS the whole assembled clip, so cost grows with the
+            square of this — see max_cost_usd.
         model: Veo model (not the Lite model)
         aspect_ratio: 16:9 or 9:16. An extension continues the source, so the
             rendered aspect ratio is the source's; this value must match it.
@@ -6175,8 +6249,15 @@ async def loop_extend(
         include_audio: Generate audio on the extended sections (default True,
             so extending an audio video doesn't go silent; Vertex only)
         output_gcs_uri: GCS output URI (required on Vertex for extensions)
-        dry_run: When True, return only the cost of the extension chain
-            (times x ~7s at the model's rate) and generate nothing.
+        dry_run: When True, return only the cost of the extension chain and
+            generate nothing. The basis is NOT times x ~7s: MEASURED, a Veo
+            turn renders and bills the ASSEMBLED clip (a 4.0s source came
+            back 11s billed at 11s), so the chain costs the SUM of the turn
+            outputs — source + 7i for turn i — and grows with times². The
+            quote reports billed_seconds, assembled_seconds and
+            appended_seconds separately for that reason. A local source is
+            measured; a remote one is a labelled FLOOR here, and measured on
+            the real run.
 
     Returns:
         JSON with the final video_url and the ordered list of intermediate
@@ -6276,7 +6357,7 @@ async def loop_extend(
                     include_audio=include_audio,
                     presnapped=True,  # measured lengths must not re-snap
                 )
-                quote["duration_source"] = (
+                quote["billed_seconds_source"] = (
                     f"projection from a measured {source_seconds:g}s source: a "
                     "Veo turn renders the ASSEMBLED clip, not the "
                     f"{VEO_EXTENSION_STEP_SECONDS:g}s it appends (measured: a "
@@ -6312,7 +6393,7 @@ async def loop_extend(
                     include_audio=include_audio,
                     presnapped=True,
                 )
-                quote["duration_source"] = (
+                quote["billed_seconds_source"] = (
                     "FLOOR, not an estimate: a Veo turn re-bills the assembled "
                     "clip, so the true cost is this plus the source's length "
                     f"charged once per turn ({times}x). The source is remote "
@@ -6344,7 +6425,9 @@ async def loop_extend(
 
         # Measured up front: the projection below needs it, and the manifest
         # after the loop reuses it rather than probing twice.
-        source_seconds = await _probe_local_video_seconds(ctx, video_uri)
+        source_seconds = await _extension_source_seconds(
+            ctx, video_uri, allow_remote=True
+        )
         if max_cost_usd is not None:
             # Refuse BEFORE the first turn bills. This is the tool where a cap
             # earns its keep: the bill grows with the square of `times`.
@@ -6454,7 +6537,12 @@ async def loop_extend(
             turn_seconds=turn_seconds,
             source_seconds=source_seconds,
         )
-        for key in ("billed_seconds", "appended_seconds", "turn_output_seconds"):
+        for key in (
+            "billed_seconds",
+            "billed_seconds_source",
+            "appended_seconds",
+            "turn_output_seconds",
+        ):
             if key in manifest:
                 result[key] = manifest[key]
         if manifest.get("cost"):
