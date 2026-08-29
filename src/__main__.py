@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -325,6 +325,64 @@ def _get_omni_vertex_global_client() -> genai.Client:
     if _omni_vertex_global_client is None:
         _omni_vertex_global_client = genai.Client(vertexai=True, location="global")
     return _omni_vertex_global_client
+
+
+class _RenderedFacts(NamedTuple):
+    """What a probe could establish about a file that actually rendered."""
+
+    duration_seconds: float | None
+    duration_source: str | None
+    resolution_source: str | None
+
+
+async def _measure_rendered_video(
+    result: dict[str, Any],
+    *,
+    resolution_key: str,
+    requested_resolution: str | None,
+) -> _RenderedFacts:
+    """Replace echoes of the request with measurements of the artifact.
+
+    Both families bill by resolution, and both used to report the resolution
+    the caller ASKED for — a figure indistinguishable from a report of what
+    rendered. Omni was given a probe; Veo was not, so generate_video billed at
+    a resolution its response never named. Keeping one copy is the point:
+    the divergence is what produced the gap.
+
+    Mutates `result` with the measured dimensions, the classified resolution
+    and a warning when the render disagrees with the request. Returns the
+    facts the caller needs for its own cost line.
+    """
+    duration_source: str | None = None
+    resolution_source: str | None = None
+    raw = result.get("duration_seconds")
+    duration = float(raw) if isinstance(raw, (int, float)) else None
+
+    video_url = result.get("video_url") or ""
+    if not isinstance(video_url, str) or not video_url.startswith("file://"):
+        # A remote render is not opened here: a probe would have to download
+        # it, and silence is why an unmeasured number needs a stated source.
+        return _RenderedFacts(duration, None, None)
+
+    rendered_path = Path(video_url[7:])
+    measured = await _probe_media(measure_video_duration, rendered_path)
+    if measured is not None:
+        duration = measured
+        duration_source = "measured from the rendered video"
+    size = await _probe_media(measure_video_dimensions, rendered_path)
+    if size is not None:
+        result["rendered_dimensions"] = list(size)
+        classified = classify_video_resolution(size)
+        if classified is not None:
+            result[resolution_key] = classified
+            resolution_source = "measured from the rendered video"
+            if requested_resolution and requested_resolution != classified:
+                result.setdefault("warnings", []).append(
+                    f"Requested {requested_resolution} but the render measured "
+                    f"{classified} ({size[0]}x{size[1]}). The cost below "
+                    "prices what rendered, not what was asked for."
+                )
+    return _RenderedFacts(duration, duration_source, resolution_source)
 
 
 def _stamp_provenance(
@@ -634,39 +692,23 @@ async def _omni_generate_and_manifest(
     # rendered; an unmeasurable edit bills the service maximum as a labelled
     # upper bound, never a guessed figure presented as fact.
     billed_model = result.get("model") or model
-    raw_duration: Any = result.get("duration_seconds")
-    effective_duration: float | None = (
-        float(raw_duration) if isinstance(raw_duration, (int, float)) else None
+    # The resolution needs the same treatment the duration got, and for a
+    # sharper reason: `rendered_resolution` was an echo of the REQUEST,
+    # indistinguishable from a report of what rendered, while omni's
+    # per-second rate differs threefold across its tiers. One extra probe on a
+    # file already open turns the billing basis into evidence.
+    facts = await _measure_rendered_video(
+        result,
+        resolution_key="rendered_resolution",
+        requested_resolution=(
+            str(result["rendered_resolution"])
+            if result.get("rendered_resolution")
+            else None
+        ),
     )
-    duration_source: str | None = None
-
-    resolution_source: str | None = None
-    video_url = result.get("video_url") or ""
-    if isinstance(video_url, str) and video_url.startswith("file://"):
-        rendered_path = Path(video_url[7:])
-        measured = await _probe_media(measure_video_duration, rendered_path)
-        if measured is not None:
-            effective_duration = measured
-            duration_source = "measured from the rendered video"
-        # The resolution needs the same treatment the duration got, and for a
-        # sharper reason: `rendered_resolution` was an echo of the REQUEST,
-        # indistinguishable from a report of what rendered, while omni's
-        # per-second rate differs threefold across its tiers. One extra probe
-        # on a file already open turns the billing basis into evidence.
-        size = await _probe_media(measure_video_dimensions, rendered_path)
-        if size is not None:
-            result["rendered_dimensions"] = list(size)
-            classified = classify_video_resolution(size)
-            if classified is not None:
-                requested_res = result.get("rendered_resolution")
-                result["rendered_resolution"] = classified
-                resolution_source = "measured from the rendered video"
-                if requested_res and requested_res != classified:
-                    result.setdefault("warnings", []).append(
-                        f"Requested {requested_res} but the render measured "
-                        f"{classified} ({size[0]}x{size[1]}). The cost below "
-                        "prices what rendered, not what was asked for."
-                    )
+    effective_duration = facts.duration_seconds
+    duration_source = facts.duration_source
+    resolution_source = facts.resolution_source
 
     # An edit is any turn that continues existing footage — a prior
     # interaction OR an input video — mirroring omni's own _select_task_type.
@@ -2399,6 +2441,7 @@ def _assemble_loop_extend_manifest(
     final_video_url: str,
     include_audio: bool,
     warnings: list[str],
+    resolution: str = "720p",
 ) -> dict[str, Any]:
     """Build loop_extend's manifest for the extensions that actually ran.
 
@@ -2418,10 +2461,14 @@ def _assemble_loop_extend_manifest(
         "final_video_url": final_video_url,
         "extension_steps": list(steps),
     }
+    manifest["resolution"] = resolution
     cost = _video_cost(
         served_model,
         float(len(steps) * 7),
-        resolution="720p",
+        # Priced at what the assembled clip measured, not at an assumption.
+        # The tool cannot request a resolution, which says nothing about what
+        # Veo handed back.
+        resolution=resolution,
         include_audio=include_audio,
         actual=True,
     )
@@ -2840,10 +2887,7 @@ async def generate_image(
         preview_bytes = base64.b64decode(preview_b64)
         return [
             Image(data=preview_bytes, format="jpeg"),
-            TextContent(
-                type="text",
-                text=json.dumps(response_data, indent=2),
-            ),
+            TextContent(type="text", text=_respond(app_ctx, response_data)),
         ]
     except Exception as e:
         await ctx.error(f"Image generation failed: {e}")
@@ -3233,9 +3277,7 @@ async def generate_storyboard(
         blocks: list[Any] = []
         if inline_preview:
             blocks.append(Image(data=inline_preview, format="jpeg"))
-        blocks.append(
-            TextContent(type="text", text=json.dumps(response_data, indent=2))
-        )
+        blocks.append(TextContent(type="text", text=_respond(app_ctx, response_data)))
         return blocks
     except Exception as e:
         await ctx.error(f"Storyboard failed: {e}")
@@ -3705,10 +3747,27 @@ async def generate_video(
         # not, and a session spent three calls working out a backend confusion
         # that this field answers in one.
         result["backend"] = "vertex" if is_vertex_client else "gemini_api"
+        # Veo bills by resolution too, and this response named one nowhere:
+        # the manifest recorded the raw request — null whenever the caller
+        # defaulted — while the cost line below priced 720p. Measured, the
+        # two cannot disagree silently.
+        veo_facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=resolution
+        )
+        if veo_facts.duration_source:
+            result["duration_seconds"] = round(veo_facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = veo_facts.duration_source
+        effective_resolution = str(result.get("resolution") or resolution or "720p")
+        result["resolution"] = effective_resolution
+        result["resolution_source"] = veo_facts.resolution_source or (
+            "the request"
+            if resolution
+            else "the default: generate_video renders 720p unless asked otherwise"
+        )
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
-            resolution=resolution or "720p",
+            resolution=effective_resolution,
             include_audio=result.get("audio_enabled", include_audio),
             actual=True,
         )
@@ -3724,7 +3783,9 @@ async def generate_video(
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
-            "resolution": resolution,
+            "duration_source": result.get("duration_source"),
+            "resolution": result.get("resolution", resolution),
+            "resolution_source": result.get("resolution_source"),
             "person_generation": person_generation,
             "audio_enabled": result.get("audio_enabled", include_audio),
             "generation_mode": result.get("generation_mode"),
@@ -3903,24 +3964,25 @@ async def generate_transition(
         # one rendered path with neither a duration_source nor a
         # resolution_source" — was false as it was written: this path had the
         # same hole. Two tools with the same shape, one updated.
-        rendered_url = result.get("video_url") or ""
-        if isinstance(rendered_url, str) and rendered_url.startswith("file://"):
-            measured = await _probe_media(
-                measure_video_duration, Path(rendered_url[7:])
-            )
-            if measured is not None:
-                result["duration_seconds"] = round(measured, 3)
-                result["duration_source"] = "measured from the rendered video"
+        # generate_transition takes no resolution parameter, but "the tool cannot
+        # ask for anything else" is a fact about the tool, not about the file
+        # that came back — and the cost line below prices whatever this says.
+        facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=None
+        )
+        if facts.duration_source:
+            result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = facts.duration_source
         result.setdefault(
             "duration_source",
             "the snapped request: Veo renders exactly the length it is sent",
         )
-        # generate_transition takes no resolution parameter, so this is a fact
-        # about the tool rather than about the file.
         result.setdefault("resolution", "720p")
         result.setdefault(
             "resolution_source",
-            "fixed: generate_transition takes no resolution parameter",
+            facts.resolution_source
+            or "assumed: generate_transition takes no resolution parameter and the "
+            "render could not be measured",
         )
 
         # Cost from the measured length where there is one, else the snapped
@@ -3928,7 +3990,7 @@ async def generate_transition(
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
-            resolution="720p",
+            resolution=str(result.get("resolution") or "720p"),
             include_audio=result.get("audio_enabled", include_audio),
             actual=True,
         )
@@ -4133,28 +4195,29 @@ async def generate_bridge(
         )
         await ctx.info("Bridge generated successfully")
 
-        # Measured like every other local render. A bridge reported the
-        # snapped request as an unlabelled integer — the one rendered path
-        # with neither a duration_source nor a resolution_source, so its
-        # number could not be told apart from a measured one.
-        rendered_url = result.get("video_url") or ""
-        if isinstance(rendered_url, str) and rendered_url.startswith("file://"):
-            measured = await _probe_media(
-                measure_video_duration, Path(rendered_url[7:])
-            )
-            if measured is not None:
-                result["duration_seconds"] = round(measured, 3)
-                result["duration_source"] = "measured from the rendered video"
+        # Measured like every other local render. This comment used to call
+        # bridge "the one rendered path" without a duration_source, which was
+        # false as written — generate_transition beside it had the same hole
+        # and kept it for two more rounds. Both now share one helper.
+        # generate_bridge takes no resolution parameter, but "the tool cannot
+        # ask for anything else" is a fact about the tool, not about the file
+        # that came back — and the cost line below prices whatever this says.
+        facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=None
+        )
+        if facts.duration_source:
+            result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = facts.duration_source
         result.setdefault(
             "duration_source",
             "the snapped request: Veo renders exactly the length it is sent",
         )
-        # generate_bridge takes no resolution parameter, so this is a fact
-        # about the tool rather than about the file.
         result.setdefault("resolution", "720p")
         result.setdefault(
             "resolution_source",
-            "fixed: generate_bridge takes no resolution parameter",
+            facts.resolution_source
+            or "assumed: generate_bridge takes no resolution parameter and the "
+            "render could not be measured",
         )
         result["backend"] = "vertex" if is_vertex_client else "gemini_api"
 
@@ -4163,7 +4226,7 @@ async def generate_bridge(
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
-            resolution="720p",
+            resolution=str(result.get("resolution") or "720p"),
             include_audio=result.get("audio_enabled", include_audio),
             actual=True,
         )
@@ -5854,6 +5917,36 @@ async def loop_extend(
             step_warnings.extend(ext_result.get("warnings") or [])
             served_model = ext_result.get("model", model)
 
+        # What the caller ends up with, measured — before the manifest is
+        # assembled, because the manifest's cost line prices this. The chain
+        # reported how many times it ran and what it cost, but never how long
+        # the result was, which is the one number that says whether the
+        # extensions actually landed.
+        result: dict[str, Any] = {
+            "message": f"Extended video {times} time(s)",
+            "video_url": current,
+            "model": served_model,
+            "times": times,
+            "extension_steps": steps,
+        }
+        facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=None
+        )
+        if facts.duration_source:
+            result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = "measured from the assembled video"
+        result.setdefault(
+            "duration_source",
+            "not measured: the assembled video was delivered to GCS, which a "
+            "local probe does not open",
+        )
+        result.setdefault("resolution", "720p")
+        result.setdefault(
+            "resolution_source",
+            facts.resolution_source
+            or "assumed: loop_extend takes no resolution parameter and the "
+            "assembled video could not be measured",
+        )
         manifest = _assemble_loop_extend_manifest(
             source_video_uri=video_uri,
             prompt=prompt,
@@ -5863,30 +5956,7 @@ async def loop_extend(
             final_video_url=current,
             include_audio=include_audio,
             warnings=step_warnings,
-        )
-        result: dict[str, Any] = {
-            "message": f"Extended video {times} time(s)",
-            "video_url": current,
-            "model": served_model,
-            "times": times,
-            "extension_steps": steps,
-            "resolution": "720p",
-            "resolution_source": "fixed: loop_extend takes no resolution parameter",
-        }
-        # What the caller ends up with, measured. The chain reported how many
-        # times it ran and what it cost, but never how long the result was —
-        # the one number that says whether the extensions actually landed.
-        if isinstance(current, str) and current.startswith("file://"):
-            final_measured = await _probe_media(
-                measure_video_duration, Path(current[7:])
-            )
-            if final_measured is not None:
-                result["duration_seconds"] = round(final_measured, 3)
-                result["duration_source"] = "measured from the assembled video"
-        result.setdefault(
-            "duration_source",
-            "not measured: the assembled video was delivered to GCS, which a "
-            "local probe does not open",
+            resolution=str(result.get("resolution") or "720p"),
         )
         if manifest.get("cost"):
             result["cost"] = manifest["cost"]

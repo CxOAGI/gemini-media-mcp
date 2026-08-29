@@ -747,3 +747,123 @@ async def test_a_loop_extend_quote_says_why_a_remote_source_is_unmeasured(
     assert "error" not in payload, payload.get("error")
     assert payload["source_duration_seconds"] is None
     assert "does not download" in payload["source_duration_source"]
+
+
+def _write_video(path: Path, width: int, height: int, frames: int = 24) -> None:
+    import imageio.v3 as iio
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    iio.imwrite(
+        path,
+        [
+            np.full((height, width, 3), (i * 7) % 256, dtype=np.uint8)
+            for i in range(frames)
+        ],
+        extension=".mp4",
+        fps=24,
+    )
+
+
+def _impl_rendering(path: Path, width: int, height: int) -> Any:
+    async def veo_impl(**kwargs: Any) -> dict[str, Any]:
+        _write_video(path, width, height)
+        return {
+            "video_url": f"file://{path}",
+            "model": kwargs.get("model"),
+            "duration_seconds": kwargs.get("duration_seconds", 4),
+        }
+
+    return veo_impl
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_generate_video_reports_the_resolution_it_billed_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Veo bills by resolution and the response named one nowhere.
+
+    The manifest recorded the raw request — null whenever the caller
+    defaulted — while the cost line priced 720p. Two fields that must agree,
+    neither of them measured.
+    """
+    from src.__main__ import generate_video
+
+    out = tmp_path / "videos" / "r.mp4"
+    monkeypatch.setattr(
+        "src.__main__.generate_video_impl", _impl_rendering(out, 1280, 720)
+    )
+
+    payload = json.loads(
+        await generate_video(ctx=_ctx(tmp_path), prompt="x", model=VEO_FAST)
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["resolution"] == "720p"
+    assert payload["resolution_source"] == "measured from the rendered video"
+    assert payload["rendered_dimensions"] == [1280, 720]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_veo_render_that_defies_the_request_is_priced_as_rendered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asking for 1080p and getting 360p must not bill 1080p.
+
+    The request was the only resolution this path ever knew, so a render that
+    came back smaller was billed at the price of the one that was asked for.
+    """
+    from src.__main__ import generate_video
+
+    out = tmp_path / "videos" / "small.mp4"
+    monkeypatch.setattr(
+        "src.__main__.generate_video_impl", _impl_rendering(out, 640, 360)
+    )
+
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path), prompt="x", model=VEO_FAST, resolution="1080p"
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["resolution"] == "360p"
+    assert payload["resolution_source"] == "measured from the rendered video"
+    assert any("measured 360p" in w for w in payload.get("warnings", [])), payload.get(
+        "warnings"
+    )
+    priced = json.dumps(payload.get("cost", {}))
+    assert "1080p" not in priced, priced
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_an_unmeasurable_veo_render_says_its_resolution_is_assumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tier the classifier will not claim must not be reported as measured.
+
+    64x64 is near no tier, and inventing one would be exactly the evidence
+    the classifier refuses to fabricate.
+    """
+    from src.__main__ import generate_transition
+
+    out = tmp_path / "videos" / "odd.mp4"
+    monkeypatch.setattr(
+        "src.__main__.generate_video_impl", _impl_rendering(out, 64, 64)
+    )
+    img = tmp_path / "images" / "a.png"
+    _seed_media(tmp_path)
+
+    payload = json.loads(
+        await generate_transition(
+            ctx=_ctx(tmp_path),
+            prompt="x",
+            first_frame_uri=f"file://{img}",
+            last_frame_uri=f"file://{img}",
+            model=VEO_FAST,
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["resolution"] == "720p"
+    assert payload["resolution_source"].startswith("assumed:")
