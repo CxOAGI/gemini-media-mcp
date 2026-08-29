@@ -503,3 +503,82 @@ async def test_an_unmeasurable_extension_never_borrows_the_text_to_video_rule(
     assert "exactly the length it is sent" not in payload["duration_source"]
     assert "not measured" in payload["duration_source"]
     assert payload["cost"]["is_estimate"] is True
+
+
+# --------------------------------------------------------------------------
+# the invariant, and its one documented exception
+# --------------------------------------------------------------------------
+
+
+def test_the_one_place_a_quote_can_under_state_is_documented_in_prose() -> None:
+    """The campaign's invariant is "may over-state, never under-state".
+
+    An extension from a remote source breaks it — deliberately, because a dry
+    run is offline and Veo publishes no maximum source length to assume in
+    place of measuring. That exception was only inferable from a runtime
+    field (billed_seconds_source), which is not where a caller looks before
+    committing to a call. It belongs in the docstring, and it has to stay
+    there: this is the check that notices if it is edited away.
+    """
+    import inspect
+
+    from src.__main__ import generate_video, loop_extend
+
+    for tool in (generate_video, loop_extend):
+        doc = " ".join((inspect.getdoc(tool) or "").split())
+        assert "FLOOR" in doc, tool.__name__
+        assert "under-state" in doc, tool.__name__
+        # The concrete measurement, so the size of the gap is not abstract.
+        assert "$1.80" in doc or "61%" in doc, tool.__name__
+        # And the way out, so the note is actionable rather than a caveat.
+        assert "local copy" in doc, tool.__name__
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_both_provenance_fields_name_the_measurement_they_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """duration_source said "projected"; billed_seconds_source said
+    "PROJECTED from a measured 11.01s source". They agreed on the number and
+    only one said where it came from, which reads like disagreement."""
+    import src.__main__ as main_mod
+
+    real = _write_video(tmp_path / "videos" / "src.mp4", seconds=4.0)
+    source_bytes = Path(real[7:]).read_bytes()
+
+    async def fake_fetch(uri: str, **kwargs: Any) -> bytes | None:
+        return source_bytes
+
+    async def impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "video_url": "gs://bkt/out/x.mp4",
+            "model": kwargs.get("model"),
+            "duration_seconds": 7,
+            "generation_mode": "extend_video",
+        }
+
+    monkeypatch.setattr(main_mod, "fetch", fake_fetch)
+    monkeypatch.setattr(main_mod, "generate_video_impl", impl)
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="c",
+            model=VEO,
+            extend_video_uri="gs://bkt/in/src.mp4",
+        )
+    )
+    for field in ("duration_source", "billed_seconds_source"):
+        assert "measured 4s source" in payload[field], (field, payload[field])
+
+    # And the quote, from a local source, does the same.
+    quote = json.loads(
+        await main_mod.generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="c",
+            model=VEO,
+            extend_video_uri=real,
+            dry_run=True,
+        )
+    )
+    assert "measured 4s source" in quote["duration_source"], quote["duration_source"]

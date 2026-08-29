@@ -3612,6 +3612,21 @@ async def generate_video(
             model"), so the tool rejects it before spending. Billed on the
             ASSEMBLED clip, not the ~7s appended: a 4s source extended once
             renders and bills 11s.
+
+            A REMOTE source (gs://, http://) makes the dry-run estimate a
+            FLOOR rather than a ceiling. This is the one place a pre-flight in
+            this server can under-state, and it is deliberate: the bill
+            depends on the source's length, a dry run is documented offline so
+            it does not download the source to measure it, and Veo publishes
+            no maximum source length to assume in its place — so there is no
+            honest ceiling to quote. MEASURED: an 11.01s remote source quoted
+            $0.70 and billed $1.80, 61% under. billed_seconds_source says
+            "FLOOR, not an estimate" when it applies, and the real run
+            measures the source and reports the true figure. For a ceiling
+            before you spend, quote against a local copy, or compute it:
+            billed = source + ~7s per turn. (Omni's extension quote has no
+            such exception — omni documents a maximum source length, so an
+            unmeasurable source is quoted at that maximum and over-states.)
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
             Vertex AI only — on the Gemini API, output is always returned inline
             and an explicit output_gcs_uri is rejected.
@@ -3619,6 +3634,8 @@ async def generate_video(
             estimate for the call that would run (the omni draft price when
             draft=True). Free and instant. A real run reports the actual
             cost, derived from the effective duration the API rendered.
+            With extend_video_uri and a REMOTE source the estimate is a
+            FLOOR, not a ceiling — see the note under extend_video_uri.
         draft_resolution: Resolution for a `draft=True` pass. Naming one
             renders the draft on gemini-omni-1.1-flash, which is the model
             with a resolution parameter; "360p" is about a third of the 720p
@@ -3798,11 +3815,11 @@ async def generate_video(
                 # quote beside it was not: 7s / $0.70 for a 4s source whose
                 # extension renders and bills 11s — a quote BELOW its own real
                 # run's figure. Same rule, same shared function, both ends.
+                quoted_source_seconds = await _probe_local_video_seconds(
+                    ctx, extend_video_uri
+                )
                 ext_billing = veo_extension_billing(
-                    turns=1,
-                    source_seconds=await _probe_local_video_seconds(
-                        ctx, extend_video_uri
-                    ),
+                    turns=1, source_seconds=quoted_source_seconds
                 )
                 payload["billed_seconds"] = ext_billing.billed_seconds
                 payload["appended_seconds"] = ext_billing.appended_seconds
@@ -3812,8 +3829,12 @@ async def generate_video(
                 payload["billed_seconds_source"] = ext_billing.duration_source
                 if ext_billing.turn_output_seconds:
                     payload["duration_source"] = (
-                        "projected: an extension renders the assembled clip "
-                        "(source + ~7s)"
+                        "projected from a measured "
+                        f"{quoted_source_seconds:g}s source: an extension "
+                        "renders the assembled clip (source + ~7s)"
+                        if quoted_source_seconds is not None
+                        else "projected: an extension renders the assembled "
+                        "clip (source + ~7s)"
                     )
                 payload["estimated_cost"] = _video_cost(
                     est_model,
@@ -4075,6 +4096,9 @@ async def generate_video(
             # did not. It billed 7s, asserted is_estimate=False for a file it
             # never opened, and labelled the figure with the TEXT-TO-VIDEO
             # rule in the one mode where that rule is known to be false.
+            ext_source_seconds = await _extension_source_seconds(
+                ctx, extend_video_uri, allow_remote=True
+            )
             billing = veo_extension_billing(
                 turns=1,
                 measured_turns=(
@@ -4082,9 +4106,7 @@ async def generate_video(
                     if veo_facts.duration_source and veo_facts.duration_seconds
                     else None
                 ),
-                source_seconds=await _extension_source_seconds(
-                    ctx, extend_video_uri, allow_remote=True
-                ),
+                source_seconds=ext_source_seconds,
             )
             extension_metered = billing.is_metered
             result["billed_seconds"] = billing.billed_seconds
@@ -4097,10 +4119,18 @@ async def generate_video(
                     # delivered nor what is billed, and labelling that number
                     # with the projection described a length it did not hold.
                     result["duration_seconds"] = billing.turn_output_seconds[-1]
+                    # Names the measurement, as billed_seconds_source does.
+                    # Two fields agreeing on a number while only one says
+                    # where it came from reads like they disagree.
                     result["duration_source"] = (
-                        "projected: an extension delivers the assembled clip "
-                        "(source + ~7s), and this one was delivered remotely "
-                        "so it could not be measured"
+                        "projected from a measured "
+                        f"{ext_source_seconds:g}s source: an extension delivers "
+                        "the assembled clip (source + ~7s), and this one was "
+                        "delivered remotely so it could not be measured"
+                        if ext_source_seconds is not None
+                        else "projected: an extension delivers the assembled "
+                        "clip (source + ~7s), and this one was delivered "
+                        "remotely so it could not be measured"
                     )
             result["billed_seconds_source"] = billing.duration_source
             if billing.warning:
@@ -6255,9 +6285,17 @@ async def loop_extend(
             back 11s billed at 11s), so the chain costs the SUM of the turn
             outputs — source + 7i for turn i — and grows with times². The
             quote reports billed_seconds, assembled_seconds and
-            appended_seconds separately for that reason. A local source is
-            measured; a remote one is a labelled FLOOR here, and measured on
-            the real run.
+            appended_seconds separately for that reason.
+
+            A REMOTE source makes this quote a FLOOR rather than a ceiling —
+            the one place a pre-flight in this server can under-state, and
+            deliberately so: a dry run is documented offline, and Veo
+            publishes no maximum source length to assume instead. MEASURED:
+            an 11.01s remote source quoted $0.70 and billed $1.80, 61% under.
+            billed_seconds_source says "FLOOR, not an estimate" when it
+            applies; the real run measures the source. For a ceiling before
+            you spend, quote against a local copy, or compute it: billed =
+            sum over turns i of (source + 7i).
 
     Returns:
         JSON with the final video_url and the ordered list of intermediate
