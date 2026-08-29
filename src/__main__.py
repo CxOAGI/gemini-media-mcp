@@ -34,6 +34,7 @@ from PIL import Image as PILImage
 from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import (
+    omni_model_reroute_warning,
     omni_model_refusal,
     OMNI_1_1_MODEL,
     OMNI_DEFAULT_TIMEOUT_SECONDS,
@@ -1044,6 +1045,42 @@ def _omni_preview_model(resolution: str | None) -> tuple[str, str | None]:
     return OMNI_1_1_MODEL, _validate_omni_resolution(spec, resolution)
 
 
+async def _omni_local_reference_video_warnings(
+    ctx: Context[ServerSession, AppContext],
+    spec: Any,
+    uris: list[str],
+) -> list[str]:
+    """The reference-clip ceiling check, run at the PRE-FLIGHT on local files.
+
+    The check itself only ran on the real render, so a 23.02s clip against a
+    documented 3s ceiling drew a clean quote and said nothing — the caller
+    learned about the violation after paying for it. "A dry run is offline" is
+    no defence here: the clip is a local file, and loop_extend's own dry run
+    measures exactly this way. Remote clips are still left to the real run,
+    which is where they are fetched.
+    """
+    warnings: list[str] = []
+    for index, uri in enumerate(uris):
+        measured = await _probe_local_video_seconds(ctx, uri)
+        if measured is not None and measured > spec.max_reference_video_seconds:
+            warnings.append(_reference_video_over_ceiling(spec, index, measured))
+    return warnings
+
+
+def _reference_video_over_ceiling(spec: Any, index: int, measured: float) -> str:
+    """One wording for the ceiling breach, whichever path found it.
+
+    Shared so a quote and a render cannot describe the same violation
+    differently — the divergence this codebase keeps producing.
+    """
+    return (
+        f"reference_video_uris[{index}] is {measured:.2f}s, over the "
+        f"documented {spec.max_reference_video_seconds:g}s ceiling for "
+        "a video reference; the service may truncate it or refuse the "
+        "request."
+    )
+
+
 async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[str]:
     """Warn about reference clips longer than the documented ceiling.
 
@@ -1062,12 +1099,7 @@ async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[
     for index, clip in enumerate(clips):
         measured = await _probe_media(measure_video_duration_bytes, clip)
         if measured is not None and measured > spec.max_reference_video_seconds:
-            warnings.append(
-                f"reference_video_uris[{index}] is {measured:.2f}s, over the "
-                f"documented {spec.max_reference_video_seconds:g}s ceiling for "
-                "a video reference; the service may truncate it or refuse the "
-                "request."
-            )
+            warnings.append(_reference_video_over_ceiling(spec, index, measured))
     return warnings
 
 
@@ -1217,6 +1249,11 @@ def _validate_omni_model(omni_model: str) -> Any:
         # A dead endpoint must fail here, where it is free, not after a fetch.
         raise ValueError(refusal)
     return omni_spec(omni_model)
+
+
+def _omni_requested_model(requested: str, spec: Any) -> dict[str, str]:
+    """`requested_model` for a response, or nothing when no ID was folded."""
+    return {"requested_model": str(requested)} if str(requested) != spec.model else {}
 
 
 def _validate_omni_resolution(spec: Any, resolution: str | None) -> str | None:
@@ -5464,6 +5501,16 @@ async def generate_video_omni(
             _assert_local_source(
                 input_video_uri, app_ctx.data_folder, "input_video_uri"
             )
+            # Measured here, not only on the render: pre-flighting must buy
+            # the caller something for a violation the server can already see.
+            gcs_warnings.extend(
+                await _omni_local_reference_video_warnings(ctx, spec, reference_videos)
+            )
+            # Disclosed on the render already; a quote that stayed silent left
+            # the caller uninformed while it was still free to act on.
+            quote_reroute = omni_model_reroute_warning(omni_model, spec.model)
+            if quote_reroute:
+                gcs_warnings.append(quote_reroute)
             # An input video (or a prior interaction) makes this an edit —
             # omni._select_task_type keys on either — and an edit sends no
             # duration and renders a service-chosen length that measured 10s
@@ -5485,6 +5532,7 @@ async def generate_video_omni(
                         "dry_run": True,
                         "message": "Estimate only — nothing was generated",
                         "model": spec.model,
+                        **_omni_requested_model(omni_model, spec),
                         "resolution": billed_resolution,
                         "duration_seconds": quoted,
                         "duration_source": (
@@ -5513,6 +5561,7 @@ async def generate_video_omni(
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
                     "model": spec.model,
+                    **_omni_requested_model(omni_model, spec),
                     "resolution": billed_resolution,
                     # Report both, like generate_video and edit_video: a caller
                     # who asked for 2s must see it snapped to 3 here, not a bare
@@ -5719,6 +5768,11 @@ async def edit_video(
             }
             if source_duration is not None:
                 payload["source_duration_seconds"] = source_duration
+            payload.update(_omni_requested_model(omni_model, spec))
+            edit_reroute = omni_model_reroute_warning(omni_model, spec.model)
+            if edit_reroute:
+                payload.setdefault("warnings", []).append(edit_reroute)
+                await _emit_warnings(ctx, [edit_reroute])
             payload["estimated_cost"] = _video_cost(
                 spec.model,
                 quoted,
@@ -5925,6 +5979,12 @@ async def extend_video_omni(
         if dry_run:
             for uri in (*reference_images, *reference_videos):
                 _assert_local_source(uri, app_ctx.data_folder, "reference_uri")
+            warnings.extend(
+                await _omni_local_reference_video_warnings(ctx, spec, reference_videos)
+            )
+            extend_reroute = omni_model_reroute_warning(omni_model, spec.model)
+            if extend_reroute:
+                warnings.append(extend_reroute)
             _assert_local_source(
                 input_video_uri, app_ctx.data_folder, "input_video_uri"
             )
@@ -5960,6 +6020,7 @@ async def extend_video_omni(
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
                 "model": spec.model,
+                **_omni_requested_model(omni_model, spec),
                 "resolution": billed_resolution,
                 "times": times,
                 # Each turn renders the assembled clip, so these three are
@@ -6111,6 +6172,7 @@ async def extend_video_omni(
                 "video_url": final.get("video_url"),
                 "interaction_id": final.get("interaction_id"),
                 "model": spec.model,
+                **_omni_requested_model(omni_model, spec),
                 "resolution": billed_resolution,
                 "times": times,
                 "completed_turns": done,
