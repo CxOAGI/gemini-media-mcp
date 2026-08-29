@@ -2564,6 +2564,16 @@ def _select_video_tool(request: ResolvedRequest) -> ToolName:
         return "generate_bridge" if request.wants_bridge else "generate_transition"
     if request.wants_bridge and request.source_video_uri is not None:
         return "generate_bridge"
+    if request.num_beats <= 1 and (request.wants_bridge or request.wants_transition):
+        # A single-shot brief that ASKS for a transition gets the tool that
+        # renders one, even with no endpoints yet — _video_params then names
+        # the URIs it still needs. Falling through to generate_video here made
+        # the plan incoherent: the conflict block and the capability
+        # rejections both named generate_transition while every route offered
+        # was generate_video. Guarded on the beat count so a multi-shot brief
+        # ("a 3 shot reel with crossfade transitions") still routes to
+        # generate_clip, which renders its own bridges.
+        return "generate_bridge" if request.wants_bridge else "generate_transition"
     if request.num_beats > 1:
         return "generate_clip"
     return "generate_video"
