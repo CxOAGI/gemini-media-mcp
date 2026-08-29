@@ -322,3 +322,184 @@ async def test_a_draft_folds_the_negative_prompt_inline_instead_of_dropping_it(
     assert payload["negative_prompt_inlined"] == "rain"
     assert "negative_prompt" not in payload.get("ignored_veo_params", [])
     assert any("folded into the prompt" in w for w in payload["warnings"])
+
+
+# --------------------------------------------------------------------------
+# a remote extension source
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+@pytest.mark.parametrize(
+    ("tool", "uri_kwarg"),
+    [("generate_video", "extend_video_uri"), ("loop_extend", "video_uri")],
+)
+async def test_a_real_run_measures_a_remote_extension_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str, uri_kwarg: str
+) -> None:
+    """On Vertex the source is usually gs://, and that was the loose case.
+
+    Extension REQUIRES a GCS destination on Vertex, so the source is normally
+    remote too — and a remote source fell straight to the appended-only floor:
+    7s / $0.70 against a 4s source whose extension bills 11s / $1.10. A real
+    run is already committing to a render, so a capped read of the source is
+    what turns that floor into a projection. Both chains, one helper.
+    """
+    import src.__main__ as main_mod
+
+    real = _write_video(tmp_path / "videos" / "src.mp4", seconds=4.0)
+    source_bytes = Path(real[7:]).read_bytes()
+
+    async def fake_fetch(uri: str, **kwargs: Any) -> bytes | None:
+        assert uri.startswith("gs://")
+        return source_bytes
+
+    async def impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "video_url": "gs://bkt/out/x.mp4",
+            "model": kwargs.get("model"),
+            "duration_seconds": 7,
+            "generation_mode": "extend_video",
+        }
+
+    monkeypatch.setattr(main_mod, "fetch", fake_fetch)
+    monkeypatch.setattr(main_mod, "generate_video_impl", impl)
+
+    kwargs: dict[str, Any] = {uri_kwarg: "gs://bkt/in/src.mp4", "model": VEO}
+    if tool == "generate_video":
+        kwargs["prompt"] = "c"
+    else:
+        kwargs["prompt"] = "c"
+        kwargs["times"] = 1
+    payload = json.loads(await getattr(main_mod, tool)(ctx=_ctx(tmp_path), **kwargs))
+    assert "error" not in payload, payload.get("error")
+    manifest = payload.get("manifest") or {}
+    billed = payload.get("billed_seconds", manifest.get("billed_seconds"))
+    # The BILLING basis has its own key: duration_source describes
+    # duration_seconds, which is the artifact's length, not what was charged.
+    source = payload.get(
+        "billed_seconds_source", manifest.get("billed_seconds_source", "")
+    )
+    assert billed == pytest.approx(11.0, abs=0.2), payload
+    assert source.startswith("PROJECTED"), source
+    cost = payload.get("cost") or manifest.get("cost") or {}
+    assert cost["usd"] == pytest.approx(4.40, abs=0.05)  # 11s at veo-3.1 $0.40/s
+    assert cost["is_estimate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_dry_run_stays_offline_and_says_the_real_run_will_measure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quote is documented free, instant and offline, so it must not
+    download a remote source — but it must not pass its floor off as a price
+    either. It says FLOOR, and the real run measures."""
+    import src.__main__ as main_mod
+
+    called: list[str] = []
+
+    async def fake_fetch(uri: str, **kwargs: Any) -> bytes | None:
+        called.append(uri)
+        return None
+
+    monkeypatch.setattr(main_mod, "fetch", fake_fetch)
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="c",
+            model=VEO,
+            extend_video_uri="gs://bkt/in/src.mp4",
+            dry_run=True,
+        )
+    )
+    assert called == [], "a dry run downloaded a remote source"
+    assert payload["billed_seconds_source"].startswith("FLOOR")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_extension_billing_does_not_depend_on_the_impl_echoing_a_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rule was keyed on generation_mode coming back in the response.
+
+    A caller who passed extend_video_uri IS extending; if that field were
+    ever absent the response silently reverted to the pre-fix numbers —
+    7s billed AND is_estimate: false, which is exactly the pair reported
+    from the field. Keyed on the request now.
+    """
+    import src.__main__ as main_mod
+
+    real = _write_video(tmp_path / "videos" / "src.mp4", seconds=4.0)
+
+    async def impl_without_mode(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "video_url": "gs://bkt/out/x.mp4",
+            "model": kwargs.get("model"),
+            "duration_seconds": 7,
+        }
+
+    monkeypatch.setattr(main_mod, "generate_video_impl", impl_without_mode)
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_ctx(tmp_path), prompt="c", model=VEO, extend_video_uri=real
+        )
+    )
+    assert payload["billed_seconds"] == pytest.approx(11.0, abs=0.2)
+    assert payload["cost"]["is_estimate"] is True
+
+
+def test_no_docstring_still_prices_a_chain_at_times_times_seven() -> None:
+    """The basis moved to the assembled clip; the prose has to move with it.
+
+    A docstring that still says "times x ~7s" teaches the caller the number
+    the code was corrected away from.
+    """
+    import pathlib
+
+    for path in sorted(pathlib.Path("src").glob("*.py")):
+        text = " ".join(path.read_text().split())
+        assert "times x ~7s at the model" not in text, path
+        assert "1527 input tokens" not in text, path
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_an_unmeasurable_extension_never_borrows_the_text_to_video_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Veo renders exactly the length it is sent" is text-to-video's rule.
+
+    An extension delivers the assembled clip, so that sentence is false in the
+    one mode it was being applied to — and a confidently wrong source gets
+    trusted where an absent one would not. It reappeared through the fallback
+    when neither the render nor its source could be measured.
+    """
+    import src.__main__ as main_mod
+
+    async def unreadable(uri: str, **kwargs: Any) -> bytes | None:
+        return None
+
+    async def impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "video_url": "gs://bkt/out/x.mp4",
+            "model": kwargs.get("model"),
+            "duration_seconds": 7,
+            "generation_mode": "extend_video",
+        }
+
+    monkeypatch.setattr(main_mod, "fetch", unreadable)
+    monkeypatch.setattr(main_mod, "generate_video_impl", impl)
+    payload = json.loads(
+        await main_mod.generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="c",
+            model=VEO,
+            extend_video_uri="gs://bkt/in/src.mp4",
+        )
+    )
+    assert "exactly the length it is sent" not in payload["duration_source"]
+    assert "not measured" in payload["duration_source"]
+    assert payload["cost"]["is_estimate"] is True
