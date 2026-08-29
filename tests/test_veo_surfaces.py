@@ -605,7 +605,14 @@ async def test_every_render_tool_reports_its_backend(
         assert "error" not in payload, f"{tool}: {payload['error']}"
         if payload.get("backend") != expected:
             missing.append(f"{tool}: {payload.get('backend')!r} != {expected!r}")
-    assert not missing, "tools not reporting their backend:\n" + "\n".join(missing)
+        # A quoted number is the figure a caller decides on, so it needs a
+        # source at least as much as a billed one does.
+        for field in ("duration_seconds", "resolution"):
+            if payload.get(field) is not None and not payload.get(
+                f"{field.split('_')[0]}_source"
+            ):
+                missing.append(f"{tool}: {field} quoted with no source")
+    assert not missing, "quotes missing provenance:\n" + "\n".join(missing)
 
 
 @pytest.mark.asyncio
@@ -624,3 +631,119 @@ async def test_planning_does_not_claim_a_backend_it_never_calls(
     result = await plan_generation(ctx=_ctx(tmp_path), intent="a 5 second clip")
     payload = json.loads(result[0].text)
     assert "backend" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60.0)
+@pytest.mark.parametrize("vertexai", [False, True])
+async def test_every_rendered_response_reports_backend_and_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vertexai: bool
+) -> None:
+    """The REAL run is the one that reports a bill.
+
+    The dry-run sweep passed while four rendered paths returned a bare
+    duration with no source and no backend — the fields stamped on the
+    quote and missing from the invoice, which is exactly backwards.
+    generate_transition is the case in point: its sibling generate_bridge
+    was given a measurement and provenance block, and the identically
+    shaped tool beside it was not.
+    """
+    import src.__main__ as main_mod
+
+    video, image = _seed_media(tmp_path)
+    rendered = tmp_path / "videos" / "out.mp4"
+
+    async def veo_impl(**kwargs: Any) -> dict[str, Any]:
+        rendered.write_bytes((tmp_path / "videos" / "seed.mp4").read_bytes())
+        return {
+            "video_url": f"file://{rendered}",
+            "model": kwargs.get("model"),
+            "duration_seconds": kwargs.get("duration_seconds", 4),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", veo_impl)
+
+    calls = {
+        "generate_transition": dict(
+            prompt="x", first_frame_uri=image, last_frame_uri=image, model=VEO_FAST
+        ),
+        "generate_bridge": dict(
+            prompt="x", from_clip_uri=video, to_clip_uri=video, model=VEO_FAST
+        ),
+        "loop_extend": dict(prompt="c", video_uri=video, model=VEO_FAST, times=1),
+        "generate_video": dict(prompt="x", model=VEO_FAST),
+    }
+    expected = "vertex" if vertexai else "gemini_api"
+    bad: list[str] = []
+    for tool, kwargs in calls.items():
+        raw = await getattr(main_mod, tool)(
+            ctx=_ctx(
+                tmp_path,
+                vertexai=vertexai,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
+            **kwargs,
+        )
+        payload = json.loads(raw if isinstance(raw, str) else raw[0].text)
+        assert "error" not in payload, f"{tool}: {payload['error']}"
+        if payload.get("backend") != expected:
+            bad.append(f"{tool}: backend {payload.get('backend')!r} != {expected!r}")
+        # A number a caller reconciles a bill against must say where it came
+        # from; an unlabelled one cannot be told apart from a measured one.
+        for field in ("duration_seconds", "resolution"):
+            if field in payload and not payload.get(f"{field.split('_')[0]}_source"):
+                bad.append(f"{tool}: {field} present with no source")
+    assert not bad, "rendered responses missing provenance:\n" + "\n".join(bad)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_loop_extend_quote_measures_the_source_it_can_open(
+    tmp_path: Path,
+) -> None:
+    """added_seconds is growth over a base, and the base was never reported.
+
+    extend_video_omni opens its local source in the pre-flight; this one
+    quoted `added_seconds: 7` against nothing, so the number could not be
+    reconciled against the file that produced it.
+    """
+    from src.__main__ import loop_extend
+
+    video, _ = _seed_media(tmp_path)
+    payload = json.loads(
+        await loop_extend(
+            ctx=_ctx(tmp_path), prompt="c", video_uri=video, model=VEO, dry_run=True
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    # The seeded clip is 48 frames at 24fps.
+    assert payload["source_duration_seconds"] == pytest.approx(2.0, abs=0.05)
+    assert "measured" in payload["source_duration_source"]
+    assert payload["final_duration_seconds"] == pytest.approx(9.0, abs=0.05)
+    assert payload["added_seconds"] == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_loop_extend_quote_says_why_a_remote_source_is_unmeasured(
+    tmp_path: Path,
+) -> None:
+    """A dry run is documented offline, so it must not download a gs:// source.
+
+    Silence would be indistinguishable from a failed probe.
+    """
+    from src.__main__ import loop_extend
+
+    payload = json.loads(
+        await loop_extend(
+            ctx=_ctx(tmp_path, allowed=frozenset({"bkt"})),
+            prompt="c",
+            video_uri="gs://bkt/in.mp4",
+            model=VEO,
+            dry_run=True,
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["source_duration_seconds"] is None
+    assert "does not download" in payload["source_duration_source"]

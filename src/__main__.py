@@ -357,8 +357,17 @@ def _stamp_provenance(
 
 
 # What a dry run's numbers are, in one phrase: nothing has rendered, so every
-# figure in the payload is a projection of the call that would be made.
-DRY_RUN_PROVENANCE = "the request: a dry run renders nothing to measure"
+# figure in the payload is a projection of the call that would be made. These
+# are the weakest true statement about a quoted number; any tool that can say
+# something more specific sets its own and wins, because _stamp_provenance
+# never overwrites.
+QUOTE_DURATION_PROVENANCE = (
+    "the request, snapped to a length the model accepts: a dry run renders "
+    "nothing to measure"
+)
+QUOTE_RESOLUTION_PROVENANCE = (
+    "the request: a dry run renders nothing whose resolution could be measured"
+)
 
 
 def _backend_of(app_ctx: AppContext, model: str | None) -> str:
@@ -391,8 +400,17 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
     debugging session went to answer — and adding it tool by tool is how it
     ended up on one of eight. Routed through here it cannot be forgotten.
     """
+    quote = bool(payload.get("dry_run"))
     return json.dumps(
-        _stamp_provenance(payload, backend=_backend_of(app_ctx, payload.get("model"))),
+        _stamp_provenance(
+            payload,
+            backend=_backend_of(app_ctx, payload.get("model")),
+            # A quoted number needs a source as much as a billed one does —
+            # more so, since it is the figure a caller decides on. Defaulting
+            # here is what stops the next tool from shipping a bare integer.
+            duration_source=QUOTE_DURATION_PROVENANCE if quote else None,
+            resolution_source=QUOTE_RESOLUTION_PROVENANCE if quote else None,
+        ),
         indent=2,
     )
 
@@ -1147,15 +1165,15 @@ def _omni_billed_resolution(spec: Any, resolution: str | None) -> str:
     return resolution or spec.rendered_resolution
 
 
-async def _fetch_local_omni_source(
+async def _fetch_local_source(
     ctx: Context[ServerSession, AppContext],
     uri: str,
 ) -> bytes | None:
-    """Read a LOCAL omni source for a pre-flight, or None.
+    """Read a LOCAL source for a pre-flight, or None.
 
-    A dry run is documented as free, instant and offline, so it reads a
-    file:// source the caller already has and leaves gs:// and http(s):// to
-    the real run. Never raises: a quote that cannot open the file falls back
+    Used by both families: a dry run is documented as free, instant and
+    offline, so it reads a file:// source the caller already has and leaves
+    gs:// and http(s):// to the real run. Never raises: a quote that cannot open the file falls back
     to the documented maximum and says so, rather than failing a call that
     generates nothing.
     """
@@ -2753,7 +2771,7 @@ async def generate_image(
             for warning in result.get("warnings", []):
                 await ctx.warning(warning)
             await ctx.info("Model returned text only")
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            return [TextContent(type="text", text=_respond(app_ctx, result))]
 
         await ctx.info("Image generated successfully")
 
@@ -3566,7 +3584,7 @@ async def generate_video(
             # Mirror warnings (ignored Veo params, any GCS notice) onto the
             # notification channel, not just the JSON body.
             await _emit_warnings(ctx, result.get("warnings"))
-            return json.dumps(result, indent=2)
+            return _respond(app_ctx, result)
 
         # Fetch first frame image
         image_bytes = None
@@ -3733,7 +3751,7 @@ async def generate_video(
             # large-video path GCS output is meant for.
             result["manifest"] = manifest
 
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Video generation failed: {e}")
         logger.exception("Tool error")
@@ -3818,6 +3836,8 @@ async def generate_transition(
                     "duration_seconds": _snapped_duration_for_quote(
                         model, duration_seconds, "first_last_frame"
                     ),
+                    "resolution": "720p",
+                    "resolution_source": "fixed: this tool takes no resolution parameter",
                     "estimated_cost": _video_cost(
                         model,
                         duration_seconds,
@@ -3878,7 +3898,33 @@ async def generate_transition(
         )
         await ctx.info("Transition generated successfully")
 
-        # Cost from the snapped duration the impl actually sent to Veo.
+        # Measured, like its sibling generate_bridge. Transition was left out
+        # of the round that fixed bridge, and the comment written there — "the
+        # one rendered path with neither a duration_source nor a
+        # resolution_source" — was false as it was written: this path had the
+        # same hole. Two tools with the same shape, one updated.
+        rendered_url = result.get("video_url") or ""
+        if isinstance(rendered_url, str) and rendered_url.startswith("file://"):
+            measured = await _probe_media(
+                measure_video_duration, Path(rendered_url[7:])
+            )
+            if measured is not None:
+                result["duration_seconds"] = round(measured, 3)
+                result["duration_source"] = "measured from the rendered video"
+        result.setdefault(
+            "duration_source",
+            "the snapped request: Veo renders exactly the length it is sent",
+        )
+        # generate_transition takes no resolution parameter, so this is a fact
+        # about the tool rather than about the file.
+        result.setdefault("resolution", "720p")
+        result.setdefault(
+            "resolution_source",
+            "fixed: generate_transition takes no resolution parameter",
+        )
+
+        # Cost from the measured length where there is one, else the snapped
+        # duration the impl actually sent to Veo.
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
@@ -3898,6 +3944,9 @@ async def generate_transition(
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "duration_source": result.get("duration_source"),
+            "resolution": result.get("resolution"),
+            "resolution_source": result.get("resolution_source"),
             "audio_enabled": result.get("audio_enabled", include_audio),
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
@@ -3921,7 +3970,7 @@ async def generate_transition(
         result["first_frame_uri"] = first_frame_uri
         result["last_frame_uri"] = last_frame_uri
 
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Transition generation failed: {e}")
         logger.exception("Tool error")
@@ -4017,6 +4066,8 @@ async def generate_bridge(
                     "duration_seconds": _snapped_duration_for_quote(
                         model, duration_seconds, "first_last_frame"
                     ),
+                    "resolution": "720p",
+                    "resolution_source": "fixed: this tool takes no resolution parameter",
                     "preflight_checks": preflight,
                     "estimated_cost": _video_cost(
                         model,
@@ -4154,7 +4205,7 @@ async def generate_bridge(
         result["from_clip_uri"] = from_clip_uri
         result["to_clip_uri"] = to_clip_uri
 
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Bridge generation failed: {e}")
         logger.exception("Tool error")
@@ -5052,7 +5103,7 @@ async def generate_video_omni(
                 if warning not in body_warnings:
                     body_warnings.append(warning)
         await _emit_warnings(ctx, result.get("warnings"))
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Omni video generation failed: {e}")
         logger.exception("Tool error")
@@ -5189,7 +5240,7 @@ async def edit_video(
             manifest_extra={"kind": "omni_edit"},
         )
         await _emit_warnings(ctx, result.get("warnings"))
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Video edit failed: {e}")
         logger.exception("Tool error")
@@ -5376,7 +5427,7 @@ async def extend_video_omni(
                 # render that billed $0.4396 — over-stating, so the invariant
                 # held, but by 54% on a figure that was free to measure. Only
                 # local sources: a quote does not download a remote one.
-                source_bytes = await _fetch_local_omni_source(ctx, input_video_uri)
+                source_bytes = await _fetch_local_source(ctx, input_video_uri)
                 if source_bytes is not None:
                     source_duration = await _probe_media(
                         measure_video_duration_bytes, source_bytes
@@ -5634,7 +5685,7 @@ async def extend_video_omni(
                 "tool."
             )
             await _emit_warnings(ctx, warnings)
-            return json.dumps(partial, indent=2)
+            return _respond(app_ctx, partial)
 
         payload = _payload()
         await _emit_warnings(ctx, warnings)
@@ -5731,24 +5782,53 @@ async def loop_extend(
             # not price an extension that cannot run. A gs:// source was already
             # allowlist-checked above and still prices.
             _assert_local_source(video_uri, data_dir, "video_uri")
+            # The source is the base the chain grows from, and it is sitting
+            # in a local file the quote can open. extend_video_omni measures
+            # its source here; this one reported added_seconds as a bare
+            # number with no base, so nothing in the quote could be
+            # reconciled against the file that produced it.
+            source_seconds: float | None = None
+            source_bytes = await _fetch_local_source(ctx, video_uri)
+            if source_bytes is not None:
+                source_seconds = await _probe_media(
+                    measure_video_duration_bytes, source_bytes
+                )
             # Each extension is a ~7s Veo render billed like any other.
-            return _respond(
-                app_ctx,
-                {
-                    "dry_run": True,
-                    "message": "Estimate only — nothing was generated",
-                    "model": model,
-                    "times": times,
-                    "added_seconds": times * 7,
-                    "estimated_cost": _video_cost(
-                        model,
-                        float(times * 7),
-                        resolution="720p",
-                        include_audio=include_audio,
-                        presnapped=True,  # 7s steps must not re-snap to 8
-                    ),
-                },
+            quote: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "model": model,
+                "resolution": "720p",
+                "resolution_source": "fixed: loop_extend takes no resolution parameter",
+                "times": times,
+                "added_seconds": times * 7,
+                "estimated_cost": _video_cost(
+                    model,
+                    float(times * 7),
+                    resolution="720p",
+                    include_audio=include_audio,
+                    presnapped=True,  # 7s steps must not re-snap to 8
+                ),
+            }
+            if source_seconds is not None:
+                quote["source_duration_seconds"] = round(source_seconds, 3)
+                quote["source_duration_source"] = "measured from the local source"
+                quote["final_duration_seconds"] = round(source_seconds + times * 7, 3)
+            else:
+                quote["source_duration_seconds"] = None
+                quote["source_duration_source"] = (
+                    "not measured: the source is remote, so a dry run — which "
+                    "is documented as offline — does not download it"
+                )
+            quote["duration_source"] = (
+                "projection: each of the "
+                f"{times} extension(s) is priced as a 7s Veo render. Unlike "
+                "omni, whose turns were MEASURED to re-bill the assembled "
+                "clip, this assumes Veo bills only the appended footage — "
+                "reconcile against a real bill before trusting a long chain, "
+                "because if Veo re-bills the assembly this under-states."
             )
+            return _respond(app_ctx, quote)
 
         # Validate the initial gs:// source against the allowlist (intermediate
         # outputs land in the already-validated gcs_uri bucket).
@@ -5790,7 +5870,24 @@ async def loop_extend(
             "model": served_model,
             "times": times,
             "extension_steps": steps,
+            "resolution": "720p",
+            "resolution_source": "fixed: loop_extend takes no resolution parameter",
         }
+        # What the caller ends up with, measured. The chain reported how many
+        # times it ran and what it cost, but never how long the result was —
+        # the one number that says whether the extensions actually landed.
+        if isinstance(current, str) and current.startswith("file://"):
+            final_measured = await _probe_media(
+                measure_video_duration, Path(current[7:])
+            )
+            if final_measured is not None:
+                result["duration_seconds"] = round(final_measured, 3)
+                result["duration_source"] = "measured from the assembled video"
+        result.setdefault(
+            "duration_source",
+            "not measured: the assembled video was delivered to GCS, which a "
+            "local probe does not open",
+        )
         if manifest.get("cost"):
             result["cost"] = manifest["cost"]
         if manifest.get("warnings"):
@@ -5803,7 +5900,7 @@ async def loop_extend(
             result["sidecar_url"] = sidecar_url
         else:
             result["manifest"] = manifest
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except asyncio.CancelledError:
         # Same hole generate_clip had: a cancellation is a BaseException, so
         # the handler below never ran and a caller that disconnected after
