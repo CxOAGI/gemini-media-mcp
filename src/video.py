@@ -278,7 +278,7 @@ def validate_render_options(
             # server. Veo-specific — omni renders 4K on this backend fine.
             raise ValueError(
                 "Veo cannot render 4K on the Gemini Developer API: the service "
-                "answers \"The string value 4K for resolution is invalid\". "
+                'answers "The string value 4K for resolution is invalid". '
                 "Render at 720p or 1080p here, or run against Vertex AI. "
                 "(Omni does render 4K on this backend.)"
             )
@@ -590,7 +590,11 @@ async def generate_video(
         config_kwargs["output_gcs_uri"] = output_gcs_uri
 
     if resolution is not None:
-        validate_render_options(model, resolution)
+        # With the backend: the dry run refused Veo 4K on the Gemini API and
+        # this, the real call, let it through to a 400 on the wire.
+        validate_render_options(
+            model, resolution, backend="vertex" if is_vertexai else "gemini_api"
+        )
         config_kwargs["resolution"] = resolution
 
     if person_generation is not None:

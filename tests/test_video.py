@@ -1376,7 +1376,7 @@ async def test_generate_video_resolution_passed_through(
     gen_video = FakeGeneratedVideo(video_obj)
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     def capturing_generate_videos(**kwargs: Any) -> FakeOperation:
         captured["config"] = kwargs.get("config")

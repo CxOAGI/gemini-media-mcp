@@ -20,6 +20,7 @@ tool-level routing rules) are defined here.
 
 import math
 import re
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, get_args
 
@@ -2311,6 +2312,9 @@ class VideoNeeds:
     audio: bool
     conversational_edit: bool
     clip_duration_seconds: float
+    # Which backend the request runs on. A capability is not a property of the
+    # model alone: Veo has four the Gemini Developer API refuses.
+    backend: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -2432,21 +2436,73 @@ _VIDEO_CAPABILITY_RULES: tuple[_CapabilityRule, ...] = (
 )
 
 
+# MEASURED against the live service: Veo on the Gemini Developer API refuses
+# these four. first/last-frame answers "Your use case is currently not
+# supported", extension "encodedVideo isn't supported by this model",
+# reference images an empty result that still bills, and 4K "The string value
+# 4K for resolution is invalid". All four work on Vertex. The capability table
+# is per model, so without this the planner offered Veo for every one of them
+# on a backend that cannot serve it — and the 4K case is the worst, because
+# omni renders 4K there fine and would have been the right answer.
+_GEMINI_API_VEO_RESTRICTIONS: dict[str, str] = {
+    "supports_first_last_frame": (
+        "First/last-frame control is Vertex-only for Veo. Run against Vertex "
+        "AI, or describe the shot as one text-to-video prompt."
+    ),
+    "supports_extension": (
+        "Extension is Vertex-only for Veo. Run against Vertex AI (with "
+        "output_gcs_uri or VIDEO_GCS_BUCKET for delivery)."
+    ),
+    "supports_reference_images": (
+        "Veo reference images are Vertex-only; the Gemini Developer API "
+        "returns an empty result and bills for it. Use gemini-omni-1.1-flash's "
+        "reference_image_uris here, or run against Vertex AI."
+    ),
+    "supports_4k": (
+        "Veo cannot render 4K on the Gemini Developer API. gemini-omni-1.1-flash "
+        "renders 4K there via generate_video_omni, or run Veo against Vertex AI."
+    ),
+}
+
+
+def _video_capabilities_for(model: str, backend: str) -> VideoCapabilities | None:
+    """The capability set a model actually has ON THIS BACKEND."""
+    capabilities = _VIDEO_CAPABILITIES.get(model)
+    if capabilities is None or backend != "gemini_api" or is_omni_model(model):
+        return capabilities
+    return dataclasses.replace(
+        capabilities, **{attr: False for attr in _GEMINI_API_VEO_RESTRICTIONS}
+    )
+
+
 def _capability_rejection(
     model: str, needs: VideoNeeds
 ) -> tuple[_CapabilityRule, str] | None:
     """Return the first hard rule ``model`` violates, or None.
 
     Only the first is reported: once a model is out, listing every additional
-    reason is noise rather than expertise.
+    reason is noise rather than expertise. A restriction that comes from the
+    BACKEND rather than the model says so, and names the fix that actually
+    applies — the generic rule's "use a Veo model" is wrong advice when the
+    Veo model is exactly what this backend refuses.
     """
-    capabilities = _VIDEO_CAPABILITIES.get(model)
-    if capabilities is None:
+    intrinsic = _VIDEO_CAPABILITIES.get(model)
+    capabilities = _video_capabilities_for(model, needs.backend)
+    if capabilities is None or intrinsic is None:
         return None
     for rule in _VIDEO_CAPABILITY_RULES:
         if getattr(needs, rule.need_attr) and not getattr(
             capabilities, rule.capability_attr
         ):
+            if getattr(intrinsic, rule.capability_attr):
+                return (
+                    dataclasses.replace(
+                        rule,
+                        resolution=_GEMINI_API_VEO_RESTRICTIONS[rule.capability_attr],
+                    ),
+                    f"{model} excluded on the Gemini Developer API: the backend "
+                    f"refuses {rule.need_attr.replace('_', ' ')} for Veo.",
+                )
             return rule, rule.reason.format(model=model) + "."
     return None
 
@@ -2599,6 +2655,18 @@ def _route_tool(tool: ToolName, model: str) -> ToolName:
     return tool
 
 
+def _clip_bridges_possible(request: ResolvedRequest) -> bool:
+    """Whether generate_clip can render the bridges a brief asks for.
+
+    A bridge is a first/last-frame render, which Veo refuses on the Gemini
+    Developer API. The clip itself still runs there, so bridges are a
+    preference the tool degrades around (add_bridges off, with a caveat), not
+    a capability to demand of the model — demanding it excluded every Veo
+    model and returned a plan with no routes and no explanation.
+    """
+    return request.backend != "gemini_api"
+
+
 def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
     """Translate the resolved request plus chosen tool into hard requirements."""
     # A brief that ASKS for a transition needs first/last-frame support
@@ -2611,9 +2679,13 @@ def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
     first_last = (
         tool in ("generate_transition", "generate_bridge")
         or (request.has_first_frame and request.has_last_frame)
-        or request.wants_transition
+        or (
+            request.wants_transition
+            and not (tool == "generate_clip" and not _clip_bridges_possible(request))
+        )
     )
     return VideoNeeds(
+        backend=request.backend,
         first_last_frame=first_last,
         extension=tool == "loop_extend" or request.needs_extension,
         reference_images=request.num_reference_images > 0,
@@ -2862,6 +2934,18 @@ def _video_params(
             "include_audio": request.needs_audio,
             "add_bridges": request.wants_transition or request.wants_bridge,
         }
+        if params["add_bridges"] and not _clip_bridges_possible(request):
+            # A bridge is a first/last-frame render, which Veo refuses on this
+            # backend. The clip itself runs here; with bridges on, the beats
+            # rendered and billed and the first bridge then failed — so the
+            # planner must not hand over the parameter that springs that trap.
+            params["add_bridges"] = False
+            caveats.append(
+                "add_bridges disabled: Veo cannot render first/last-frame "
+                "bridges on the Gemini Developer API (it refuses the mode after "
+                "the beats have billed). Run against Vertex AI for bridged "
+                "clips, or cut the beats together as-is."
+            )
         caveats.append(
             f"Replace each of the {beat_count} beat prompts with that "
             "shot's own description — they are seeded from the intent."
@@ -3470,6 +3554,10 @@ def _plan_video(
     else:
         candidates = sorted(LIVE_VIDEO_MODELS)
 
+    # The fix for each exclusion, kept: when EVERY candidate is excluded the
+    # plan used to return no routes and no conflicts, and the resolutions the
+    # rules had computed were discarded on the way out.
+    exclusion_fixes: list[str] = []
     for model in candidates:
         profile = _VIDEO_PROFILES[model]
 
@@ -3497,6 +3585,8 @@ def _plan_video(
         if reason is not None:
             route_tool = _route_tool(tool, model)
             rejected.append(RejectedRoute(model=model, reason=reason, tool=route_tool))
+            if resolution:
+                exclusion_fixes.append(resolution)
             if request.pinned_model == model:
                 conflicts.append(
                     RoutingConflict(
@@ -3592,6 +3682,29 @@ def _plan_video(
                         )
                     )
             ranked = pinned_routes
+
+    if not ranked and rejected and not conflicts:
+        # Every candidate was excluded and nothing else in the request was
+        # contradictory, so the exclusions ARE the answer. Without this a
+        # 4K multi-shot brief on the Gemini Developer API — where Veo cannot
+        # render 4K and generate_clip cannot run omni — came back as an empty
+        # plan with no explanation. The planner's own agreement test calls
+        # that silence, and it is right to.
+        reasons = list(dict.fromkeys(r.reason for r in rejected))
+        fixes = list(dict.fromkeys(exclusion_fixes))
+        conflicts.append(
+            RoutingConflict(
+                code="no_model_can_serve_request",
+                detail=(
+                    f"Every candidate for {tool} was excluded: " + " ".join(reasons)
+                ),
+                resolution=(
+                    " ".join(fixes)
+                    if fixes
+                    else "Relax one of the constraints named above."
+                ),
+            )
+        )
 
     return (
         ranked,
