@@ -34,6 +34,7 @@ from PIL import Image as PILImage
 from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import (
+    omni_model_refusal,
     OMNI_1_1_MODEL,
     OMNI_DEFAULT_TIMEOUT_SECONDS,
     OMNI_MAX_DURATION_SECONDS,
@@ -1211,6 +1212,10 @@ def _validate_omni_model(omni_model: str) -> Any:
             f"Unsupported omni_model '{omni_model}'. "
             f"Supported values are {', '.join(OMNI_MODELS)}."
         )
+    refusal = omni_model_refusal(omni_model)
+    if refusal:
+        # A dead endpoint must fail here, where it is free, not after a fetch.
+        raise ValueError(refusal)
     return omni_spec(omni_model)
 
 
@@ -2585,6 +2590,39 @@ def veo_extension_billing(
     )
 
 
+def _usd_of(cost: Any) -> float:
+    """The dollar figure of a cost payload, whatever shape it came in."""
+    if cost is None:
+        return 0.0
+    value = cost.get("usd") if isinstance(cost, dict) else getattr(cost, "usd", None)
+    return float(value or 0.0)
+
+
+def _over_budget_message(
+    projected_usd: float, max_cost_usd: float, times: int, *, floor: bool = False
+) -> str:
+    """Why a chain was (or would be) refused against its caller's cap.
+
+    Extension chains are the one place a cap earns its keep: the bill grows
+    with the SQUARE of `times`, because every turn re-renders the footage
+    before it, and `times` accepts 20. Twenty turns off a 10s source bills
+    ~1670s — several hundred dollars from one call with only a warning
+    between the caller and the invoice.
+    """
+    basis = (
+        "a FLOOR (the source could not be measured, so the true bill is higher)"
+        if floor
+        else "the projected bill"
+    )
+    return (
+        f"Refused before rendering: {basis} for {times} extension turn(s) is "
+        f"${projected_usd:.2f}, over the max_cost_usd of ${max_cost_usd:.2f} you "
+        "set. Fewer turns cost far less than proportionally less — each turn "
+        "re-bills everything before it — so reduce `times` first, or raise the "
+        "cap deliberately."
+    )
+
+
 def _assemble_loop_extend_manifest(
     *,
     source_video_uri: str,
@@ -3745,7 +3783,7 @@ async def generate_video(
             if draft:
                 ignored = _draft_ignored_veo_params(
                     seed=seed,
-                    negative_prompt=negative_prompt,
+                    negative_prompt=None,  # folded inline, see below
                     resolution=resolution,
                     person_generation=person_generation,
                     last_frame=last_frame_uri or last_frame_base64,
@@ -3781,7 +3819,7 @@ async def generate_video(
         if draft:
             ignored = _draft_ignored_veo_params(
                 seed=seed,
-                negative_prompt=negative_prompt,
+                negative_prompt=None,  # folded inline, see below
                 resolution=resolution,
                 person_generation=person_generation,
                 last_frame=last_frame_uri or last_frame_base64,
@@ -3795,6 +3833,12 @@ async def generate_video(
             draft_prompt = prompt
             if audio_prompt:
                 draft_prompt = f"{prompt}\nAudio: {audio_prompt}"
+            if negative_prompt:
+                # Omni has no negative_prompt field, and its docs say to state
+                # negatives inline ("No dialogue"). Folded rather than dropped:
+                # a draft that ignores the caller's exclusions previews the
+                # wrong shot.
+                draft_prompt = f"{draft_prompt}\nNo {negative_prompt}."
             draft_image_bytes: list[bytes] | None = None
             if image_uri:
                 b = await fetch(
@@ -3811,6 +3855,8 @@ async def generate_video(
             extra: dict[str, Any] = {"draft": True}
             if ignored:
                 extra["ignored_veo_params"] = ignored
+            if negative_prompt:
+                extra["negative_prompt_inlined"] = negative_prompt
             draft_model, draft_res = _omni_preview_model(draft_resolution)
             await ctx.info(f"Generating draft with {draft_model}")
             result = await _omni_generate_and_manifest(
@@ -3827,6 +3873,16 @@ async def generate_video(
             if ignored:
                 result.setdefault("warnings", []).append(
                     _draft_ignored_warning(ignored)
+                )
+            if negative_prompt:
+                # On the response too, not only in the manifest: the caller
+                # reading the result should not need the sidecar to learn
+                # their exclusion was honoured.
+                result["negative_prompt_inlined"] = negative_prompt
+                result.setdefault("warnings", []).append(
+                    f"negative_prompt was folded into the prompt as 'No "
+                    f"{negative_prompt}.' — omni has no negative_prompt field; "
+                    "its documentation recommends inline negatives."
                 )
             # The omni impl reports neither of these, so a draft response was
             # missing the two keys this tool's own Returns block names and
@@ -5604,6 +5660,7 @@ async def extend_video_omni(
     reference_video_uris: list[str] | None = None,
     output_gcs_uri: str | None = None,
     timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
+    max_cost_usd: float | None = None,
     dry_run: bool = False,
 ) -> str:
     """Append a seamless continuation to an existing video (Omni 1.1 only).
@@ -5618,6 +5675,12 @@ async def extend_video_omni(
     * `previous_interaction_id` — a clip this server already rendered. The
       video context lives on the service, nothing is uploaded, and spoken
       dialogue may be added in the continuation.
+    * Editing or extending an UPLOADED video is not available to users in the
+      EEA, Switzerland or the UK (Google's regional restriction). The service
+      refuses; this server cannot pre-check it.
+    * `max_cost_usd`: refuse BEFORE the first turn renders if the projected
+      bill exceeds it. Each turn re-bills the assembled clip, so cost grows
+      with times². A dry run reports `would_be_refused: true` instead.
     * `input_video_uri` — a clip of your own. It must be 10 seconds or shorter,
       it cannot gain new dialogue if someone is talking in it, and uploading it
       to be extended is unavailable in the EEA, Switzerland and the UK.
@@ -5839,6 +5902,18 @@ async def extend_video_omni(
             # Emitted last, so the cap warning added above reaches the
             # notification channel and not just the quote body.
             await _emit_warnings(ctx, warnings)
+            if max_cost_usd is not None:
+                projected_usd = _usd_of(payload.get("estimated_cost"))
+                if projected_usd > max_cost_usd:
+                    payload["would_be_refused"] = True
+                    payload.setdefault("warnings", []).append(
+                        _over_budget_message(
+                            projected_usd,
+                            max_cost_usd,
+                            times,
+                            floor=source_duration is None,
+                        )
+                    )
             return _respond(app_ctx, payload)
 
         reference_image_bytes = [
@@ -5875,6 +5950,25 @@ async def extend_video_omni(
             )
         if source_duration is not None:
             warnings.extend(_omni_cumulative_cap_warning(spec, source_duration, times))
+        if max_cost_usd is not None:
+            # Refuse BEFORE the first turn bills — same quadratic hazard as
+            # loop_extend, same cap.
+            projected_usd = _usd_of(
+                _omni_extension_quote(
+                    spec.model,
+                    billed_resolution,
+                    omni_extension_output_lengths(spec, source_duration, times),
+                )
+            )
+            if projected_usd > max_cost_usd:
+                raise ValueError(
+                    _over_budget_message(
+                        projected_usd,
+                        max_cost_usd,
+                        times,
+                        floor=source_duration is None,
+                    )
+                )
 
         # One backend for the whole chain. Resolved once, before the first
         # turn, because every turn after it carries a previous_interaction_id
@@ -6050,9 +6144,16 @@ async def loop_extend(
     aspect_ratio: str = "16:9",
     include_audio: bool = True,
     output_gcs_uri: str | None = None,
+    max_cost_usd: float | None = None,
     dry_run: bool = False,
 ) -> str:
     """Extend a Veo-generated video multiple times in one call.
+
+    max_cost_usd: refuse BEFORE the first turn renders if the projected bill
+    for the whole chain exceeds this. Unset by default. Worth setting: each
+    turn re-bills every second before it, so the cost grows with times²
+    — 20 turns off a 10s source is ~1670 billed seconds. A dry run reports
+    `would_be_refused: true` instead of refusing, so the number is visible.
 
     Each Veo extension continues the video by ~7 seconds; this chains them,
     feeding each extended result back in as the source for the next. Veo
@@ -6224,6 +6325,15 @@ async def loop_extend(
                     f"estimate: add {times}x the source's length to it. A "
                     "local source is measured and quoted exactly."
                 )
+            if max_cost_usd is not None:
+                projected_usd = _usd_of(quote.get("estimated_cost"))
+                if projected_usd > max_cost_usd:
+                    quote["would_be_refused"] = True
+                    step_warnings.append(
+                        _over_budget_message(
+                            projected_usd, max_cost_usd, times, floor=not turn_lengths
+                        )
+                    )
             if step_warnings:
                 quote["warnings"] = list(step_warnings)
                 await _emit_warnings(ctx, step_warnings)
@@ -6231,6 +6341,34 @@ async def loop_extend(
 
         # Validate the initial gs:// source against the allowlist (intermediate
         # outputs land in the already-validated gcs_uri bucket).
+
+        # Measured up front: the projection below needs it, and the manifest
+        # after the loop reuses it rather than probing twice.
+        source_seconds = await _probe_local_video_seconds(ctx, video_uri)
+        if max_cost_usd is not None:
+            # Refuse BEFORE the first turn bills. This is the tool where a cap
+            # earns its keep: the bill grows with the square of `times`.
+            projection = veo_extension_billing(
+                turns=times, source_seconds=source_seconds
+            )
+            projected_usd = _usd_of(
+                _video_cost(
+                    model,
+                    float(projection.billed_seconds),
+                    resolution="720p",
+                    include_audio=include_audio,
+                    presnapped=True,
+                )
+            )
+            if projected_usd > max_cost_usd:
+                raise ValueError(
+                    _over_budget_message(
+                        projected_usd,
+                        max_cost_usd,
+                        times,
+                        floor=not projection.turn_output_seconds,
+                    )
+                )
 
         for i in range(times):
             await ctx.info(f"Extension {i + 1}/{times}")
@@ -6277,7 +6415,6 @@ async def loop_extend(
         # for the identical call. Only the OUTPUT went remote. The source is
         # still local and still measurable, so the floor is the projection,
         # not the appended footage.
-        source_seconds = await _probe_local_video_seconds(ctx, video_uri)
         # Every turn is billed at its OWN assembled length, so the chain's cost
         # needs all of them, not just the one the caller keeps.
         turn_seconds: list[float] = []

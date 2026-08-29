@@ -295,8 +295,10 @@ async def test_generate_video_draft_emits_ignored_params_to_channel(
         )
     )
     warning = next(w for w in result["warnings"] if "ignored Veo-only" in w)
-    assert "seed" in warning and "negative_prompt" in warning
+    assert "seed" in warning and "negative_prompt" not in warning
     assert warning in _emitted(ctx)
+    # The negative is no longer dropped: omni's docs say to state it inline.
+    assert any("folded into the prompt" in w for w in result["warnings"])
 
 
 # ===========================================================================
@@ -325,7 +327,9 @@ async def test_generate_video_dry_run_draft_discloses_ignored_params(
     )
     assert result["dry_run"] is True
     assert "seed" in result["ignored_veo_params"]
-    assert "negative_prompt" in result["ignored_veo_params"]
+    # negative_prompt is no longer dropped: omni's docs say to state negatives
+    # inline, so a draft folds it into the prompt as "No <x>." instead.
+    assert "negative_prompt" not in result["ignored_veo_params"]
     assert any("ignored Veo-only" in w for w in result["warnings"])
     assert any("ignored Veo-only" in w for w in _emitted(ctx))
 

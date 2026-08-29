@@ -83,6 +83,7 @@ import base64
 import functools
 import io
 import re
+import datetime
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -104,6 +105,84 @@ OMNI_1_1_MODEL = "gemini-omni-1.1-flash"
 # every call that still pins it, because a caller who reads a warning has time
 # to move and a caller who reads nothing does not.
 OMNI_PREVIEW_SUNSET = "2026-09-30"
+
+
+def _today() -> datetime.date:
+    """Today — a function so a test can pin the calendar."""
+    return datetime.date.today()
+
+
+def omni_preview_is_sunset(today: datetime.date | None = None) -> bool:
+    """Whether the preview endpoint's switch-off date has arrived."""
+    return (today or _today()) >= datetime.date.fromisoformat(OMNI_PREVIEW_SUNSET)
+
+
+def omni_model_refusal(model: str | None) -> str | None:
+    """Why ``model`` must not be called at all today, or None.
+
+    Until the sunset the preview model is carried with a warning on every
+    call. On the day, a warning becomes a lie: the endpoint is gone, and a
+    quote or a render attempted against it is a 404 with a price beside it.
+    Refused at the pre-flight instead, so a dry run says so for free.
+    """
+    if (
+        canonical_omni_model(model) != OMNI_PREVIEW_MODEL
+        or not omni_preview_is_sunset()
+    ):
+        return None
+    return (
+        f"{OMNI_PREVIEW_MODEL} was switched off on {OMNI_PREVIEW_SUNSET} and can "
+        f"no longer be called. Use {OMNI_1_1_MODEL}: generally available on the "
+        "Gemini Developer API at the same published 720p rate, with resolution "
+        "control, extension and first/last-frame interpolation. On Vertex AI it "
+        "is Preview and may need an allowlist request."
+    )
+
+
+def _access_refusal(
+    exc: BaseException, served_model: Any, *, vertexai: bool
+) -> ValueError | None:
+    """Turn a 403/404 from interactions.create into advice, or None.
+
+    The one failure a Vertex-only deployment is most likely to meet with 1.1
+    is "model not found / no access", because on Vertex the model is Preview
+    and allowlist-plus-quota gated. The raw error names an endpoint and a
+    project; it does not say that the same model is GA one credential away,
+    or that the preview model still answers until its sunset.
+    """
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    text = str(exc)
+    markers = (
+        "NOT_FOUND",
+        "PERMISSION_DENIED",
+        "not found",
+        "does not have access",
+        "allowlist",
+        "is not supported for",
+        "404",
+        "403",
+    )
+    if code not in (403, 404) and not any(m in text for m in markers):
+        return None
+    if vertexai:
+        fallback = (
+            f" Or use {OMNI_PREVIEW_MODEL} on Vertex until {OMNI_PREVIEW_SUNSET}."
+            if not omni_preview_is_sunset()
+            else ""
+        )
+        return ValueError(
+            f"Vertex AI refused model '{served_model}': {text[:200]}. On Vertex "
+            "this model is Preview and allowlist/quota-gated — request access "
+            "for the project, or set GEMINI_API_KEY so omni runs on the Gemini "
+            "Developer API where it is generally available (this server prefers "
+            f"that route whenever a key is present).{fallback}"
+        )
+    return ValueError(
+        f"The Gemini Developer API refused model '{served_model}': {text[:200]}. "
+        "Check the model id, and that the key's project has access to the "
+        "Interactions API."
+    )
+
 
 # Kept as the preview model's name, not as "the default" — it is imported all
 # over the tree as an identity (which price, which capability set) and renaming
@@ -1244,6 +1323,9 @@ async def generate_video_omni(
     warnings: list[str] = []
     spec = omni_spec(model)
 
+    refusal = omni_model_refusal(spec.model)
+    if refusal:
+        raise ValueError(refusal)
     if spec.model == OMNI_PREVIEW_MODEL:
         # A caller who reads this has time to move; one who reads nothing gets
         # a dead endpoint. Said on every call rather than once at startup,
@@ -1486,9 +1568,21 @@ async def generate_video_omni(
         media_before_text=spec.media_before_text,
     )
 
-    interaction = await _run_within_deadline(
-        client.interactions.create, **create_kwargs
-    )
+    try:
+        interaction = await _run_within_deadline(
+            client.interactions.create, **create_kwargs
+        )
+    except Exception as exc:
+        advice = _access_refusal(
+            exc,
+            create_kwargs.get("model"),
+            vertexai=bool(
+                getattr(getattr(client, "_api_client", None), "vertexai", False)
+            ),
+        )
+        if advice is None:
+            raise
+        raise advice from exc
 
     interaction_id = _field(interaction, "id") or _field(interaction, "name")
     if not interaction_id:
