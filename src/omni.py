@@ -228,6 +228,24 @@ def canonical_omni_model(model: str | None) -> str:
     return _CANONICAL_MODEL_IDS.get(name, name)
 
 
+def omni_model_reroute_warning(requested: str | None, canonical: str) -> str | None:
+    """Disclose a folded model ID, or None when nothing was folded.
+
+    A caller who pins the Vertex spelling gets the canonical one back. That is
+    correct — one name for pricing, manifests and follow-ups — but swallowing
+    it left them no signal the name changed, while the Veo path discloses the
+    same reroute. Shared by the quote and the render so they cannot describe
+    one reroute two ways.
+    """
+    if requested is None or str(requested) == canonical:
+        return None
+    return (
+        f"Requested model '{requested}' is a backend-specific spelling; it "
+        f"resolves to '{canonical}', which is what this response reports and "
+        "prices. The ID actually sent is in served_model."
+    )
+
+
 def served_omni_model(model: str, *, vertexai: bool) -> str:
     """The ID to actually send, for the backend the call is going to."""
     canonical = canonical_omni_model(model)
@@ -1326,6 +1344,10 @@ async def generate_video_omni(
     refusal = omni_model_refusal(spec.model)
     if refusal:
         raise ValueError(refusal)
+
+    reroute = omni_model_reroute_warning(model, spec.model)
+    if reroute:
+        warnings.append(reroute)
     if spec.model == OMNI_PREVIEW_MODEL:
         # A caller who reads this has time to move; one who reads nothing gets
         # a dead endpoint. Said on every call rather than once at startup,
@@ -1654,7 +1676,22 @@ async def generate_video_omni(
         # went on the wire is reported alongside rather than swapped in.
         "model": spec.model,
         "served_model": served_model,
+        **({"requested_model": str(model)} if str(model) != spec.model else {}),
         "task": task_type,
+        # A mixed role set maps to no single documented task, so none is sent
+        # and the role tags carry the intent (see _select_task_type). That is
+        # a decision, and `task` is the field a caller reads to learn what the
+        # server decided — reporting a bare null told them nothing about it.
+        "task_source": (
+            "requested by the caller"
+            if task
+            else f"classified from the role mix as {task_type}"
+            if task_type
+            else "not sent: this role mix maps to no single documented task, "
+            "so the role declarations in the prompt carry it instead. The "
+            "reference warns that the task field adds strict constraints, so "
+            "inventing one here would over-constrain the render."
+        ),
         # For a continuation the duration was never sent, so reporting the
         # request here would describe a render that did not happen — and the
         # caller bills from this field. None means "unknown here, resolve

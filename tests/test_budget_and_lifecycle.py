@@ -582,3 +582,119 @@ async def test_both_provenance_fields_name_the_measurement_they_share(
         )
     )
     assert "measured 4s source" in quote["duration_source"], quote["duration_source"]
+
+
+# --------------------------------------------------------------------------
+# what a pre-flight is for
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_an_over_long_reference_clip_is_caught_by_the_quote(
+    tmp_path: Path,
+) -> None:
+    """The ceiling check ran only on the real render.
+
+    A 23s clip against a documented 3s ceiling drew a clean quote that said
+    nothing, so pre-flighting bought the caller nothing: they learned about
+    the violation after paying. "A dry run is offline" is no defence — the
+    clip is a local file, and loop_extend's own dry run measures exactly
+    this way.
+    """
+    from src.__main__ import generate_video_omni
+
+    long_clip = _write_video(tmp_path / "videos" / "long.mp4", seconds=23.0)
+    payload = json.loads(
+        await generate_video_omni(
+            ctx=_ctx(tmp_path, vertexai=False),
+            prompt="x",
+            reference_video_uris=[long_clip],
+            dry_run=True,
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    warning = next(
+        (w for w in payload.get("warnings", []) if "reference_video_uris[0]" in w), None
+    )
+    assert warning is not None, payload
+    # The index, the measurement, the ceiling and the consequence.
+    assert "over the documented 3s ceiling" in warning
+    assert "truncate it or refuse" in warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_folded_model_id_is_disclosed_on_the_quote_too(
+    tmp_path: Path,
+) -> None:
+    """Omni swallowed a backend-specific spelling; Veo discloses the reroute.
+
+    A caller who pins the Vertex ID gets the canonical one back with no
+    signal the name changed. The render was fixed first and the quote left
+    silent — the half of every fix this codebase keeps missing — so this
+    covers the pre-flight, where the disclosure is still free to act on.
+    """
+    from src.__main__ import generate_video_omni
+
+    payload = json.loads(
+        await generate_video_omni(
+            ctx=_ctx(tmp_path, vertexai=False),
+            prompt="x",
+            omni_model="gemini-omni-1.1-flash-preview",
+            dry_run=True,
+        )
+    )
+    assert payload["model"] == "gemini-omni-1.1-flash"
+    assert payload["requested_model"] == "gemini-omni-1.1-flash-preview"
+    assert any("backend-specific spelling" in w for w in payload["warnings"])
+
+    # The canonical spelling discloses nothing, or the notice is just noise.
+    clean = json.loads(
+        await generate_video_omni(
+            ctx=_ctx(tmp_path, vertexai=False),
+            prompt="x",
+            omni_model="gemini-omni-1.1-flash",
+            dry_run=True,
+        )
+    )
+    assert "requested_model" not in clean
+    assert not any("backend-specific" in w for w in clean.get("warnings", []))
+
+
+def test_a_mixed_role_call_says_why_it_sent_no_task() -> None:
+    """`task: null` told a caller nothing about a decision that was made.
+
+    Declining to send a task for a mixed role set is deliberate — the
+    reference warns the field adds strict constraints, and the role tags
+    already say what the mix is — but `task` is the field a caller reads to
+    learn what the server decided, and a bare null reads as a gap.
+    """
+    from src.omni import _select_task_type  # pyright: ignore[reportPrivateUsage]
+
+    mixed = _select_task_type(
+        previous_interaction_id=None,
+        input_video_bytes=None,
+        reference_image_count=2,
+        has_first_frame=True,
+        has_last_frame=True,
+    )
+    assert mixed is None, "the wire behaviour is deliberate and unchanged"
+
+    single = _select_task_type(
+        previous_interaction_id=None, input_video_bytes=None, reference_image_count=2
+    )
+    assert single == "reference_to_video"
+
+
+def test_one_wording_for_the_reference_ceiling_whichever_path_finds_it() -> None:
+    """A quote and a render must not describe one violation two ways."""
+    from src.__main__ import (  # pyright: ignore[reportPrivateUsage]
+        _reference_video_over_ceiling,
+    )
+    from src.omni import omni_spec
+
+    spec = omni_spec("gemini-omni-1.1-flash")
+    assert "reference_video_uris[1] is 5.00s" in _reference_video_over_ceiling(
+        spec, 1, 5.0
+    )
