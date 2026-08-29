@@ -1250,6 +1250,29 @@ def _omni_billed_resolution(spec: Any, resolution: str | None) -> str:
     return resolution or spec.rendered_resolution
 
 
+async def _probe_local_video_seconds(
+    ctx: Context[ServerSession, AppContext],
+    uri: str | None,
+) -> float | None:
+    """Duration of a LOCAL video for a pre-flight or a projection, or None.
+
+    Path-based: ffprobe reads the container header, so there is no reason to
+    load the whole file — up to the 50 MB fetch cap — into memory first, which
+    is what routing this through the bytes fetch did. Containment is enforced
+    the same way every other caller-supplied path is. Never raises: a source
+    that cannot be probed falls back to a labelled floor, not a failure.
+    """
+    if not uri or not uri.startswith("file://"):
+        return None
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        path = _validate_local_path(Path(uri[7:]), app_ctx.data_folder)
+    except Exception:
+        logger.debug("Could not resolve %s for a probe", uri, exc_info=True)
+        return None
+    return await _probe_media(measure_video_duration, path)
+
+
 async def _fetch_local_source(
     ctx: Context[ServerSession, AppContext],
     uri: str,
@@ -3689,6 +3712,32 @@ async def generate_video(
                     generation_mode=quoted_mode,
                 ),
             }
+            if quoted_mode == "extend_video":
+                # The real run was corrected to bill the ASSEMBLED clip and the
+                # quote beside it was not: 7s / $0.70 for a 4s source whose
+                # extension renders and bills 11s — a quote BELOW its own real
+                # run's figure. Same rule, same shared function, both ends.
+                ext_billing = veo_extension_billing(
+                    turns=1,
+                    source_seconds=await _probe_local_video_seconds(
+                        ctx, extend_video_uri
+                    ),
+                )
+                payload["billed_seconds"] = ext_billing.billed_seconds
+                payload["appended_seconds"] = ext_billing.appended_seconds
+                if ext_billing.turn_output_seconds:
+                    payload["turn_output_seconds"] = ext_billing.turn_output_seconds
+                    payload["duration_seconds"] = ext_billing.turn_output_seconds[-1]
+                payload["duration_source"] = ext_billing.duration_source
+                payload["estimated_cost"] = _video_cost(
+                    est_model,
+                    float(ext_billing.billed_seconds),
+                    resolution=est_res,
+                    include_audio=include_audio,
+                    presnapped=True,  # a measured/projected length must not re-snap
+                )
+                if ext_billing.warning:
+                    payload.setdefault("warnings", []).append(ext_billing.warning)
             # Disclose the Veo-only params a draft will drop, exactly as the
             # real draft run does — a quote that hid them let a caller price a
             # render believing paid controls (seed, negative_prompt, ...) were
@@ -3910,18 +3959,15 @@ async def generate_video(
             if resolution
             else "the default: generate_video renders 720p unless asked otherwise"
         )
+        # A non-extension render is metered when it was measured; only an
+        # extension can be a projection, and the billing helper says which.
+        extension_metered = True
         if result.get("generation_mode") == "extend_video":
             # An extension is billed on the assembled clip, not on the footage
             # it appends — the same rule loop_extend applies, which this path
             # did not. It billed 7s, asserted is_estimate=False for a file it
             # never opened, and labelled the figure with the TEXT-TO-VIDEO
             # rule in the one mode where that rule is known to be false.
-            ext_source_bytes = await _fetch_local_source(ctx, extend_video_uri or "")
-            ext_source_seconds = (
-                await _probe_media(measure_video_duration_bytes, ext_source_bytes)
-                if ext_source_bytes is not None
-                else None
-            )
             billing = veo_extension_billing(
                 turns=1,
                 measured_turns=(
@@ -3929,8 +3975,9 @@ async def generate_video(
                     if veo_facts.duration_source and veo_facts.duration_seconds
                     else None
                 ),
-                source_seconds=ext_source_seconds,
+                source_seconds=await _probe_local_video_seconds(ctx, extend_video_uri),
             )
+            extension_metered = billing.is_metered
             result["billed_seconds"] = billing.billed_seconds
             result["appended_seconds"] = billing.appended_seconds
             if billing.turn_output_seconds:
@@ -3957,12 +4004,10 @@ async def generate_video(
             else float(duration_seconds)
         )
         # Metered only where the figure was measured. An extension projected
-        # from its source is a good number, but it is not a meter reading.
-        metered = (
-            not is_extension
-            or bool(result.get("turn_output_seconds"))
-            and str(result.get("duration_source", "")).startswith("measured")
-        )
+        # from its source is a good number, but it is not a meter reading —
+        # and that is a fact the billing helper states, not one to re-derive
+        # from the wording of a string.
+        metered = extension_metered
         cost = _video_cost(
             result.get("model", model),
             billed_seconds,
@@ -4072,6 +4117,20 @@ async def generate_transition(
         _validate_aspect_ratio(aspect_ratio)
         _validate_duration_seconds(duration_seconds)
 
+        # Resolve the client up front so GCS gating can see which backend is
+        # in play (the Gemini API does not support GCS output).
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        # Resolved BEFORE the quote, as generate_video's already is. Left after
+        # it, the dry run skipped the allowlist and backend checks the real
+        # call applies — a quote for a destination the render would refuse.
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+
         if dry_run:
             # Both tools are first/last-frame renders by definition, which
             # Veo Lite cannot serve — the docstrings said so but nothing
@@ -4113,11 +4172,6 @@ async def generate_transition(
                 },
             )
 
-        # Resolve the client up front so GCS gating can see which backend is
-        # in play (the Gemini API does not support GCS output).
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
-
         first_bytes = await fetch(
             first_frame_uri,
             allowed_dir=data_dir,
@@ -4135,13 +4189,6 @@ async def generate_transition(
                 + "; "
                 + _fetch_failure("last_frame_uri", last_frame_uri, data_dir)
             )
-
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
 
         await ctx.info(f"Generating transition with model={model}")
         result = await generate_video_impl(
@@ -4302,6 +4349,20 @@ async def generate_bridge(
         # error. Runs before the quote so both agree.
         assert_frame_decoding_available()
 
+        # Resolve the client up front so GCS gating can see which backend is
+        # in play (the Gemini API does not support GCS output).
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        # Resolved BEFORE the quote, as generate_video's already is. Left after
+        # it, the dry run skipped the allowlist and backend checks the real
+        # call applies — a quote for a destination the render would refuse.
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+
         if dry_run:
             # Both tools are first/last-frame renders by definition, which
             # Veo Lite cannot serve — the docstrings said so but nothing
@@ -4349,11 +4410,6 @@ async def generate_bridge(
                 },
             )
 
-        # Resolve the client up front so GCS gating can see which backend is
-        # in play (the Gemini API does not support GCS output).
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
-
         from_bytes = await fetch(
             from_clip_uri,
             allowed_dir=data_dir,
@@ -4375,13 +4431,6 @@ async def generate_bridge(
         await ctx.info("Extracting bridge frames")
         first_frame_png = await _decode_media(extract_frame_png, from_bytes, "end")
         last_frame_png = await _decode_media(extract_frame_png, to_bytes, "start")
-
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
 
         await ctx.info(f"Generating bridge with model={model}")
         result = await generate_video_impl(
@@ -6092,12 +6141,7 @@ async def loop_extend(
             # its source here; this one reported added_seconds as a bare
             # number with no base, so nothing in the quote could be
             # reconciled against the file that produced it.
-            source_seconds: float | None = None
-            source_bytes = await _fetch_local_source(ctx, video_uri)
-            if source_bytes is not None:
-                source_seconds = await _probe_media(
-                    measure_video_duration_bytes, source_bytes
-                )
+            source_seconds = await _probe_local_video_seconds(ctx, video_uri)
             # MEASURED: a 4.0s source extended once returned 11.0s and billed
             # 11s. Each turn re-bills the assembly, so the chain costs the SUM
             # of the turn outputs, not the footage it added.
@@ -6233,12 +6277,7 @@ async def loop_extend(
         # for the identical call. Only the OUTPUT went remote. The source is
         # still local and still measurable, so the floor is the projection,
         # not the appended footage.
-        source_bytes = await _fetch_local_source(ctx, video_uri)
-        source_seconds = (
-            await _probe_media(measure_video_duration_bytes, source_bytes)
-            if source_bytes is not None
-            else None
-        )
+        source_seconds = await _probe_local_video_seconds(ctx, video_uri)
         # Every turn is billed at its OWN assembled length, so the chain's cost
         # needs all of them, not just the one the caller keeps.
         turn_seconds: list[float] = []

@@ -1331,3 +1331,112 @@ def test_no_docstring_claims_extension_is_served_inline_on_the_gemini_api() -> N
     for path in sorted(pathlib.Path("src").glob("*.py")):
         text = path.read_text()
         assert "the extended clip is" not in text or "returned inline" not in text, path
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_generate_videos_extend_quote_bills_the_assembled_clip(
+    tmp_path: Path,
+) -> None:
+    """The real run was corrected and the quote beside it was not.
+
+    A 4s source, extend_video_uri, dry_run: 7s / $0.70 against a real run
+    that now reports 11s / $1.10 — the quote BELOW its own render. Both ends
+    go through veo_extension_billing now.
+    """
+    from src.__main__ import generate_video
+
+    src_video = tmp_path / "videos" / "src.mp4"
+    _write_video(src_video, 1280, 720, frames=96)  # 4.0s
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(
+                tmp_path,
+                vertexai=True,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
+            prompt="c",
+            model=VEO_FAST,
+            extend_video_uri=f"file://{src_video}",
+            dry_run=True,
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["billed_seconds"] == pytest.approx(11.0, abs=0.2)
+    assert payload["duration_seconds"] == pytest.approx(11.0, abs=0.2)
+    assert payload["estimated_cost"]["usd"] == pytest.approx(1.10, abs=0.05)
+    assert "nothing to measure" not in payload["duration_source"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+@pytest.mark.parametrize("tool", ["generate_transition", "generate_bridge"])
+async def test_first_last_frame_quotes_apply_the_gcs_allowlist(
+    tmp_path: Path, tool: str
+) -> None:
+    """generate_video's quote had GCS resolution hoisted above it; its two
+    siblings did not, so their quotes skipped the allowlist and backend checks
+    the real call applies — a price for a destination the render refuses."""
+    import src.__main__ as main_mod
+
+    video, image = _seed_media(tmp_path)
+    kwargs: dict[str, Any] = (
+        dict(first_frame_uri=image, last_frame_uri=image)
+        if tool == "generate_transition"
+        else dict(from_clip_uri=video, to_clip_uri=video)
+    )
+    payload = json.loads(
+        await getattr(main_mod, tool)(
+            ctx=_ctx(tmp_path, vertexai=True, allowed=frozenset({"trusted"})),
+            prompt="x",
+            model=VEO_FAST,
+            output_gcs_uri="gs://other/out/",
+            dry_run=True,
+            **kwargs,
+        )
+    )
+    assert "estimated_cost" not in payload, f"{tool} priced a refused destination"
+    assert "not in the allowlist" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_the_impl_refuses_veo_4k_on_the_gemini_api_before_the_wire() -> None:
+    """The dry run refused it; the real call let it through to a 400.
+
+    Same rule, both ends — the impl's resolution check now sees the backend.
+    """
+    from unittest.mock import MagicMock
+
+    from src.video import generate_video as impl
+
+    client = MagicMock()
+    client._api_client.vertexai = False
+    with pytest.raises(ValueError, match="4K"):
+        await impl(
+            client=client, prompt="x", videos_dir=Path("."), model=VEO, resolution="4K"
+        )
+    client.models.generate_videos.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_local_probe_reads_the_header_and_respects_the_sandbox(
+    tmp_path: Path,
+) -> None:
+    """Probing went through the bytes fetch, loading up to 50 MB to read a
+    header. Path-based now, with the same containment as every other
+    caller-supplied path."""
+    from src.__main__ import _probe_local_video_seconds
+
+    video, _ = _seed_media(tmp_path)  # 2.0s
+    ctx = _ctx(tmp_path)
+    assert await _probe_local_video_seconds(ctx, video) == pytest.approx(2.0, abs=0.05)
+    outside = tmp_path.parent / "outside.mp4"
+    _write_video(outside, 64, 64)
+    try:
+        assert await _probe_local_video_seconds(ctx, f"file://{outside}") is None
+        assert await _probe_local_video_seconds(ctx, "gs://bkt/a.mp4") is None
+    finally:
+        outside.unlink(missing_ok=True)
