@@ -3382,6 +3382,11 @@ async def generate_video(
                 "model": est_model,
                 "resolution": est_res,
                 "generation_mode": "draft" if draft else quoted_mode,
+                # Which backend this will actually run on. Omni's responses
+                # carry it; Veo's did not, and a session spent three calls
+                # working out a backend confusion that this field answers in
+                # one.
+                "backend": "vertex" if is_vertex_client else "gemini_api",
                 "requested_duration_seconds": duration_seconds,
                 "duration_seconds": quoted_duration,
                 "estimated_cost": _video_cost(
@@ -3604,6 +3609,14 @@ async def generate_video(
             if measured is not None:
                 result["duration_seconds"] = round(measured, 3)
                 result["duration_source"] = "measured from the rendered video"
+        result.setdefault(
+            "duration_source",
+            "the snapped request: Veo renders exactly the length it is sent",
+        )
+        # Which backend actually ran this. Omni's responses carry it; Veo's did
+        # not, and a session spent three calls working out a backend confusion
+        # that this field answers in one.
+        result["backend"] = "vertex" if is_vertex_client else "gemini_api"
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
@@ -3999,7 +4012,33 @@ async def generate_bridge(
         )
         await ctx.info("Bridge generated successfully")
 
-        # Cost from the snapped duration the impl actually sent to Veo.
+        # Measured like every other local render. A bridge reported the
+        # snapped request as an unlabelled integer — the one rendered path
+        # with neither a duration_source nor a resolution_source, so its
+        # number could not be told apart from a measured one.
+        rendered_url = result.get("video_url") or ""
+        if isinstance(rendered_url, str) and rendered_url.startswith("file://"):
+            measured = await _probe_media(
+                measure_video_duration, Path(rendered_url[7:])
+            )
+            if measured is not None:
+                result["duration_seconds"] = round(measured, 3)
+                result["duration_source"] = "measured from the rendered video"
+        result.setdefault(
+            "duration_source",
+            "the snapped request: Veo renders exactly the length it is sent",
+        )
+        # generate_bridge takes no resolution parameter, so this is a fact
+        # about the tool rather than about the file.
+        result.setdefault("resolution", "720p")
+        result.setdefault(
+            "resolution_source",
+            "fixed: generate_bridge takes no resolution parameter",
+        )
+        result["backend"] = "vertex" if is_vertex_client else "gemini_api"
+
+        # Cost from the measured length where there is one, else the snapped
+        # duration the impl actually sent to Veo.
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
@@ -4019,6 +4058,9 @@ async def generate_bridge(
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "duration_source": result.get("duration_source"),
+            "resolution": result.get("resolution"),
+            "resolution_source": result.get("resolution_source"),
             "audio_enabled": result.get("audio_enabled", include_audio),
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
@@ -4406,7 +4448,16 @@ async def generate_clip(
             # probe. Without this, a 20-beat animatic reported a cost nobody
             # measured as though it were metered.
             beat_duration = float(beat_result.get("duration_seconds") or duration)
-            beat_duration_source: str | None = None
+            # Veo renders EXACTLY the length it is sent — the same fact
+            # _segment_is_metered relies on to price a Veo segment without a
+            # probe — so its duration has a provenance, it just is not a
+            # measurement. Leaving the field off made a Veo segment the one
+            # place in the response where a number carried no source at all.
+            beat_duration_source: str | None = (
+                None
+                if animatic
+                else "the snapped request: Veo renders exactly the length it is sent"
+            )
             beat_resolution_source: str | None = None
             beat_dimensions: list[int] | None = None
             beat_resolution = (

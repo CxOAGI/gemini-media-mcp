@@ -380,3 +380,147 @@ def test_the_veo_duration_snap_is_untouched_by_the_omni_extend_branch(
     assert snap_video_duration(model, duration) == expected
     assert snap_video_duration(model, 4.0, "extend_video") == 7
     assert snap_video_duration(model, 4.0, "reference_to_video") == 8
+
+
+# ============================================================================
+# Provenance parity: every rendered number says where it came from
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_veo_clip_segment_states_where_its_duration_came_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It carried resolution_source but no duration_source — the one gap left.
+
+    Veo renders exactly the length it is sent, which is the fact
+    _segment_is_metered already relies on to price a Veo segment without a
+    probe. So the number has a provenance; it just is not a measurement, and
+    saying nothing left it indistinguishable from one.
+    """
+    from src.__main__ import generate_clip
+
+    calls: list[dict[str, Any]] = []
+
+    async def veo_impl(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        out = tmp_path / "videos" / f"beat{len(calls)}.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model"),
+            "duration_seconds": kwargs.get("duration_seconds", 4),
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", veo_impl)
+
+    payload = json.loads(
+        await generate_clip(ctx=_ctx(tmp_path), beats=[{"prompt": "a"}], model=VEO_FAST)
+    )
+    segment = payload["segments"][0]
+    assert "Veo renders exactly the length it is sent" in segment["duration_source"]
+    assert "no resolution parameter" in segment["resolution_source"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_bridge_measures_its_render_and_labels_both_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bridge reported the snapped request as an unlabelled integer.
+
+    It was the one rendered path with neither a duration_source nor a
+    resolution_source, so its number could not be told apart from a measured
+    one — and the integer was the tell.
+    """
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import generate_bridge
+
+    frames = [
+        np.full((64, 64, 3), (i * 5) % 256, dtype=np.uint8) for i in range(24 * 3)
+    ]
+    buf = __import__("io").BytesIO()
+    iio.imwrite(buf, frames, extension=".mp4", fps=24)
+    clip = buf.getvalue()
+    for name in ("from.mp4", "to.mp4"):
+        (tmp_path / name).write_bytes(clip)
+
+    async def veo_impl(**kwargs: Any) -> dict[str, Any]:
+        out = tmp_path / "videos" / "bridge.mp4"
+        out.write_bytes(clip)
+        return {
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model"),
+            "duration_seconds": 4,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", veo_impl)
+
+    payload = json.loads(
+        await generate_bridge(
+            ctx=_ctx(tmp_path),
+            from_clip_uri=f"file://{tmp_path / 'from.mp4'}",
+            to_clip_uri=f"file://{tmp_path / 'to.mp4'}",
+            model=VEO_FAST,
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    # Measured off the file the stub wrote: 3s, not the 4s the request snapped
+    # to — which is exactly the difference the label exists to expose.
+    assert payload["duration_source"] == "measured from the rendered video"
+    assert payload["duration_seconds"] == pytest.approx(3.0, abs=0.2)
+    assert "no resolution parameter" in payload["resolution_source"]
+    assert payload["resolution"] == "720p"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+@pytest.mark.parametrize("vertexai", [True, False])
+async def test_a_veo_response_says_which_backend_ran_it(
+    tmp_path: Path, vertexai: bool
+) -> None:
+    """Omni's responses carry it; Veo's did not.
+
+    A session spent three calls working out a backend confusion that this
+    field answers in one.
+    """
+    payload = await _quote(_ctx(tmp_path, vertexai=vertexai))
+    assert payload["backend"] == ("vertex" if vertexai else "gemini_api")
+
+
+def test_the_planner_routes_to_the_tool_its_reasons_name() -> None:
+    """A brief asking for a transition offered only generate_video routes.
+
+    The conflict block and the capability rejections both named
+    generate_transition, so the plan talked about a tool it never handed over.
+    """
+    from src.routing import plan_generation
+
+    plan = plan_generation("a smooth transition from sunrise to snowfall")
+    named = {
+        "generate_transition"
+        for r in plan.rejected
+        if "generate_transition" in r.reason
+    }
+    if named:
+        assert any(r.tool == "generate_transition" for r in plan.routes), [
+            r.tool for r in plan.routes
+        ]
+    top = plan.recommended
+    assert top is not None
+    assert top.tool == "generate_transition"
+    # And it says what it still needs.
+    assert any("Add first_frame_uri" in c for c in top.caveats)
+
+
+def test_a_multi_shot_brief_mentioning_transitions_still_routes_to_clip() -> None:
+    """generate_clip renders its own bridges; the guard is the beat count."""
+    from src.routing import plan_generation
+
+    plan = plan_generation(
+        "a 3 shot commercial with crossfade transitions, 24 seconds total"
+    )
+    assert plan.routes[0].tool == "generate_clip"
