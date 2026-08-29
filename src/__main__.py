@@ -80,11 +80,18 @@ MAX_FETCH_BYTES = 50 * 1024 * 1024
 # target is re-validated against the SSRF guard before it is requested.
 MAX_HTTP_REDIRECTS = 5
 
-# Cap on a thought-signature file read. A signature is an opaque token of at
-# most a few kilobytes, but the path is caller-supplied and the strongest
-# target is a large file the server itself wrote into DATA_FOLDER — an
-# uncapped read_text() of a 157 MB render added ~150 MB RSS in one call.
-MAX_THOUGHT_SIGNATURE_BYTES = 256 * 1024
+# Cap on a thought-signature file read. The path is caller-supplied and the
+# strongest target is a large file the server itself wrote into DATA_FOLDER —
+# an uncapped read_text() of a 157 MB render added ~150 MB RSS in one call.
+#
+# "At most a few kilobytes" was the original premise and it is wrong. MEASURED:
+# gemini-3-pro-image writes 2,828,040 bytes and gemini-3.1-flash-image
+# 1,634,388, so a 256 KB cap refused every signature the server itself had just
+# written and made multi-turn editing unreachable on both models — the
+# docstring's own two-step example could not execute. Sized to the largest
+# observed signature with generous headroom, still two orders of magnitude
+# below the render that motivated the cap.
+MAX_THOUGHT_SIGNATURE_BYTES = 16 * 1024 * 1024
 
 # Upper bound on shots in one storyboard. Every shot is a billed image
 # generation, so an unbounded list is an unbounded bill; exceeding this is an
@@ -1517,7 +1524,9 @@ def _read_thought_signature(path: Path, allowed_dir: Path) -> str:
     if size > MAX_THOUGHT_SIGNATURE_BYTES:
         raise ValueError(
             f"thought_signature_url file is {size} bytes, over the "
-            f"{MAX_THOUGHT_SIGNATURE_BYTES}-byte cap: {path}"
+            f"{MAX_THOUGHT_SIGNATURE_BYTES}-byte cap: {path}. Signatures the "
+            "server writes are a few megabytes; a file this size is more "
+            "likely a rendered image or video than a signature."
         )
     return validated.read_text()
 
@@ -2467,6 +2476,92 @@ def _assemble_clip_manifest(
     return manifest
 
 
+class _ExtensionBilling(NamedTuple):
+    """How a Veo extension should be billed, and on what evidence."""
+
+    billed_seconds: float
+    turn_output_seconds: list[float]
+    appended_seconds: float
+    duration_source: str
+    is_metered: bool
+    warning: str | None
+
+
+def veo_extension_billing(
+    *,
+    turns: int,
+    measured_turns: list[float] | None = None,
+    source_seconds: float | None = None,
+) -> _ExtensionBilling:
+    """Bill a Veo extension for what it renders, on the best evidence to hand.
+
+    MEASURED: a Veo turn renders and bills the ASSEMBLED clip, so turn i is
+    the source plus 7s per turn and a chain costs the SUM of those lengths.
+    Billing the appended footage alone under-billed a single 4s-source
+    extension by 57%.
+
+    Three tiers, best evidence first: every turn measured, else a projection
+    from a measured source, else the appended footage as a labelled floor. The
+    projection matters because only the OUTPUT of a GCS-delivered render is out
+    of reach — a local source still pins every turn's length, and skipping
+    straight to the floor made a real run report less than its own pre-flight.
+
+    Shared, because this is the second path to need it. generate_video's
+    extend_video_uri mode had none of it: it billed the appended footage,
+    asserted is_estimate=False for a file it never opened, and labelled the
+    figure with the TEXT-TO-VIDEO rule ("Veo renders exactly the length it is
+    sent") in the one mode where that rule is known to be false. Two
+    implementations of one service's billing is what produced that.
+    """
+    measured = [t for t in (measured_turns or []) if t is not None]
+    everything_measured = bool(turns) and len(measured) == turns
+    projected = veo_extension_output_lengths(source_seconds, turns)
+    appended = turns * VEO_EXTENSION_STEP_SECONDS
+
+    if everything_measured:
+        return _ExtensionBilling(
+            billed_seconds=round(sum(measured), 3),
+            turn_output_seconds=[round(t, 3) for t in measured],
+            appended_seconds=appended,
+            duration_source="measured from each rendered turn",
+            is_metered=True,
+            warning=None,
+        )
+    if projected:
+        return _ExtensionBilling(
+            billed_seconds=round(sum(projected), 3),
+            turn_output_seconds=projected,
+            appended_seconds=appended,
+            duration_source=(
+                "PROJECTED from a measured "
+                f"{source_seconds:g}s source: the render was delivered "
+                "remotely so it could not be opened, but a Veo turn renders "
+                "the assembled clip, so turn i is the source plus "
+                f"{VEO_EXTENSION_STEP_SECONDS:g}s per turn. This is the same "
+                "figure the pre-flight quoted."
+            ),
+            is_metered=False,
+            warning=None,
+        )
+    return _ExtensionBilling(
+        billed_seconds=appended,
+        turn_output_seconds=[],
+        appended_seconds=appended,
+        duration_source=(
+            "FLOOR, not a metered figure: the render was delivered remotely "
+            "and not opened, its source is remote too, and a Veo turn bills "
+            "the assembled clip rather than the footage it appends. The true "
+            "bill is higher by the source's length charged once per turn."
+        ),
+        is_metered=False,
+        warning=(
+            "This cost is a FLOOR. Neither the render nor its source could be "
+            "measured, and Veo bills each turn's assembled length rather than "
+            f"the {VEO_EXTENSION_STEP_SECONDS:g}s it appends."
+        ),
+    )
+
+
 def _assemble_loop_extend_manifest(
     *,
     source_video_uri: str,
@@ -2500,53 +2595,20 @@ def _assemble_loop_extend_manifest(
         "extension_steps": list(steps),
     }
     manifest["resolution"] = resolution
-    # MEASURED: a Veo turn renders and bills the ASSEMBLED clip, so the chain
-    # costs the sum of the turn outputs. Billing len(steps)*7 charged only the
-    # appended footage and under-billed a single 4s-source extension by 57%.
-    measured = [t for t in (turn_seconds or []) if t is not None]
-    everything_measured = len(measured) == len(steps) and bool(steps)
-    # Three tiers, best evidence first. The projection matters because only the
-    # OUTPUT of a GCS-delivered chain is out of reach: a local source still
-    # pins every turn's length, and dropping to the appended-only floor made
-    # the real run report less than its own pre-flight quote.
-    projected = veo_extension_output_lengths(source_seconds, len(steps))
-    if everything_measured:
-        billed = sum(measured)
-    elif projected:
-        billed = sum(projected)
-    else:
-        billed = len(steps) * VEO_EXTENSION_STEP_SECONDS
-    manifest["billed_seconds"] = round(billed, 3)
-    manifest["appended_seconds"] = len(steps) * VEO_EXTENSION_STEP_SECONDS
-    if everything_measured:
-        manifest["turn_output_seconds"] = [round(t, 3) for t in measured]
-        manifest["duration_source"] = "measured from each rendered turn"
-    elif projected:
-        manifest["turn_output_seconds"] = projected
-        manifest["duration_source"] = (
-            "PROJECTED from a measured "
-            f"{source_seconds:g}s source: the chain was delivered remotely so "
-            "its turns could not be opened, but a Veo turn renders the "
-            "assembled clip, so turn i is the source plus "
-            f"{VEO_EXTENSION_STEP_SECONDS:g}s per turn. This is the same "
-            "figure the pre-flight quoted."
-        )
-    else:
-        # Neither the turns nor the source could be opened, so this is the
-        # appended footage alone, with every turn's re-billed assembly missing.
-        # Asserting is_estimate=False on it claimed a metered figure for a
-        # file that was never read.
-        manifest["duration_source"] = (
-            "FLOOR, not a metered figure: the chain was delivered remotely and "
-            "not opened, its source is remote too, and a Veo turn bills the "
-            "assembled clip rather than the footage it appends. The true bill "
-            "is higher by the source's length charged once per turn."
-        )
-        warnings.append(
-            "This cost is a FLOOR. Neither the chain nor its source could be "
-            "measured, and Veo bills each turn's assembled length rather than "
-            f"the {VEO_EXTENSION_STEP_SECONDS:g}s it appends."
-        )
+    billing = veo_extension_billing(
+        turns=len(steps),
+        measured_turns=turn_seconds,
+        source_seconds=source_seconds,
+    )
+    everything_measured = billing.is_metered
+    billed = billing.billed_seconds
+    manifest["billed_seconds"] = billed
+    manifest["appended_seconds"] = billing.appended_seconds
+    if billing.turn_output_seconds:
+        manifest["turn_output_seconds"] = billing.turn_output_seconds
+    manifest["duration_source"] = billing.duration_source
+    if billing.warning:
+        warnings.append(billing.warning)
     cost = _video_cost(
         served_model,
         float(billed),
@@ -3440,9 +3502,12 @@ async def generate_video(
         extend_video_uri: URI of existing VEO-generated video to extend.
             Extends the final second of the video and continues the action.
             Note: Cannot be used together with other image inputs.
-            On Vertex AI, extension requires output_gcs_uri (the larger combined
-            video exceeds inline limits). On the Gemini API the extended clip is
-            returned inline, so no GCS target is needed.
+            Vertex AI only: extension requires output_gcs_uri there (the larger
+            combined video exceeds inline limits), and the Gemini Developer API
+            refuses the mode outright ("encodedVideo isn't supported by this
+            model"), so the tool rejects it before spending. Billed on the
+            ASSEMBLED clip, not the ~7s appended: a 4s source extended once
+            renders and bills 11s.
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
             Vertex AI only — on the Gemini API, output is always returned inline
             and an explicit output_gcs_uri is rejected.
@@ -3824,22 +3889,6 @@ async def generate_video(
         )
         await ctx.info("Video generated successfully")
 
-        # Write sidecar manifest alongside local video output.
-        # Cost from what actually rendered where that can be measured, else
-        # the snapped duration the impl sent to Veo. Measuring is the only
-        # figure that cannot drift from the request or a stale record.
-        rendered_url = result.get("video_url") or ""
-        if isinstance(rendered_url, str) and rendered_url.startswith("file://"):
-            measured = await _probe_media(
-                measure_video_duration, Path(rendered_url[7:])
-            )
-            if measured is not None:
-                result["duration_seconds"] = round(measured, 3)
-                result["duration_source"] = "measured from the rendered video"
-        result.setdefault(
-            "duration_source",
-            "the snapped request: Veo renders exactly the length it is sent",
-        )
         # Which backend actually ran this. Omni's responses carry it; Veo's did
         # not, and a session spent three calls working out a backend confusion
         # that this field answers in one.
@@ -3861,12 +3910,66 @@ async def generate_video(
             if resolution
             else "the default: generate_video renders 720p unless asked otherwise"
         )
+        if result.get("generation_mode") == "extend_video":
+            # An extension is billed on the assembled clip, not on the footage
+            # it appends — the same rule loop_extend applies, which this path
+            # did not. It billed 7s, asserted is_estimate=False for a file it
+            # never opened, and labelled the figure with the TEXT-TO-VIDEO
+            # rule in the one mode where that rule is known to be false.
+            ext_source_bytes = await _fetch_local_source(ctx, extend_video_uri or "")
+            ext_source_seconds = (
+                await _probe_media(measure_video_duration_bytes, ext_source_bytes)
+                if ext_source_bytes is not None
+                else None
+            )
+            billing = veo_extension_billing(
+                turns=1,
+                measured_turns=(
+                    [veo_facts.duration_seconds]
+                    if veo_facts.duration_source and veo_facts.duration_seconds
+                    else None
+                ),
+                source_seconds=ext_source_seconds,
+            )
+            result["billed_seconds"] = billing.billed_seconds
+            result["appended_seconds"] = billing.appended_seconds
+            if billing.turn_output_seconds:
+                result["turn_output_seconds"] = billing.turn_output_seconds
+            result["duration_source"] = billing.duration_source
+            if billing.warning:
+                result.setdefault("warnings", []).append(billing.warning)
+        result.setdefault(
+            "duration_source",
+            "the snapped request: Veo renders exactly the length it is sent",
+        )
+        is_extension = result.get("generation_mode") == "extend_video"
+        raw_billed = (
+            result.get("billed_seconds")
+            if is_extension
+            else result.get("duration_seconds", duration_seconds)
+        )
+        # An extension always sets billed_seconds just above, but falling back
+        # to the request rather than asserting keeps a missing key from
+        # becoming a 500 on a render the caller has already paid for.
+        billed_seconds = (
+            float(raw_billed)
+            if isinstance(raw_billed, (int, float))
+            else float(duration_seconds)
+        )
+        # Metered only where the figure was measured. An extension projected
+        # from its source is a good number, but it is not a meter reading.
+        metered = (
+            not is_extension
+            or bool(result.get("turn_output_seconds"))
+            and str(result.get("duration_source", "")).startswith("measured")
+        )
         cost = _video_cost(
             result.get("model", model),
-            float(result.get("duration_seconds", duration_seconds)),
+            billed_seconds,
             resolution=effective_resolution,
             include_audio=result.get("audio_enabled", include_audio),
-            actual=True,
+            actual=metered,
+            presnapped=not metered,
         )
         if cost:
             result["cost"] = cost
@@ -4566,6 +4669,19 @@ async def generate_clip(
             # bridges into the estimate — so the check is reported positively
             # too, exactly as generate_bridge does.
             assert_frame_decoding_available()
+            # A bridge IS a first/last-frame render, so this composite inherits
+            # the backend restriction its standalone sibling already enforces.
+            # Without this the quote came back clean on the Gemini API, the
+            # beats rendered and billed ~$0.80, and only then did the first
+            # bridge fail — a partial-spend trap made worse by a pre-flight
+            # that reassured the caller first. Checked here, before any beat.
+            from .video import validate_render_options
+
+            validate_render_options(
+                model,
+                generation_mode="first_last_frame",
+                backend=_backend_of(app_ctx, str(model)),
+            )
             preflight.append("ffmpeg available for frame decoding (bridges)")
 
         if dry_run:
@@ -5110,6 +5226,17 @@ async def generate_video_omni(
             )
             if allowlist_warning:
                 gcs_warnings.append(allowlist_warning)
+            if _omni_backend_choice(app_ctx, need_gcs=True) == "gemini_api":
+                # The docstring promised this notice and only the allowlist
+                # warning ever fired, so a caller's destination was dropped in
+                # silence. Omni prefers the Gemini API whenever a key is
+                # configured, which is exactly when this bites.
+                gcs_warnings.append(
+                    "output_gcs_uri is ignored: this call runs on the Gemini "
+                    "Developer API, which returns media inline and has no GCS "
+                    "destination. Configure Vertex credentials to deliver to "
+                    "Cloud Storage."
+                )
 
         billed_resolution = _omni_billed_resolution(spec, normalized_resolution)
 

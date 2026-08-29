@@ -600,6 +600,11 @@ async def test_every_render_tool_reports_its_backend(
             # response to stamp — the refusal is the correct behaviour and is
             # covered by test_a_gemini_api_quote_refuses_a_mode_veo_cannot_serve.
             continue
+        if not vertexai and kwargs.get("add_bridges"):
+            # A bridge is a first/last-frame render, so a clip that builds them
+            # inherits the restriction. The clip itself runs here; the bridges
+            # do not, so drop them rather than skipping the tool.
+            kwargs = {**kwargs, "add_bridges": False}
         # A bucket, because Vertex refuses to extend without a destination;
         # on the Gemini API the env default is dropped rather than rejected.
         raw = await getattr(main_mod, tool)(
@@ -1196,3 +1201,133 @@ async def test_image_to_video_is_not_warned_about_on_the_gemini_api(
     assert not [w for w in payload.get("warnings", []) if "text-to-video only" in w], (
         payload.get("warnings")
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_generate_videos_extend_mode_bills_the_assembled_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second extension entry point had none of loop_extend's fixes.
+
+    Same service, same rule, separate implementation: it billed the ~7s it
+    appends rather than the assembled clip, asserted is_estimate=False for a
+    gs:// file it never opened, and labelled the figure with the TEXT-TO-VIDEO
+    rule ("Veo renders exactly the length it is sent") in the one mode where
+    that rule is known to be false. A confidently wrong source is worse than
+    an absent one, because it will be trusted.
+    """
+    from src.__main__ import generate_video
+
+    src_video = tmp_path / "videos" / "src.mp4"
+    _write_video(src_video, 1280, 720, frames=96)  # 4.0s
+
+    async def gcs_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "video_url": "gs://bkt/out/sample_0.mp4",
+            "model": kwargs.get("model"),
+            "duration_seconds": 7,
+            "generation_mode": "extend_video",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", gcs_impl)
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(
+                tmp_path,
+                vertexai=True,
+                bucket="gs://bkt/out/",
+                allowed=frozenset({"bkt"}),
+            ),
+            prompt="c",
+            model=VEO_FAST,
+            extend_video_uri=f"file://{src_video}",
+        )
+    )
+    assert "error" not in payload, payload.get("error")
+    assert payload["billed_seconds"] == pytest.approx(11.0, abs=0.2)
+    assert payload["appended_seconds"] == 7.0
+    assert payload["cost"]["is_estimate"] is True
+    assert payload["cost"]["usd"] == pytest.approx(1.10, abs=0.05)
+    # The text-to-video rule must not be asserted over an extension.
+    assert "exactly the length it is sent" not in payload["duration_source"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_veo_4k_is_refused_on_the_gemini_api_before_it_is_priced(
+    tmp_path: Path,
+) -> None:
+    """Gating covered modes but not resolutions.
+
+    This quoted $1.20 at the 4K rate and then 400'd — the highest-value false
+    quote in the server. Veo-specific: omni renders 4K on this backend.
+    """
+    from src.__main__ import generate_video
+
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(tmp_path),
+            prompt="x",
+            model=VEO_FAST,
+            resolution="4K",
+            dry_run=True,
+        )
+    )
+    assert "estimated_cost" not in payload
+    assert "4K" in payload["error"]
+    assert "Vertex" in payload["error"] or "720p" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_clip_with_bridges_is_refused_before_any_beat_is_billed(
+    tmp_path: Path,
+) -> None:
+    """A partial-spend trap, made worse by a pre-flight that reassured first.
+
+    On the Gemini API the quote came back clean with bridge_count: 1 and a
+    positive ffmpeg check, the beats then rendered and billed ~$0.80, and only
+    the first bridge failed. Standalone bridges already refused on that
+    backend; the composite that builds them did not.
+    """
+    from src.__main__ import generate_clip
+
+    payload = json.loads(
+        await generate_clip(
+            ctx=_ctx(tmp_path),
+            beats=[{"prompt": "a"}, {"prompt": "b"}],
+            model=VEO_FAST,
+            add_bridges=True,
+            dry_run=True,
+        )
+    )
+    assert "estimated_cost" not in payload
+    assert "first_last_frame" in payload["error"]
+
+
+def test_a_thought_signature_the_server_wrote_can_be_read_back() -> None:
+    """The cap refused every signature the server itself had just written.
+
+    MEASURED: 2,828,040 bytes from gemini-3-pro-image and 1,634,388 from
+    gemini-3.1-flash-image, against a 256 KB cap — so the docstring's own
+    two-step editing example could not execute on either model. The cap still
+    has to refuse the 157 MB render that motivated it.
+    """
+    from src.__main__ import MAX_THOUGHT_SIGNATURE_BYTES
+
+    assert MAX_THOUGHT_SIGNATURE_BYTES >= 2_828_040
+    assert MAX_THOUGHT_SIGNATURE_BYTES < 157 * 1024 * 1024
+
+
+def test_no_docstring_claims_extension_is_served_inline_on_the_gemini_api() -> None:
+    """The mode is gated there and the service refuses it.
+
+    A docstring that contradicts a gate sends a caller at a wall the server
+    already knows about.
+    """
+    import pathlib
+
+    for path in sorted(pathlib.Path("src").glob("*.py")):
+        text = path.read_text()
+        assert "the extended clip is" not in text or "returned inline" not in text, path

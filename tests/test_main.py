@@ -4982,17 +4982,23 @@ async def test_clip_dry_run_prices_beats_and_bridges(
 
     plain = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True), beats=beats, dry_run=True
         )
     )
     bridged = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=beats,
+            add_bridges=True,
+            dry_run=True,
         )
     )
     animatic = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, animatic=True, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=beats,
+            animatic=True,
+            dry_run=True,
         )
     )
     assert plain["estimated_cost"]["usd"] == pytest.approx(3 * 0.8)
@@ -5683,14 +5689,17 @@ async def test_clip_quote_reports_the_ffmpeg_check_when_bridging(
     beats = [{"prompt": "b", "duration_seconds": 8}] * 3
     bridged = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=beats,
+            add_bridges=True,
+            dry_run=True,
         )
     )
     assert any("ffmpeg" in c for c in bridged["preflight_checks"])
 
     plain = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True), beats=beats, dry_run=True
         )
     )
     assert plain["preflight_checks"] == []

@@ -272,6 +272,16 @@ def validate_render_options(
                 f"Model {model} does not support 4K resolution. "
                 "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
             )
+        if resolution == "4K" and backend == "gemini_api":
+            # Gating covered modes but not resolutions, so this quoted $1.20 at
+            # the 4K rate and then 400'd: the highest-value false quote in the
+            # server. Veo-specific — omni renders 4K on this backend fine.
+            raise ValueError(
+                "Veo cannot render 4K on the Gemini Developer API: the service "
+                "answers \"The string value 4K for resolution is invalid\". "
+                "Render at 720p or 1080p here, or run against Vertex AI. "
+                "(Omni does render 4K on this backend.)"
+            )
     if (
         generation_mode is not None
         and model in _VEO_LITE_MODELS
