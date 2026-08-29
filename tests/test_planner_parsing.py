@@ -176,7 +176,12 @@ def _tool_ctx(tmp_path: Path) -> MagicMock:
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
     client = MagicMock()
-    client._api_client.vertexai = False
+    # Vertex: plan_generation here runs backend-agnostic (backend="unknown"),
+    # so its routes must be validated on the backend that can serve them. Veo
+    # refuses first/last-frame and extension on the Gemini Developer API.
+    client._api_client.vertexai = True
+    lite_client = MagicMock()
+    lite_client._api_client.vertexai = False
     ctx = MagicMock()
     ctx.info = AsyncMock()
     ctx.error = AsyncMock()
@@ -186,6 +191,11 @@ def _tool_ctx(tmp_path: Path) -> MagicMock:
         images_dir=tmp_path / "images",
         videos_dir=videos_dir,
         client=client,
+        # Lite is served only by the Gemini API even on a Vertex deployment,
+        # so the planner's Lite routes need a client to land on.
+        gemini_api_client=lite_client,
+        video_gcs_bucket="gs://bkt/out/",
+        allowed_gcs_buckets=frozenset({"bkt", "bucket"}),
     )
     return ctx
 

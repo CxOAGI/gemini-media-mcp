@@ -755,7 +755,7 @@ async def test_generate_video_first_last_frame(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -891,7 +891,7 @@ async def test_generate_video_extend(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -1017,12 +1017,13 @@ async def test_generate_video_still_picks_a_mode_when_inputs_do_not_conflict(
         ({}, "text_to_video"),
     ):
         client = FakeGenaiClient(
+            vertexai=True,
             operation=FakeOperation(
                 done=True,
                 result=FakeVideoResult(
                     [FakeGeneratedVideo(FakeVideoObject(video_bytes=b"video content"))]
                 ),
-            )
+            ),
         )
         gen_result = await generate_video(
             client=client,  # type: ignore[arg-type]
@@ -1165,7 +1166,7 @@ async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> N
     gen_video = FakeGeneratedVideo(video_obj)
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     with pytest.raises(ValueError, match="outside the permitted data folder"):
         await generate_video(
@@ -1183,13 +1184,13 @@ async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> N
 # ============================================================================
 
 
-def _basic_client() -> "FakeGenaiClient":
+def _basic_client(vertexai: bool = False) -> "FakeGenaiClient":
     """Build a client whose fake operation returns a single video with bytes."""
     video_obj = FakeVideoObject(video_bytes=b"fake video content")
     gen_video = FakeGeneratedVideo(video_obj)
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
-    return FakeGenaiClient(operation=operation)
+    return FakeGenaiClient(operation=operation, vertexai=vertexai)
 
 
 @pytest.mark.parametrize(
@@ -1251,7 +1252,7 @@ async def test_generate_video_extend_duration_forced_to_7(tmp_path: Path) -> Non
     videos_dir.mkdir()
 
     gen_result = await generate_video(
-        client=_basic_client(),  # type: ignore[arg-type]
+        client=_basic_client(vertexai=True),  # type: ignore[arg-type]
         prompt="Extend",
         videos_dir=videos_dir,
         model="veo-3.1-generate-001",

@@ -3327,6 +3327,43 @@ def _plan_video(
             )
         )
 
+    # Same shape as the GCS contradiction above, and measured the same way:
+    # on the Gemini Developer API, Veo refuses every mode that conditions on
+    # existing footage. generate_transition and generate_bridge come back
+    # "Your use case is currently not supported"; loop_extend comes back
+    # "encodedVideo isn't supported by this model". Identical calls succeed on
+    # Vertex. Without this the planner ranked generate_transition top on a
+    # backend that cannot render it, and handed over a clean quote beside it.
+    _GEMINI_API_BLOCKED_TOOLS = {
+        "loop_extend": ("extension", "encodedVideo isn't supported by this model"),
+        "generate_transition": (
+            "first/last-frame control",
+            "Your use case is currently not supported",
+        ),
+        "generate_bridge": (
+            "first/last-frame control",
+            "Your use case is currently not supported",
+        ),
+    }
+    if request.backend == "gemini_api" and tool in _GEMINI_API_BLOCKED_TOOLS:
+        capability, service_message = _GEMINI_API_BLOCKED_TOOLS[tool]
+        conflicts.append(
+            RoutingConflict(
+                code="veo_mode_unsupported_on_gemini_api",
+                detail=(
+                    f"{tool} needs Veo {capability}, which the Gemini Developer "
+                    f'API refuses: the service answers "{service_message}". '
+                    "Only text-to-video runs on this backend."
+                ),
+                resolution=(
+                    "Run against Vertex AI, where this mode works (set "
+                    "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, plus "
+                    "output_gcs_uri or VIDEO_GCS_BUCKET for delivery), or "
+                    "describe the shot as a single text-to-video prompt."
+                ),
+            )
+        )
+
     # Runtime beyond what a Veo extension chain can reach.
     if (
         request.total_duration_seconds is not None

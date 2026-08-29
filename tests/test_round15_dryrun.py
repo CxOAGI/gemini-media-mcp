@@ -81,7 +81,11 @@ async def test_generate_video_dry_run_refuses_an_out_of_sandbox_source(
 
     payload = _payload(
         await generate_video(
-            ctx=_video_ctx(tmp_path), prompt="x", model=VEO, dry_run=True, **kwargs
+            ctx=_video_ctx(tmp_path, vertexai=True, video_gcs_bucket="gs://bkt/out/"),
+            prompt="x",
+            model=VEO,
+            dry_run=True,
+            **kwargs,
         )
     )
     assert "estimated_cost" not in payload
@@ -258,7 +262,10 @@ async def test_generate_transition_dry_run_refuses_an_out_of_sandbox_source(
     kwargs = {bad_key: _out_of_sandbox(), good_key: "gs://b/ok.png"}
     payload = _payload(
         await generate_transition(
-            ctx=_video_ctx(tmp_path), model=VEO, dry_run=True, **kwargs
+            ctx=_video_ctx(tmp_path, vertexai=True, video_gcs_bucket="gs://bkt/out/"),
+            model=VEO,
+            dry_run=True,
+            **kwargs,
         )
     )
     assert "estimated_cost" not in payload
@@ -275,7 +282,7 @@ async def test_generate_transition_dry_run_refuses_a_missing_in_sandbox_source(
 
     payload = _payload(
         await generate_transition(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True, video_gcs_bucket="gs://bkt/out/"),
             model=VEO,
             first_frame_uri=_missing_in_sandbox(tmp_path),
             last_frame_uri="gs://b/ok.png",
@@ -296,7 +303,7 @@ async def test_generate_transition_dry_run_still_prices_gs_sources(
 
     payload = _payload(
         await generate_transition(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True, video_gcs_bucket="gs://bkt/out/"),
             model=VEO,
             first_frame_uri="gs://b/a.png",
             last_frame_uri="gs://b/b.png",
