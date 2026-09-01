@@ -1,6 +1,6 @@
 # Gemini Media MCP
 
-Plan, generate, compose, and edit images and video on Google Gemini and Veo 3.1, with a cost estimate before every call.
+Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with a cost estimate before every call.
 
 ## What it does
 
