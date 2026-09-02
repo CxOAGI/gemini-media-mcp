@@ -698,3 +698,106 @@ def test_one_wording_for_the_reference_ceiling_whichever_path_finds_it() -> None
     assert "reference_video_uris[1] is 5.00s" in _reference_video_over_ceiling(
         spec, 1, 5.0
     )
+
+
+# --------------------------------------------------------------------------
+# quick-scan findings
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_chain_at_the_ceiling_is_refused_not_attempted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 40s source plans zero turns. The quote said planned_turns: 0 with a
+    null cost, the render attempted every turn anyway, and max_cost_usd could
+    not stop it: an unpriced plan reads as $0.00, and 0.0 is under any cap.
+    A call the quote cannot price must not run."""
+    import src.__main__ as main_mod
+
+    # Only reachable through a prior interaction: an UPLOADED 40s source is
+    # refused earlier by the 10s upload limit. The sidecar of a chain that has
+    # already reached the ceiling records 40s, which is what is stubbed here.
+    async def at_ceiling(*args: Any, **kwargs: Any) -> float | None:
+        return 40.0
+
+    calls: list[Any] = []
+
+    async def impl(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "video_url": "gs://bkt/out/x.mp4",
+            "duration_seconds": 40,
+            "interaction_id": "i",
+        }
+
+    async def prior_at_ceiling(*args: Any, **kwargs: Any) -> Any:
+        return main_mod.PriorInteraction(
+            backend="gemini_api", model="gemini-omni-1.1-flash", duration_seconds=40.0
+        )
+
+    # The quote reads the prior one way and the render another; stub both.
+    monkeypatch.setattr(main_mod, "_prior_interaction_or_empty", prior_at_ceiling)
+    monkeypatch.setattr(main_mod, "_source_duration_or_none", at_ceiling)
+    monkeypatch.setattr(main_mod, "_omni_generate_and_manifest", impl)
+    for extra in ({"dry_run": True}, {}, {"max_cost_usd": 0.01}):
+        payload = json.loads(
+            await main_mod.extend_video_omni(
+                ctx=_ctx(tmp_path, vertexai=False),
+                prompt="c",
+                previous_interaction_id="i-chain",
+                times=1,
+                **extra,
+            )
+        )
+        assert "40s ceiling" in payload["error"], (extra, payload)
+    assert calls == [], "a turn was attempted on a chain that cannot grow"
+
+
+def test_access_advice_does_not_rewrap_unrelated_errors() -> None:
+    """The first matcher treated "404" and "is not supported for" as
+    substrings, so a timeout carrying "4034ms" or a duration 400 would have
+    become allowlist advice — sending the caller to fix credentials that were
+    never the problem."""
+    from src.omni import _access_refusal  # pyright: ignore[reportPrivateUsage]
+
+    for benign in (
+        "deadline exceeded after 4034ms",
+        "Aspect ratio is not supported for extend task",
+        "Duration cannot be set in response format for edit task",
+        "RESOURCE_EXHAUSTED: quota",
+    ):
+        assert _access_refusal(RuntimeError(benign), "m", vertexai=True) is None, benign
+    for access in (
+        "404 NOT_FOUND: Publisher Model `x` not found",
+        "PERMISSION_DENIED",
+        "Project is not on the allowlist for this model",
+    ):
+        assert _access_refusal(RuntimeError(access), "m", vertexai=True) is not None, (
+            access
+        )
+
+
+def test_task_source_says_a_conversational_turn_sends_no_task() -> None:
+    """`task: edit` is reported on every prior-interaction turn, but nothing
+    goes on the wire — the API rejects a task beside previous_interaction_id.
+    Saying "classified as edit" implied it was sent."""
+    from src.omni import _build_create_kwargs  # pyright: ignore[reportPrivateUsage]
+
+    kwargs = _build_create_kwargs(
+        model="gemini-omni-1.1-flash",
+        prompt="x",
+        image_parts=[],
+        video_parts=[],
+        task_type="edit",
+        aspect_ratio="16:9",
+        duration_seconds_int=None,
+        resolution=None,
+        previous_interaction_id="i-1",
+        output_gcs_uri=None,
+        uri_delivery=False,
+        media_before_text=True,
+    )
+    assert "generation_config" not in kwargs
+    assert kwargs["previous_interaction_id"] == "i-1"

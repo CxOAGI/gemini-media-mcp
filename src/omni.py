@@ -152,17 +152,20 @@ def _access_refusal(
     """
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     text = str(exc)
-    markers = (
-        "NOT_FOUND",
-        "PERMISSION_DENIED",
-        "not found",
-        "does not have access",
-        "allowlist",
-        "is not supported for",
-        "404",
-        "403",
+    # Deliberately narrow. A first cut matched "404"/"403" as substrings and
+    # "is not supported for" anywhere, which would have rewrapped a duration
+    # 400 or a timeout carrying "4034ms" as an allowlist problem — advice that
+    # sends the caller to fix credentials that were never the issue.
+    looks_like_access = (
+        code in (403, 404)
+        or re.search(r"\b(?:404|403)\b", text) is not None
+        or "NOT_FOUND" in text
+        or "PERMISSION_DENIED" in text
+        or "does not have access" in text
+        or "allowlist" in text.lower()
+        or ("model" in text.lower() and "not found" in text.lower())
     )
-    if code not in (403, 404) and not any(m in text for m in markers):
+    if not looks_like_access:
         return None
     if vertexai:
         fallback = (
@@ -1683,7 +1686,11 @@ async def generate_video_omni(
         # a decision, and `task` is the field a caller reads to learn what the
         # server decided — reporting a bare null told them nothing about it.
         "task_source": (
-            "requested by the caller"
+            f"classified as {task_type}, but NOT sent: a turn carrying "
+            "previous_interaction_id cannot also carry a task (the API "
+            "rejects the pair), so the service infers it from the context"
+            if previous_interaction_id is not None and task_type
+            else "requested by the caller"
             if task
             else f"classified from the role mix as {task_type}"
             if task_type
@@ -1778,6 +1785,29 @@ def omni_extension_output_lengths(
         assembled = min(assembled + step, ceiling)
         lengths.append(assembled)
     return lengths
+
+
+def omni_extension_refusal(
+    spec: OmniModelSpec, source_seconds: float | None
+) -> str | None:
+    """Why a chain cannot append anything, or None.
+
+    A source already at the documented ceiling plans zero turns. The quote
+    reported planned_turns: 0 with estimated_cost: null, the render attempted
+    every turn anyway, and max_cost_usd could not stop it because an unpriced
+    plan reads as $0.00 — the cap compared 0.0 against the limit and passed.
+    A call the quote cannot price is a call that must not run.
+    """
+    if source_seconds is None or spec.max_extended_seconds <= 0:
+        return None
+    if source_seconds < spec.max_extended_seconds:
+        return None
+    return (
+        f"The source is {source_seconds:g}s, at or over {spec.model}'s documented "
+        f"{spec.max_extended_seconds}s ceiling for an extended video, so no turn "
+        "can append anything. Nothing was rendered or billed. Start a new "
+        "generation, or edit the clip rather than extending it."
+    )
 
 
 def omni_extension_appended_seconds(
