@@ -34,6 +34,7 @@ from PIL import Image as PILImage
 from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import (
+    omni_extension_refusal,
     omni_model_reroute_warning,
     omni_model_refusal,
     OMNI_1_1_MODEL,
@@ -6014,6 +6015,12 @@ async def extend_video_omni(
             # Each turn renders the ASSEMBLED clip, so the source is the base
             # every turn is billed on top of and the chain stops when it
             # reaches the documented ceiling.
+            at_ceiling = omni_extension_refusal(spec, source_duration)
+            if at_ceiling:
+                # A quote for a call that cannot run refuses, as every other
+                # pre-flight here does; planned_turns: 0 beside a null cost
+                # said the same thing in a way nothing acts on.
+                raise ValueError(at_ceiling)
             turn_lengths = omni_extension_output_lengths(spec, source_duration, times)
             appended = omni_extension_appended_seconds(source_duration, turn_lengths)
             payload: dict[str, Any] = {
@@ -6111,6 +6118,9 @@ async def extend_video_omni(
             source_duration = await _source_duration_or_none(
                 app_ctx.videos_dir, previous_interaction_id or ""
             )
+        at_ceiling = omni_extension_refusal(spec, source_duration)
+        if at_ceiling:
+            raise ValueError(at_ceiling)
         if source_duration is not None:
             warnings.extend(_omni_cumulative_cap_warning(spec, source_duration, times))
         if max_cost_usd is not None:
