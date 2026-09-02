@@ -181,7 +181,15 @@ async def test_loop_extend_emits_warnings_to_channel(
 ) -> None:
     from src.__main__ import loop_extend
 
-    ctx = _ctx(_app_ctx(tmp_path))
+    # Vertex: Veo refuses extension on the Gemini Developer API outright
+    # ("encodedVideo isn't supported by this model"), so a chain cannot reach
+    # the point of emitting anything there. What this test is about — a
+    # warning from a chained impl reaching the notification channel — is not
+    # about a backend, so it runs where the chain can run.
+    app_ctx = _app_ctx(tmp_path, vertexai=True)
+    object.__setattr__(app_ctx, "video_gcs_bucket", "gs://bkt/out/")
+    object.__setattr__(app_ctx, "allowed_gcs_buckets", frozenset({"bkt"}))
+    ctx = _ctx(app_ctx)
     src_video = tmp_path / "videos" / "src.mp4"
     src_video.write_bytes(b"mp4")
     out = tmp_path / "videos" / "ext.mp4"
@@ -287,8 +295,10 @@ async def test_generate_video_draft_emits_ignored_params_to_channel(
         )
     )
     warning = next(w for w in result["warnings"] if "ignored Veo-only" in w)
-    assert "seed" in warning and "negative_prompt" in warning
+    assert "seed" in warning and "negative_prompt" not in warning
     assert warning in _emitted(ctx)
+    # The negative is no longer dropped: omni's docs say to state it inline.
+    assert any("folded into the prompt" in w for w in result["warnings"])
 
 
 # ===========================================================================
@@ -317,7 +327,9 @@ async def test_generate_video_dry_run_draft_discloses_ignored_params(
     )
     assert result["dry_run"] is True
     assert "seed" in result["ignored_veo_params"]
-    assert "negative_prompt" in result["ignored_veo_params"]
+    # negative_prompt is no longer dropped: omni's docs say to state negatives
+    # inline, so a draft folds it into the prompt as "No <x>." instead.
+    assert "negative_prompt" not in result["ignored_veo_params"]
     assert any("ignored Veo-only" in w for w in result["warnings"])
     assert any("ignored Veo-only" in w for w in _emitted(ctx))
 

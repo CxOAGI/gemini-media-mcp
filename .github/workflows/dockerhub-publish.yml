@@ -34,6 +34,7 @@ jobs:
             org.opencontainers.image.url=https://github.com/CxOAGI/gemini-media-mcp
             org.opencontainers.image.documentation=https://github.com/CxOAGI/gemini-media-mcp
             org.opencontainers.image.vendor=CxOAGI
+            org.opencontainers.image.description=Cost-aware MCP for Gemini images, Veo and Gemini Omni video, storyboards, clips, and editing.
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -60,4 +61,5 @@ jobs:
           username: ${{ secrets.DOCKERHUBUSERNAME }}
           password: ${{ secrets.DOCKERHUBTOKEN }}
           repository: cxoagi/gemini-media-mcp
+          short-description: Cost-aware MCP for Gemini images, Veo and Gemini Omni video, storyboards, clips, and editing.
           readme-filepath: ./DOCKER_HUB_README.md

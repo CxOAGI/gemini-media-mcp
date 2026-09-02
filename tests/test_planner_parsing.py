@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.omni import OMNI_MODEL
+from src.omni import OMNI_MODELS
 from src.routing import (
     MAX_CLIP_BEATS,
     RoutedCall,
@@ -165,7 +165,7 @@ def test_a_clip_route_never_exceeds_the_tools_beat_limit() -> None:
 # ============================================================================
 
 
-def _tool_ctx(tmp_path: Path) -> MagicMock:
+def _tool_ctx(tmp_path: Path, *, vertexai: bool = True) -> MagicMock:
     """A context the dry_run paths can read, with a non-Vertex client.
 
     A bare MagicMock reads as Vertex (every attribute is truthy), which sends
@@ -176,7 +176,12 @@ def _tool_ctx(tmp_path: Path) -> MagicMock:
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
     client = MagicMock()
-    client._api_client.vertexai = False
+    # Vertex: plan_generation here runs backend-agnostic (backend="unknown"),
+    # so its routes must be validated on the backend that can serve them. Veo
+    # refuses first/last-frame and extension on the Gemini Developer API.
+    client._api_client.vertexai = vertexai
+    lite_client = MagicMock()
+    lite_client._api_client.vertexai = False
     ctx = MagicMock()
     ctx.info = AsyncMock()
     ctx.error = AsyncMock()
@@ -186,6 +191,11 @@ def _tool_ctx(tmp_path: Path) -> MagicMock:
         images_dir=tmp_path / "images",
         videos_dir=videos_dir,
         client=client,
+        # Lite is served only by the Gemini API even on a Vertex deployment,
+        # so the planner's Lite routes need a client to land on.
+        gemini_api_client=lite_client,
+        video_gcs_bucket="gs://bkt/out/" if vertexai else None,
+        allowed_gcs_buckets=frozenset({"bkt", "bucket"}),
     )
     return ctx
 
@@ -282,14 +292,22 @@ async def test_the_edit_route_quotes_the_same_upper_bound_as_the_tool(
     top = plan.recommended
     assert top is not None
     assert top.tool == "edit_video"
-    assert top.model == OMNI_MODEL
+    # Conversational editing is omni-only; which omni model wins is a ranking
+    # decision, but the emitted params must name the same one the route was
+    # priced for, or the caller's call and the plan's quote describe
+    # different renders.
+    assert top.model in OMNI_MODELS
+    assert top.params["omni_model"] == top.model
     assert top.cost is not None
     assert top.cost.usd == pytest.approx(
         await _tool_quote(top, tmp_path), abs=_PAYLOAD_ROUNDING_USD
     )
     # The route still shows the (unsent) duration, so the quote's basis has
-    # to be stated or the two numbers look like a contradiction.
-    assert any("10s maximum" in caveat for caveat in top.caveats)
+    # to be stated or the two numbers look like a contradiction — including
+    # the one case where the tool quotes HIGHER than the planner, an already-
+    # extended source whose length only the tool can read.
+    assert any("per-render maximum" in caveat for caveat in top.caveats)
+    assert any("quotes higher" in caveat for caveat in top.caveats)
 
 
 _INVARIANT_INTENTS: list[tuple[str, RoutingConstraints | None]] = [
@@ -355,3 +373,111 @@ async def test_every_planned_route_agrees_with_the_tools_own_dry_run(
         assert route.cost.usd == pytest.approx(
             await _tool_quote(route, tmp_path), abs=_PAYLOAD_ROUNDING_USD
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120.0)
+@pytest.mark.parametrize("backend", ["gemini_api", "vertex"])
+@pytest.mark.parametrize(
+    ("intent", "constraints"),
+    [
+        pytest.param(intent, constraints, id=intent.replace(" ", "_")[:40])
+        for intent, constraints in _INVARIANT_INTENTS
+    ],
+)
+async def test_the_planner_never_silently_hands_over_a_route_the_tool_refuses(
+    intent: str, constraints: RoutingConstraints | None, backend: str, tmp_path: Path
+) -> None:
+    """Planner-tool agreement, on the backend the request will actually run on.
+
+    The agreement test above runs the planner backend-agnostic and validates
+    on Vertex, so it could not see the class of bug that has now recurred
+    three times: the planner recommending, on the Gemini Developer API, a
+    Veo mode that backend refuses — first/last-frame, extension, references,
+    4K — with a clean quote beside it. Here the planner is told the backend,
+    the tool runs on the same one, and for every route either the tool quotes
+    and the two agree, or the plan carries a conflict that says why it won't.
+    A route the tool refuses with no conflict in the plan is the failure.
+    """
+    import dataclasses
+
+    given = constraints or RoutingConstraints()
+    plan = plan_generation(intent, dataclasses.replace(given, backend=backend))
+    assert plan.routes or plan.conflicts, "no routes and no explanation"
+    import src.__main__ as server
+
+    for route in plan.routes:
+        kwargs = dict(_MISSING_URI_STUBS.get(route.tool, {}))
+        kwargs.update(route.params)
+        payload = json.loads(
+            await getattr(server, route.tool)(
+                ctx=_tool_ctx(tmp_path, vertexai=backend == "vertex"),
+                dry_run=True,
+                **kwargs,
+            )
+        )
+        if "error" in payload:
+            assert plan.conflicts, (
+                f"{route.tool}/{route.model} on {backend}: the tool refuses "
+                f"({payload['error'][:90]}) and the plan says nothing about it"
+            )
+            continue
+        assert route.cost is not None
+        assert route.cost.usd == pytest.approx(
+            float(payload["estimated_cost"]["usd"]), abs=_PAYLOAD_ROUNDING_USD
+        ), f"{route.tool}/{route.model} on {backend}"
+
+
+def test_on_the_gemini_api_the_planner_routes_4k_and_references_to_omni() -> None:
+    """The capability table was per model; four Veo capabilities are per backend.
+
+    Veo 4K on the Gemini Developer API 400s and reference images return an
+    empty result that still bills. The planner offered Veo for both. Omni
+    renders 4K and takes references on that backend, so it is not a conflict
+    to report — it is a different right answer.
+    """
+    for intent, kwargs in (
+        ("a 4K video of a skyline", {}),
+        ("a video of this mascot walking", {"num_reference_images": 1}),
+    ):
+        plan = plan_generation(
+            intent, RoutingConstraints(backend="gemini_api", **kwargs)
+        )
+        assert plan.routes, intent
+        assert plan.routes[0].tool == "generate_video_omni", (intent, plan.routes[0])
+        assert not any(r.model.startswith("veo") for r in plan.routes), intent
+    # And Veo stays the 4K answer where it can render 4K.
+    vertex = plan_generation(
+        "a 4K video of a skyline", RoutingConstraints(backend="vertex")
+    )
+    assert vertex.routes[0].model.startswith("veo")
+
+
+def test_a_gemini_api_clip_plan_does_not_hand_over_bridges() -> None:
+    """add_bridges on that backend is a partial-spend trap: beats bill, bridge fails."""
+    plan = plan_generation(
+        "a 3 shot commercial with crossfade transitions",
+        RoutingConstraints(backend="gemini_api"),
+    )
+    clip = next(r for r in plan.routes if r.tool == "generate_clip")
+    assert clip.params.get("add_bridges") is False
+    assert any("add_bridges disabled" in c for c in clip.caveats)
+
+
+def test_an_all_excluded_plan_explains_itself_instead_of_returning_nothing() -> None:
+    """Zero routes and zero conflicts is silence, and silence reads as a bug.
+
+    A 4K multi-shot brief on the Gemini Developer API: Veo cannot render 4K
+    there and generate_clip cannot run omni, so every candidate is excluded.
+    The rules had computed the fix for each exclusion and the plan threw them
+    away on the way out.
+    """
+    plan = plan_generation(
+        "a 3 shot 4K commercial for sneakers", RoutingConstraints(backend="gemini_api")
+    )
+    assert not plan.routes
+    codes = [c.code for c in plan.conflicts]
+    assert "no_model_can_serve_request" in codes
+    conflict = next(c for c in plan.conflicts if c.code == "no_model_can_serve_request")
+    assert "gemini-omni-1.1-flash" in conflict.resolution
+    assert "Vertex" in conflict.resolution
