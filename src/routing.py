@@ -50,6 +50,7 @@ from .omni import (
     OMNI_RESOLUTIONS,
     is_omni_model,
     omni_extension_output_lengths,
+    omni_extension_priced_lengths,
     omni_spec,
 )
 from .video import (
@@ -1095,6 +1096,12 @@ _ADDED_DURATION_PATTERN = re.compile(
     r"(?<!\w)(?:by|add|plus|another)\s+(?:another\s+)?(\d+(?:\.\d+)?)\s*"
     r"(?:-|\s)?\s*(s\b|sec\b|secs\b|second\b|seconds\b"
     r"|m\b|min\b|mins\b|minute\b|minutes\b)"
+    # An optional adjacent seconds part, so "by another 2 minutes 30 seconds"
+    # is 150s. Without it the delta read the minutes alone (120s) while the
+    # total read the compound (150s): two signals from one phrase disagreeing,
+    # and loop_extend planning 18 turns where 20 were asked for.
+    r"(?:\s*(?:,\s*|and\s+)?(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*"
+    r"(?:s|sec|secs|second|seconds)\b)?"
 )
 
 # The single-letter units are the ambiguous ones: "8s" is a runtime but "the
@@ -1440,6 +1447,10 @@ def infer_signals(intent: str) -> IntentSignals:
         added_duration = (
             added_value * 60.0 if added_match.group(2).startswith("m") else added_value
         )
+        if added_match.group(3) is not None and added_match.group(2).startswith("m"):
+            # "2 minutes 30 seconds": the trailing part only exists after a
+            # minutes unit -- "30 seconds 5 seconds" is not a compound.
+            added_duration += float(added_match.group(3))
     # A runtime can name BOTH units, and seconds winning outright dropped the
     # minutes on the floor: "a 2 minute 30 second trailer" read as 30s, so a
     # 2.5-minute brief was planned as one sub-8s render with no extension
@@ -2755,6 +2766,20 @@ def _route_tool(tool: ToolName, model: str) -> ToolName:
     return tool
 
 
+def _omni_serves_on_vertex(request: ResolvedRequest) -> bool:
+    """Whether an omni call from this request will run on Vertex AI.
+
+    Mirrors the server's own choice (_omni_backend_choice): omni goes to the
+    Gemini Developer API whenever a key is present, even on a Vertex-primary
+    deployment, so "backend is vertex" alone is not the question. Pricing the
+    Vertex upload ceiling off that alone had the plan saying $12.18 for a
+    chain the tool quoted at $9.14 on the same server. An UNKNOWN key
+    (None) is read as absent, which prices the higher Vertex ceiling -- the
+    direction a quote may err in.
+    """
+    return request.backend == "vertex" and request.gemini_api_key_available is not True
+
+
 def _clip_bridges_possible(request: ResolvedRequest) -> bool:
     """Whether generate_clip can render the bridges a brief asks for.
 
@@ -2993,7 +3018,15 @@ def _video_params(
         # that had no room and was priced as three — the plan and its own
         # quote disagreeing about how many renders it was recommending.
         ceiling = max(
-            1, len(omni_extension_output_lengths(spec, None, spec.max_extended_seconds))
+            1,
+            len(
+                omni_extension_output_lengths(
+                    spec,
+                    None,
+                    spec.max_extended_seconds,
+                    vertexai=_omni_serves_on_vertex(request),
+                )
+            ),
         )
         if times > ceiling:
             caveats.append(
@@ -3357,7 +3390,14 @@ def _video_cost(
         # assumed; a shorter real source quotes lower, and assuming one would
         # under-quote. The tool's own dry_run measures it and is sharper.
         turns = int(params.get("times", 1))
-        lengths = omni_extension_output_lengths(omni_spec(model), None, turns)
+        # The same list the tool's dry_run prices, for the backend omni will
+        # actually run on. This quoted the model's 10s fallback list on both
+        # backends, so on a Vertex-only server the plan said $9.14 for three
+        # turns while extend_video_omni's own quote said $12.18 -- and a
+        # max_cost_usd taken from the plan was refused by the tool.
+        lengths = omni_extension_priced_lengths(
+            omni_spec(model), None, turns, vertexai=_omni_serves_on_vertex(request)
+        )
         if not lengths:
             return None
         return _aggregate_video_cost(

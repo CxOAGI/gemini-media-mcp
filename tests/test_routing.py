@@ -2255,3 +2255,93 @@ def test_two_duration_units_are_summed_only_when_adjacent(
 ) -> None:
     """"2 minute 30 second" is one number; a deadline elsewhere is not."""
     assert infer_signals(intent).duration_seconds == expected
+
+
+@pytest.mark.asyncio
+async def test_the_planners_extension_quote_matches_the_tools_on_vertex(
+    tmp_path: Any,
+) -> None:
+    """The plan priced the model's 10s fallback list on both backends, so on a
+    Vertex-only server it said $9.14 for three turns while extend_video_omni's
+    own dry_run said $12.18 -- and a max_cost_usd taken from the plan was
+    refused. Parity is asserted against the tool itself, on a matching
+    deployment, for both backends."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.__main__ import AppContext, extend_video_omni
+    from src.omni import OMNI_1_1_MODEL
+
+    def tool_ctx(*, vertex: bool) -> Any:
+        (tmp_path / "images").mkdir(exist_ok=True)
+        (tmp_path / "videos").mkdir(exist_ok=True)
+        client = MagicMock()
+        client._api_client.vertexai = vertex
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+        ctx.error = AsyncMock()
+        ctx.warning = AsyncMock()
+        ctx.request_context.lifespan_context = AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=tmp_path / "videos",
+            client=client,
+            gemini_api_client=None if vertex else client,
+        )
+        return ctx
+
+    span = "extend my omni clip from interaction abc by another 30 seconds"
+    for backend in ("vertex", "gemini_api"):
+        plan = plan_generation(
+            span,
+            RoutingConstraints(
+                backend=backend,
+                gemini_api_key_available=backend != "vertex",
+                needs_extension=True,
+                previous_interaction_id="abc",
+            ),
+        )
+        route = next(
+            r for r in plan.routes if r.tool == "extend_video_omni" and r.model == OMNI_1_1_MODEL
+        )
+        quote = json.loads(
+            await extend_video_omni(
+                ctx=tool_ctx(vertex=backend == "vertex"),
+                prompt=span,
+                previous_interaction_id="abc",
+                times=int(route.params["times"]),
+                omni_model=OMNI_1_1_MODEL,
+                dry_run=True,
+            )
+        )
+        assert "error" not in quote, quote
+        assert route.cost is not None
+        assert route.cost.usd == pytest.approx(quote["estimated_cost"]["usd"], abs=0.005), (
+            backend,
+            quote["turn_output_seconds"],
+        )
+        if backend == "vertex":
+            assert quote["turn_output_seconds"] == [40.0] * int(route.params["times"])
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected_added"),
+    [
+        ("extend my 8 second clip by another 2 minutes 30 seconds", 150.0),
+        ("extend it by 2 min 30 sec", 150.0),
+        ("extend it by 30 seconds", 30.0),
+        ("add another 2 minutes", 120.0),
+        # A seconds delta followed by an unrelated seconds figure is not a
+        # compound.
+        ("extend by 10 seconds and 5 seconds of credits", 10.0),
+    ],
+)
+def test_the_delta_reads_a_compound_the_way_the_total_does(
+    intent: str, expected_added: float
+) -> None:
+    """duration and added_duration came from one phrase and disagreed:
+    "by another 2 minutes 30 seconds" -> total 150s, delta 120s."""
+    signals = infer_signals(intent)
+    assert signals.added_duration_seconds == expected_added
+    if "2 min" in intent and "30" in intent:
+        assert signals.duration_seconds == signals.added_duration_seconds

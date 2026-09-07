@@ -757,7 +757,7 @@ async def test_an_input_video_edit_dry_run_quotes_the_upper_bound(
     already fixed, surviving because the guard keyed on previous_interaction_id
     while omni also treats input_video_uri as an edit."""
     from src.__main__ import edit_video, generate_video_omni
-    from src.omni import OMNI_MAX_DURATION_SECONDS
+    from src.omni import OMNI_VERTEX_SOURCE_MAX_SECONDS
 
     omni = json.loads(
         await generate_video_omni(
@@ -768,7 +768,10 @@ async def test_an_input_video_edit_dry_run_quotes_the_upper_bound(
             dry_run=True,
         )
     )
-    assert omni["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    # _make_ctx is a Vertex deployment, and an unrecorded source there may be
+    # a 30s upload: the bound is the backend's ceiling, not the 10s
+    # per-render figure that is the Developer API's.
+    assert omni["duration_seconds"] == OMNI_VERTEX_SOURCE_MAX_SECONDS
     assert "upper bound" in omni["duration_source"]
 
     # It agrees with the tool built for edits, to the cent.

@@ -402,7 +402,14 @@ async def test_the_planner_never_silently_hands_over_a_route_the_tool_refuses(
     import dataclasses
 
     given = constraints or RoutingConstraints()
-    plan = plan_generation(intent, dataclasses.replace(given, backend=backend))
+    # _tool_ctx always carries a Gemini API client, and the server sends omni
+    # there whenever a key is present -- so the planner is told, as the MCP
+    # tool tells it. Without this the planner priced Vertex's 30s upload
+    # ceiling for a chain the tool quoted on the Developer API.
+    plan = plan_generation(
+        intent,
+        dataclasses.replace(given, backend=backend, gemini_api_key_available=True),
+    )
     assert plan.routes or plan.conflicts, "no routes and no explanation"
     import src.__main__ as server
 
