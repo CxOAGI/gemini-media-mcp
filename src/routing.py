@@ -1254,7 +1254,11 @@ _BEAT_PATTERN = re.compile(
     # "per sec", "/second", "-per-second", "/s". The first guard knew only the
     # first spelling, so "a 24 frames per sec animation" planned 20 beats at
     # $12.00 in place of one $0.60 render.
-    r"|keyframes?|frames?(?!\s*(?:-\s*)?(?:per[\s\-]*|/\s*)(?:sec(?:ond)?s?|s)\b))\b"
+    # ... and "a second", "every second", "each second", "per minute": the
+    # guard was an enumeration of one word, and "24 frames a second" still
+    # planned 20 paid beats one word away from the spelling it knew.
+    r"|keyframes?|frames?(?!\s*(?:-\s*)?(?:(?:per|a|every|each)[\s\-]*|/\s*)"
+    r"(?:sec(?:ond)?s?|s|min(?:ute)?s?)\b))\b"
 )
 
 # "up to 6 reference images", "3 reference photos". Same lookbehind as the beat
@@ -1320,14 +1324,16 @@ _AUDIO_NEGATORS: tuple[str, ...] = _NEGATORS + ("silent", "mute", "muted")
 # before a term can negate it.
 _NEGATION_WINDOW = 3
 
-# How much text is handed to that check, in characters. _negator_precedes reads
+# How much text is handed to that check, in WORDS. _negator_precedes reads
 # only the last _NEGATION_WINDOW words of the current clause, but it was handed
 # the ENTIRE prefix and re-split it on every match -- so a fully negated intent
 # cost O(matches x length): "no video " x 6000 took 2.6s, x 12000 took 9.9s,
-# inline on the event loop. A negator is a short word, so a window this wide
-# always contains the whole of the three words that matter (widened back to a
-# word boundary so it never starts mid-token).
-_NEGATION_LOOKBACK_CHARS = 120
+# inline on the event loop. A first fix handed it a 120-character window, and a
+# single token longer than that between the negator and the term cut the
+# negator off ("no " + 130-char hashtag + " video" stopped reading as
+# negated). Stepping back one whitespace at a time is exact whatever the token
+# lengths, and still linear: each step costs the length of one word.
+_NEGATION_LOOKBACK_WORDS = _NEGATION_WINDOW + 1
 
 # The longest intent the planner will read. It is pure string work, but it is
 # not free -- see _NEGATION_LOOKBACK_CHARS -- and nothing above this length is
@@ -1377,12 +1383,15 @@ def _is_negated(text: str, term: str) -> bool:
     for match in pattern.finditer(text):
         found = True
         start = match.start()
-        low = max(0, start - _NEGATION_LOOKBACK_CHARS)
-        if low > 0:
-            # Back up to a word boundary, or a cut token ("techno" -> "no")
-            # could read as a negator.
-            boundary = text.rfind(" ", 0, low)
-            low = boundary + 1 if boundary >= 0 else 0
+        low = start
+        for _ in range(_NEGATION_LOOKBACK_WORDS):
+            # One whitespace back per word; stop at the start of the text.
+            # Always lands on a boundary, so no token is ever cut mid-way.
+            boundary = text.rfind(" ", 0, max(0, low - 1))
+            if boundary < 0:
+                low = 0
+                break
+            low = boundary
         if not _negator_precedes(text[low:start], negators):
             return False
     return found

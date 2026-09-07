@@ -115,8 +115,12 @@ def test_inline_credentials_survive_a_lifespan_cleanup_cycle(
     assert second is None
     assert set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json"))) == before
 
-    # The inline JSON is still where the operator put it, untouched.
-    assert os.environ["GOOGLE_APPLICATION_CREDENTIALS"] == service_account_json
+    # The inline JSON is kept -- under the variable that means "inline". The
+    # path variable is cleared, because google-auth reads it as a FILE PATH and
+    # its error for a missing file quotes the variable's whole value: with key
+    # text there, the private key was returned to the MCP caller.
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ
+    assert os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] == service_account_json
     found = main_mod._service_account_credentials()
     assert found is not None
     creds, project = found
@@ -203,3 +207,67 @@ def test_both_calendars_are_pinned_for_the_suite() -> None:
     assert image.date is not datetime.date, "image clock is not pinned"
     assert image.date.today() == omni._today()
     assert isinstance(image.date.today(), datetime.date)
+
+
+def test_the_image_models_vertex_client_gets_the_same_credentials(
+    monkeypatch: pytest.MonkeyPatch, service_account_json: str
+) -> None:
+    """image.py builds its own Vertex client for the Gemini-3 image models, and
+    it was the one client the credentials redesign missed: on an inline-JSON
+    deployment it fell into ADC, found nothing, and every default-model image
+    render failed with DefaultCredentialsError while Veo and omni worked."""
+    import src.image as image
+
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", service_account_json)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+
+    built: list[dict[str, object]] = []
+    monkeypatch.setattr(image.genai, "Client", lambda **kw: built.append(kw) or object())
+    monkeypatch.setattr(image, "_vertex_global_client", None)
+
+    image._get_vertex_global_client()
+    assert built and built[0]["vertexai"] is True
+    assert built[0]["location"] == "global"
+    assert built[0]["credentials"] is not None
+    assert built[0]["project"] == "proj-x"
+    # Same object the server's own clients hold.
+    assert built[0]["credentials"] is main_mod._service_account_credentials()[0]  # type: ignore[index]
+
+
+def test_a_key_without_a_project_fails_with_the_missing_name_not_adc(
+    monkeypatch: pytest.MonkeyPatch, service_account_json: str
+) -> None:
+    """google-genai calls google.auth.default() whenever project is None,
+    whatever credentials it was handed -- so a key with no project_id and no
+    GOOGLE_CLOUD_PROJECT tumbled into ADC discovery (and, in a container, a
+    metadata-server probe) instead of saying what was missing."""
+    info = json.loads(service_account_json)
+    info.pop("project_id")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", json.dumps(info))
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+
+    with pytest.raises(ValueError, match="GOOGLE_CLOUD_PROJECT"):
+        main_mod.create_client()
+
+
+def test_key_text_never_stays_in_the_path_variable(
+    monkeypatch: pytest.MonkeyPatch, service_account_json: str
+) -> None:
+    """Whichever spelling the operator used, after setup no variable that
+    google-auth reads as a path holds key text -- the precondition for its
+    "File {...} was not found" message ever containing a private key."""
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", service_account_json)
+
+    setup_vertex_credentials()
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ
+    assert "BEGIN PRIVATE KEY" in os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    # And a real path is left alone.
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/etc/gcp/key.json")
+    setup_vertex_credentials()
+    assert os.environ["GOOGLE_APPLICATION_CREDENTIALS"] == "/etc/gcp/key.json"

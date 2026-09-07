@@ -140,10 +140,18 @@ def _prepare_image_input(image_bytes: bytes) -> types.Image:
 
     The size is read from the header before anything is materialised, so an
     oversized source is refused without ever being decoded. A PNG or JPEG in a
-    mode the service accepts is sent as the bytes it arrived as: the caller's
-    encoding is already the right one, and re-encoding it bought nothing but
-    CPU and, for JPEG, a many-fold larger payload. Only other formats and
-    modes (WEBP, GIF, palette, LA) are decoded and converted.
+    mode the service accepts is sent as the bytes it arrived as -- decoded once
+    to prove they are whole, but not re-encoded: the caller's encoding is
+    already the right one, and re-encoding bought nothing but CPU and, for
+    JPEG, a many-fold larger payload. That decode is deliberate. The first
+    cut of the pass-through skipped it, and a truncated or data-less file
+    that the old code refused locally ("image file is truncated") went onto
+    the wire to fail as an opaque 400 after the upload; with the pixel cap
+    enforced first and this running off the loop, the decode is bounded and
+    cheap. Other formats and modes are converted -- to PNG, never to lossy
+    JPEG, so a lossless WEBP, BMP or TIFF reference keeps its fidelity (the
+    first cut recompressed those at JPEG q75); only a JPEG source is
+    re-encoded as JPEG.
     """
     from .image import _MAX_SOURCE_PIXELS, _megapixels  # shared ceiling
 
@@ -158,13 +166,16 @@ def _prepare_image_input(image_bytes: bytes) -> types.Image:
             )
         source_format = probe.format
         mode = probe.mode
+        # Whole-file check: a truncated stream raises here, locally, as before.
+        probe.load()
         if source_format == "PNG" and mode in ("RGB", "RGBA"):
             return types.Image(image_bytes=image_bytes, mime_type="image/png")
         if source_format == "JPEG" and mode == "RGB":
             return types.Image(image_bytes=image_bytes, mime_type="image/jpeg")
-        # Anything else is normalised: alpha keeps PNG, everything else JPEG.
-        fmt = "PNG" if mode in ("RGBA", "LA", "P") and source_format != "JPEG" else "JPEG"
-        converted = probe.convert("RGBA" if fmt == "PNG" else "RGB")
+        # Anything else is normalised. Lossless stays lossless: PNG unless
+        # the source was itself a JPEG.
+        fmt = "JPEG" if source_format == "JPEG" else "PNG"
+        converted = probe.convert("RGB" if fmt == "JPEG" else "RGBA")
     try:
         buf = BytesIO()
         converted.save(buf, format=fmt)

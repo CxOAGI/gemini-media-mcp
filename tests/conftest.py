@@ -18,8 +18,10 @@ from __future__ import annotations
 import datetime
 import functools
 import json
+import os
 
 import pytest
+from collections.abc import Iterator
 
 import src.__main__ as _server
 import src.image as image
@@ -64,10 +66,42 @@ def _pin_the_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
 # from_service_account_info path gets a real-shaped key, minted once.
 # ---------------------------------------------------------------------------
 
+_CREDENTIAL_ENV = (
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_credential_environment() -> Iterator[None]:
+    """Snapshot the credential variables and put them back after every test.
+
+    src.credentials.normalize_environment writes GOOGLE_SERVICE_ACCOUNT_JSON
+    and deletes GOOGLE_APPLICATION_CREDENTIALS directly -- the point of it, in
+    production. But monkeypatch.delenv on a variable that was ABSENT records
+    nothing to restore, so a placeholder key one test normalised into the
+    environment leaked into the next, which then failed with "not a usable
+    service-account key" having set no key at all.
+    """
+    before = {name: os.environ.get(name) for name in _CREDENTIAL_ENV}
+    yield
+    for name, value in before.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 @pytest.fixture(autouse=True)
 def _forget_service_account_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    # raising=False: the suite is sometimes run against an older src/ to prove
-    # a new test fails there, and these attributes may not exist yet.
+    # The memo lives in src.credentials now (shared with image.py). raising=
+    # False: the suite is sometimes run against an older src/ to prove a new
+    # test fails there, and the module may not exist yet.
+    import src.credentials as creds
+
+    monkeypatch.setattr(creds, "_creds", None, raising=False)
+    monkeypatch.setattr(creds, "_project", None, raising=False)
     monkeypatch.setattr(_server, "_service_account_creds", None, raising=False)
     monkeypatch.setattr(_server, "_service_account_project", None, raising=False)
 

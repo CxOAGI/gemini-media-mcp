@@ -1676,12 +1676,19 @@ def test_other_formats_are_normalised_to_something_the_service_accepts() -> None
 
     from src.video import _prepare_image_input
 
+    # Lossless stays lossless: an RGB WEBP/BMP/TIFF reference is converted to
+    # PNG, never to JPEG q75 (the first cut of the pass-through did that).
     webp = _prepare_image_input(_encoded("WEBP"))
-    assert webp.mime_type == "image/jpeg"
-    assert Image.open(BytesIO(webp.image_bytes)).format == "JPEG"
+    assert webp.mime_type == "image/png"
+    assert Image.open(BytesIO(webp.image_bytes)).format == "PNG"
+    bmp = _prepare_image_input(_encoded("BMP"))
+    assert bmp.mime_type == "image/png"
     palette = _prepare_image_input(_encoded("PNG", mode="P"))
     assert palette.mime_type == "image/png"
     assert Image.open(BytesIO(palette.image_bytes)).mode == "RGBA"
+    # Only a JPEG source is re-encoded as JPEG (e.g. a CMYK JPEG).
+    cmyk = _prepare_image_input(_encoded("JPEG", mode="CMYK"))
+    assert cmyk.mime_type == "image/jpeg"
 
 
 def test_an_oversized_input_is_refused_from_its_header_without_decoding() -> None:
@@ -1729,3 +1736,19 @@ def test_image_inputs_are_prepared_off_the_event_loop() -> None:
     # And no bare call is left in the coroutine body.
     body = source[source.index("async def generate_video(") :]
     assert not re.search(r"^\s+\w+ = _prepare_image_input\(", body, re.M)
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
+def test_a_truncated_input_is_refused_locally_not_on_the_wire(fmt: str) -> None:
+    """The old full decode refused a truncated file with "image file is
+    truncated". The first cut of the pass-through skipped the decode, so the
+    same file went onto the wire to fail as an opaque API 400 after the
+    upload. The bytes are decoded once (off the loop, under the pixel cap) to
+    prove they are whole, and still sent as they arrived."""
+    from src.video import _prepare_image_input
+
+    whole = _encoded(fmt, size=(400, 300))
+    with pytest.raises(OSError):
+        _prepare_image_input(whole[: len(whole) // 2])
+    # A whole file is still passed through untouched.
+    assert _prepare_image_input(whole).image_bytes is whole
