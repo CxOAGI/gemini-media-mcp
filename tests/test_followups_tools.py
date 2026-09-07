@@ -578,3 +578,317 @@ def test_setup_vertex_credentials_no_sa_json_still_returns_none(
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
 
     assert setup_vertex_credentials() is None
+
+
+# ===========================================================================
+# A draft is not a Veo call
+#
+# generate_video resolves the Veo client and the GCS destination in a
+# pre-flight so a dry_run refuses everything the render refuses. Hoisting that
+# above the draft branch applied Veo's rejections to a call that routes to
+# omni, and both of them fire on parameters the draft documents as IGNORED.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_draft_reports_output_gcs_uri_as_ignored_instead_of_refusing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_resolve_video_gcs` ran before the draft branch on a Gemini-API ctx.
+
+    It raises "output_gcs_uri requires Vertex AI mode" for a non-Vertex
+    client, so `draft=True, output_gcs_uri=...` errored -- even though
+    `_draft_ignored_veo_params` lists output_gcs_uri as ignored and builds a
+    warning naming it, which sat downstream and had become unreachable.
+    """
+    from src.__main__ import generate_video
+
+    ctx = _ctx(_app_ctx(tmp_path))
+    out = tmp_path / "videos" / "draft.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"mp4")
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        return _omni_result(f"file://{out}")
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+
+    result = json.loads(
+        await generate_video(
+            ctx=ctx,
+            prompt="a cat",
+            model="veo-3.1-fast-generate-001",
+            draft=True,
+            output_gcs_uri="gs://bucket/out/",
+        )
+    )
+    assert "error" not in result, result
+    warning = next(w for w in result["warnings"] if "ignored Veo-only" in w)
+    assert "output_gcs_uri" in warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_draft_dry_run_prices_a_gcs_request_it_will_ignore(
+    tmp_path: Path,
+) -> None:
+    """The quote must not refuse what the draft render happily ignores."""
+    from src.__main__ import generate_video
+
+    result = json.loads(
+        await generate_video(
+            ctx=_ctx(_app_ctx(tmp_path)),
+            prompt="a cat",
+            model="veo-3.1-fast-generate-001",
+            draft=True,
+            dry_run=True,
+            output_gcs_uri="gs://bucket/out/",
+        )
+    )
+    assert "error" not in result, result
+    assert result["dry_run"] is True
+    assert "output_gcs_uri" in result["ignored_veo_params"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_draft_never_resolves_a_client_for_the_veo_model_it_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_client_for_video_model` raises for a Lite model on Vertex with no key.
+
+    The draft renders on omni and never uses that client, so resolving it
+    turned a working draft into a RuntimeError about a model it does not
+    touch. Asserted by making the resolver fail outright: if the draft path
+    calls it at all, this test fails.
+    """
+    from src.__main__ import generate_video
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the draft path must not resolve a Veo client")
+
+    monkeypatch.setattr("src.__main__._client_for_video_model", boom)
+
+    result = json.loads(
+        await generate_video(
+            ctx=_ctx(_app_ctx(tmp_path)),
+            prompt="a cat",
+            model="veo-3.1-lite-generate-preview",
+            draft=True,
+            dry_run=True,
+        )
+    )
+    assert "error" not in result, result
+    assert result["dry_run"] is True
+
+
+# ===========================================================================
+# An ignored parameter must be ignored, and a failure must be a body
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_animatic_resolution_is_ignored_when_animatic_is_false(
+    tmp_path: Path,
+) -> None:
+    """It was validated above the try, and unconditionally.
+
+    So generate_clip(animatic=False, animatic_resolution="9000p") raised
+    ValueError straight out of the tool -- past the handler that turns every
+    other failure into an {"error": ...} body -- on a parameter the docstring
+    calls "Ignored unless animatic is True".
+    """
+    from src.__main__ import generate_clip
+
+    result = json.loads(
+        await generate_clip(
+            ctx=_ctx(_app_ctx(tmp_path)),
+            beats=[{"prompt": "a cat"}],
+            animatic=False,
+            animatic_resolution="9000p",
+            dry_run=True,
+        )
+    )
+    assert "error" not in result, result
+    assert result["dry_run"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_bad_animatic_resolution_is_an_error_body_not_a_raise(
+    tmp_path: Path,
+) -> None:
+    """When it DOES apply, it still fails the way every other input fails."""
+    from src.__main__ import generate_clip
+
+    result = json.loads(
+        await generate_clip(
+            ctx=_ctx(_app_ctx(tmp_path)),
+            beats=[{"prompt": "a cat"}],
+            animatic=True,
+            animatic_resolution="9000p",
+            dry_run=True,
+        )
+    )
+    assert "9000p" in result["error"]
+
+
+# ===========================================================================
+# An interaction must stay findable past the sidecar read cap
+# ===========================================================================
+
+
+def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> None:
+    """Only the newest _SIDECAR_SCAN_LIMIT sidecars are ever READ.
+
+    So past 200 renders an older interaction returned None from a directory
+    that plainly contained it, and every fact PriorInteraction carries went
+    with it: prefer_backend fell back to None, so a chain's last turn carrying
+    output_gcs_uri could be routed to Vertex holding a Gemini-API-minted id --
+    the exact failure PriorInteraction was added to fix -- and
+    extend_video_omni's `prior.model != spec.model` refusal was disabled.
+    """
+    import time
+
+    from src.__main__ import (
+        _SIDECAR_SCAN_LIMIT,
+        _manifest_for_interaction,
+        _prior_interaction,
+        _write_sidecar,
+    )
+    from src.omni import OMNI_1_1_MODEL
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    # Written first, so it sorts oldest and falls outside the read window.
+    buried = videos_dir / "buried.mp4"
+    buried.write_bytes(b"mp4")
+    _write_sidecar(
+        f"file://{buried}",
+        {
+            "interaction_id": "i-buried",
+            "backend": "gemini_api",
+            "model": OMNI_1_1_MODEL,
+            "duration_seconds": 7.5,
+        },
+    )
+    time.sleep(0.01)
+
+    for i in range(_SIDECAR_SCAN_LIMIT * 2):
+        media = videos_dir / f"r{i}.mp4"
+        media.write_bytes(b"mp4")
+        _write_sidecar(
+            f"file://{media}",
+            {
+                "interaction_id": f"i-{i}",
+                "backend": "vertex",
+                "model": OMNI_1_1_MODEL,
+                "duration_seconds": 1.0,
+            },
+        )
+
+    manifest = _manifest_for_interaction(videos_dir, "i-buried")
+    assert manifest is not None, "the interaction is in the directory"
+    assert manifest["interaction_id"] == "i-buried"
+
+    prior = _prior_interaction(videos_dir, "i-buried")
+    assert prior.backend == "gemini_api"
+    assert prior.model == OMNI_1_1_MODEL
+    assert prior.duration_seconds == 7.5
+
+
+def test_the_interaction_index_does_not_invent_a_match(tmp_path: Path) -> None:
+    """An id that was never recorded still resolves to nothing."""
+    from src.__main__ import _manifest_for_interaction, _write_sidecar
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    media = videos_dir / "one.mp4"
+    media.write_bytes(b"mp4")
+    _write_sidecar(f"file://{media}", {"interaction_id": "i-real"})
+
+    assert _manifest_for_interaction(videos_dir, "i-nope") is None
+    assert _manifest_for_interaction(videos_dir, "i-real") is not None
+
+
+def test_a_recent_interaction_still_resolves_without_an_index(
+    tmp_path: Path,
+) -> None:
+    """The scan remains the fallback for sidecars written before the index."""
+    import shutil
+
+    from src.__main__ import (
+        _INTERACTION_INDEX_DIRNAME,
+        _manifest_for_interaction,
+        _write_sidecar,
+    )
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    media = videos_dir / "recent.mp4"
+    media.write_bytes(b"mp4")
+    _write_sidecar(f"file://{media}", {"interaction_id": "i-recent"})
+
+    shutil.rmtree(videos_dir / _INTERACTION_INDEX_DIRNAME)
+    assert _manifest_for_interaction(videos_dir, "i-recent") is not None
+
+
+def test_the_index_is_not_mistaken_for_a_sidecar(tmp_path: Path) -> None:
+    """The `*.json` glob must not see index entries.
+
+    They live in a subdirectory for exactly this reason: an index entry read
+    as a manifest would be a record with no model, backend or duration.
+    """
+    from src.__main__ import _write_sidecar
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    media = videos_dir / "one.mp4"
+    media.write_bytes(b"mp4")
+    _write_sidecar(f"file://{media}", {"interaction_id": "i-1"})
+
+    assert [p.name for p in videos_dir.glob("*.json")] == ["one.json"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_storyboard_text_fields_are_bounded(tmp_path: Path) -> None:
+    """A generous cap on the text a board draws.
+
+    Not the fix for the quadratic layout -- `_split_overlong` and `_ellipsize`
+    binary-search their cuts now -- but a bound on memory and wasted work for
+    input that cannot be meant seriously. Deliberately far above any real
+    prompt, since `prompt` is also what the image model receives.
+    """
+    from src.__main__ import MAX_STORYBOARD_TEXT_CHARS, generate_storyboard
+
+    over = "x" * (MAX_STORYBOARD_TEXT_CHARS + 1)
+
+    blocks = await generate_storyboard(
+        ctx=_ctx(_app_ctx(tmp_path)),
+        shots=[{"prompt": over}],
+        dry_run=True,
+    )
+    payload = json.loads(blocks[0].text)
+    assert str(MAX_STORYBOARD_TEXT_CHARS) in payload["error"]
+
+    blocks = await generate_storyboard(
+        ctx=_ctx(_app_ctx(tmp_path)),
+        shots=[{"prompt": "a cat"}],
+        title=over,
+        dry_run=True,
+    )
+    payload = json.loads(blocks[0].text)
+    assert "title" in payload["error"]
+
+    # A long-but-plausible prompt is still accepted.
+    blocks = await generate_storyboard(
+        ctx=_ctx(_app_ctx(tmp_path)),
+        shots=[{"prompt": "a cat " * 300}],
+        dry_run=True,
+    )
+    payload = json.loads(blocks[0].text)
+    assert "error" not in payload, payload

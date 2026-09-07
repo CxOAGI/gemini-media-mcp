@@ -244,7 +244,7 @@ Generate videos using VEO models. Video works on **both** credential modes: Veo 
 - `negative_prompt`: Things to avoid in the video
 - `seed`: Random seed for reproducibility
 - `image_uri`: First frame image URI for image-to-video generation
-- `draft` (default `false`): When `true`, routes the request to `gemini-omni-flash-preview` for a fast 720p draft instead of Veo. Iterate fast, then re-run with `draft=false` to finalize on Veo. At 720p this buys speed, not savings (omni is $0.10136/s against Veo Fast's $0.10/s) — add `draft_resolution="360p"` and it buys both. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
+- `draft` (default `false`): When `true`, routes the request to `gemini-omni-1.1-flash` for a fast 720p draft instead of Veo. Iterate fast, then re-run with `draft=false` to finalize on Veo. At 720p this buys speed, not savings (omni is $0.10136/s against Veo Fast's $0.10/s) — add `draft_resolution="360p"` and it buys both. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
 - `draft_resolution`: Resolution for a `draft=true` pass. Naming one renders the draft on `gemini-omni-1.1-flash`, the model that has a resolution parameter; `360p` is about a third of the 720p price and the cheapest render this server can issue. Unset keeps the preview model's fixed 720p.
 
 **Additional Parameters:**
@@ -272,7 +272,7 @@ Fast conversational video generation through Google's Omni models (Interactions 
 
 Two models, selected with `omni_model`:
 
-| | `gemini-omni-flash-preview` (default) | `gemini-omni-1.1-flash` |
+| | `gemini-omni-flash-preview` (switched off 2026-09-30) | `gemini-omni-1.1-flash` (default) |
 |---|---|---|
 | Output | 720p / 24fps, fixed | 360p, 720p, 1080p, 4K |
 | Conversational editing | yes | yes |
@@ -294,7 +294,7 @@ Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast
 
 **Parameters:**
 - `prompt` (required): Text description of the video. Timecodes work in plain language (`"[0-3s] a person walks"`), as does audio direction (`"include calm background music"`). If you write your own role tags (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) they are passed through untouched; otherwise the declarations are generated from the media arguments and echoed back as `effective_prompt`
-- `omni_model`: `gemini-omni-flash-preview` (default) or `gemini-omni-1.1-flash`. Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K. Pass the Gemini-API spelling on either backend: Vertex AI publishes 1.1 as `gemini-omni-1.1-flash-preview` and the translation is automatic, with the canonical ID reported back and the served one alongside it as `served_model`
+- `omni_model`: `gemini-omni-1.1-flash` (default) or `gemini-omni-flash-preview` (switched off 2026-09-30). Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K. Pass the Gemini-API spelling on either backend: Vertex AI publishes 1.1 as `gemini-omni-1.1-flash-preview` and the translation is automatic, with the canonical ID reported back and the served one alongside it as `served_model`
 - `image_uris`: Image URIs whose role the model infers — one is a starting frame, several are subject references (optional; **at most 8 images total** — more is rejected, since each is buffered in memory)
 - `first_frame_uri` / `last_frame_uri` (1.1): Keyframe interpolation. `last_frame_uri` requires `first_frame_uri`; the same URI for both makes a seamless loop
 - `reference_image_uris` (1.1): Subject/style references, bound to `<IMAGE_REF_0>`, `<IMAGE_REF_1>`, … in order
@@ -393,7 +393,7 @@ This is the highest-leverage tool in the server: one call produces a whole seque
 - `include_audio` (default `true`): Audio per beat (Vertex only)
 - `beats` are capped at 20 per call — each is a billed Veo render, and `add_bridges` nearly doubles that. Split longer sequences into several clips
 - `add_bridges`: Generate a transition between consecutive beats using the last frame of beat N and the first frame of beat N+1. Requires local (`file://`) beat outputs
-- `animatic`: Render every beat with `gemini-omni-flash-preview` (fast 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
+- `animatic`: Render every beat with `gemini-omni-1.1-flash` (fast 720p) for a **storyboard preview of the whole reel** before committing to full Veo renders. Bridges and Veo-only controls (`seed`, `negative_prompt`) are ignored in this mode
 - `animatic_resolution`: Resolution for the animatic pass. Naming one renders it on `gemini-omni-1.1-flash`; `360p` is a third of the 720p price, which is what turns the preview from roughly the cost of the delivery render into a real saving on a long reel
 - `output_gcs_uri`: GCS URI for all outputs
 
@@ -431,7 +431,7 @@ Same primitive as `generate_transition`, but takes **two clips instead of two st
 
 There are two video paths, and you choose based on where you are in the workflow:
 
-- **`gemini-omni-flash-preview` (fastest turnaround)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, no negative prompts, no first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video(draft=true)`, and `generate_clip(animatic=true)`.
+- **`gemini-omni-flash-preview` (retiring)** — 720p, 24fps, conversational multi-turn editing. No seeds, no negative prompts, no first/last-frame control. **Switched off on 2026-09-30**; reachable only by pinning `omni_model="gemini-omni-flash-preview"`, which warns with that date. The draft and animatic paths no longer route here.
 - **`gemini-omni-1.1-flash` (fast, and far more controllable)** — everything above plus 360p/1080p/4K output, first/last-frame interpolation, video references, native audio and scene extension. Still no seeds and no negative prompts. Reached by passing `omni_model="gemini-omni-1.1-flash"` to `generate_video_omni` or `edit_video`, and by `extend_video_omni`.
 - **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds for reproducibility, first/last-frame control, reference images, and extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
 
@@ -439,9 +439,9 @@ Typical workflows (`plan_generation` recommends these as ordered `workflow` step
 - **cheap draft → finalize**: run `generate_video_omni(omni_model="gemini-omni-1.1-flash", resolution="360p")` for a preview at roughly a third of the 720p price, then re-run at `720p`/`1080p`/`4K` — or on Veo — once the shot is right. The equivalent shortcuts are `generate_video(draft=true, draft_resolution="360p")` and `generate_clip(animatic=true, animatic_resolution="360p")`.
 - **two stills → interpolation**: give `generate_video_omni` a `first_frame_uri` and a `last_frame_uri` on 1.1 and it renders the motion between them — the same job `generate_transition` does on Veo, and the planner now offers both. The same URI for both loops the clip.
 - **draft → finalize**: run `generate_video(draft=true)` to preview quickly on omni, then re-run the same prompt with `draft=false` to render the final on Veo.
-- **animatic → final**: run `generate_clip(animatic=true)` to render each beat via `gemini-omni-flash-preview` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` (the default) to commit to full Veo renders.
+- **animatic → final**: run `generate_clip(animatic=true)` to render each beat via `gemini-omni-1.1-flash` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` (the default) to commit to full Veo renders.
 
-> **Note:** `generate_clip`'s new `animatic` parameter (default `false`) renders each beat through `gemini-omni-flash-preview` instead of Veo, so you can preview an entire reel quickly before committing to full Veo renders (price parity with the fast tier; the saving is real only against the standard tier).
+> **Note:** `generate_clip`'s new `animatic` parameter (default `false`) renders each beat through `gemini-omni-1.1-flash` instead of Veo, so you can preview an entire reel quickly before committing to full Veo renders (price parity with the fast tier; the saving is real only against the standard tier).
 
 ## Google Vertex AI and Gemini Access
 
