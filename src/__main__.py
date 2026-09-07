@@ -203,10 +203,9 @@ def _interaction_index_path(media_dir: Path, interaction_id: str) -> Path:
 def _write_interaction_index(sidecar: Path, metadata: dict[str, Any]) -> None:
     """Record which sidecar holds ``interaction_id``, if there is one.
 
-    Makes the by-id lookup a single read instead of a directory scan, which is
-    what `_manifest_for_interaction` needs to stay correct past
-    _SIDECAR_SCAN_LIMIT sidecars. Stores the sidecar's NAME rather than a copy
-    of the manifest, so the manifest has exactly one home.
+    Makes the by-id lookup a single read instead of a directory scan. Stores
+    the sidecar's NAME rather than a copy of the manifest, so the manifest has
+    exactly one home.
 
     Best-effort: a failure here costs the fast path and falls back to the
     scan, so it must never fail a render that already succeeded.
@@ -243,14 +242,28 @@ def _write_remote_interaction_record(
     interaction_id = manifest.get("interaction_id")
     if not isinstance(interaction_id, str) or not interaction_id:
         return
+    # Only the fields the by-id readers consume -- not the whole manifest,
+    # whose size scales with the caller's prompt. A ~260 KB prompt pushed the
+    # entry past _SIDECAR_MAX_BYTES, the reader skipped it, and with no
+    # sidecar to fall back to the interaction was unfindable: exactly the
+    # cross-backend hazard this record exists to close.
+    record = {
+        key: manifest[key]
+        for key in (
+            "interaction_id",
+            "backend",
+            "model",
+            "duration_seconds",
+            "duration_source",
+            "video_url",
+        )
+        if key in manifest
+    }
     entry = _interaction_index_path(media_dir, interaction_id)
     try:
         entry.parent.mkdir(parents=True, exist_ok=True)
         entry.write_text(
-            json.dumps(
-                {"interaction_id": interaction_id, "manifest": manifest},
-                sort_keys=True,
-            )
+            json.dumps({"interaction_id": interaction_id, "manifest": record}, sort_keys=True)
         )
     except (OSError, TypeError, ValueError) as e:  # pragma: no cover
         logger.warning("Failed to record remote interaction %s: %s", entry, e)
@@ -866,7 +879,14 @@ async def _omni_generate_and_manifest(
         # turn four of a chain renders 40s, not 10s. One rule, keyed on which
         # kind of continuation this was and on the source when it is known.
         effective_duration = omni_continuation_upper_bound(
-            omni_spec(billed_model), result.get("task"), prior.duration_seconds
+            omni_spec(billed_model),
+            result.get("task"),
+            prior.duration_seconds,
+            # The backend this render actually ran on. The parameter was added
+            # and then passed by no caller, so a Vertex edit of an unrecorded
+            # source delivered to gs:// was still billed at the 10s Developer
+            # API bound (~$1.02) against Vertex's 30s (~$3.04).
+            vertexai=client_is_vertex,
         )
         billed_upper_bound = True
         duration_source = (
@@ -2179,10 +2199,6 @@ def _image_cost(
     return _cost_payload(_image_cost_estimate(model, image_size, usage=usage, n=n))
 
 
-# Bounds on the sidecar scan behind an edit_video quote. A media directory is
-# user-controlled and may sit on a network mount, so the lookup is capped in
-# every dimension rather than trusted to finish.
-_SIDECAR_SCAN_LIMIT = 200
 _SIDECAR_MAX_BYTES = 256 * 1024
 _SIDECAR_SCAN_TIMEOUT_SECONDS = 5.0
 
@@ -2300,9 +2316,9 @@ def _source_duration_for_interaction(
     Hardened because the media directory is caller-controlled and may live on
     a network mount: a named pipe among the sidecars made ``read_text`` block
     forever, hanging every edit_video quote. Only regular files are opened,
-    reads are size-capped, and the scan stops after a fixed number of
-    candidates. Anything unreadable is skipped, never fatal — the caller's
-    fallback already reports an unknown source honestly.
+    reads are size-capped, and the index is consulted before any scan.
+    Anything unreadable is skipped, never fatal — the caller's fallback
+    already reports an unknown source honestly.
 
     Args:
         videos_dir: Directory the video sidecars are written to.
@@ -2335,21 +2351,18 @@ def _manifest_for_interaction(
     was created on. The scan stays paranoid — the media directory is
     caller-controlled and may live on a network mount, so only regular files
     are opened, reads are size-capped, and anything unreadable is skipped
-    rather than raised. The scan reads every candidate: a cap of
-    _SIDECAR_SCAN_LIMIT on the reads made it lose any record older than the
-    newest 200, and a lookup that answers None for an id the directory holds
-    is not bounded, it is wrong. A hit backfills the index, so the full walk
-    is paid once per id.
+    rather than raised. The scan reads every candidate -- an earlier cap of
+    200 on the reads made it lose any record older than that, and a lookup
+    that answers None for an id the directory holds is not bounded, it is
+    wrong. A hit backfills the index, so the full walk is paid once per id.
 
-    The index is tried first, and it is what makes this correct rather than
-    merely bounded. Only the newest _SIDECAR_SCAN_LIMIT sidecars are ever
-    read, so past 200 renders an older interaction returned None from a
-    directory that plainly contained it — and every fact `PriorInteraction`
-    exists to carry went with it: `prefer_backend` fell back to None, so the
-    last turn of a chain carrying output_gcs_uri could be routed to Vertex
-    holding a Gemini-API-minted id (the exact failure PriorInteraction was
-    added to fix), and extend_video_omni's `prior.model != spec.model` refusal
-    was disabled too.
+    The index is tried first. Before it existed, an interaction past the
+    newest 200 sidecars returned None from a directory that plainly contained
+    it -- and every fact `PriorInteraction` exists to carry went with it:
+    `prefer_backend` fell back to None, so the last turn of a chain carrying
+    output_gcs_uri could be routed to Vertex holding a Gemini-API-minted id
+    (the exact failure PriorInteraction was added to fix), and
+    extend_video_omni's `prior.model != spec.model` refusal was disabled too.
     """
     entry_path = _interaction_index_path(videos_dir, interaction_id)
     try:
@@ -2402,8 +2415,8 @@ def _manifest_for_interaction(
     # Newest first: an interaction id is chained forward by edits, so the most
     # recent manifest naming it is the closest ancestor of this edit.
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    # Every candidate, not the newest _SIDECAR_SCAN_LIMIT. The cap made the
-    # scan bounded and wrong: a directory with more than 200 renders written
+    # Every candidate, not the newest 200. That cap made the scan bounded and
+    # wrong: a directory with more than 200 renders written
     # before the index existed could not find any older one, and the first
     # version of the index left that as it was while claiming the scan was
     # "still correct for everything written before the index existed". Reads
@@ -5830,7 +5843,12 @@ async def generate_video_omni(
                                 app_ctx, bool(output_gcs_uri)
                             ),
                         )
-                quoted = omni_continuation_upper_bound(spec, "edit", prior_duration)
+                quoted = omni_continuation_upper_bound(
+                    spec,
+                    "edit",
+                    prior_duration,
+                    vertexai=_omni_backend_is_vertex(app_ctx, bool(output_gcs_uri)),
+                )
                 return _respond(
                     app_ctx,
                     {
@@ -6056,7 +6074,16 @@ async def edit_video(
             source_duration = await _source_duration_or_none(
                 app_ctx.videos_dir, previous_interaction_id
             )
-            quoted = omni_continuation_upper_bound(spec, "edit", source_duration)
+            # The edit runs on the backend that minted the interaction, and
+            # that backend's upload ceiling is what bounds an unrecorded
+            # source's length -- 30s on Vertex, 10s on the Developer API.
+            prior = await _prior_interaction_or_empty(app_ctx.videos_dir, previous_interaction_id)
+            quoted = omni_continuation_upper_bound(
+                spec,
+                "edit",
+                source_duration,
+                vertexai=_omni_backend_is_vertex(app_ctx, False, prior.backend),
+            )
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
@@ -6631,7 +6658,7 @@ async def extend_video_omni(
                     "extend_video_omni cancelled after %d of %d turn(s); "
                     "resume from interaction %s",
                     len(segments),
-                    times,
+                    effective_times,
                     chain_id,
                 )
             raise
@@ -6644,7 +6671,7 @@ async def extend_video_omni(
             logger.exception("extend_video_omni failed mid-chain")
             partial = _payload()
             partial["error"] = (
-                f"Extension stopped after {len(segments)} of {times} turn(s). "
+                f"Extension stopped after {len(segments)} of {effective_times} turn(s). "
                 "The turns listed in `segments` rendered and were billed; "
                 "resume by passing the `interaction_id` above back to this "
                 "tool."

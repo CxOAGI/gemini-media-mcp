@@ -4919,9 +4919,12 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
             "edit_video",
             {"previous_interaction_id": "i", "prompt": "x"},
             # An edit's rendered length is chosen by the service, so the quote
-            # is Omni's 10s maximum, plus one frame of encoder overhang so the
+            # is the longest clip it could produce: on Vertex (this case runs
+            # there) an unrecorded source may be a 30s upload, so the bound is
+            # 30s -- not Omni's 10s per-render figure, which is the Developer
+            # API's upload ceiling -- plus one frame of encoder overhang so the
             # bound is a true ceiling.
-            (10 + 1 / 24) * 0.10136,
+            (30 + 1 / 24) * 0.10136,
             id="edit_quotes_the_worst_case",
         ),
     ],

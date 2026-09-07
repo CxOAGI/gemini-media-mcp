@@ -3175,3 +3175,151 @@ async def test_a_remote_delivery_still_records_its_interaction(
     prior = _prior_interaction(tmp_path / "videos", "remote-1")
     assert prior.backend == "gemini_api"  # ...yet the id is still on record
     assert prior.model == OMNI_1_1_MODEL
+
+
+# ============================================================================
+# Third review pass: the vertexai= argument nobody passed, and two leftovers
+# ============================================================================
+
+
+def _vertex_ctx(tmp_path: Path) -> Any:
+    """A Vertex-primary deployment with no Gemini API key."""
+    ctx = _ctx(tmp_path)
+    app_ctx = ctx.request_context.lifespan_context
+    app_ctx.client._api_client.vertexai = True
+    app_ctx.gemini_api_client = None
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_unrecorded_edit_source_is_bounded_by_the_backends_ceiling(
+    tmp_path: Path,
+) -> None:
+    """omni_continuation_upper_bound grew a vertexai= parameter and no caller
+    passed it, so a Vertex edit of an unrecorded source was still bounded at
+    the Developer API's 10s (~$1.02) against Vertex's 30s (~$3.04). All three
+    callers pass it now; this covers the two quote paths."""
+    from src.__main__ import edit_video, generate_video_omni
+
+    def body(out: Any) -> dict[str, Any]:
+        return json.loads(out[0].text if isinstance(out, list) else out)
+
+    vertex = body(
+        await edit_video(
+            ctx=_vertex_ctx(tmp_path),
+            previous_interaction_id="i-unrecorded",
+            prompt="make it anime",
+            dry_run=True,
+        )
+    )
+    assert "error" not in vertex, vertex
+    assert vertex["duration_seconds"] == 30.0
+
+    gemini = body(
+        await edit_video(
+            ctx=_ctx(tmp_path),
+            previous_interaction_id="i-unrecorded",
+            prompt="make it anime",
+            dry_run=True,
+        )
+    )
+    assert gemini["duration_seconds"] == 10.0
+
+    # generate_video_omni's edit path (previous_interaction_id) on Vertex.
+    via_generate = body(
+        await generate_video_omni(
+            ctx=_vertex_ctx(tmp_path),
+            prompt="make it anime",
+            previous_interaction_id="i-unrecorded",
+            dry_run=True,
+        )
+    )
+    assert via_generate["duration_seconds"] == 30.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_mid_chain_failure_reports_the_clamped_denominator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One response carried two denominators: message "1 of 2 turn(s)",
+    planned_turns 2, and error "stopped after 1 of 4 turn(s)"."""
+    from src.__main__ import extend_video_omni
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    (tmp_path / "videos" / "prior.json").write_text(
+        json.dumps(
+            {
+                "interaction_id": "i-25s",
+                "duration_seconds": 25.0,
+                "model": OMNI_1_1_MODEL,
+                "backend": "gemini_api",
+            }
+        )
+    )
+    calls = 0
+
+    async def one_then_fail(**kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("service hiccup")
+        out = tmp_path / "videos" / "t1.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": "i-1",
+            "model": OMNI_1_1_MODEL,
+            "task": "extend",
+            "duration_seconds": None,
+            "aspect_ratio": None,
+            "resolution": None,
+            "rendered_resolution": "720p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", one_then_fail)
+    payload = json.loads(
+        await extend_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            previous_interaction_id="i-25s",
+            times=4,
+        )
+    )
+    assert payload["planned_turns"] == 2
+    assert "1 of 2 turn(s)" in payload["error"], payload["error"]
+    assert "of 4" not in payload["error"]
+
+
+def test_a_remote_record_stays_findable_whatever_the_prompt_length(
+    tmp_path: Path,
+) -> None:
+    """The entry stored the whole manifest, so a ~260 KB prompt pushed it past
+    _SIDECAR_MAX_BYTES and the reader skipped it -- with no sidecar to fall
+    back to, the interaction was unfindable and the cross-backend hazard the
+    record exists to close was back. Only the fields the readers use go in."""
+    from src.__main__ import (
+        _SIDECAR_MAX_BYTES,
+        _interaction_index_path,
+        _prior_interaction,
+        _write_remote_interaction_record,
+    )
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(exist_ok=True)
+    manifest = {
+        "interaction_id": "remote-long",
+        "backend": "vertex",
+        "model": OMNI_1_1_MODEL,
+        "duration_seconds": 9.0,
+        "video_url": "gs://b/x.mp4",
+        "prompt": "p" * (_SIDECAR_MAX_BYTES + 1024),
+        "warnings": ["w" * 4096],
+    }
+    _write_remote_interaction_record(videos_dir, manifest)
+    entry = _interaction_index_path(videos_dir, "remote-long")
+    assert entry.stat().st_size < 4096
+    prior = _prior_interaction(videos_dir, "remote-long")
+    assert (prior.backend, prior.model, prior.duration_seconds) == ("vertex", OMNI_1_1_MODEL, 9.0)

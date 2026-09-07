@@ -741,7 +741,7 @@ async def test_a_bad_animatic_resolution_is_an_error_body_not_a_raise(
 
 
 def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> None:
-    """Only the newest _SIDECAR_SCAN_LIMIT sidecars are ever READ.
+    """Only the newest 200 sidecars were ever READ.
 
     So past 200 renders an older interaction returned None from a directory
     that plainly contained it, and every fact PriorInteraction carries went
@@ -753,7 +753,6 @@ def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> 
     import time
 
     from src.__main__ import (
-        _SIDECAR_SCAN_LIMIT,
         _manifest_for_interaction,
         _prior_interaction,
         _write_sidecar,
@@ -777,7 +776,7 @@ def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> 
     )
     time.sleep(0.01)
 
-    for i in range(_SIDECAR_SCAN_LIMIT * 2):
+    for i in range(400):  # well past the old 200-read cap
         media = videos_dir / f"r{i}.mp4"
         media.write_bytes(b"mp4")
         _write_sidecar(
@@ -910,7 +909,6 @@ def test_a_pre_index_interaction_past_the_old_cap_is_found_and_backfilled(
 
     from src.__main__ import (
         _INTERACTION_INDEX_DIRNAME,
-        _SIDECAR_SCAN_LIMIT,
         _manifest_for_interaction,
         _write_sidecar,
     )
@@ -921,7 +919,7 @@ def test_a_pre_index_interaction_past_the_old_cap_is_found_and_backfilled(
     old.write_bytes(b"mp4")
     _write_sidecar(f"file://{old}", {"interaction_id": "i-preindex", "backend": "vertex"})
     time.sleep(0.01)
-    for i in range(_SIDECAR_SCAN_LIMIT + 50):
+    for i in range(250):  # past the old 200-read cap
         media = videos_dir / f"r{i}.mp4"
         media.write_bytes(b"mp4")
         _write_sidecar(f"file://{media}", {"interaction_id": f"i-{i}"})
