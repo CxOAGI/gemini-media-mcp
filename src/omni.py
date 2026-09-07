@@ -152,6 +152,14 @@ def _access_refusal(
     """
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     text = str(exc)
+    if isinstance(code, int) and code not in (403, 404):
+        # The service SAID what this is. A 400 whose body happens to mention a
+        # 404 (an expired Files-API upload reports NOT_FOUND inside a 400), or
+        # a 504 reading "timed out after 403 seconds", is not an access
+        # problem, and the text matchers below were rewrapping both as
+        # allowlist advice. Those matchers exist for exceptions that carry no
+        # code at all, so they run only then.
+        return None
     # Deliberately narrow. A first cut matched "404"/"403" as substrings and
     # "is not supported for" anywhere, which would have rewrapped a duration
     # 400 or a timeout carrying "4034ms" as an allowlist problem — advice that
@@ -1745,6 +1753,8 @@ def omni_extension_output_lengths(
     source_seconds: float | None,
     times: int,
     per_turn_seconds: float | None = None,
+    *,
+    vertexai: bool = False,
 ) -> list[float]:
     """Billable OUTPUT length of each turn of an extension chain.
 
@@ -1765,10 +1775,17 @@ def omni_extension_output_lengths(
         spec: The model's capability record.
         source_seconds: Length of the clip being extended. This is now
             load-bearing, not decorative: it is the base every turn is billed
-            on top of. None falls back to the longest source the model
+            on top of. None falls back to the longest source the BACKEND
             documents accepting, because assuming a SHORTER source than the
             real one under-quotes, which is the one direction a pre-flight
             may not err in.
+        vertexai: Which backend's upload ceiling the fallback uses. This was
+            missing, and the fallback read the model's 10s figure on both
+            backends -- but Vertex documents 30s for the same upload, so a
+            Vertex quote for an unmeasurable source under-stated by up to 20s
+            per turn ([20.0] against a real 30s source's [40.0]), and a
+            max_cost_usd cap that passed the low figure then billed the high
+            one. The invariant above was stated and not kept.
         times: How many turns are planned.
         per_turn_seconds: Ignored, kept for call-site compatibility. The
             launch post describes extension as fixed 10-second increments and
@@ -1784,7 +1801,7 @@ def omni_extension_output_lengths(
     assembled = (
         float(source_seconds)
         if source_seconds is not None
-        else float(spec.max_uploaded_source_seconds or 0.0)
+        else omni_source_limit_seconds(spec, vertexai=vertexai)
     )
     lengths: list[float] = []
     for _ in range(max(0, times)):
@@ -1795,6 +1812,39 @@ def omni_extension_output_lengths(
         assembled = min(assembled + step, ceiling)
         lengths.append(assembled)
     return lengths
+
+
+def omni_extension_priced_lengths(
+    spec: OmniModelSpec,
+    source_seconds: float | None,
+    times: int,
+    *,
+    vertexai: bool = False,
+) -> list[float]:
+    """The per-turn lengths a quote and a cost cap must PRICE.
+
+    Identical to omni_extension_output_lengths when the source is measured:
+    the chain is clamped at the ceiling and only those turns run. When it is
+    NOT measured the render loop cannot clamp -- the fallback assumes the
+    longest documented source, and cutting a short real source's chain on
+    that guess would render fewer turns than it can take -- so every one of
+    ``times`` turns runs, and every one of them must be priced. The fallback
+    list stops emitting at the ceiling, which is exactly what made the quote
+    and the cap disagree with the loop: a 10s-fallback list has three entries
+    for times=4, the loop ran four, and a $10 cap that passed a $9.14
+    projection billed at least $10.15.
+
+    Turns past the fallback's ceiling are priced AT the ceiling, which is the
+    most any turn can render, so the result is a true upper bound whatever the
+    real source turns out to be.
+    """
+    lengths = omni_extension_output_lengths(
+        spec, source_seconds, times, vertexai=vertexai
+    )
+    if source_seconds is not None or len(lengths) >= times:
+        return lengths
+    ceiling = float(spec.max_extended_seconds or _MAX_DURATION)
+    return lengths + [ceiling] * (times - len(lengths))
 
 
 def omni_extension_refusal(
@@ -1837,7 +1887,11 @@ def omni_extension_appended_seconds(
 
 
 def omni_continuation_upper_bound(
-    spec: OmniModelSpec, task: str | None, source_seconds: float | None
+    spec: OmniModelSpec,
+    task: str | None,
+    source_seconds: float | None,
+    *,
+    vertexai: bool = False,
 ) -> float:
     """Longest clip a continuation could render, for a cost that cannot be measured.
 
@@ -1868,12 +1922,18 @@ def omni_continuation_upper_bound(
         return min(source_seconds + spec.extension_step_seconds, ceiling)
     # An edit re-renders the clip it is given, and the per-render maximum is
     # what the one measurement in hand showed it producing (a 3s source
-    # rendered 10.01s). A source longer than that is only reachable by
-    # extending, which happens HERE and writes a sidecar — so an unrecorded
-    # source is a short one, and assuming the 40s ceiling for it would
-    # over-quote every ordinary edit fourfold.
+    # rendered 10.01s). A source longer than that comes from an extension
+    # chain or from an UPLOAD -- and the upload ceiling is the backend's:
+    # 10s on the Developer API, 30s on Vertex. "An unrecorded source is a
+    # short one" held only for the first backend; on Vertex a 30s upload
+    # edited and delivered to gs:// was bounded at 10s (~$1.02) against
+    # ~$3.04. The 40s extension ceiling is still not assumed here: an edit of
+    # an extended clip has a sidecar, so its length is known.
     if source_seconds is None:
-        return float(_MAX_DURATION)
+        return min(
+            max(float(_MAX_DURATION), omni_source_limit_seconds(spec, vertexai=vertexai)),
+            ceiling,
+        )
     return min(max(float(_MAX_DURATION), source_seconds), ceiling)
 
 

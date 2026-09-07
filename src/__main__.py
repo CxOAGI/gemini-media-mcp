@@ -46,7 +46,7 @@ from .omni import (
     is_omni_model,
     normalize_omni_resolution,
     omni_extension_appended_seconds,
-    omni_extension_output_lengths,
+    omni_extension_priced_lengths,
     omni_continuation_upper_bound,
     omni_source_limit_seconds,
     omni_spec,
@@ -225,6 +225,35 @@ def _write_interaction_index(sidecar: Path, metadata: dict[str, Any]) -> None:
         )
     except OSError as e:  # pragma: no cover - index is an optimisation
         logger.warning("Failed to write interaction index %s: %s", entry, e)
+
+
+def _write_remote_interaction_record(
+    media_dir: Path, manifest: dict[str, Any]
+) -> None:
+    """Record an interaction whose media did not land locally.
+
+    _write_sidecar writes nothing for a gs:// delivery, so a Vertex omni render
+    sent to a bucket left NO local trace of its interaction_id -- and
+    PriorInteraction, which the index exists to serve, came back empty for
+    exactly the Vertex-minted ids that must never be sent to the Gemini
+    Developer API. A real edit_video(previous_interaction_id=<vertex id>) went
+    out on the Gemini client. The manifest itself goes into the index entry
+    here, since there is no sidecar to point at.
+    """
+    interaction_id = manifest.get("interaction_id")
+    if not isinstance(interaction_id, str) or not interaction_id:
+        return
+    entry = _interaction_index_path(media_dir, interaction_id)
+    try:
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(
+            json.dumps(
+                {"interaction_id": interaction_id, "manifest": manifest},
+                sort_keys=True,
+            )
+        )
+    except (OSError, TypeError, ValueError) as e:  # pragma: no cover
+        logger.warning("Failed to record remote interaction %s: %s", entry, e)
 
 
 def _write_sidecar(media_url: str, metadata: dict[str, Any]) -> str | None:
@@ -949,6 +978,9 @@ async def _omni_generate_and_manifest(
         # manifest inline so interaction lineage (previous_interaction_id,
         # ignored params) isn't lost. Matches the Veo tools' fallback.
         result["manifest"] = manifest
+        # And keep it findable by id, or the next continuation cannot learn
+        # which backend minted it.
+        _write_remote_interaction_record(app_ctx.videos_dir, manifest)
     return result
 
 
@@ -1124,7 +1156,9 @@ async def _omni_local_reference_video_warnings(
     warnings: list[str] = []
     for index, uri in enumerate(uris):
         measured = await _probe_local_video_seconds(ctx, uri)
-        if measured is not None and measured > spec.max_reference_video_seconds:
+        if measured is not None and measured > (
+            spec.max_reference_video_seconds + _encoder_allowance_seconds()
+        ):
             warnings.append(_reference_video_over_ceiling(spec, index, measured))
     return warnings
 
@@ -1160,9 +1194,18 @@ async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[
     warnings: list[str] = []
     for index, clip in enumerate(clips):
         measured = await _probe_media(measure_video_duration_bytes, clip)
-        if measured is not None and measured > spec.max_reference_video_seconds:
+        if measured is not None and measured > (
+            spec.max_reference_video_seconds + _encoder_allowance_seconds()
+        ):
             warnings.append(_reference_video_over_ceiling(spec, index, measured))
     return warnings
+
+
+def _encoder_allowance_seconds() -> float:
+    """One frame, for ceilings compared against a measured file (see #14)."""
+    from .pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
+    return float(OMNI_ENCODER_ALLOWANCE_SECONDS)
 
 
 async def _check_omni_source_video(
@@ -1190,11 +1233,17 @@ async def _check_omni_source_video(
     Returns an empty list; it exists to raise, and returns a warning list so
     the call sites read like the other pre-flights.
     """
+    from .pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
     limit = omni_source_limit_seconds(spec, vertexai=vertexai)
     if not limit:
         return []
     measured = await _probe_media(measure_video_duration_bytes, data)
-    if measured is not None and measured > limit:
+    # One frame of tolerance. This server's own 10s omni renders measure
+    # 10.01s (pricing.py documents the allowance for exactly that reason), so
+    # a strict comparison refused to edit or extend a file this server had
+    # just produced, at all four call sites, on both dry_run and real run.
+    if measured is not None and measured > limit + OMNI_ENCODER_ALLOWANCE_SECONDS:
         raise ValueError(
             f"The source video is {measured:.2f}s. An UPLOADED video to edit "
             f"or extend must be {limit:g}s or shorter on "
@@ -2285,10 +2334,12 @@ def _manifest_for_interaction(
     needs a different field off the same record: which backend the interaction
     was created on. The scan stays paranoid — the media directory is
     caller-controlled and may live on a network mount, so only regular files
-    are opened, reads are size-capped, at most _SIDECAR_SCAN_LIMIT of them are
-    READ (the walk itself covers the whole directory; an earlier version of
-    this docstring claimed the walk stopped, which it does not), and anything
-    unreadable is skipped rather than raised.
+    are opened, reads are size-capped, and anything unreadable is skipped
+    rather than raised. The scan reads every candidate: a cap of
+    _SIDECAR_SCAN_LIMIT on the reads made it lose any record older than the
+    newest 200, and a lookup that answers None for an id the directory holds
+    is not bounded, it is wrong. A hit backfills the index, so the full walk
+    is paid once per id.
 
     The index is tried first, and it is what makes this correct rather than
     merely bounded. Only the newest _SIDECAR_SCAN_LIMIT sidecars are ever
@@ -2308,6 +2359,12 @@ def _manifest_for_interaction(
             # The id is re-checked against the manifest below, so a truncated
             # digest that collided would fall through to the scan rather than
             # return the wrong interaction.
+            if isinstance(entry, dict) and isinstance(entry.get("manifest"), dict):
+                # A remote delivery: the manifest lives in the entry, there
+                # being no local sidecar to point at.
+                inline = entry["manifest"]
+                if inline.get("interaction_id") == interaction_id:
+                    return inline
             if isinstance(entry, dict) and isinstance(entry.get("sidecar"), str):
                 # Name only: joining a stored path would let a tampered index
                 # read outside the media directory.
@@ -2324,8 +2381,7 @@ def _manifest_for_interaction(
                         return manifest
     except (OSError, ValueError):
         # No index entry, an unreadable one, or a sidecar that has since been
-        # deleted: fall through to the scan, which is still correct for
-        # everything written before the index existed.
+        # deleted: fall through to the scan.
         pass
 
     candidates: list[tuple[float, Path]] = []
@@ -2346,7 +2402,14 @@ def _manifest_for_interaction(
     # Newest first: an interaction id is chained forward by edits, so the most
     # recent manifest naming it is the closest ancestor of this edit.
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    for _mtime, sidecar in candidates[:_SIDECAR_SCAN_LIMIT]:
+    # Every candidate, not the newest _SIDECAR_SCAN_LIMIT. The cap made the
+    # scan bounded and wrong: a directory with more than 200 renders written
+    # before the index existed could not find any older one, and the first
+    # version of the index left that as it was while claiming the scan was
+    # "still correct for everything written before the index existed". Reads
+    # stay size-capped and regular-file-only; a hit writes the index entry the
+    # record never had, so this full walk happens at most once per id.
+    for _mtime, sidecar in candidates:
         try:
             manifest = json.loads(sidecar.read_text())
         except (OSError, ValueError):
@@ -2354,6 +2417,7 @@ def _manifest_for_interaction(
         if not isinstance(manifest, dict):
             continue
         if manifest.get("interaction_id") == interaction_id:
+            _write_interaction_index(sidecar, manifest)
             return manifest
     return None
 
@@ -2828,7 +2892,12 @@ def _usd_of(cost: Any) -> float:
 
 
 def _over_budget_message(
-    projected_usd: float, max_cost_usd: float, times: int, *, floor: bool = False
+    projected_usd: float,
+    max_cost_usd: float,
+    times: int,
+    *,
+    floor: bool = False,
+    unmeasured: bool = False,
 ) -> str:
     """Why a chain was (or would be) refused against its caller's cap.
 
@@ -2838,11 +2907,24 @@ def _over_budget_message(
     ~1670s — several hundred dollars from one call with only a warning
     between the caller and the invoice.
     """
-    basis = (
-        "a FLOOR (the source could not be measured, so the true bill is higher)"
-        if floor
-        else "the projected bill"
-    )
+    # `times` here is the number of turns PRICED, which the caller takes from
+    # the priced list -- not the number requested. The two differ when the
+    # ceiling cuts a measured chain short, and quoting the requested count
+    # against the clamped sum ("for 4 turn(s) is $9.14") named a number the
+    # adjacent warning had just said would not be billed.
+    # Two callers, two different honest labels. loop_extend (Veo) passes
+    # `floor` when its projection genuinely under-states; extend_video_omni
+    # passes `unmeasured`, where every unmeasured turn is priced at the
+    # ceiling and the figure is therefore an upper bound, not a floor.
+    if unmeasured:
+        basis = (
+            "an UPPER BOUND (the source could not be measured, so every turn is "
+            "priced at the ceiling; the true bill is at most this)"
+        )
+    elif floor:
+        basis = "a FLOOR (the source could not be measured, so the true bill is higher)"
+    else:
+        basis = "the projected bill"
     return (
         f"Refused before rendering: {basis} for {times} extension turn(s) is "
         f"${projected_usd:.2f}, over the max_cost_usd of ${max_cost_usd:.2f} you "
@@ -6243,7 +6325,16 @@ async def extend_video_omni(
                 # pre-flight here does; planned_turns: 0 beside a null cost
                 # said the same thing in a way nothing acts on.
                 raise ValueError(at_ceiling)
-            turn_lengths = omni_extension_output_lengths(spec, source_duration, times)
+            # Priced, not merely planned: with no measured source the loop
+            # below runs every requested turn, so every one is priced, at the
+            # ceiling past the fallback. The fallback itself is the BACKEND's
+            # upload limit -- 30s on Vertex, not the model's 10s.
+            chain_is_vertex = _omni_backend_is_vertex(
+                app_ctx, bool(output_gcs_uri), prior.backend
+            )
+            turn_lengths = omni_extension_priced_lengths(
+                spec, source_duration, times, vertexai=chain_is_vertex
+            )
             appended = omni_extension_appended_seconds(source_duration, turn_lengths)
             payload: dict[str, Any] = {
                 "dry_run": True,
@@ -6273,9 +6364,13 @@ async def extend_video_omni(
                         f"{spec.max_extended_seconds}s total)."
                         if source_duration is not None
                         else " (the source's length is not known here, so the "
-                        f"documented {spec.max_uploaded_source_seconds:g}s "
-                        "maximum is assumed — a shorter real source would "
-                        "quote lower, and assuming one would under-quote)."
+                        "documented "
+                        f"{omni_source_limit_seconds(spec, vertexai=chain_is_vertex):g}s "
+                        "upload maximum for this backend is assumed, and every "
+                        "requested turn is priced -- at the ceiling once the "
+                        "assumed chain reaches it -- because the render cannot "
+                        "shorten a chain it cannot measure. A shorter real "
+                        "source bills less; nothing bills more)."
                     )
                     + " The real run reports the measured length of each turn."
                 ),
@@ -6304,8 +6399,8 @@ async def extend_video_omni(
                         _over_budget_message(
                             projected_usd,
                             max_cost_usd,
-                            times,
-                            floor=source_duration is None,
+                            len(turn_lengths),
+                            unmeasured=source_duration is None,
                         )
                     )
             return _respond(app_ctx, payload)
@@ -6349,7 +6444,12 @@ async def extend_video_omni(
         # The turns that fit under the ceiling -- the same list the quote
         # prices, computed once here so the loop below, this warning and the
         # max_cost_usd projection cannot disagree about how many turns run.
-        turn_lengths = omni_extension_output_lengths(spec, source_duration, times)
+        chain_is_vertex = _omni_backend_is_vertex(
+            app_ctx, bool(output_gcs_uri), prior.backend
+        )
+        turn_lengths = omni_extension_priced_lengths(
+            spec, source_duration, times, vertexai=chain_is_vertex
+        )
         effective_times = times
         if source_duration is not None:
             # Only a MEASURED source may shorten the chain. With no
@@ -6366,7 +6466,10 @@ async def extend_video_omni(
         if max_cost_usd is not None:
             # Refuse BEFORE the first turn bills — same quadratic hazard as
             # loop_extend, same cap. Projected off the turns that will really
-            # run, which is only now the same list the loop uses.
+            # run: the clamped list when the source was measured, and every
+            # requested turn priced at the ceiling when it was not -- the
+            # first cut of this fix clamped the projection but not the loop on
+            # that path, so a $10 cap passed a 3-turn $9.14 and billed 4.
             projected_usd = _usd_of(
                 _omni_extension_quote(
                     spec.model,
@@ -6379,8 +6482,8 @@ async def extend_video_omni(
                     _over_budget_message(
                         projected_usd,
                         max_cost_usd,
-                        times,
-                        floor=source_duration is None,
+                        len(turn_lengths),
+                        unmeasured=source_duration is None,
                     )
                 )
 
@@ -6495,13 +6598,17 @@ async def extend_video_omni(
                     task="extend",
                     duration_seconds=None,
                     resolution=normalized_resolution,
-                    output_gcs_uri=output_gcs_uri if turn == times else None,
+                    # effective_times, not times: on a chain the ceiling cut
+                    # short no turn ever equalled the requested count, so the
+                    # caller's GCS destination was silently never sent and the
+                    # final clip landed locally.
+                    output_gcs_uri=output_gcs_uri if turn == effective_times else None,
                     prefer_backend=chain_backend,
                     timeout_seconds=timeout_seconds,
                     manifest_extra={
                         "kind": "omni_extension",
                         "turn": turn,
-                        "of_turns": times,
+                        "of_turns": effective_times,
                         "input_video_uri": input_video_uri if turn == 1 else None,
                     },
                 )

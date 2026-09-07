@@ -1318,3 +1318,22 @@ def test_write_storyboard_reports_undecodable_shots(tmp_path: Path) -> None:
     ]
     artifacts = write_storyboard(frames, tmp_path, title="T")
     assert artifacts["undecodable_shots"] == "2"
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP"])
+def test_a_truncated_frame_is_flagged_whatever_its_format(fmt: str) -> None:
+    """verify() does not detect truncation for JPEG; load() does.
+
+    A half-written JPEG passed the first normalize_frames, _render_panel drew
+    "SHOT NOT GENERATED" for it, and the board still reported every shot
+    rendered -- the defect the function exists to close, for the one format
+    image.py is most likely to write verbatim.
+    """
+    from src.storyboard import StoryboardFrame, normalize_frames
+
+    whole = make_image(400, 300, fmt=fmt)
+    truncated = whole[: len(whole) // 2]
+    _, undecodable = normalize_frames(
+        [StoryboardFrame(index=1, image_bytes=truncated, prompt="broken")]
+    )
+    assert undecodable == [1], fmt

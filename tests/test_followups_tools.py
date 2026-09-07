@@ -892,3 +892,44 @@ async def test_storyboard_text_fields_are_bounded(tmp_path: Path) -> None:
     )
     payload = json.loads(blocks[0].text)
     assert "error" not in payload, payload
+
+
+def test_a_pre_index_interaction_past_the_old_cap_is_found_and_backfilled(
+    tmp_path: Path,
+) -> None:
+    """An upgrade with >200 existing renders: no index, old cap, lost records.
+
+    The first version of the index left the fallback scan reading only the
+    newest 200 sidecars while its docstring claimed it was "still correct for
+    everything written before the index existed". Position 201 returned None.
+    The scan reads every candidate now and writes the index entry the record
+    never had, so the full walk is paid once per id.
+    """
+    import shutil
+    import time
+
+    from src.__main__ import (
+        _INTERACTION_INDEX_DIRNAME,
+        _SIDECAR_SCAN_LIMIT,
+        _manifest_for_interaction,
+        _write_sidecar,
+    )
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    old = videos_dir / "old.mp4"
+    old.write_bytes(b"mp4")
+    _write_sidecar(f"file://{old}", {"interaction_id": "i-preindex", "backend": "vertex"})
+    time.sleep(0.01)
+    for i in range(_SIDECAR_SCAN_LIMIT + 50):
+        media = videos_dir / f"r{i}.mp4"
+        media.write_bytes(b"mp4")
+        _write_sidecar(f"file://{media}", {"interaction_id": f"i-{i}"})
+    # Simulate the upgrade: these sidecars predate the index entirely.
+    shutil.rmtree(videos_dir / _INTERACTION_INDEX_DIRNAME)
+
+    found = _manifest_for_interaction(videos_dir, "i-preindex")
+    assert found is not None and found["backend"] == "vertex"
+    # And the hit was backfilled, so the next lookup is one read.
+    index_dir = videos_dir / _INTERACTION_INDEX_DIRNAME
+    assert index_dir.exists() and any(index_dir.iterdir())
