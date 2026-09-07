@@ -1,6 +1,6 @@
 """Suite-wide fixtures.
 
-The one thing here is the calendar. `src.omni` asks the real clock whether the
+The one thing here is the calendar -- both of them. `src.omni` asks the real clock whether the
 preview endpoint's switch-off date has passed, and 17 tests across
 `test_omni.py`, `test_wire_contract_omni.py` and `test_routing.py` pass
 `model=OMNI_PREVIEW_MODEL` and expect it to work. On 2026-09-30 the real clock
@@ -19,6 +19,7 @@ import datetime
 
 import pytest
 
+import src.image as image
 import src.omni as omni
 
 # Before OMNI_PREVIEW_SUNSET (2026-09-30), so the preview model still serves and
@@ -36,3 +37,16 @@ def _pin_the_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
     tests to remember to ask for it would not have prevented it.
     """
     monkeypatch.setattr(omni, "_today", lambda: PINNED_TODAY)
+
+    # The second clock. src.image reads `date.today()` directly for the image
+    # model shutdown phrasing, and the first version of this fixture pinned
+    # only omni's -- so test_sunset_model_warning_does_not_claim_it_is_already_
+    # gone would have failed on 2026-10-02 on its own. `date` is imported by
+    # name there, so the class itself is swapped for one whose today() is
+    # pinned; every other date method is inherited unchanged.
+    class _PinnedDate(datetime.date):
+        @classmethod
+        def today(cls) -> datetime.date:  # type: ignore[override]
+            return PINNED_TODAY
+
+    monkeypatch.setattr(image, "date", _PinnedDate)

@@ -120,3 +120,20 @@ def test_inline_credentials_survive_a_lifespan_cleanup_cycle(
     finally:
         if second is not None:
             cleanup_credentials(second)
+
+
+def test_both_calendars_are_pinned_for_the_suite() -> None:
+    """src.image reads date.today() too, and the first pin covered only omni.
+
+    Without this, test_sunset_model_warning_does_not_claim_it_is_already_gone
+    would have failed on 2026-10-02 on its own. The class is swapped rather
+    than the module function, because image.py imports `date` by name.
+    """
+    import datetime
+
+    import src.image as image
+    import src.omni as omni
+
+    assert image.date is not datetime.date, "image clock is not pinned"
+    assert image.date.today() == omni._today()
+    assert isinstance(image.date.today(), datetime.date)

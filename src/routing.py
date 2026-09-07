@@ -1070,6 +1070,20 @@ _MINUTES_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(m|min|mins|minute|minutes)\b"
 )
 
+# "2 minute 30 second", "2 min 30 sec", "2 minutes and 30 seconds" -- one
+# runtime spelled in two units, which is the ONLY case in which the two should
+# be summed. The first fix for the dropped-minutes bug summed whenever both
+# units appeared anywhere in the intent, and any unrelated minute mention
+# became hundreds of seconds of planned runtime: "a 6 second clip of a cat, I
+# need it in 5 minutes" read as 306s and planned a 20-turn extension chain at
+# $14.00 for a 6s clip. Adjacency is what makes "2 minute 30 second" one
+# number; a deadline, a render-time budget or a second deliverable is not.
+_COMPOUND_DURATION_PATTERN = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(?:m|min|mins|minute|minutes)\b"
+    r"\s*(?:,\s*|and\s+)?"
+    r"(\d+(?:\.\d+)?)\s*(?:-|\s)?\s*(?:s|sec|secs|second|seconds)\b"
+)
+
 # "by another 30 seconds", "add 20s", "extend by 2 minutes" — an amount to
 # ADD, not a total. Without this, the plain duration pattern takes the first
 # number in the sentence, so "extend my 8 second clip by another 30 seconds"
@@ -1429,10 +1443,12 @@ def infer_signals(intent: str) -> IntentSignals:
     # A runtime can name BOTH units, and seconds winning outright dropped the
     # minutes on the floor: "a 2 minute 30 second trailer" read as 30s, so a
     # 2.5-minute brief was planned as one sub-8s render with no extension
-    # ceiling handling at all. Sum them when both are present -- that is what
-    # "2 minute 30 second" means -- and fall back to whichever one appeared.
-    if seconds_value is not None and minutes_value is not None:
-        duration = minutes_value * 60.0 + seconds_value
+    # ceiling handling at all. Summed only when the two are ADJACENT (see
+    # _COMPOUND_DURATION_PATTERN); otherwise seconds keep winning, since a
+    # stray minute figure elsewhere is a deadline or a budget, not a runtime.
+    compound = _COMPOUND_DURATION_PATTERN.search(text)
+    if compound is not None:
+        duration = float(compound.group(1)) * 60.0 + float(compound.group(2))
     elif seconds_value is not None:
         duration = seconds_value
     elif minutes_value is not None:
@@ -1845,10 +1861,15 @@ def resolve_request(
     # longer has to come from extensions or several beats.
     #
     # Capped at MAX_SINGLE_RENDER_SECONDS rather than Veo's 8s so an 8-10s ask
-    # stays a one-render request. Veo routes are unaffected: the omni duration
-    # capability check in _duration_rejection returns early for non-omni
-    # models, and _video_route snaps a Veo clip into the 4/6/8s ladder and
-    # says so in a caveat.
+    # stays a one-render request. Veo routes still VALIDATE and PRICE
+    # correctly: the omni duration capability check in _duration_rejection
+    # returns early for non-omni models, and _video_params snaps a Veo clip
+    # into the 4/6/8s ladder and says so in a caveat. What this does NOT do is
+    # re-rank: for a 9-10s ask a Veo route snapped to 8s can still score above
+    # the omni route that renders the full length, because the ranker weighs
+    # cost and fidelity, not duration shortfall. The caveat discloses the
+    # shortfall; preferring the model that meets the duration is a ranking
+    # policy decision left open here.
     total_duration = _first_not_none(given.duration_seconds, signals.duration_seconds)
     if total_duration is None:
         clip_duration = DEFAULT_VIDEO_DURATION_SECONDS

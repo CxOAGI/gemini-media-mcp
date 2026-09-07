@@ -543,11 +543,17 @@ def normalize_frames(
             normalized.append(frame)
             continue
         try:
-            # verify() validates the encoded stream without paying for a full
-            # decode and resample; _render_panel keeps its own try/except for
-            # bytes that pass here and still fail to decode.
+            # load(), not verify(): verify() checks the container and does
+            # not detect truncation for JPEG, so a half-written JPEG passed
+            # here, _render_panel then drew "SHOT NOT GENERATED" for it, and
+            # the board still reported every shot rendered -- the exact
+            # defect this function was added to close. load() is the decode
+            # _prepare_frame_image performs anyway, so this is the same
+            # judgement made once, earlier; the cost is one extra decode per
+            # frame, bounded by the same pixel limits. _render_panel keeps
+            # its own try/except as a last line.
             with Image.open(BytesIO(frame.image_bytes)) as probe:
-                probe.verify()
+                probe.load()
         except Exception as exc:  # noqa: BLE001 - Pillow raises broadly here
             logger.warning(
                 "Shot %s: undecodable image bytes (%s)", frame.index, exc

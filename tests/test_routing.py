@@ -2228,3 +2228,30 @@ def test_a_format_word_is_not_read_out_of_a_narrative(
 ) -> None:
     """"story" is a narrative unless a platform is named; "short" is a length."""
     assert infer_signals(intent).aspect_ratio == expected
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # One runtime in two units: summed.
+        ("a 2 minute 30 second trailer", 150.0),
+        ("a 2 min 30 sec trailer", 150.0),
+        ("2 minutes and 30 seconds of footage", 150.0),
+        ("a 1 minute, 5 second clip", 65.0),
+        # A minute figure that is NOT part of the runtime: seconds win, as
+        # they did before the first fix over-corrected. "I need it in 5
+        # minutes" read as 306s and planned a $14 extension chain for a 6s clip.
+        ("a 6 second clip of a cat, I need it in 5 minutes", 6.0),
+        ("a 2 minute video made of 8 second clips", 8.0),
+        ("a 2 minute trailer and a 30 second teaser", 30.0),
+        ("a 30 second loop, keep it under 2 minutes of render time", 30.0),
+        # Single units unchanged.
+        ("a 2 minute trailer", 120.0),
+        ("a 90 second promo", 90.0),
+    ],
+)
+def test_two_duration_units_are_summed_only_when_adjacent(
+    intent: str, expected: float
+) -> None:
+    """"2 minute 30 second" is one number; a deadline elsewhere is not."""
+    assert infer_signals(intent).duration_seconds == expected

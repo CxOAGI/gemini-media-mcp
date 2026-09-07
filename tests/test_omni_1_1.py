@@ -2876,3 +2876,302 @@ async def test_an_in_range_uploaded_edit_source_still_quotes(tmp_path: Path) -> 
     # prediction.
     assert payload["duration_seconds"] == 10.0
     assert "upper bound" in payload["duration_source"]
+
+
+# ============================================================================
+# Second review pass: the extension chain on the UNMEASURED path
+#
+# The first fix clamped the render loop to the quoted turns, but only when the
+# source had been measured. Where it had not, the quote and the cap were still
+# priced off the clamped fallback list while the loop ran every requested
+# turn -- the same disagreement, reopened on the one path the cap matters
+# most. These pin both halves: what the quote says, and what the loop does.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_unmeasured_source_quotes_every_turn_the_loop_will_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No sidecar for the interaction: the source cannot be measured.
+
+    The loop cannot clamp such a chain (the fallback is a pessimistic guess,
+    and cutting a short real source's chain on it would under-render), so it
+    runs all four turns -- and the quote must say four, priced at the ceiling
+    past the fallback, not three. Before: planned_turns=3 / $9.14 against four
+    impl calls billing at least $10.15.
+    """
+    from src.__main__ import extend_video_omni
+
+    ctx = _ctx(tmp_path)
+    quote = json.loads(
+        await extend_video_omni(
+            ctx=ctx,
+            prompt="Continue.",
+            previous_interaction_id="i-never-recorded",
+            times=4,
+            dry_run=True,
+        )
+    )
+    assert "error" not in quote, quote
+    assert quote["planned_turns"] == 4
+    # 10s fallback -> 20, 30, 40, then the fourth priced AT the ceiling.
+    assert quote["turn_output_seconds"] == [20.0, 30.0, 40.0, 40.0]
+
+    calls = 0
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        out = tmp_path / "videos" / f"u{calls}.mp4"
+        out.parent.mkdir(exist_ok=True)
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": f"i-{calls}",
+            "model": OMNI_1_1_MODEL,
+            "task": "extend",
+            "duration_seconds": None,
+            "aspect_ratio": None,
+            "resolution": None,
+            "rendered_resolution": "720p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+    run = json.loads(
+        await extend_video_omni(
+            ctx=ctx,
+            prompt="Continue.",
+            previous_interaction_id="i-never-recorded",
+            times=4,
+        )
+    )
+    assert "error" not in run, run
+    assert calls == 4
+    assert run["planned_turns"] == 4 == run["completed_turns"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_cap_between_the_clamped_and_real_projection_now_refuses(
+    tmp_path: Path,
+) -> None:
+    """$10 sat above the 3-turn figure and below the 4-turn one, and passed."""
+    from src.__main__ import extend_video_omni
+
+    payload = json.loads(
+        await extend_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            previous_interaction_id="i-never-recorded",
+            times=4,
+            max_cost_usd=10.0,
+        )
+    )
+    assert "error" in payload, payload
+    assert "Refused before rendering" in payload["error"]
+    # Priced as a ceiling, and it says so -- not as a "floor".
+    assert "UPPER BOUND" in payload["error"]
+    assert "for 4 extension turn(s)" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_clamped_chain_treats_its_last_turn_as_the_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clamp left `turn == times` on the final-turn conditions.
+
+    On a chain the ceiling cut from 4 to 2 turns, no turn ever equalled 4, so
+    the caller's output_gcs_uri was silently never sent and every sidecar
+    recorded of_turns=4 for a 2-turn chain. Both follow the clamped count now.
+    """
+    from src.__main__ import extend_video_omni
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    (tmp_path / "videos" / "prior.json").write_text(
+        json.dumps(
+            {
+                "interaction_id": "i-25s",
+                "duration_seconds": 25.0,
+                "model": OMNI_1_1_MODEL,
+                "backend": "gemini_api",
+            }
+        )
+    )
+    seen: list[dict[str, Any]] = []
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        seen.append(kwargs)
+        out = tmp_path / "videos" / f"c{len(seen)}.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": f"i-{len(seen)}",
+            "model": OMNI_1_1_MODEL,
+            "task": "extend",
+            "duration_seconds": None,
+            "aspect_ratio": None,
+            "resolution": None,
+            "rendered_resolution": "720p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+    payload = json.loads(
+        await extend_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            previous_interaction_id="i-25s",
+            times=4,
+        )
+    )
+    assert "error" not in payload, payload
+    assert payload["planned_turns"] == 2 and len(seen) == 2
+    # manifest_extra is folded into the sidecar by the wrapper, so the record
+    # on disk is where of_turns lands -- and where a later reader would see a
+    # 2-turn chain labelled as 4.
+    sidecars = [
+        json.loads(p.read_text())
+        for p in (tmp_path / "videos").glob("*.json")
+        if p.name != "prior.json"
+    ]
+    chain = sorted(
+        (m for m in sidecars if m.get("kind") == "omni_extension"),
+        key=lambda m: m["turn"],
+    )
+    assert [m["turn"] for m in chain] == [1, 2]
+    assert all(m["of_turns"] == 2 for m in chain), chain
+
+
+def test_the_unknown_source_fallbacks_use_the_backends_upload_limit() -> None:
+    """Vertex documents 30s for the same upload the Developer API caps at 10s.
+
+    Both fallbacks read the model's 10s figure on both backends, so a Vertex
+    quote for an unmeasurable source under-stated by up to 20s a turn -- the
+    module's own "assume the longest documented source" invariant, unkept.
+    """
+    from src.omni import (
+        omni_continuation_upper_bound,
+        omni_extension_output_lengths,
+        omni_spec,
+    )
+
+    spec = omni_spec(OMNI_1_1_MODEL)
+    assert omni_extension_output_lengths(spec, None, 1) == [20.0]
+    assert omni_extension_output_lengths(spec, None, 1, vertexai=True) == [40.0]
+    assert omni_continuation_upper_bound(spec, "edit", None) == 10.0
+    assert omni_continuation_upper_bound(spec, "edit", None, vertexai=True) == 30.0
+    # A measured source is unaffected by the backend.
+    assert omni_continuation_upper_bound(spec, "edit", 25.0, vertexai=True) == 25.0
+
+
+@pytest.mark.parametrize(
+    ("code", "text", "is_access"),
+    [
+        (400, "file not found: 404 NOT_FOUND on an expired upload", False),
+        (504, "the request timed out after 403 seconds", False),
+        (404, "model not found", True),
+        (403, "PERMISSION_DENIED", True),
+        (None, "PERMISSION_DENIED: no access", True),
+        (None, "Duration cannot be set", False),
+    ],
+)
+def test_a_known_non_access_code_is_not_rewrapped_as_allowlist_advice(
+    code: int | None, text: str, is_access: bool
+) -> None:
+    """The service SAID what the error is; the text matchers run only when it did not."""
+    from src.omni import _access_refusal
+
+    class Err(Exception):
+        def __init__(self) -> None:
+            super().__init__(text)
+            self.code = code
+
+    got = _access_refusal(Err(), "m", vertexai=False)
+    assert (got is not None) is is_access, got
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_the_servers_own_ten_second_render_can_be_edited(tmp_path: Path) -> None:
+    """omni's 10s renders measure 10.01s; a strict ceiling refused them.
+
+    241 frames at 24fps measures 10.04s and must pass; 252 (10.5s) must not.
+    """
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import generate_video_omni
+
+    def clip(frames: int, name: str) -> Path:
+        buf = BytesIO()
+        iio.imwrite(
+            buf,
+            [np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(frames)],
+            extension=".mp4",
+            fps=24,
+        )
+        path = tmp_path / name
+        path.write_bytes(buf.getvalue())
+        return path
+
+    def body(out: Any) -> dict[str, Any]:
+        return json.loads(out[0].text if isinstance(out, list) else out)
+
+    ok = body(
+        await generate_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="anime",
+            input_video_uri=f"file://{clip(241, 'own_render.mp4')}",
+            dry_run=True,
+        )
+    )
+    assert "error" not in ok, ok
+
+    refused = body(
+        await generate_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="anime",
+            input_video_uri=f"file://{clip(252, 'too_long.mp4')}",
+            dry_run=True,
+        )
+    )
+    assert "10s or shorter" in refused["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_remote_delivery_still_records_its_interaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No sidecar is written for a gs:// URL, so nothing recorded the id.
+
+    PriorInteraction then came back empty for exactly the ids whose backend
+    matters most, and a Vertex-minted id was sent to the Gemini client.
+    """
+    from src.__main__ import _prior_interaction, generate_video_omni
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": "gs://bucket/out/v1.mp4",
+            "interaction_id": "remote-1",
+            "model": OMNI_1_1_MODEL,
+            "task": "generate",
+            "duration_seconds": None,
+            "aspect_ratio": "16:9",
+            "resolution": "720p",
+            "rendered_resolution": "720p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+    out = await generate_video_omni(ctx=_ctx(tmp_path), prompt="a cat")
+    payload = json.loads(out[0].text if isinstance(out, list) else out)
+    assert "error" not in payload, payload
+    assert "sidecar_url" not in payload  # nothing local to point at...
+    prior = _prior_interaction(tmp_path / "videos", "remote-1")
+    assert prior.backend == "gemini_api"  # ...yet the id is still on record
+    assert prior.model == OMNI_1_1_MODEL
