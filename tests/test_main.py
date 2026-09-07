@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import logging
 import time
 from io import BytesIO
@@ -171,12 +172,16 @@ class FakeContextManager:
             None,
             id="vertexai_true_no_json",
         ),
+        # Inline JSON no longer produces a temp file: credentials are built
+        # in-process and handed to each client, because on the HTTP transports
+        # the lifespan runs per session and a per-session file was deleted
+        # from under every other live session. setup now only validates.
         pytest.param(
             {
                 "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 "GOOGLE_SERVICE_ACCOUNT_JSON": '{"type": "service_account", "project_id": "test"}',
             },
-            Path,
+            None,
             id="vertexai_with_sa_json",
         ),
         pytest.param(
@@ -184,7 +189,7 @@ class FakeContextManager:
                 "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 "GOOGLE_APPLICATION_CREDENTIALS": '{"type": "service_account", "project_id": "test2"}',
             },
-            Path,
+            None,
             id="vertexai_with_gac_json",
         ),
         # The invalid-JSON case no longer returns None: a malformed
@@ -212,15 +217,18 @@ def test_setup_vertex_credentials(
     for key, value in input.items():
         monkeypatch.setenv(key, value)
 
+    import glob
+    import tempfile
+
+    before = set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json")))
     result = setup_vertex_credentials()
+    after = set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json")))
 
     if expected is None:
         assert result is None
-    else:
+        assert after == before, "no credentials file may be written"
+    else:  # pragma: no cover - no parameter expects a path any more
         assert isinstance(result, Path)
-        assert result.exists()
-        # Cleanup
-        result.unlink()
 
 
 # ============================================================================
@@ -794,30 +802,37 @@ async def test_app_lifespan_default_dirs(
 async def test_app_lifespan_cleanup_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    service_account_json: str,
 ) -> None:
-    """Test app_lifespan cleans up temporary credentials."""
+    """The lifespan hands the client a credentials OBJECT and writes no file.
+
+    A placeholder key ("private_key": "K") is no longer enough here: the
+    credentials are really built, so the fixture mints a real-shaped one.
+    """
     monkeypatch.setenv("DATA_FOLDER", str(tmp_path))
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
-    monkeypatch.setenv(
-        "GOOGLE_SERVICE_ACCOUNT_JSON",
-        '{"type": "service_account", "project_id": "test"}',
-    )
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", service_account_json)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
 
-    # Mock genai.Client
+    seen: list[dict[str, Any]] = []
     mock_client = MagicMock()
-    monkeypatch.setattr("src.__main__.genai.Client", lambda **kwargs: mock_client)
+
+    def fake_client(**kwargs: Any) -> MagicMock:
+        seen.append(kwargs)
+        return mock_client
+
+    monkeypatch.setattr("src.__main__.genai.Client", fake_client)
 
     server = FakeFastMCP()
-    temp_creds_path: Path | None = None
-
     async with app_lifespan(server) as ctx:  # type: ignore[arg-type]
-        temp_creds_path = ctx.temp_creds_path
-        if temp_creds_path:
-            assert temp_creds_path.exists()
+        assert ctx.temp_creds_path is None
+        vertex_calls = [k for k in seen if k.get("vertexai")]
+        assert vertex_calls, seen
+        assert vertex_calls[0]["credentials"] is not None
+        assert vertex_calls[0]["project"] == "proj-x"
 
-    # After context exit, temp credentials should be cleaned up
-    if temp_creds_path:
-        assert not temp_creds_path.exists()
+    # And the environment was never repointed at anything.
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ
 
 
 # ============================================================================

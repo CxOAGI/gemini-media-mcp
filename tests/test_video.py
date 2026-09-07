@@ -1637,3 +1637,95 @@ async def test_generate_video_vertex_sends_generate_audio_false(
 
     assert captured["config"].generate_audio is False
     assert result["audio_enabled"] is False
+
+
+# ============================================================================
+# Image inputs: header-checked, passed through, off the loop
+# ============================================================================
+
+
+def _encoded(fmt: str, size: tuple[int, int] = (64, 64), mode: str = "RGB") -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    color = {"RGB": (1, 2, 3), "RGBA": (1, 2, 3, 4)}.get(mode, 5)
+    buf = BytesIO()
+    Image.new(mode, size, color).save(buf, fmt)  # pyright: ignore[reportArgumentType]
+    return buf.getvalue()
+
+
+def test_png_and_jpeg_inputs_are_sent_as_the_bytes_they_arrived_as() -> None:
+    """Every input used to be decoded and re-encoded as PNG whenever the mode
+    was RGB -- a 5 MB 4000x4000 JPEG went onto the wire as a 28.5 MB PNG. The
+    caller's encoding is already the right one."""
+    from src.video import _prepare_image_input
+
+    png = _encoded("PNG")
+    jpeg = _encoded("JPEG")
+    out_png = _prepare_image_input(png)
+    out_jpeg = _prepare_image_input(jpeg)
+    assert out_png.image_bytes is png and out_png.mime_type == "image/png"
+    assert out_jpeg.image_bytes is jpeg and out_jpeg.mime_type == "image/jpeg"
+
+
+def test_other_formats_are_normalised_to_something_the_service_accepts() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from src.video import _prepare_image_input
+
+    webp = _prepare_image_input(_encoded("WEBP"))
+    assert webp.mime_type == "image/jpeg"
+    assert Image.open(BytesIO(webp.image_bytes)).format == "JPEG"
+    palette = _prepare_image_input(_encoded("PNG", mode="P"))
+    assert palette.mime_type == "image/png"
+    assert Image.open(BytesIO(palette.image_bytes)).mode == "RGBA"
+
+
+def test_an_oversized_input_is_refused_from_its_header_without_decoding() -> None:
+    """A 308 KB 9999x9999 solid PNG is under the fetch cap and under Pillow's
+    hard bomb threshold, and cost +382 MB RSS in 1.6s on the loop. The size
+    is in the header; nothing is materialised."""
+    import time
+
+    from src.video import _prepare_image_input
+
+    from PIL import Image
+
+    huge = _encoded("PNG", size=(9999, 9999))
+    start = time.perf_counter()
+    # Pillow flags the header size on open; that signal is expected, and our
+    # own 40 MP refusal fires before anything is decoded.
+    with pytest.warns(Image.DecompressionBombWarning):
+        with pytest.raises(ValueError, match="above the 40.0MP limit"):
+            _prepare_image_input(huge)
+    assert time.perf_counter() - start < 1.0
+
+
+def test_reference_inputs_are_capped_with_a_warning() -> None:
+    from src.video import _MAX_REFERENCE_IMAGES, _prepare_frame_inputs
+
+    first, last, refs, warnings = _prepare_frame_inputs(
+        "reference_to_video", None, None, [_encoded("JPEG")] * 5
+    )
+    assert first is None and last is None
+    assert len(refs) == _MAX_REFERENCE_IMAGES
+    assert warnings and "were not" in warnings[0]
+
+
+def test_image_inputs_are_prepared_off_the_event_loop() -> None:
+    """Source-level, like the other executor guards: five near-limit inputs
+    measured ~8s of frozen loop when prepared inline in async generate_video.
+    Scanned across line breaks -- ruff wraps the call."""
+    import re
+    from pathlib import Path
+
+    source = Path("src/video.py").read_text()
+    assert re.search(
+        r"await\s+run_off_loop\(\s*functools\.partial\(\s*_prepare_frame_inputs", source
+    ), "_prepare_frame_inputs must run through run_off_loop"
+    # And no bare call is left in the coroutine body.
+    body = source[source.index("async def generate_video(") :]
+    assert not re.search(r"^\s+\w+ = _prepare_image_input\(", body, re.M)

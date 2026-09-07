@@ -16,9 +16,12 @@ after this fixture, so it wins) and assert both sides of it deliberately.
 from __future__ import annotations
 
 import datetime
+import functools
+import json
 
 import pytest
 
+import src.__main__ as _server
 import src.image as image
 import src.omni as omni
 
@@ -50,3 +53,56 @@ def _pin_the_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
             return PINNED_TODAY
 
     monkeypatch.setattr(image, "date", _PinnedDate)
+
+
+# ---------------------------------------------------------------------------
+# Service-account credentials
+#
+# src.__main__ builds Vertex credentials once per process from the inline
+# service-account JSON and memoises them. Tests set different environments, so
+# the memo is cleared for every test; and a test that wants the real
+# from_service_account_info path gets a real-shaped key, minted once.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _forget_service_account_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    # raising=False: the suite is sometimes run against an older src/ to prove
+    # a new test fails there, and these attributes may not exist yet.
+    monkeypatch.setattr(_server, "_service_account_creds", None, raising=False)
+    monkeypatch.setattr(_server, "_service_account_project", None, raising=False)
+
+
+@functools.lru_cache(maxsize=1)
+def fake_service_account_json(project_id: str = "proj-x") -> str:
+    """A syntactically valid service-account key with a freshly minted RSA key.
+
+    google-auth parses the PEM when it builds the credentials object, so the
+    placeholder keys the older tests used ("private_key": "K") no longer get
+    past construction. Nothing here can authenticate to anything.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    return json.dumps(
+        {
+            "type": "service_account",
+            "project_id": project_id,
+            "private_key_id": "test-key",
+            "private_key": pem,
+            "client_email": f"svc@{project_id}.iam.gserviceaccount.com",
+            "client_id": "1",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    )
+
+
+@pytest.fixture
+def service_account_json() -> str:
+    """The minted key above, as a fixture."""
+    return fake_service_account_json()

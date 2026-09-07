@@ -931,3 +931,89 @@ def test_a_pre_index_interaction_past_the_old_cap_is_found_and_backfilled(
     # And the hit was backfilled, so the next lookup is one read.
     index_dir = videos_dir / _INTERACTION_INDEX_DIRNAME
     assert index_dir.exists() and any(index_dir.iterdir())
+
+
+# ===========================================================================
+# Second review pass: two tool-contract gaps
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_draft_quote_refuses_the_source_its_render_refuses(
+    tmp_path: Path,
+) -> None:
+    """Every local-source check sat under `if not draft`, so
+    generate_video(draft=True, dry_run=True, image_uri=<missing>) quoted
+    $0.815 for a render that cannot fetch its input -- the exact invariant
+    the pre-flight's own docstring states."""
+    from src.__main__ import generate_video
+
+    result = json.loads(
+        await generate_video(
+            ctx=_ctx(_app_ctx(tmp_path)),
+            prompt="a cat",
+            model="veo-3.1-fast-generate-001",
+            draft=True,
+            dry_run=True,
+            image_uri=f"file://{tmp_path / 'does-not-exist.png'}",
+        )
+    )
+    assert "error" in result, result
+    assert "does-not-exist.png" in result["error"] or "image_uri" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_cancelled_storyboard_records_the_shots_it_paid_for(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """generate_storyboard had no CancelledError handler, unlike loop_extend,
+    generate_clip and extend_video_omni: cancel after 2 of 4 paid shots left
+    two orphan PNGs with no sidecar and no cost record. It now says what was
+    rendered and billed before letting the cancellation continue."""
+    import asyncio
+    import base64
+    import logging
+
+    from src.__main__ import generate_storyboard
+
+    app_ctx = _app_ctx(tmp_path)
+    images_dir = app_ctx.images_dir
+    calls = {"n": 0}
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (32, 32), (9, 9, 9)).save(buf, "PNG")
+    image_bytes = buf.getvalue()
+
+    async def two_then_cancel(**kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise asyncio.CancelledError()
+        path = images_dir / f"shot{calls['n']}.png"
+        path.write_bytes(image_bytes)
+        return {
+            "message": "ok",
+            "image_url": f"file://{path}",
+            "image_preview": "data:image/png;base64,"
+            + base64.b64encode(image_bytes).decode(),
+            "prompt": kwargs["prompt"],
+            "model": kwargs["model"],
+        }
+
+    monkeypatch.setattr("src.__main__.generate_image_impl", two_then_cancel)
+
+    with caplog.at_level(logging.WARNING, logger="src.__main__"):
+        with pytest.raises(asyncio.CancelledError):
+            await generate_storyboard(
+                ctx=_ctx(app_ctx),
+                shots=[{"prompt": f"shot {i}"} for i in range(4)],
+            )
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "cancelled after 2 of 4" in joined, joined
+    assert "shot1.png" in joined and "shot2.png" in joined
