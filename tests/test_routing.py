@@ -2370,22 +2370,22 @@ def test_a_fully_negated_intent_is_linear_in_its_length() -> None:
     assert elapsed < 1.5, f"{elapsed:.2f}s"
 
 
-def test_the_negation_window_never_starts_mid_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A cut token must not read as a negator: "...techno" -> "no".
-
-    The window is shrunk so the construction is exact: with 8 characters of
-    look-back before "video" in "x techno beat video", a naive cut lands on
-    the "no" inside "techno". Snapping back to the previous word boundary
-    reads "techno beat" instead, which negates nothing -- while a real "no"
-    in the same position still does.
+def test_the_negation_window_is_counted_in_words_not_characters() -> None:
+    """The first bounded window was 120 characters, and a single token longer
+    than that between the negator and the term cut the negator off: "no " +
+    130-char hashtag + " video" stopped reading as negated. Counting back in
+    whitespace-delimited words is exact whatever the token lengths, and a cut
+    token can never read as a negator ("techno" -> "no") because the window
+    always starts on a boundary.
     """
-    import src.routing as routing
+    from src.routing import _is_negated
 
-    monkeypatch.setattr(routing, "_NEGATION_LOOKBACK_CHARS", 8)
-    assert routing._is_negated("x techno beat video", "video") is False
-    assert routing._is_negated("x with no beat video", "video") is True
+    assert _is_negated("no " + "x" * 130 + " video please", "video") is True
+    assert _is_negated("without " + "y" * 60 + " " + "z" * 60 + " video", "video") is True
+    assert _is_negated("x techno beat video", "video") is False
+    assert _is_negated("a loud track with no video", "video") is True
+    # A clause break inside the window still ends the negator's reach.
+    assert _is_negated("no audio, a video of rain", "video") is False
 
 
 def test_an_intent_past_the_length_cap_is_refused() -> None:
@@ -2406,6 +2406,12 @@ def test_an_intent_past_the_length_cap_is_refused() -> None:
         "a 24 frames-per-second animation",
         "a 24 frames / sec animation",
         "24 frames/s of a running horse",
+        # The "per" spelled another way: one word from the guard's list still
+        # planned 20 paid beats.
+        "a 24 frames a second animation",
+        "a 24 frames every second animation",
+        "24 frames each second",
+        "24 frames per minute",
     ],
 )
 def test_a_frame_rate_is_not_a_shot_count_however_it_is_spelled(intent: str) -> None:

@@ -24,7 +24,8 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from google import genai
-from google.oauth2 import service_account
+
+from . import credentials
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
@@ -300,108 +301,11 @@ def _compute_allowed_gcs_buckets() -> frozenset[str]:
     return frozenset(buckets)
 
 
-_SERVICE_ACCOUNT_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
-_service_account_creds: Any | None = None
-_service_account_project: str | None = None
-_service_account_lock = threading.Lock()
-
-
-def _inline_service_account_json() -> tuple[str, str] | None:
-    """The inline service-account JSON the operator set, and which variable.
-
-    Two spellings are accepted: GOOGLE_SERVICE_ACCOUNT_JSON, or the JSON pasted
-    into GOOGLE_APPLICATION_CREDENTIALS in place of a path (it starts with
-    "{"). A path in GOOGLE_APPLICATION_CREDENTIALS is not inline JSON and is
-    left to Application Default Credentials as before.
-    """
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if sa_json:
-        return sa_json, "GOOGLE_SERVICE_ACCOUNT_JSON"
-    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-    if gac.strip().startswith("{"):
-        return gac, "GOOGLE_APPLICATION_CREDENTIALS"
-    return None
-
-
-def _parse_service_account_json() -> dict[str, Any] | None:
-    """Parse the inline service-account JSON, failing loudly if it is broken.
-
-    A configured service-account JSON that does not parse must fail. Falling
-    through to genai.Client(vertexai=True) discovered whatever ambient ADC
-    happened to exist -- so a typo'd credential silently ran the server as a
-    DIFFERENT identity than configured, with one log line as the only signal.
-    """
-    inline = _inline_service_account_json()
-    if inline is None:
-        return None
-    sa_json, source = inline
-    try:
-        data = json.loads(sa_json)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"{source} is set but is not valid JSON: {e}. "
-            "Refusing to fall back to ambient application-default "
-            "credentials — that would run the server as a different "
-            "identity than configured. Fix the JSON or unset the variable."
-        ) from e
-    if not isinstance(data, dict):
-        raise ValueError(f"{source} must be a JSON object, got {type(data).__name__}.")
-    return data
-
-
-def _service_account_credentials() -> tuple[Any, str | None] | None:
-    """Process-wide credentials built from the inline JSON, or None for ADC.
-
-    Returns ``(credentials, project_id)`` and is memoised for the life of the
-    process. This replaces a temp file. The old design wrote the JSON to
-    ``/tmp/gcp_sa_*.json``, pointed the process-wide GOOGLE_APPLICATION_
-    CREDENTIALS at it, and deleted the file on lifespan teardown -- and on the
-    sse / streamable-http transports the MCP SDK enters the lifespan once PER
-    SESSION. So every connecting client wrote its own file and repointed the
-    shared variable, and every disconnecting client deleted the file that
-    every other live session's lazily-loaded Vertex credentials pointed at.
-    Verified against mcp 1.28.1 and google-genai 2.20.0: client A connects, a
-    probe connects and disconnects, A's first tool call fails with
-    DefaultCredentialsError naming the probe's deleted file; the module-global
-    Vertex and Storage clients failed the same way. The Dockerfile ships this
-    exact configuration. stdio, with its single lifespan, never saw it.
-
-    A credentials object handed to each client has no file to delete and
-    mutates no environment, so there is no shared state to get wrong.
-    """
-    global _service_account_creds, _service_account_project
-    with _service_account_lock:
-        if _service_account_creds is not None:
-            return _service_account_creds, _service_account_project
-        info = _parse_service_account_json()
-        if info is None:
-            return None
-        try:
-            creds = service_account.Credentials.from_service_account_info(
-                info, scopes=list(_SERVICE_ACCOUNT_SCOPES)
-            )
-        except (ValueError, KeyError) as e:
-            raise ValueError(
-                "The inline service-account JSON parsed but is not a usable "
-                f"service-account key: {e}."
-            ) from e
-        _service_account_creds = creds
-        _service_account_project = (
-            os.environ.get("GOOGLE_CLOUD_PROJECT") or info.get("project_id") or None
-        )
-        return creds, _service_account_project
-
-
-def _vertex_client_kwargs(**extra: Any) -> dict[str, Any]:
-    """Keyword arguments for a Vertex genai.Client on this deployment."""
-    kwargs: dict[str, Any] = {"vertexai": True, **extra}
-    found = _service_account_credentials()
-    if found is not None:
-        creds, project = found
-        kwargs["credentials"] = creds
-        if project and "project" not in kwargs:
-            kwargs["project"] = project
-    return kwargs
+# Credentials live in one shared module so image.py's Vertex client can be
+# built the same way as every client here; see src/credentials.py.
+_parse_service_account_json = credentials.parse_service_account_json
+_service_account_credentials = credentials.service_account_credentials
+_vertex_client_kwargs = credentials.vertex_client_kwargs
 
 
 def setup_vertex_credentials() -> Path | None:
@@ -415,6 +319,8 @@ def setup_vertex_credentials() -> Path | None:
     if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() != "true":
         return None
     _parse_service_account_json()
+    # Key text out of the path variable before anything can reach ADC.
+    credentials.normalize_environment()
     return None
 
 

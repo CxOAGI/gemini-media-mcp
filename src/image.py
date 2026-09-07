@@ -331,7 +331,14 @@ def _get_vertex_global_client() -> genai.Client:
     """
     global _vertex_global_client
     if _vertex_global_client is None:
-        _vertex_global_client = genai.Client(vertexai=True, location="global")
+        # Built the way every other Vertex client is, credentials included.
+        # This one was missed when credentials became an in-process object,
+        # so on an inline-JSON deployment it fell into Application Default
+        # Credentials, found nothing, and every default-model image render
+        # failed with DefaultCredentialsError.
+        from .credentials import vertex_client_kwargs
+
+        _vertex_global_client = genai.Client(**vertex_client_kwargs(location="global"))
     return _vertex_global_client
 
 
