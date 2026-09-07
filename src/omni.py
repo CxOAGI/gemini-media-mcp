@@ -1412,8 +1412,15 @@ async def generate_video_omni(
     is_continuation = (
         task_type in _CONTINUATION_TASKS or previous_interaction_id is not None
     )
-    # Narrower than "is it a continuation": an extend with an uploaded source
-    # DOES send its aspect ratio and duration, so it can report them as fact.
+    # Identical to `is_continuation` today, and kept as its own name because
+    # the two ask different questions and could diverge: one is "is this turn
+    # a continuation", the other is "must this request omit aspect_ratio and
+    # duration". This comment used to claim the second was NARROWER -- that an
+    # extend with an uploaded source still sends both and can report them as
+    # fact -- which _strips_output_spec's own docstring contradicts: an
+    # uploaded extend 400s on aspect ratio, and duration is stripped there
+    # too. Two of the response fields below are None on that path, so the
+    # claim was falsified by the code three lines away.
     withholds_output_spec = _strips_output_spec(task_type, previous_interaction_id)
 
     if task_type == _TASK_EXTEND and previous_interaction_id is None:
@@ -1454,7 +1461,10 @@ async def generate_video_omni(
             "this turn continues a previous interaction, so it cannot declare "
             "its task and the service infers one"
             if previous_interaction_id is not None
-            else "this is an edit task"
+            # Names the task that actually applies. This said "edit" flatly,
+            # so an uploaded extend was told the wrong reason for its own
+            # suppressed fields.
+            else f"this is an {task_type} task"
         )
         warnings.append(
             "This request sends neither duration_seconds nor aspect_ratio: "

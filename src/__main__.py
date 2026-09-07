@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import ipaddress
+import hashlib
 import json
 import logging
 import math
@@ -101,6 +102,15 @@ MAX_THOUGHT_SIGNATURE_BYTES = 16 * 1024 * 1024
 # error rather than a silent truncation.
 MAX_STORYBOARD_SHOTS = 24
 
+# Per-field ceiling on the text a storyboard draws. Deliberately far above any
+# real prompt: the panel shows about three wrapped lines, but `prompt` is also
+# what the image model receives, and a detailed prompt is legitimately long, so
+# this refuses only input that cannot be meant seriously. The layout cost is
+# linear now (`_split_overlong` and `_ellipsize` binary-search their cuts), so
+# this is a bound on memory and wasted work rather than the fix for the
+# quadratic blow-up it used to be.
+MAX_STORYBOARD_TEXT_CHARS = 20_000
+
 # Upper bound on beats in one clip. Same reasoning as the storyboard cap, but
 # it matters far more here: a beat is a Veo render costing roughly a hundred
 # times an image and taking minutes, and add_bridges nearly doubles the count.
@@ -173,6 +183,50 @@ def _parse_gcs_bucket(uri: str) -> str | None:
     return remainder or None
 
 
+# Where the interaction-id index lives, relative to the media directory. A
+# subdirectory rather than a name prefix so the `*.json` sidecar glob -- which
+# is not recursive -- cannot see these entries and mistake one for a manifest.
+_INTERACTION_INDEX_DIRNAME = ".interactions"
+
+
+def _interaction_index_path(media_dir: Path, interaction_id: str) -> Path:
+    """Path of the index entry for ``interaction_id``.
+
+    Hashed, not used verbatim: an interaction id is minted by the service and
+    is not guaranteed to be a safe filename (a "/" in one would silently write
+    outside the index, or fail).
+    """
+    digest = hashlib.sha256(interaction_id.encode("utf-8")).hexdigest()[:32]
+    return media_dir / _INTERACTION_INDEX_DIRNAME / f"{digest}.json"
+
+
+def _write_interaction_index(sidecar: Path, metadata: dict[str, Any]) -> None:
+    """Record which sidecar holds ``interaction_id``, if there is one.
+
+    Makes the by-id lookup a single read instead of a directory scan, which is
+    what `_manifest_for_interaction` needs to stay correct past
+    _SIDECAR_SCAN_LIMIT sidecars. Stores the sidecar's NAME rather than a copy
+    of the manifest, so the manifest has exactly one home.
+
+    Best-effort: a failure here costs the fast path and falls back to the
+    scan, so it must never fail a render that already succeeded.
+    """
+    interaction_id = metadata.get("interaction_id")
+    if not isinstance(interaction_id, str) or not interaction_id:
+        return
+    entry = _interaction_index_path(sidecar.parent, interaction_id)
+    try:
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(
+            json.dumps(
+                {"interaction_id": interaction_id, "sidecar": sidecar.name},
+                sort_keys=True,
+            )
+        )
+    except OSError as e:  # pragma: no cover - index is an optimisation
+        logger.warning("Failed to write interaction index %s: %s", entry, e)
+
+
 def _write_sidecar(media_url: str, metadata: dict[str, Any]) -> str | None:
     """Write <stem>.json next to a file:// media URL and return its file:// URL.
 
@@ -189,6 +243,7 @@ def _write_sidecar(media_url: str, metadata: dict[str, Any]) -> str | None:
     except OSError as e:
         logger.warning("Failed to write sidecar %s: %s", sidecar, e)
         return None
+    _write_interaction_index(sidecar, metadata)
     return f"file://{sidecar}"
 
 
@@ -1032,9 +1087,15 @@ def _omni_preview_model(resolution: str | None) -> tuple[str, str | None]:
     """The (model, resolution) a draft or animatic pass should render at.
 
     Asking for a resolution at all means asking for the model that HAS one, so
-    naming a resolution implies gemini-omni-1.1-flash. Leaving it unset keeps
-    the preview model and its fixed 720p, which is what every existing caller
-    gets — this is the one knob, not a second model argument to keep in sync.
+    naming a resolution implies gemini-omni-1.1-flash. Leaving it unset takes
+    DEFAULT_OMNI_MODEL at its own default resolution — this is the one knob,
+    not a second model argument to keep in sync.
+
+    That default USED to be the preview model, and this docstring still said
+    so after it moved: the preview endpoint is switched off on
+    OMNI_PREVIEW_SUNSET, so a draft path pinned to it would have started
+    failing on that date. The code was already correct; only the description
+    was stale.
 
     360p is the point of the knob: it is a third of the 720p price, which is
     what turns a preview pass from "costs about what the delivery render
@@ -1146,26 +1207,61 @@ async def _check_omni_source_video(
 
 
 def _omni_cumulative_cap_warning(
-    spec: Any, source_seconds: float, times: int
+    spec: Any, source_seconds: float, times: int, planned_turns: int
 ) -> list[str]:
-    """Warn when a chain of extensions would pass omni's 40s ceiling.
+    """Warn when omni's 40s ceiling cuts a chain of extensions short.
 
-    A warning rather than a refusal: the ceiling is documented for the
-    finished clip, and each turn's actual contribution is the service's
-    choice, so "source + turns x 10s" is an upper bound on the total rather
-    than a figure worth failing a call over. What it is worth is saying so
-    before the later turns are paid for.
+    Two distinct things go wrong at the ceiling, and they need different
+    warnings:
+
+    * turns that cannot run at all, because the clip is already at the
+      ceiling when they come up -- a count the caller did not choose;
+    * a chain where every turn runs but the last cannot append a full step,
+      so the finished clip is shorter than "source + turns x 10s" -- a length
+      the caller did not choose.
+
+    A warning rather than a refusal in both cases: the turns that fit still
+    render, so there is no failure to report.
+
+    This used to hedge ("later turns may be refused or truncated by the
+    service"), because the quote clamped the chain at the ceiling while the
+    render looped the full ``times`` regardless. That disagreement was the
+    defect: a 10s source with ``times=4`` was quoted for 3 turns (~$9.14) and
+    billed for 4 (~$13.19), and because ``max_cost_usd`` was projected off the
+    clamped list, a $10 cap passed and then billed ~$14. Both paths stop at
+    ``planned_turns`` now, so this states what happens instead of guessing.
+
+    Args:
+        planned_turns: Turns that fit under the ceiling -- what both the quote
+            and the render will actually do.
     """
+    ceiling = spec.max_extended_seconds
+    if planned_turns < times:
+        # Turns that cannot run at all: the clip reaches the ceiling before
+        # the chain is done, so the rest would append nothing.
+        dropped = times - planned_turns
+        return [
+            f"The source is {source_seconds:g}s, so only {planned_turns} of the "
+            f"{times} requested turn(s) fit under {spec.model}'s documented "
+            f"{ceiling}s ceiling for an extended video. The remaining "
+            f"{dropped} turn(s) would append nothing to a clip already at the "
+            "ceiling, so they are not rendered and not billed."
+        ]
     projected = source_seconds + float(spec.extension_step_seconds) * times
-    if projected <= spec.max_extended_seconds:
-        return []
-    return [
-        f"The source is {source_seconds:g}s and {times} turn(s) would append "
-        f"up to {float(spec.extension_step_seconds) * times:g}s, reaching "
-        f"{projected:g}s against omni's documented {spec.max_extended_seconds}s "
-        "ceiling — later turns may be refused or truncated by the service. "
-        f"The quote clamps each turn at {spec.max_extended_seconds}s."
-    ]
+    if projected > ceiling:
+        # Every turn runs, but the last one cannot append a full step: the
+        # ceiling is on the assembled clip, so the finished video stops there.
+        # Distinct from the case above -- nothing is dropped, so this is about
+        # the LENGTH the caller gets, not the number of turns.
+        return [
+            f"The source is {source_seconds:g}s and {times} turn(s) would append "
+            f"up to {float(spec.extension_step_seconds) * times:g}s, reaching "
+            f"{projected:g}s against omni's documented {ceiling}s ceiling — so "
+            f"the assembled clip stops at {ceiling}s and the last turn appends "
+            f"less than a full {spec.extension_step_seconds:g}s step. The quote "
+            f"clamps each turn at {ceiling}s."
+        ]
+    return []
 
 
 def _omni_extension_quote(
@@ -2187,12 +2283,51 @@ def _manifest_for_interaction(
 
     The hardened half of the lookup above, split out because a second caller
     needs a different field off the same record: which backend the interaction
-    was created on. The scan itself is unchanged and stays paranoid — the
-    media directory is caller-controlled and may live on a network mount, so
-    only regular files are opened, reads are size-capped, the walk stops after
-    a fixed number of candidates, and anything unreadable is skipped rather
-    than raised.
+    was created on. The scan stays paranoid — the media directory is
+    caller-controlled and may live on a network mount, so only regular files
+    are opened, reads are size-capped, at most _SIDECAR_SCAN_LIMIT of them are
+    READ (the walk itself covers the whole directory; an earlier version of
+    this docstring claimed the walk stopped, which it does not), and anything
+    unreadable is skipped rather than raised.
+
+    The index is tried first, and it is what makes this correct rather than
+    merely bounded. Only the newest _SIDECAR_SCAN_LIMIT sidecars are ever
+    read, so past 200 renders an older interaction returned None from a
+    directory that plainly contained it — and every fact `PriorInteraction`
+    exists to carry went with it: `prefer_backend` fell back to None, so the
+    last turn of a chain carrying output_gcs_uri could be routed to Vertex
+    holding a Gemini-API-minted id (the exact failure PriorInteraction was
+    added to fix), and extend_video_omni's `prior.model != spec.model` refusal
+    was disabled too.
     """
+    entry_path = _interaction_index_path(videos_dir, interaction_id)
+    try:
+        entry_stat = entry_path.stat()
+        if S_ISREG(entry_stat.st_mode) and entry_stat.st_size <= _SIDECAR_MAX_BYTES:
+            entry = json.loads(entry_path.read_text())
+            # The id is re-checked against the manifest below, so a truncated
+            # digest that collided would fall through to the scan rather than
+            # return the wrong interaction.
+            if isinstance(entry, dict) and isinstance(entry.get("sidecar"), str):
+                # Name only: joining a stored path would let a tampered index
+                # read outside the media directory.
+                named = videos_dir / Path(str(entry["sidecar"])).name
+                named_stat = named.stat()
+                if S_ISREG(named_stat.st_mode) and (
+                    named_stat.st_size <= _SIDECAR_MAX_BYTES
+                ):
+                    manifest = json.loads(named.read_text())
+                    if (
+                        isinstance(manifest, dict)
+                        and manifest.get("interaction_id") == interaction_id
+                    ):
+                        return manifest
+    except (OSError, ValueError):
+        # No index entry, an unreadable one, or a sidecar that has since been
+        # deleted: fall through to the scan, which is still correct for
+        # everything written before the index existed.
+        pass
+
     candidates: list[tuple[float, Path]] = []
     try:
         for entry in videos_dir.glob("*.json"):
@@ -3393,6 +3528,13 @@ async def generate_storyboard(
 
         if not shots:
             raise ValueError("shots list must not be empty")
+        for name, value in (("title", title), ("subtitle", subtitle)):
+            if isinstance(value, str) and len(value) > MAX_STORYBOARD_TEXT_CHARS:
+                raise ValueError(
+                    f"{name} is {len(value)} characters; the limit is "
+                    f"{MAX_STORYBOARD_TEXT_CHARS}. It is drawn as a single "
+                    "ellipsized line."
+                )
         # Each shot is a paid image generation, so an oversized board is a real
         # bill. Refuse loudly rather than truncating: silently dropping shots
         # would render a board that looks complete but is not.
@@ -3422,6 +3564,13 @@ async def generate_storyboard(
                     raise ValueError(
                         f"shots[{i}].{field} must be a string, "
                         f"got {type(value).__name__}"
+                    )
+                if isinstance(value, str) and len(value) > MAX_STORYBOARD_TEXT_CHARS:
+                    raise ValueError(
+                        f"shots[{i}].{field} is {len(value)} characters; the "
+                        f"limit is {MAX_STORYBOARD_TEXT_CHARS}. A panel draws "
+                        "about three wrapped lines, so text this long cannot "
+                        "be shown and is more likely a mistake than a prompt."
                     )
             _validate_duration_seconds(
                 shot.get("duration_seconds"), f"shots[{i}].duration_seconds"
@@ -3552,6 +3701,17 @@ async def generate_storyboard(
 
         inline_preview = await asyncio.to_thread(_sheet_preview)
 
+        # A frame whose bytes exist but do not decode renders as "SHOT NOT
+        # GENERATED" on the sheet, so it must not be counted as a rendered
+        # shot here — this message said "3/3 shots" for a board with a hole
+        # in it. write_storyboard reports them because it is the one place
+        # that has tried to decode them.
+        undecodable = {
+            int(i) for i in (artifacts.get("undecodable_shots") or "").split(",") if i
+        }
+        for result in shot_results:
+            if result["shot"] in undecodable and "error" not in result:
+                result["error"] = "Image could not be decoded"
         failed = [r for r in shot_results if "error" in r]
         total_runtime = sum(float(s.get("duration_seconds") or 0) for s in shots)
         response_data: dict[str, Any] = {
@@ -3754,14 +3914,30 @@ async def generate_video(
         # but the check lived past the dry_run return, so a quote priced a call
         # the real path refuses, with no warning and no warnings field at all.
         # Same defect class as the over-length extension source.
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = bool(getattr(video_client._api_client, "vertexai", False))
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
+        #
+        # Skipped for a draft, which is not a Veo call at all: it routes to
+        # omni. Hoisting these above the draft branch made draft=True fail on
+        # inputs it documents as IGNORED — `_draft_ignored_veo_params` lists
+        # output_gcs_uri, yet _resolve_video_gcs raised on a Gemini-API
+        # deployment before the warning naming it could ever be built, and
+        # _client_for_video_model raised for a Lite model on Vertex without
+        # GEMINI_API_KEY over a Veo client the draft never uses. The backend a
+        # draft reports is omni's, which is the one that will serve it.
+        video_client: genai.Client | None = None
+        if draft:
+            is_vertex_client = _omni_backend_is_vertex(app_ctx)
+            gcs_uri = None
+        else:
+            video_client = _client_for_video_model(app_ctx, model)
+            is_vertex_client = bool(
+                getattr(video_client._api_client, "vertexai", False)
+            )
+            gcs_uri = _resolve_video_gcs(
+                output_gcs_uri,
+                app_ctx.video_gcs_bucket,
+                app_ctx.allowed_gcs_buckets,
+                is_vertex_client,
+            )
 
         if dry_run:
             # Draft mode routes to omni, which serves a plain text/image
@@ -4094,6 +4270,8 @@ async def generate_video(
                 )
 
         await ctx.info(f"Generating video with model={model}")
+        # Only the Veo path reaches this: the draft branch returned above.
+        assert video_client is not None
         result = await generate_video_impl(
             client=video_client,
             prompt=prompt,
@@ -4843,9 +5021,19 @@ async def generate_clip(
     errors: list[dict[str, Any]] = []
     clip_warnings: list[str] = []
     total_duration = 0.0
-    animatic_model, animatic_res = _omni_preview_model(animatic_resolution)
-    beat_model = animatic_model if animatic else model
     try:
+        # Inside the try, and only when it applies. This sat above the try and
+        # ran unconditionally, so generate_clip(animatic=False,
+        # animatic_resolution="9000p") raised ValueError straight out of the
+        # tool instead of returning the {"error": ...} body every other failure
+        # here returns — on a parameter the docstring calls "Ignored unless
+        # animatic is True".
+        if animatic:
+            animatic_model, animatic_res = _omni_preview_model(animatic_resolution)
+            beat_model = animatic_model
+        else:
+            animatic_res = None
+            beat_model = model
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
 
@@ -5535,13 +5723,31 @@ async def generate_video_omni(
             # under-quoted an input-video edit 3.3x, the same defect edit_video
             # already fixed; match it and quote the maximum as an upper bound.
             if previous_interaction_id or input_video_uri:
-                prior_duration = (
-                    await _source_duration_or_none(
+                if previous_interaction_id:
+                    prior_duration = await _source_duration_or_none(
                         app_ctx.videos_dir, previous_interaction_id
                     )
-                    if previous_interaction_id
-                    else None
-                )
+                else:
+                    # Measured, like extend_video_omni's dry_run already does
+                    # for a local source. Passing None here quoted the 10s
+                    # bound for every uploaded edit and skipped the source
+                    # ceiling entirely: on Vertex, whose ceiling is 30s, that
+                    # under-quoted an edit by up to 3x and let a quote succeed
+                    # for a source the real run refuses. Remote sources stay
+                    # unmeasured -- a quote does not download one.
+                    prior_duration = None
+                    source_bytes = await _fetch_local_source(ctx, input_video_uri)
+                    if source_bytes is not None:
+                        prior_duration = await _probe_media(
+                            measure_video_duration_bytes, source_bytes
+                        )
+                        _ = await _check_omni_source_video(
+                            spec,
+                            source_bytes,
+                            vertexai=_omni_backend_is_vertex(
+                                app_ctx, bool(output_gcs_uri)
+                            ),
+                        )
                 quoted = omni_continuation_upper_bound(spec, "edit", prior_duration)
                 return _respond(
                     app_ctx,
@@ -6078,7 +6284,9 @@ async def extend_video_omni(
             if source_duration is not None:
                 payload["source_duration_seconds"] = source_duration
                 warnings.extend(
-                    _omni_cumulative_cap_warning(spec, source_duration, times)
+                    _omni_cumulative_cap_warning(
+                        spec, source_duration, times, len(turn_lengths)
+                    )
                 )
             payload["estimated_cost"] = _omni_extension_quote(
                 spec.model, billed_resolution, turn_lengths
@@ -6137,16 +6345,33 @@ async def extend_video_omni(
         at_ceiling = omni_extension_refusal(spec, source_duration)
         if at_ceiling:
             raise ValueError(at_ceiling)
+
+        # The turns that fit under the ceiling -- the same list the quote
+        # prices, computed once here so the loop below, this warning and the
+        # max_cost_usd projection cannot disagree about how many turns run.
+        turn_lengths = omni_extension_output_lengths(spec, source_duration, times)
+        effective_times = times
         if source_duration is not None:
-            warnings.extend(_omni_cumulative_cap_warning(spec, source_duration, times))
+            # Only a MEASURED source may shorten the chain. With no
+            # measurement, omni_extension_output_lengths falls back to the
+            # longest source the model documents -- deliberately pessimistic
+            # for pricing -- and clamping the loop on that would render fewer
+            # turns than a short real source can actually take.
+            effective_times = len(turn_lengths)
+            warnings.extend(
+                _omni_cumulative_cap_warning(
+                    spec, source_duration, times, effective_times
+                )
+            )
         if max_cost_usd is not None:
             # Refuse BEFORE the first turn bills — same quadratic hazard as
-            # loop_extend, same cap.
+            # loop_extend, same cap. Projected off the turns that will really
+            # run, which is only now the same list the loop uses.
             projected_usd = _usd_of(
                 _omni_extension_quote(
                     spec.model,
                     billed_resolution,
-                    omni_extension_output_lengths(spec, source_duration, times),
+                    turn_lengths,
                 )
             )
             if projected_usd > max_cost_usd:
@@ -6191,9 +6416,9 @@ async def extend_video_omni(
             final = segments[-1] if segments else {}
             body: dict[str, Any] = {
                 "message": (
-                    f"Video extended over {done} of {times} turn(s)"
-                    if done != times
-                    else f"Video extended over {times} turn(s)"
+                    f"Video extended over {done} of {effective_times} turn(s)"
+                    if done != effective_times
+                    else f"Video extended over {effective_times} turn(s)"
                 ),
                 "video_url": final.get("video_url"),
                 "interaction_id": final.get("interaction_id"),
@@ -6201,6 +6426,10 @@ async def extend_video_omni(
                 **_omni_requested_model(omni_model, spec),
                 "resolution": billed_resolution,
                 "times": times,
+                # What the ceiling allowed, which is what ran. Equal to
+                # `times` unless the source was long enough to cut the chain
+                # short; the warning above says so when they differ.
+                "planned_turns": effective_times,
                 "completed_turns": done,
                 # Three different numbers, because a turn renders the
                 # assembled clip: billed is the sum of what each turn
@@ -6232,9 +6461,10 @@ async def extend_video_omni(
             return body
 
         try:
-            for turn in range(1, times + 1):
+            for turn in range(1, effective_times + 1):
                 await ctx.info(
-                    f"Extending video with {spec.model} (turn {turn}/{times})"
+                    f"Extending video with {spec.model} "
+                    f"(turn {turn}/{effective_times})"
                 )
                 result = await _omni_generate_and_manifest(
                     app_ctx,

@@ -833,6 +833,119 @@ async def test_a_chain_that_would_pass_the_40s_ceiling_says_so(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_clamped_chain_renders_exactly_the_turns_it_quoted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The render may not run a turn the quote did not price.
+
+    omni_extension_output_lengths stops emitting once the assembled clip
+    reaches the 40s ceiling, but the render loop was `range(1, times + 1)`
+    with no clamp. A 25s source with times=4 was quoted for 2 turns ($7.61)
+    and billed for 4 ($15.73) -- and because max_cost_usd was projected off
+    the clamped list, a $10 cap passed and then billed ~$14. Under-quoting is
+    the one direction this module forbids, on the one tool the cap exists for.
+
+    Extends a prior interaction rather than an upload, because two other
+    guards fire first on that route: an UPLOADED source over 10s is refused
+    outright on the Gemini Developer API, and `times` is statically capped at
+    40/10 = 4 turns. A recorded 25s interaction is under neither, and reaches
+    the ceiling in two turns (25 -> 35 -> 40), so turns 3 and 4 append nothing.
+
+    Counts impl calls rather than reading the payload: the payload agreeing
+    with itself is what the bug already did.
+    """
+    from src.__main__ import extend_video_omni
+
+    # The sidecar the duration lookup reads back. `model` must match the spec
+    # or the chain is refused before the arithmetic under test is reached.
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    (tmp_path / "videos" / "prior.json").write_text(
+        json.dumps(
+            {
+                "interaction_id": "i-prior",
+                "duration_seconds": 25.0,
+                "model": OMNI_1_1_MODEL,
+                "backend": "gemini_api",
+            }
+        )
+    )
+
+    calls = 0
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        out = tmp_path / "videos" / f"x{calls}.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": f"i-{calls}",
+            "model": OMNI_1_1_MODEL,
+            "task": "extend",
+            "duration_seconds": None,
+            "aspect_ratio": None,
+            "resolution": None,
+            "rendered_resolution": "720p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+
+    payload = json.loads(
+        await extend_video_omni(
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            previous_interaction_id="i-prior",
+            times=4,
+        )
+    )
+    assert "error" not in payload, payload
+    # The ceiling allowed two turns, so exactly two turns billed.
+    assert calls == 2, f"quoted 2 turns, rendered {calls}"
+    assert payload["planned_turns"] == 2
+    assert payload["completed_turns"] == 2
+    # `times` still reports what was asked for, and a warning reconciles it.
+    assert payload["times"] == 4
+    assert any(
+        "only 2 of the 4 requested turn(s)" in w for w in payload["warnings"]
+    ), payload["warnings"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_clamped_chain_is_not_billed_past_a_cost_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """max_cost_usd is projected off the turns that actually run.
+
+    The cap compared a 2-turn projection against the limit and then let 4
+    turns bill, so a cap set to the quote passed and was then exceeded.
+    """
+    from src.__main__ import _omni_cumulative_cap_warning
+    from src.omni import DEFAULT_OMNI_MODEL, omni_extension_output_lengths, omni_spec
+
+    spec = omni_spec(DEFAULT_OMNI_MODEL)
+    for source_seconds, times, expected in [
+        (10.0, 4, 3),
+        (25.0, 4, 2),
+        (35.0, 3, 1),
+        (3.0, 3, 3),
+    ]:
+        lengths = omni_extension_output_lengths(spec, source_seconds, times)
+        assert len(lengths) == expected, (source_seconds, times, lengths)
+        warnings = _omni_cumulative_cap_warning(
+            spec, source_seconds, times, len(lengths)
+        )
+        if expected < times:
+            assert warnings and f"only {expected} of the {times}" in warnings[0]
+        else:
+            # Nothing dropped: at most the truncation warning, never a claim
+            # that turns were skipped.
+            assert not any("requested turn(s) fit under" in w for w in warnings)
+
+
+@pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
 async def test_edit_video_can_choose_a_resolution_on_1_1(tmp_path: Path) -> None:
     from src.__main__ import edit_video
@@ -2687,3 +2800,79 @@ async def test_clip_segments_carry_measured_resolution_provenance(
     width, height = segment["rendered_dimensions"]
     assert width == 640 and 360 <= height <= 376, segment["rendered_dimensions"]
     assert segment["resolution"] == "360p"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_an_uploaded_edit_source_is_measured_at_the_quote(
+    tmp_path: Path,
+) -> None:
+    """generate_video_omni's dry_run passed prior_duration=None for an upload.
+
+    Two consequences, both of them the pre-flight failing at its job:
+    `_check_omni_source_video` never ran, so a quote succeeded for a source
+    the real run refuses; and the upper bound was the model's 10s maximum
+    regardless of the source, which on Vertex (30s ceiling) under-quotes an
+    edit of a 25s clip by 2.5x. extend_video_omni's dry_run already measured
+    local sources this way.
+
+    Asserted through the ceiling refusal because it is reachable on the
+    Gemini Developer API, whose limit is 10s; the under-quote itself only
+    shows on Vertex, where a source may legitimately exceed 10s.
+    """
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import generate_video_omni
+
+    # 11s at 24fps: over the Gemini Developer API's 10s upload ceiling.
+    frames = [
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 11)
+    ]
+    buf = BytesIO()
+    iio.imwrite(buf, frames, extension=".mp4", fps=24)
+    source = tmp_path / "eleven.mp4"
+    source.write_bytes(buf.getvalue())
+
+    out = await generate_video_omni(
+        ctx=_ctx(tmp_path),
+        prompt="make it anime",
+        input_video_uri=f"file://{source}",
+        dry_run=True,
+    )
+    payload = json.loads(out[0].text if isinstance(out, list) else out)
+    assert "error" in payload, payload
+    assert "10s or shorter" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_an_in_range_uploaded_edit_source_still_quotes(tmp_path: Path) -> None:
+    """The new measurement must not refuse a source the render accepts."""
+    import imageio.v3 as iio
+    import numpy as np
+
+    from src.__main__ import generate_video_omni
+
+    frames = [
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 4)
+    ]
+    buf = BytesIO()
+    iio.imwrite(buf, frames, extension=".mp4", fps=24)
+    source = tmp_path / "four.mp4"
+    source.write_bytes(buf.getvalue())
+
+    out = await generate_video_omni(
+        ctx=_ctx(tmp_path),
+        prompt="make it anime",
+        input_video_uri=f"file://{source}",
+        dry_run=True,
+    )
+    payload = json.loads(out[0].text if isinstance(out, list) else out)
+    assert "error" not in payload, payload
+    assert payload["dry_run"] is True
+    # An edit's length is the service's choice, so the quote is still the
+    # documented upper bound -- measuring the source does not make it a
+    # prediction.
+    assert payload["duration_seconds"] == 10.0
+    assert "upper bound" in payload["duration_source"]
