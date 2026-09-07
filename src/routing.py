@@ -54,9 +54,17 @@ from .omni import (
 )
 from .video import (
     _CANONICAL_VIDEO_MODEL_IDS,  # pyright: ignore[reportPrivateUsage]
+    _GEMINI_API_MODE_ERRORS,  # pyright: ignore[reportPrivateUsage]
+    _GEMINI_API_UNSUPPORTED_MODES,  # pyright: ignore[reportPrivateUsage]
     _VEO_LITE_MODELS,  # pyright: ignore[reportPrivateUsage]
     VideoModel,
 )
+
+# Reference-to-video renders exactly this long whatever the request asks for
+# (the `effective_duration = 8` force in src/video.py). Mirrored rather than
+# imported because it is a function-local literal there, like the 4/6/8 ladder
+# above it.
+VEO_REFERENCE_MODE_SECONDS = 8.0
 
 # ============================================================================
 # Public vocabulary
@@ -116,6 +124,15 @@ VEO_MAX_EXTENSIONS = 20
 VEO_MAX_EXTENDED_SECONDS = (
     VEO_MAX_CLIP_SECONDS + VEO_EXTENSION_SECONDS * VEO_MAX_EXTENSIONS
 )
+
+# The longest clip ANY model here renders in one call. Veo tops out at 8s but
+# omni renders natively up to 10s, and measuring every request against Veo's
+# ceiling hid that: a "10 second video" was capped to an 8s clip, flagged
+# needs_extension, and routed to loop_extend -- which needs a video_uri the
+# caller does not have -- plus a two-step seed+extend workflow, when
+# generate_video_omni(duration_seconds=10) is one call. OMNI_MAX_DURATION was
+# already imported for _duration_rejection and simply never consulted here.
+MAX_SINGLE_RENDER_SECONDS = max(VEO_MAX_CLIP_SECONDS, float(OMNI_MAX_DURATION))
 
 # Veo output resolutions (src/video.py validates against exactly this set).
 VEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p", "4K")
@@ -998,18 +1015,37 @@ _GCS_TERMS: frozenset[str] = frozenset(
     {"bucket", "cloud storage", "gcs", "gs://", "output_gcs_uri"}
 )
 
+# Vertical-format vocabulary. Two entries used to be bare words with a common
+# non-format meaning, and both silently set aspect_ratio="9:16":
+#
+# * "story"/"stories" -- "an illustration telling the story of a rabbit" is a
+#   narrative, not an Instagram Story, so the platform sense has to be spelled
+#   out to count;
+# * "short" -- "a short video of a cat" is a duration. "shorts" (YouTube
+#   Shorts) stays, because the plural has no such reading.
+#
+# "reel"/"reels", "shorts" and "tiktok" already carry most of this signal, so
+# qualifying these costs almost nothing and stops a wrong frame shape being
+# chosen from a word the caller did not mean as a format.
 _VERTICAL_TERMS: frozenset[str] = frozenset(
     {
         "9:16",
         "portrait",
         "reel",
         "reels",
-        "short",
         "shorts",
-        "stories",
-        "story",
         "tiktok",
         "vertical",
+        "facebook stories",
+        "facebook story",
+        "ig stories",
+        "ig story",
+        "instagram stories",
+        "instagram story",
+        "snapchat stories",
+        "snapchat story",
+        "stories format",
+        "story format",
     }
 )
 
@@ -1164,14 +1200,23 @@ def _duration_value(text: str, pattern: re.Pattern[str]) -> float | None:
 # board size. The digit must sit immediately before the noun (so "a 4k panel" is
 # a resolution, not 4 shots), and "N frames per second" is a frame rate, not a
 # shot count.
+#
+# The leading lookbehind is the other half of that rule, and it was missing: a
+# digit that is part of a LARGER number is not a count either. Guarding only
+# the right-hand side caught "a 4k panel" (the trailing `k` fails the noun) but
+# not "a 9:16 shot of a dancer", which matched the `16` and planned a 16-beat
+# clip quoted at $9.60 in place of one 6s render (~$0.60). "16:9 shot" read as
+# 9. Text is lower-cased before matching, so `x` covers "1920x1080" too.
 _BEAT_PATTERN = re.compile(
-    r"(\d+)\s*(?:beats?|shots?|scenes?|cuts?|segments?|panels?|keyframes?"
-    r"|frames?(?!\s+per\s+second))\b"
+    r"(?<![\dx:.])(\d+)\s*(?:beats?|shots?|scenes?|cuts?|segments?|panels?"
+    r"|keyframes?|frames?(?!\s+per\s+second))\b"
 )
 
-# "up to 6 reference images", "3 reference photos".
+# "up to 6 reference images", "3 reference photos". Same lookbehind as the beat
+# count, and for the same reason: "9:16 reference images" is one aspect ratio,
+# not 16 references.
 _REFERENCE_COUNT_PATTERN = re.compile(
-    r"(\d+)\s*(?:reference|ref)\s*(?:images?|photos?)"
+    r"(?<![\dx:.])(\d+)\s*(?:reference|ref)\s*(?:images?|photos?)"
 )
 
 _TERM_PATTERNS: dict[str, re.Pattern[str]] = {}
@@ -1182,10 +1227,23 @@ def _term_pattern(term: str) -> re.Pattern[str]:
 
     Lookarounds rather than ``\\b`` so terms that start or end with
     punctuation (``gs://``, ``b-roll``, ``9:16``) still anchor correctly.
+
+    Each assertion is applied only where the term's OWN edge is a word
+    character, which is the half that was missing. Wrapping every term in
+    ``(?!\\w)`` unconditionally meant ``gs://`` required a non-word character
+    after the final slash -- and a real URI has a letter there, so the term
+    could never match one. ``infer_signals("render to gs://renders/out.mp4")``
+    reported ``wants_gcs_output=False``, which silently disabled the
+    ``gcs_output_on_gemini_api`` conflict and, on Vertex, the ``output_gcs_uri``
+    advice; it only looked like it worked when the URI happened to contain the
+    separate term ``bucket``. ``b-roll`` and ``9:16`` begin and end with word
+    characters, so they still anchor on both sides.
     """
     pattern = _TERM_PATTERNS.get(term)
     if pattern is None:
-        pattern = re.compile(rf"(?<!\w){re.escape(term)}(?!\w)")
+        lead = r"(?<!\w)" if term[:1] and re.match(r"\w", term[0]) else ""
+        trail = r"(?!\w)" if term[-1:] and re.match(r"\w", term[-1]) else ""
+        pattern = re.compile(rf"{lead}{re.escape(term)}{trail}")
         _TERM_PATTERNS[term] = pattern
     return pattern
 
@@ -1368,7 +1426,14 @@ def infer_signals(intent: str) -> IntentSignals:
         added_duration = (
             added_value * 60.0 if added_match.group(2).startswith("m") else added_value
         )
-    if seconds_value is not None:
+    # A runtime can name BOTH units, and seconds winning outright dropped the
+    # minutes on the floor: "a 2 minute 30 second trailer" read as 30s, so a
+    # 2.5-minute brief was planned as one sub-8s render with no extension
+    # ceiling handling at all. Sum them when both are present -- that is what
+    # "2 minute 30 second" means -- and fall back to whichever one appeared.
+    if seconds_value is not None and minutes_value is not None:
+        duration = minutes_value * 60.0 + seconds_value
+    elif seconds_value is not None:
         duration = seconds_value
     elif minutes_value is not None:
         duration = minutes_value * 60.0
@@ -1776,12 +1841,18 @@ def resolve_request(
     needs_audio = _first_not_none(given.needs_audio, signals.wants_audio) or False
 
     # Duration: the caller's number is the TOTAL runtime. Per-clip length is
-    # that value snapped into Veo's 4/6/8s ladder, capped at 8s — anything
+    # that value capped at the longest single render available — anything
     # longer has to come from extensions or several beats.
+    #
+    # Capped at MAX_SINGLE_RENDER_SECONDS rather than Veo's 8s so an 8-10s ask
+    # stays a one-render request. Veo routes are unaffected: the omni duration
+    # capability check in _duration_rejection returns early for non-omni
+    # models, and _video_route snaps a Veo clip into the 4/6/8s ladder and
+    # says so in a caveat.
     total_duration = _first_not_none(given.duration_seconds, signals.duration_seconds)
     if total_duration is None:
         clip_duration = DEFAULT_VIDEO_DURATION_SECONDS
-    elif total_duration > VEO_MAX_CLIP_SECONDS:
+    elif total_duration > MAX_SINGLE_RENDER_SECONDS:
         clip_duration = float(VEO_MAX_CLIP_SECONDS)
     else:
         clip_duration = float(total_duration)
@@ -1812,10 +1883,17 @@ def resolve_request(
     )
 
     # Extension: explicit, else the "longer/loop/continue" words, else implied
-    # by a single-shot request longer than Veo's 8s ceiling.
+    # by a single-shot request longer than any single render can cover.
+    #
+    # Measured against MAX_SINGLE_RENDER_SECONDS, not Veo's 8s: an implied
+    # extension routes to loop_extend / extend_video_omni, both of which need
+    # an existing clip, so implying one for a 10s ask offered the caller
+    # nothing they could run. A caller who does want a chain can still ask for
+    # it -- `needs_extension` and the "longer/continue" vocabulary both still
+    # win here.
     implied_extension = (
         total_duration is not None
-        and total_duration > VEO_MAX_CLIP_SECONDS
+        and total_duration > MAX_SINGLE_RENDER_SECONDS
         and num_beats <= 1
     )
     needs_extension = _first_not_none(
@@ -2713,6 +2791,30 @@ def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
     )
 
 
+def _veo_generation_mode(tool: ToolName, request: ResolvedRequest) -> str | None:
+    """The generation mode a Veo ``generate_video`` call will run in.
+
+    Mirrors the derivation inside ``generate_video`` and its dry_run, because
+    the mode decides both the billed length (reference_to_video is forced to
+    8s) and whether the chosen backend can serve the call at all.
+
+    Only ``generate_video`` is derived here. Every other Veo tool has a mode
+    fixed by the tool itself and already emits its own gating caveats, so
+    returning a mode for those would double up on advice they give already.
+    """
+    if tool != "generate_video":
+        return None
+    if request.source_video_uri is not None:
+        return "extend_video"
+    if request.num_reference_images:
+        return "reference_to_video"
+    if request.has_first_frame and request.has_last_frame:
+        return "first_last_frame"
+    if request.has_first_frame:
+        return "image_to_video"
+    return "text_to_video"
+
+
 def _video_params(
     tool: ToolName, model: str, request: ResolvedRequest
 ) -> tuple[dict[str, Any], list[str]]:
@@ -2735,13 +2837,47 @@ def _video_params(
 
     duration = request.clip_duration_seconds
     if not is_omni_model(model):
-        snapped = _snap_veo_duration(duration)
-        if float(snapped) != duration:
-            caveats.append(
-                f"Veo renders {'/'.join(str(d) for d in VEO_DURATIONS_SECONDS)}s "
-                f"clips; {duration:g}s snaps to {snapped}s."
+        # The mode decides the length before the ladder does. generate_video
+        # derives it from the same inputs, and src/video.py then FORCES 8s for
+        # reference_to_video -- so pricing every Veo route as text_to_video
+        # under-quoted a reference render: 3 references at duration_seconds=4
+        # was quoted $0.40 (4s) while the tool's own dry_run said $0.80 (8s).
+        veo_mode = _veo_generation_mode(tool, request)
+        if veo_mode == "reference_to_video":
+            if duration != VEO_REFERENCE_MODE_SECONDS:
+                caveats.append(
+                    f"Veo renders reference-guided clips at exactly "
+                    f"{VEO_REFERENCE_MODE_SECONDS:g}s; the {duration:g}s request "
+                    f"is not honored and the quote is for "
+                    f"{VEO_REFERENCE_MODE_SECONDS:g}s."
+                )
+            duration = VEO_REFERENCE_MODE_SECONDS
+        else:
+            snapped = _snap_veo_duration(duration)
+            if float(snapped) != duration:
+                caveats.append(
+                    f"Veo renders {'/'.join(str(d) for d in VEO_DURATIONS_SECONDS)}s "
+                    f"clips; {duration:g}s snaps to {snapped}s."
+                )
+            duration = float(snapped)
+        if veo_mode in _GEMINI_API_UNSUPPORTED_MODES and request.backend in (
+            "gemini_api",
+            "unknown",
+        ):
+            # Measured against the live service, not inferred: this is the one
+            # mode that fails by billing for an empty result, so a route that
+            # recommends it must say so. "unknown" is included deliberately --
+            # a caveat that may not apply is cheaper than a silent charge.
+            detail = _GEMINI_API_MODE_ERRORS.get(veo_mode, "")
+            hedge = (
+                "the backend is unknown, and on the Gemini Developer API "
+                if request.backend == "unknown"
+                else "on the Gemini Developer API "
             )
-        duration = float(snapped)
+            caveats.append(
+                f"{model} cannot serve this mode ({veo_mode}) {hedge}"
+                f"— {detail}. Run it on Vertex AI instead."
+            )
 
     params: dict[str, Any] = {}
     if tool == "edit_video":
@@ -3019,6 +3155,19 @@ def _video_params(
         }
         if request.resolution is not None:
             params["resolution"] = request.resolution
+        if request.num_reference_images:
+            # The rationale for these models reads "picked for subject
+            # consistency from reference images", but the router is given a
+            # COUNT and never the URIs -- so the key is named rather than
+            # invented, the way the transition/bridge routes name theirs. A
+            # plan that recommends a model for inputs it never asks for is a
+            # plan the caller cannot run.
+            caveats.append(
+                f"Add reference_image_uris ({request.num_reference_images} "
+                "image(s)): this model was chosen for subject consistency "
+                "from reference images, and without them the call is a plain "
+                "text-to-video render."
+            )
 
     # These tools have no resolution parameter at all, so an HD/4K ask cannot
     # reach them. It was previously priced as if it had — three times the
@@ -4089,8 +4238,16 @@ def plan_generation(
     if signals.media_kind is None and (
         constraints is None or constraints.media_kind is None
     ):
+        # Names the kind that was ACTUALLY planned. The note used to say "an
+        # image" unconditionally, because it checked only that no keyword
+        # matched -- ignoring resolve_request's structurally_video fallback.
+        # plan_generation("a golden retriever running on a beach",
+        # duration_seconds=6.0) planned a VIDEO and then told the caller it had
+        # planned an image, and the MCP tool forwards `notes` verbatim, so a
+        # calling agent was handed the opposite of what happened.
+        planned_as = "a video" if request.media_kind == "video" else "an image"
         extra_notes.append(
-            "No image or video keyword matched; planned as an image. Set "
+            f"No image or video keyword matched; planned as {planned_as}. Set "
             "media_kind explicitly if that is wrong."
         )
     if any(route.cost is None for route in routes):

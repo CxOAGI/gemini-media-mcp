@@ -2016,3 +2016,215 @@ def test_the_deprecation_demotion_is_what_orders_a_tie(
     ranked = _rank(routes, profiles)
     assert ranked[0].model == replacement
     assert ranked[1].model == deprecated
+
+
+# ============================================================================
+# Signal-parsing defects found reviewing this PR
+#
+# Every case below was a wrong number or a wrong claim handed to a calling
+# agent, and none of them raised: the plan looked well-formed and said
+# something false. They are grouped here because they share one shape --
+# a pattern or a note that was right about the case it was written for and
+# never checked the case next to it.
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The bug: the digit after the colon read as a shot count, so a
+        # one-render vertical brief planned a 16-beat clip quoted at $9.60.
+        ("a 9:16 shot of a dancer", None),
+        ("a 16:9 shot", None),
+        ("a 1920x1080 panel", None),
+        ("2.5 scenes", None),
+        # Still counted, or the guard has gone too far.
+        ("3 beats", 3),
+        ("5 shots", 5),
+        ("4 keyframe panels", 4),
+        ("10 shots", 10),
+        ("render 9:16 with 3 shots", 3),
+        # Pre-existing guards that must survive.
+        ("a 4k panel", None),
+        ("24 frames per second", None),
+    ],
+)
+def test_a_digit_inside_another_number_is_not_a_shot_count(
+    intent: str, expected: int | None
+) -> None:
+    """Only a digit that is not part of a larger number counts segments."""
+    assert infer_signals(intent).beat_count == expected
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The bug: seconds won outright, so the minutes were dropped and a
+        # 2.5-minute brief was planned as one sub-8s render.
+        ("a 2 minute 30 second trailer", 150.0),
+        ("a 2 min 30 sec trailer", 150.0),
+        ("a 1 minute 5 second clip", 65.0),
+        # Single-unit runtimes are unchanged.
+        ("a 90 second promo", 90.0),
+        ("a 2 minute trailer", 120.0),
+        ("a 6 second clip", 6.0),
+    ],
+)
+def test_a_runtime_naming_both_units_sums_them(intent: str, expected: float) -> None:
+    """"2 minute 30 second" is 150s, not 30s."""
+    assert infer_signals(intent).duration_seconds == expected
+
+
+def test_a_gcs_uri_in_prose_is_recognised() -> None:
+    """The "gs://" term could never match a real URI.
+
+    Every term was wrapped in a trailing ``(?!\\w)``, so ``gs://`` required a
+    non-word character after the final slash -- and a real URI has a letter
+    there. The conflict and the Vertex advice that depend on this signal were
+    both silently unreachable; it only appeared to work when the URI happened
+    to contain the separate term ``bucket``.
+    """
+    assert infer_signals("render the video to gs://renders/out.mp4").wants_gcs_output
+    assert infer_signals("render a video of a cat").wants_gcs_output is False
+
+
+def test_punctuated_terms_still_anchor_on_the_side_that_has_a_word_char() -> None:
+    """The fix must not turn the boundary check off wholesale."""
+    from src.routing import _term_pattern
+
+    assert _term_pattern("gs://").search("upload to gs://renders/out.mp4")
+    assert _term_pattern("gs://").search("xgs://nope") is None
+    assert _term_pattern("b-roll").search("some b-roll here")
+    assert _term_pattern("b-roll").search("ab-roll") is None
+    assert _term_pattern("9:16").search("shoot 9:16 please")
+    assert _term_pattern("9:16").search("19:164") is None
+
+
+def test_a_ten_second_ask_is_one_omni_render_not_an_extension_chain() -> None:
+    """Omni renders natively up to 10s; the planner measured against Veo's 8s.
+
+    A "10 second video" was capped to an 8s clip, flagged needs_extension and
+    routed to loop_extend -- which needs a video_uri the caller does not have
+    -- plus a two-step seed+extend workflow, when
+    generate_video_omni(duration_seconds=10) is a single call.
+    """
+    plan = plan_generation("a 10 second video of a sunset over the ocean")
+    assert plan.request.needs_extension is False
+    assert plan.request.clip_duration_seconds == 10.0
+    tools = [route.tool for route in plan.routes]
+    assert "generate_video_omni" in tools
+    assert "loop_extend" not in tools
+    omni = next(r for r in plan.routes if r.tool == "generate_video_omni")
+    assert omni.params["duration_seconds"] == 10.0
+
+
+def test_a_runtime_past_every_single_render_still_plans_an_extension() -> None:
+    """The cap moved from 8s to 10s; it did not go away."""
+    plan = plan_generation("a 30 second video of a sunset over the ocean")
+    assert plan.request.needs_extension is True
+    assert plan.request.clip_duration_seconds == 8.0
+
+
+def test_the_no_keyword_note_names_the_kind_that_was_planned() -> None:
+    """The note said "an image" even when a video was planned.
+
+    It was gated only on "no keyword matched", ignoring resolve_request's
+    structurally_video fallback -- and the MCP tool forwards `notes` verbatim,
+    so a calling agent was handed the opposite of what happened.
+    """
+    video = plan_generation(
+        "a golden retriever running on a beach",
+        RoutingConstraints(duration_seconds=6.0),
+    )
+    assert video.request.media_kind == "video"
+    assert any("planned as a video" in note for note in video.notes)
+    assert not any("planned as an image" in note for note in video.notes)
+
+    image = plan_generation("a golden retriever running on a beach")
+    assert image.request.media_kind == "image"
+    assert any("planned as an image" in note for note in image.notes)
+
+
+def test_a_reference_route_is_priced_and_parameterised_for_the_mode_it_runs() -> None:
+    """Veo forces reference_to_video to 8s, and the route priced the request.
+
+    src/video.py sets `effective_duration = 8` for this mode, so 3 references
+    at duration_seconds=4 was quoted $0.40 (4s) while generate_video's own
+    dry_run quoted $0.80 (8s) for the same intent. The emitted params also
+    omitted reference_image_uris entirely while the rationale read "picked for
+    subject consistency from reference images" -- a plan recommending a model
+    for inputs it never asks for.
+    """
+    plan = plan_generation(
+        "a product spinning on a turntable",
+        RoutingConstraints(
+            media_kind="video",
+            num_reference_images=3,
+            duration_seconds=4.0,
+            backend="vertex",
+        ),
+    )
+    route = next(r for r in plan.routes if r.tool == "generate_video")
+    assert route.params["duration_seconds"] == 8.0
+    assert route.cost is not None
+    assert route.cost.usd == pytest.approx(0.8)
+    assert any("reference_image_uris" in c for c in route.caveats)
+    assert any("exactly 8s" in c for c in route.caveats)
+
+
+def test_a_mode_the_gemini_api_bills_but_cannot_serve_is_called_out() -> None:
+    """reference_to_video returns an empty result there and bills anyway.
+
+    The worst failure shape in the table, and the route recommended it with
+    caveats=().
+    """
+    plan = plan_generation(
+        "a product spinning on a turntable",
+        RoutingConstraints(
+            media_kind="video",
+            num_reference_images=3,
+            backend="unknown",
+        ),
+    )
+    route = next(r for r in plan.routes if r.tool == "generate_video")
+    assert any("reference_to_video" in c for c in route.caveats)
+
+
+def test_a_plain_text_to_video_route_gains_no_reference_caveats() -> None:
+    """The new caveats must be scoped to the mode that earns them."""
+    plan = plan_generation(
+        "a sunset over the ocean",
+        RoutingConstraints(media_kind="video", duration_seconds=6.0, backend="vertex"),
+    )
+    route = next(r for r in plan.routes if r.tool == "generate_video")
+    assert route.params["duration_seconds"] == 6.0
+    assert not any("reference_image_uris" in c for c in route.caveats)
+    assert not any("reference_to_video" in c for c in route.caveats)
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The bug: two bare words with a common non-format meaning silently
+        # chose a vertical frame.
+        ("an illustration telling the story of a rabbit", None),
+        ("a short video of a cat", None),
+        # The platform senses still count.
+        ("an instagram story of a cat", "9:16"),
+        ("the stories format for ig", "9:16"),
+        ("a youtube shorts clip", "9:16"),
+        ("a tiktok of a cat", "9:16"),
+        ("a reel of a cat", "9:16"),
+        ("a vertical video", "9:16"),
+        ("a portrait photo", "9:16"),
+        ("a 9:16 video", "9:16"),
+        # And the other orientations are untouched.
+        ("a widescreen landscape shot", "16:9"),
+        ("a square logo", "1:1"),
+    ],
+)
+def test_a_format_word_is_not_read_out_of_a_narrative(
+    intent: str, expected: str | None
+) -> None:
+    """"story" is a narrative unless a platform is named; "short" is a length."""
+    assert infer_signals(intent).aspect_ratio == expected
