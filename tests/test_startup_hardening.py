@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -94,32 +95,97 @@ async def test_a_failed_startup_does_not_strand_the_credentials_file(
 
 
 def test_inline_credentials_survive_a_lifespan_cleanup_cycle(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, service_account_json: str
 ) -> None:
-    """Inline JSON passed via GOOGLE_APPLICATION_CREDENTIALS was overwritten
-    with the temp file path, which teardown then deleted — so a second
-    connection found GOOGLE_APPLICATION_CREDENTIALS pointing at a deleted file
-    and no JSON to rebuild from. Every connection after the first failed."""
+    """Inline JSON passed via GOOGLE_APPLICATION_CREDENTIALS used to be written
+    to a temp file that teardown deleted. There is no file now: the same
+    credentials object serves every lifespan, and nothing is repointed."""
+    import glob
+    import tempfile
+
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", service_account_json)
+
+    before = set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json")))
+    first = setup_vertex_credentials()
+    assert first is None
+    cleanup_credentials(first)  # a no-op on None, and must stay one
+    second = setup_vertex_credentials()
+    assert second is None
+    assert set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json"))) == before
+
+    # The inline JSON is still where the operator put it, untouched.
+    assert os.environ["GOOGLE_APPLICATION_CREDENTIALS"] == service_account_json
+    found = main_mod._service_account_credentials()
+    assert found is not None
+    creds, project = found
+    assert project == "proj-x"
+    # Memoised: every lifespan sees the one object.
+    assert main_mod._service_account_credentials()[0] is creds  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_one_session_disconnecting_does_not_break_another(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, service_account_json: str
+) -> None:
+    """The defect, end to end: on sse/streamable-http the MCP SDK enters
+    app_lifespan once PER SESSION. Each lifespan wrote GOOGLE_SERVICE_ACCOUNT_
+    JSON to its own temp file, repointed the process-wide GOOGLE_APPLICATION_
+    CREDENTIALS at it, and deleted its file on teardown -- so a probe client
+    connecting and disconnecting deleted the file every other live session's
+    lazily-loaded Vertex credentials pointed at, and their first tool call
+    failed with DefaultCredentialsError naming the deleted path. Verified
+    against mcp 1.28.1 / google-genai 2.20.0; the Dockerfile ships exactly
+    this configuration.
+
+    With a credentials object there is no file to delete and no variable to
+    repoint, so session B's teardown leaves session A exactly as it was."""
+    import glob
+    import tempfile
+
+    monkeypatch.setenv("DATA_FOLDER", str(tmp_path))
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", service_account_json)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+
+    built: list[dict[str, object]] = []
+
+    def fake_client(**kwargs: object) -> object:
+        built.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(main_mod.genai, "Client", fake_client)
+    before = set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json")))
+
+    async with app_lifespan(main_mod.mcp):  # session A
+        async with app_lifespan(main_mod.mcp):  # a probe: session B
+            pass
+        # B has torn down. A must still hold live, file-free credentials.
+        creds_a = [k for k in built if k.get("vertexai")][0]["credentials"]
+        assert creds_a is not None
+        assert main_mod._service_account_credentials()[0] is creds_a  # type: ignore[index]
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ
+        # The module-global Vertex omni client is built the same way.
+        main_mod._omni_vertex_global_client = None
+        main_mod._get_omni_vertex_global_client()
+        assert built[-1]["credentials"] is creds_a and built[-1]["location"] == "global"
+
+    assert set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json"))) == before
+    main_mod._omni_vertex_global_client = None
+
+
+def test_an_unusable_service_account_key_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid JSON that is not a key must not fall through to ambient ADC."""
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     monkeypatch.setenv(
-        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
         json.dumps({"type": "service_account", "project_id": "x", "private_key": "K"}),
     )
-
-    first = setup_vertex_credentials()
-    assert first is not None and first.exists()
-    cleanup_credentials(first)
-    assert not first.exists()
-
-    # The second connection must rebuild a real, existing key file.
-    second = setup_vertex_credentials()
-    try:
-        assert second is not None, "second lifespan could not rebuild credentials"
-        assert second.exists()
-    finally:
-        if second is not None:
-            cleanup_credentials(second)
+    with pytest.raises(ValueError, match="not a usable service-account key"):
+        main_mod.create_client()
 
 
 def test_both_calendars_are_pinned_for_the_suite() -> None:

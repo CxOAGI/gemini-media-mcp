@@ -2345,3 +2345,93 @@ def test_the_delta_reads_a_compound_the_way_the_total_does(
     assert signals.added_duration_seconds == expected_added
     if "2 min" in intent and "30" in intent:
         assert signals.duration_seconds == signals.added_duration_seconds
+
+
+# ============================================================================
+# Second review pass: planner inputs
+# ============================================================================
+
+
+def test_a_fully_negated_intent_is_linear_in_its_length() -> None:
+    """_is_negated handed the ENTIRE prefix to _negator_precedes on every match
+    and re-split it each time, so a negated intent cost O(matches x length):
+    "no video " x 6000 took 2.6s, x 12000 took 9.9s, inline on the loop with
+    no length cap anywhere. Only the last clause's last three words are ever
+    read, so a bounded window is exact -- and this pins the complexity, since
+    an assertion on the result passes just as well when it takes ten seconds.
+    """
+    import time
+
+    text = "no video " * 12000  # 108k chars, every term negated
+    start = time.perf_counter()
+    signals = infer_signals(text)
+    elapsed = time.perf_counter() - start
+    assert signals.media_kind != "video"
+    assert elapsed < 1.5, f"{elapsed:.2f}s"
+
+
+def test_the_negation_window_never_starts_mid_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cut token must not read as a negator: "...techno" -> "no".
+
+    The window is shrunk so the construction is exact: with 8 characters of
+    look-back before "video" in "x techno beat video", a naive cut lands on
+    the "no" inside "techno". Snapping back to the previous word boundary
+    reads "techno beat" instead, which negates nothing -- while a real "no"
+    in the same position still does.
+    """
+    import src.routing as routing
+
+    monkeypatch.setattr(routing, "_NEGATION_LOOKBACK_CHARS", 8)
+    assert routing._is_negated("x techno beat video", "video") is False
+    assert routing._is_negated("x with no beat video", "video") is True
+
+
+def test_an_intent_past_the_length_cap_is_refused() -> None:
+    from src.routing import MAX_INTENT_CHARS
+
+    with pytest.raises(ValueError, match=str(MAX_INTENT_CHARS)):
+        plan_generation("a" * (MAX_INTENT_CHARS + 1))
+    # At the cap is fine.
+    plan_generation("a video of a cat " + "x" * (MAX_INTENT_CHARS - 40))
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "a 24 frames per second animation",
+        "a 24 frames per sec animation",
+        "a 24 frames/second animation",
+        "a 24 frames-per-second animation",
+        "a 24 frames / sec animation",
+        "24 frames/s of a running horse",
+    ],
+)
+def test_a_frame_rate_is_not_a_shot_count_however_it_is_spelled(intent: str) -> None:
+    """The guard knew only "per second"; "24 frames per sec" planned 20 beats
+    at $12.00 in place of one $0.60 render."""
+    assert infer_signals(intent).beat_count is None
+
+
+def test_a_frame_count_still_counts() -> None:
+    assert infer_signals("4 frames").beat_count == 4
+    assert infer_signals("4 keyframes of a sunrise").beat_count == 4
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The comment's own example, which failed: _word_after saw "of".
+        ("30s of video of a beach", 30.0),
+        ("an 8s clip", 8.0),
+        ("8s of footage", 8.0),
+        # Bare units without a runtime noun still do not count.
+        ("the 1970s diner", None),
+        ("a 3 m tall robot", None),
+    ],
+)
+def test_a_bare_unit_may_sit_one_link_word_from_its_noun(
+    intent: str, expected: float | None
+) -> None:
+    assert infer_signals(intent).duration_seconds == expected

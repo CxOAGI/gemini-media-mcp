@@ -121,16 +121,107 @@ GenerationMode = Literal[
 ]
 
 
+# Wall-clock ceiling on decoding a request's image inputs off the loop. Generous:
+# the pixel cap below bounds the work, and this exists so a pathological codec
+# path releases the caller rather than parking it.
+_IMAGE_PREP_TIMEOUT_SECONDS = 60.0
+
+
 def _prepare_image_input(image_bytes: bytes) -> types.Image:
-    """Convert image bytes to types.Image for API input."""
-    pil_img = Image.open(BytesIO(image_bytes))
-    fmt = "PNG" if pil_img.mode in ("RGB", "RGBA") else "JPEG"
-    if fmt == "JPEG" and pil_img.mode != "RGB":
-        pil_img = pil_img.convert("RGB")
-    buf = BytesIO()
-    pil_img.save(buf, format=fmt)
-    pil_img.close()
+    """Convert image bytes to types.Image for API input.
+
+    Header-checked, and passed through when it can be. The previous version
+    fully decoded EVERY input and re-encoded it as PNG whenever the mode was
+    RGB -- so a 5 MB 4000x4000 JPEG went onto the wire as a 28.5 MB PNG, and a
+    308 KB 9999x9999 PNG (under the fetch cap, under Pillow's hard bomb
+    threshold) cost +382 MB RSS in 1.6s. With no pixel check at all this was
+    the one caller-image decode path left unguarded; image.py's inputs go
+    through _open_input_image and its 40 MP ceiling.
+
+    The size is read from the header before anything is materialised, so an
+    oversized source is refused without ever being decoded. A PNG or JPEG in a
+    mode the service accepts is sent as the bytes it arrived as: the caller's
+    encoding is already the right one, and re-encoding it bought nothing but
+    CPU and, for JPEG, a many-fold larger payload. Only other formats and
+    modes (WEBP, GIF, palette, LA) are decoded and converted.
+    """
+    from .image import _MAX_SOURCE_PIXELS, _megapixels  # shared ceiling
+
+    with Image.open(BytesIO(image_bytes)) as probe:
+        width, height = probe.size
+        pixels = width * height
+        if pixels > _MAX_SOURCE_PIXELS:
+            raise ValueError(
+                f"Image input is {width}x{height} ({_megapixels(pixels)}), above "
+                f"the {_megapixels(_MAX_SOURCE_PIXELS)} limit for input images. "
+                "Downscale it before sending."
+            )
+        source_format = probe.format
+        mode = probe.mode
+        if source_format == "PNG" and mode in ("RGB", "RGBA"):
+            return types.Image(image_bytes=image_bytes, mime_type="image/png")
+        if source_format == "JPEG" and mode == "RGB":
+            return types.Image(image_bytes=image_bytes, mime_type="image/jpeg")
+        # Anything else is normalised: alpha keeps PNG, everything else JPEG.
+        fmt = "PNG" if mode in ("RGBA", "LA", "P") and source_format != "JPEG" else "JPEG"
+        converted = probe.convert("RGBA" if fmt == "PNG" else "RGB")
+    try:
+        buf = BytesIO()
+        converted.save(buf, format=fmt)
+    finally:
+        converted.close()
     return types.Image(image_bytes=buf.getvalue(), mime_type=f"image/{fmt.lower()}")
+
+
+def _prepare_frame_inputs(
+    generation_mode: str,
+    image_bytes: bytes | None,
+    last_frame_bytes: bytes | None,
+    reference_images: list[bytes] | None,
+) -> tuple[
+    types.Image | None,
+    types.Image | None,
+    list[types.VideoGenerationReferenceImage],
+    list[str],
+]:
+    """Build every image input for one render. Synchronous; run it off-loop.
+
+    Returns ``(first_frame, last_frame, references, warnings)``.
+    """
+    warnings: list[str] = []
+    first_frame_input: types.Image | None = None
+    last_frame_input: types.Image | None = None
+    reference_image_inputs: list[types.VideoGenerationReferenceImage] = []
+
+    if generation_mode == "image_to_video" and image_bytes:
+        first_frame_input = _prepare_image_input(image_bytes)
+    elif generation_mode == "first_last_frame":
+        if image_bytes:
+            first_frame_input = _prepare_image_input(image_bytes)
+        if last_frame_bytes:
+            last_frame_input = _prepare_image_input(last_frame_bytes)
+    elif generation_mode == "reference_to_video" and reference_images:
+        # VEO 3.1 supports up to 3 reference images (asset type)
+        # Must wrap in VideoGenerationReferenceImage with reference_type="asset"
+        if len(reference_images) > _MAX_REFERENCE_IMAGES:
+            # A truncation, not a conflict: the render the caller asked for
+            # still happens, just without the extras. Say so rather than
+            # letting a reference the caller explicitly supplied vanish and
+            # quietly change the generation result.
+            warnings.append(
+                f"{len(reference_images)} reference images were supplied but "
+                f"Veo 3.1 accepts {_MAX_REFERENCE_IMAGES}; the last "
+                f"{len(reference_images) - _MAX_REFERENCE_IMAGES} were not "
+                "sent and did not influence this render."
+            )
+        for ref_bytes in reference_images[:_MAX_REFERENCE_IMAGES]:
+            reference_image_inputs.append(
+                types.VideoGenerationReferenceImage(
+                    image=_prepare_image_input(ref_bytes),
+                    reference_type="asset",  # asset for subject preservation
+                )
+            )
+    return first_frame_input, last_frame_input, reference_image_inputs, warnings
 
 
 # Generation modes Veo 3.1 Lite cannot serve. It handles text-to-video and
@@ -478,40 +569,29 @@ async def generate_video(
         backend="vertex" if is_vertexai else "gemini_api",
     )
 
-    # Prepare image inputs
-    first_frame_input: types.Image | None = None
-    last_frame_input: types.Image | None = None
-    reference_image_inputs: list[types.VideoGenerationReferenceImage] = []
-
-    if generation_mode == "image_to_video" and image_bytes:
-        first_frame_input = _prepare_image_input(image_bytes)
-    elif generation_mode == "first_last_frame":
-        if image_bytes:
-            first_frame_input = _prepare_image_input(image_bytes)
-        if last_frame_bytes:
-            last_frame_input = _prepare_image_input(last_frame_bytes)
-    elif generation_mode == "reference_to_video" and reference_images:
-        # VEO 3.1 supports up to 3 reference images (asset type)
-        # Must wrap in VideoGenerationReferenceImage with reference_type="asset"
-        if len(reference_images) > _MAX_REFERENCE_IMAGES:
-            # A truncation, not a conflict: the render the caller asked for
-            # still happens, just without the extras. Say so rather than
-            # letting a reference the caller explicitly supplied vanish and
-            # quietly change the generation result.
-            warnings.append(
-                f"{len(reference_images)} reference images were supplied but "
-                f"Veo 3.1 accepts {_MAX_REFERENCE_IMAGES}; the last "
-                f"{len(reference_images) - _MAX_REFERENCE_IMAGES} were not "
-                "sent and did not influence this render."
-            )
-        for ref_bytes in reference_images[:_MAX_REFERENCE_IMAGES]:
-            ref_image = _prepare_image_input(ref_bytes)
-            reference_image_inputs.append(
-                types.VideoGenerationReferenceImage(
-                    image=ref_image,
-                    reference_type="asset",  # asset for subject preservation
-                )
-            )
+    # Prepare image inputs -- off the event loop. Decoding five near-limit
+    # inputs (first, last, three references) inline measured ~8s of frozen
+    # loop from a ~1.5 MB request; see _prepare_image_input.
+    (
+        first_frame_input,
+        last_frame_input,
+        reference_image_inputs,
+        prep_warnings,
+    ) = await run_off_loop(
+        functools.partial(
+            _prepare_frame_inputs,
+            generation_mode,
+            image_bytes,
+            last_frame_bytes,
+            reference_images,
+        ),
+        timeout=_IMAGE_PREP_TIMEOUT_SECONDS,
+        message=(
+            f"Preparing the image inputs took longer than "
+            f"{_IMAGE_PREP_TIMEOUT_SECONDS:g}s."
+        ),
+    )
+    warnings.extend(prep_warnings)
 
     # Aspect ratio must match source clips for transitions/bridges, so an
     # unsupported value is a hard error rather than a silent coercion.

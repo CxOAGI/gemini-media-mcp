@@ -11,7 +11,6 @@ import math
 import os
 import socket
 import sys
-import tempfile
 import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +24,7 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from google import genai
+from google.oauth2 import service_account
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
@@ -300,66 +300,130 @@ def _compute_allowed_gcs_buckets() -> frozenset[str]:
     return frozenset(buckets)
 
 
+_SERVICE_ACCOUNT_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+_service_account_creds: Any | None = None
+_service_account_project: str | None = None
+_service_account_lock = threading.Lock()
+
+
+def _inline_service_account_json() -> tuple[str, str] | None:
+    """The inline service-account JSON the operator set, and which variable.
+
+    Two spellings are accepted: GOOGLE_SERVICE_ACCOUNT_JSON, or the JSON pasted
+    into GOOGLE_APPLICATION_CREDENTIALS in place of a path (it starts with
+    "{"). A path in GOOGLE_APPLICATION_CREDENTIALS is not inline JSON and is
+    left to Application Default Credentials as before.
+    """
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        return sa_json, "GOOGLE_SERVICE_ACCOUNT_JSON"
+    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if gac.strip().startswith("{"):
+        return gac, "GOOGLE_APPLICATION_CREDENTIALS"
+    return None
+
+
+def _parse_service_account_json() -> dict[str, Any] | None:
+    """Parse the inline service-account JSON, failing loudly if it is broken.
+
+    A configured service-account JSON that does not parse must fail. Falling
+    through to genai.Client(vertexai=True) discovered whatever ambient ADC
+    happened to exist -- so a typo'd credential silently ran the server as a
+    DIFFERENT identity than configured, with one log line as the only signal.
+    """
+    inline = _inline_service_account_json()
+    if inline is None:
+        return None
+    sa_json, source = inline
+    try:
+        data = json.loads(sa_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{source} is set but is not valid JSON: {e}. "
+            "Refusing to fall back to ambient application-default "
+            "credentials — that would run the server as a different "
+            "identity than configured. Fix the JSON or unset the variable."
+        ) from e
+    if not isinstance(data, dict):
+        raise ValueError(f"{source} must be a JSON object, got {type(data).__name__}.")
+    return data
+
+
+def _service_account_credentials() -> tuple[Any, str | None] | None:
+    """Process-wide credentials built from the inline JSON, or None for ADC.
+
+    Returns ``(credentials, project_id)`` and is memoised for the life of the
+    process. This replaces a temp file. The old design wrote the JSON to
+    ``/tmp/gcp_sa_*.json``, pointed the process-wide GOOGLE_APPLICATION_
+    CREDENTIALS at it, and deleted the file on lifespan teardown -- and on the
+    sse / streamable-http transports the MCP SDK enters the lifespan once PER
+    SESSION. So every connecting client wrote its own file and repointed the
+    shared variable, and every disconnecting client deleted the file that
+    every other live session's lazily-loaded Vertex credentials pointed at.
+    Verified against mcp 1.28.1 and google-genai 2.20.0: client A connects, a
+    probe connects and disconnects, A's first tool call fails with
+    DefaultCredentialsError naming the probe's deleted file; the module-global
+    Vertex and Storage clients failed the same way. The Dockerfile ships this
+    exact configuration. stdio, with its single lifespan, never saw it.
+
+    A credentials object handed to each client has no file to delete and
+    mutates no environment, so there is no shared state to get wrong.
+    """
+    global _service_account_creds, _service_account_project
+    with _service_account_lock:
+        if _service_account_creds is not None:
+            return _service_account_creds, _service_account_project
+        info = _parse_service_account_json()
+        if info is None:
+            return None
+        try:
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=list(_SERVICE_ACCOUNT_SCOPES)
+            )
+        except (ValueError, KeyError) as e:
+            raise ValueError(
+                "The inline service-account JSON parsed but is not a usable "
+                f"service-account key: {e}."
+            ) from e
+        _service_account_creds = creds
+        _service_account_project = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT") or info.get("project_id") or None
+        )
+        return creds, _service_account_project
+
+
+def _vertex_client_kwargs(**extra: Any) -> dict[str, Any]:
+    """Keyword arguments for a Vertex genai.Client on this deployment."""
+    kwargs: dict[str, Any] = {"vertexai": True, **extra}
+    found = _service_account_credentials()
+    if found is not None:
+        creds, project = found
+        kwargs["credentials"] = creds
+        if project and "project" not in kwargs:
+            kwargs["project"] = project
+    return kwargs
+
+
 def setup_vertex_credentials() -> Path | None:
-    """Setup Vertex AI credentials from service account JSON or environment."""
+    """Validate the Vertex credentials configuration at startup.
+
+    Kept for its name and its two callers; it no longer writes anything.
+    Parsing the inline JSON here means a broken credential fails the lifespan
+    before any client is built, as before. Always returns None: there is no
+    temp file any more (see _service_account_credentials for why).
+    """
     if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() != "true":
         return None
-
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-
-    # Remember which variable the operator actually set so a parse failure
-    # can name it in the error below.
-    sa_json_source = "GOOGLE_SERVICE_ACCOUNT_JSON"
-    if not sa_json and gac.strip().startswith("{"):
-        sa_json = gac
-        sa_json_source = "GOOGLE_APPLICATION_CREDENTIALS"
-        # On an HTTP transport the lifespan re-runs per connection. This
-        # function overwrites GOOGLE_APPLICATION_CREDENTIALS with the temp
-        # file path below, and teardown deletes that file — so the second
-        # connection would find GOOGLE_APPLICATION_CREDENTIALS pointing at a
-        # deleted path and no inline JSON to rebuild from. Persist the JSON to
-        # the primary variable so every subsequent lifespan rebuilds cleanly.
-        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = sa_json
-
-    if sa_json:
-        try:
-            data = json.loads(sa_json)
-        except json.JSONDecodeError as e:
-            # A configured service-account JSON that does not parse must fail
-            # loudly. Returning None here dropped through to
-            # genai.Client(vertexai=True), which then discovered whatever
-            # ambient ADC happened to exist — so a typo'd credential silently
-            # ran the server as a DIFFERENT identity than configured, with one
-            # log line as the only signal.
-            raise ValueError(
-                f"{sa_json_source} is set but is not valid JSON: {e}. "
-                "Refusing to fall back to ambient application-default "
-                "credentials — that would run the server as a different "
-                "identity than configured. Fix the JSON or unset the variable."
-            ) from e
-        try:
-            fd, path_str = tempfile.mkstemp(suffix=".json", prefix="gcp_sa_")
-            path = Path(path_str)
-            with open(fd, "w") as f:
-                json.dump(data, f)
-            # mkstemp creates 0600 on POSIX; make it explicit for clarity.
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
-            logger.info("Created temp credentials file: %s", path)
-            return path
-        except OSError as e:
-            logger.error("Failed to setup credentials: %s", e)
-            return None
-
+    _parse_service_account_json()
     return None
 
 
 def cleanup_credentials(path: Path | None) -> None:
-    """Clean up temporary credentials file."""
+    """Remove a temporary credentials file, if one was ever written.
+
+    None is what setup_vertex_credentials returns now; this stays as a no-op
+    for that case so the lifespan's finally reads as it always did.
+    """
     if path and path.exists():
         try:
             path.unlink()
@@ -380,7 +444,7 @@ def check_credentials() -> bool:
 def create_client() -> genai.Client:
     """Create a Google GenAI client."""
     if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true":
-        return genai.Client(vertexai=True)
+        return genai.Client(**_vertex_client_kwargs())
     api_key = os.environ.get("GEMINI_API_KEY")
     if api_key:
         return genai.Client(api_key=api_key)
@@ -432,7 +496,9 @@ def _get_omni_vertex_global_client() -> genai.Client:
     """Return a memoized Vertex client pinned to the global location."""
     global _omni_vertex_global_client
     if _omni_vertex_global_client is None:
-        _omni_vertex_global_client = genai.Client(vertexai=True, location="global")
+        _omni_vertex_global_client = genai.Client(
+            **_vertex_client_kwargs(location="global")
+        )
     return _omni_vertex_global_client
 
 
@@ -1733,13 +1799,12 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     images_dir.mkdir(parents=True, exist_ok=True)
     videos_dir.mkdir(parents=True, exist_ok=True)
 
-    # The credential file is written BEFORE the client is built, and building
-    # a Vertex client can fail (bad service-account JSON, no ambient project).
-    # With the write outside the try, that failure left the service-account
-    # private key in /tmp — and on an HTTP transport the lifespan re-runs per
-    # connection, so a misconfigured server that stays up accumulated one
-    # leaked key file per connection attempt. Everything that can fail after
-    # the write now lives under the finally.
+    # Validates the inline service-account JSON before any client is built,
+    # so a broken credential fails here and names its variable. Nothing is
+    # written: credentials are a process-wide object now (see
+    # _service_account_credentials), because on an HTTP transport this
+    # lifespan runs once PER SESSION and a per-session temp file was deleted
+    # from under every other live session on teardown.
     temp_creds_path = setup_vertex_credentials()
     try:
         client = create_client()
@@ -2014,7 +2079,12 @@ def _get_storage_client() -> storage.Client:
     global _storage_client
     with _storage_client_lock:
         if _storage_client is None:
-            _storage_client = storage.Client()
+            found = _service_account_credentials()
+            if found is not None:
+                creds, project = found
+                _storage_client = storage.Client(credentials=creds, project=project)
+            else:
+                _storage_client = storage.Client()
         return _storage_client
 
 
@@ -3527,7 +3597,10 @@ async def plan_generation(
             is_draft=is_draft,
             pinned_model=pinned_model,
         )
-        plan = plan_impl(intent, constraints)
+        # Off the loop: the planner is pure string work, but a long intent is
+        # not free (see routing.MAX_INTENT_CHARS), and one blocked coroutine
+        # blocks every request.
+        plan = await asyncio.to_thread(plan_impl, intent, constraints)
 
         def _route(route: Any) -> dict[str, Any]:
             return {
@@ -3618,6 +3691,10 @@ async def generate_storyboard(
         (HTML), sheet_url (the full-resolution PNG), per-shot results, total
         cost and total runtime.
     """
+    # Accumulators live outside the try so the cancellation handler below can
+    # still see what was rendered -- and billed -- before the caller vanished.
+    frames: list[Any] = []  # StoryboardFrame; the module is imported lazily below
+    shot_results: list[dict[str, Any]] = []
     try:
         app_ctx = ctx.request_context.lifespan_context
 
@@ -3700,8 +3777,6 @@ async def generate_storyboard(
 
         from .storyboard import StoryboardFrame, render_sheet_preview, write_storyboard
 
-        frames: list[StoryboardFrame] = []
-        shot_results: list[dict[str, Any]] = []
         costs: list[Any] = []
         warnings_seen: list[str] = list(plan_warnings)
 
@@ -3842,6 +3917,22 @@ async def generate_storyboard(
             blocks.append(Image(data=inline_preview, format="jpeg"))
         blocks.append(TextContent(type="text", text=_respond(app_ctx, response_data)))
         return blocks
+    except asyncio.CancelledError:
+        # A cancellation is a BaseException, so the handler below never sees
+        # it -- and unlike loop_extend, generate_clip and extend_video_omni,
+        # this tool had no handler of its own. Cancel after 2 of 4 paid shots
+        # left two orphan PNGs on disk with no sidecar and no cost record.
+        # Say what was rendered, then let the cancellation continue.
+        rendered = [r for r in shot_results if "image_url" in r]
+        if rendered:
+            logger.warning(
+                "generate_storyboard cancelled after %d of %d shot(s) rendered "
+                "and billed; frames: %s",
+                len(rendered),
+                len(shots),
+                ", ".join(str(r["image_url"]) for r in rendered),
+            )
+        raise
     except Exception as e:
         await ctx.error(f"Storyboard failed: {e}")
         logger.exception("Tool error")
@@ -4084,6 +4175,14 @@ async def generate_video(
                 _assert_local_source(extend_video_uri, data_dir, "extend_video_uri")
                 for ref_uri in (reference_image_uris or [])[:_MAX_REFERENCE_IMAGES]:
                     _assert_local_source(ref_uri, data_dir, "reference image")
+            else:
+                # The draft takes image_uri too (omni accepts a prompt plus
+                # images) and its real run refuses a missing or unconfined
+                # one -- but every source check above sat under `if not
+                # draft`, so generate_video(draft=True, dry_run=True,
+                # image_uri=<missing file, or /etc/passwd>) quoted $0.815 for
+                # a render that cannot fetch its input. Same invariant.
+                _assert_local_source(image_uri, data_dir, "image_uri")
             # Report the model the real run will report, not the raw input: a
             # caller who pinned (or fed back) a `-preview` id saw the quote say
             # `-preview` while the render reported the resolved `-001` name.

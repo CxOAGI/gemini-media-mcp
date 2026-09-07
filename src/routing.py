@@ -1113,7 +1113,11 @@ _ADDED_DURATION_PATTERN = re.compile(
 _BARE_DURATION_UNITS: frozenset[str] = frozenset({"s", "m"})
 
 # Nouns that can only be describing the thing being timed, so a bare unit in
-# front of one is a runtime: "8s clip", "30s of video".
+# front of one is a runtime: "8s clip", "30s of video". The second example is
+# the one the lookup used to fail -- _word_after saw "of" and stopped -- so a
+# single linking word may sit between the unit and the noun.
+_DURATION_LINK_WORDS: frozenset[str] = frozenset({"of"})
+
 _DURATION_CONTEXT_WORDS: frozenset[str] = frozenset(
     {
         "ad",
@@ -1193,6 +1197,22 @@ def _word_after(text: str, index: int) -> str:
     return match.group(1) if match else ""
 
 
+def _context_word_after(text: str, index: int) -> str:
+    """The noun a bare duration unit is describing, skipping one link word.
+
+    "30s of video": the word after the unit is "of", and the noun that makes
+    it a runtime is the one after that.
+    """
+    tail = text[index:]
+    first = _WORD_AFTER_PATTERN.search(tail)
+    if not first:
+        return ""
+    if first.group(1) not in _DURATION_LINK_WORDS:
+        return first.group(1)
+    second = _WORD_AFTER_PATTERN.search(tail[first.end() :])
+    return second.group(1) if second else ""
+
+
 def _duration_value(text: str, pattern: re.Pattern[str]) -> float | None:
     """First number in ``text`` that is really a duration, in its own unit.
 
@@ -1206,7 +1226,7 @@ def _duration_value(text: str, pattern: re.Pattern[str]) -> float | None:
             if _DECADE_PATTERN.match(match.group(1)):
                 continue
             if not (
-                _word_after(text, match.end()) in _DURATION_CONTEXT_WORDS
+                _context_word_after(text, match.end()) in _DURATION_CONTEXT_WORDS
                 or _word_before(text, match.start()) in _DURATION_CUE_WORDS
             ):
                 continue
@@ -1230,7 +1250,11 @@ def _duration_value(text: str, pattern: re.Pattern[str]) -> float | None:
 # 9. Text is lower-cased before matching, so `x` covers "1920x1080" too.
 _BEAT_PATTERN = re.compile(
     r"(?<![\dx:.])(\d+)\s*(?:beats?|shots?|scenes?|cuts?|segments?|panels?"
-    r"|keyframes?|frames?(?!\s+per\s+second))\b"
+    # A frame RATE is not a shot count, however it is spelled: "per second",
+    # "per sec", "/second", "-per-second", "/s". The first guard knew only the
+    # first spelling, so "a 24 frames per sec animation" planned 20 beats at
+    # $12.00 in place of one $0.60 render.
+    r"|keyframes?|frames?(?!\s*(?:-\s*)?(?:per[\s\-]*|/\s*)(?:sec(?:ond)?s?|s)\b))\b"
 )
 
 # "up to 6 reference images", "3 reference photos". Same lookbehind as the beat
@@ -1296,6 +1320,20 @@ _AUDIO_NEGATORS: tuple[str, ...] = _NEGATORS + ("silent", "mute", "muted")
 # before a term can negate it.
 _NEGATION_WINDOW = 3
 
+# How much text is handed to that check, in characters. _negator_precedes reads
+# only the last _NEGATION_WINDOW words of the current clause, but it was handed
+# the ENTIRE prefix and re-split it on every match -- so a fully negated intent
+# cost O(matches x length): "no video " x 6000 took 2.6s, x 12000 took 9.9s,
+# inline on the event loop. A negator is a short word, so a window this wide
+# always contains the whole of the three words that matter (widened back to a
+# word boundary so it never starts mid-token).
+_NEGATION_LOOKBACK_CHARS = 120
+
+# The longest intent the planner will read. It is pure string work, but it is
+# not free -- see _NEGATION_LOOKBACK_CHARS -- and nothing above this length is
+# a description of something to generate.
+MAX_INTENT_CHARS = 20_000
+
 # A negator only reaches a term while nothing separates them. Clause and
 # sentence punctuation ends the scan — "no audio, a video of rain" and "avoid
 # text. video montage of ocean waves" are asking FOR video, and reading the
@@ -1338,7 +1376,14 @@ def _is_negated(text: str, term: str) -> bool:
     found = False
     for match in pattern.finditer(text):
         found = True
-        if not _negator_precedes(text[: match.start()], negators):
+        start = match.start()
+        low = max(0, start - _NEGATION_LOOKBACK_CHARS)
+        if low > 0:
+            # Back up to a word boundary, or a cut token ("techno" -> "no")
+            # could read as a negator.
+            boundary = text.rfind(" ", 0, low)
+            low = boundary + 1 if boundary >= 0 else 0
+        if not _negator_precedes(text[low:start], negators):
             return False
     return found
 
@@ -4286,6 +4331,11 @@ def plan_generation(
     """
     if not intent or not intent.strip():
         raise ValueError("intent must be a non-empty description of what to generate.")
+    if len(intent) > MAX_INTENT_CHARS:
+        raise ValueError(
+            f"intent is {len(intent)} characters; the limit is {MAX_INTENT_CHARS}. "
+            "Describe what to generate, not the whole brief."
+        )
 
     signals = infer_signals(intent)
     request = resolve_request(intent, signals, constraints)
