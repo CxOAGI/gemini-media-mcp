@@ -477,8 +477,19 @@ async def generate_image(
 
     # Prepare input images (up to 14 references for Gemini 3.x image models).
     # Decoding is budgeted: see _open_input_image.
+    #
+    # Off the event loop, like the generate_content call below. The guards here
+    # cap PIXELS, not CPU: 14 references plus one edit input just under
+    # _MAX_SOURCE_PIXELS is ~128 KB encoded each -- under any byte cap -- and
+    # measured 8.7s of straight-line decode and LANCZOS resampling. Run inline
+    # that froze the whole server for those 8.7s: no other render, no Veo LRO
+    # polling, no ctx.info progress, since one blocked coroutine blocks every
+    # request. Unlike the filesystem probes, this is CPU-bound work that always
+    # terminates, so the shared to_thread pool is the right place for it.
     max_refs = 14 if model_id in _GEMINI3_IMAGE_MODELS else 1
-    pil_images = _prepare_input_images(image_bytes, reference_images, max_refs)
+    pil_images = await asyncio.to_thread(
+        _prepare_input_images, image_bytes, reference_images, max_refs
+    )
 
     try:
         # Build contents for Gemini models
