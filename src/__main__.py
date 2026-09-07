@@ -1652,12 +1652,28 @@ def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     and GKE — so `http://100.64.1.1/` was fetched and its content returned to
     the caller. `is_global` is the allowlist form of the same question and
     closes the whole class, including ranges IANA has not allocated yet.
+
+    `is_global` alone is NOT sufficient, though, and the enumeration it
+    replaced was right about one flag: `is_reserved`. CPython reports
+    `is_global=True` for the IPv6 ranges that embed an IPv4 destination, so
+    dropping `is_reserved` reopened the exact hole this guard exists to
+    close. `64:ff9b::a9fe:a9fe` is NAT64-mapped 169.254.169.254 -- the cloud
+    metadata service -- and on any host with a NAT64/DNS64 route (the
+    IPv6-only pod case) it reaches it and returns the body. `::7f00:1` and
+    `::a00:1` (IPv4-compatible, deprecated but still routed by some stacks)
+    and `5f00::/16` are the same shape. None is `is_private`, `is_loopback`
+    or `is_link_local`; every one is `is_reserved`. Checked the other way
+    too: no real public address is `is_reserved`, so this costs nothing.
     """
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         # ::ffff:a.b.c.d reaches the same host as a.b.c.d, so it must be
         # judged as the IPv4 address it wraps rather than as an IPv6 one.
         ip = mapped
+    if ip.is_reserved:
+        # See the docstring: the IPv4-embedding IPv6 ranges are is_global=True,
+        # so this is the only check standing between them and a fetch.
+        return False
     if getattr(ip, "is_site_local", False):
         # Deprecated IPv6 site-local (fec0::/10) is absent from CPython's
         # private-networks table, so `is_global` reports it as public even on
