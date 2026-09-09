@@ -287,6 +287,31 @@ _EXTEND_READ_TIMEOUT_SECONDS = 30.0
 # against the monotonic clock so blocked time counts — the previous counter
 # only added the sleep interval, so a stalled call could never reach it.
 _VEO_TOTAL_TIMEOUT_SECONDS = 1800.0
+
+# The caller-facing default deadline for ONE Veo render, and the reason it is
+# far below the 1800s budget above. Common MCP hosts cap a single tool call at
+# roughly four minutes. A render that outlives the HOST's limit is cancelled by
+# the host: this server never gets to answer, the caller sees a bare "Tool
+# execution failed" with no message, no cost and no operation name -- and the
+# Veo operation completes and bills anyway. A 4K render ($1.20) did exactly
+# that, twice. The omni tools already default to 210s for this reason; Veo did
+# not, and exposed no timeout at all. Under the host's ceiling the server
+# answers first, structured, with the operation name that lets the spend be
+# reconciled in the console. Callers whose host allows longer can raise it.
+VEO_DEFAULT_TIMEOUT_SECONDS = 210.0
+
+
+class VeoTimeoutError(TimeoutError):
+    """A Veo render ran past its deadline.
+
+    Carries the operation name when the request had been submitted, because
+    that is the handle a caller needs to find -- and reconcile -- a render
+    that may well finish and bill after this error is returned.
+    """
+
+    def __init__(self, message: str, *, operation_name: str | None = None) -> None:
+        super().__init__(message)
+        self.operation_name = operation_name
 _VEO_POLL_INTERVAL_SECONDS = 10.0
 
 # Per-call ceilings. google-genai hands timeout=None straight to httpx when
@@ -494,6 +519,7 @@ async def generate_video(
     resolution: str | None = None,
     person_generation: str | None = None,
     output_gcs_uri: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Generate a video using VEO models.
 
@@ -745,13 +771,27 @@ async def generate_video(
     # accumulated the sleep interval, which meant a stalled call could never
     # reach the limit and the request hung indefinitely.
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _VEO_TOTAL_TIMEOUT_SECONDS
-    expired = f"Video generation timed out after {_VEO_TOTAL_TIMEOUT_SECONDS:.0f}s."
+    total_budget = (
+        float(timeout_seconds) if timeout_seconds else _VEO_TOTAL_TIMEOUT_SECONDS
+    )
+    deadline = loop.time() + total_budget
+    expired = f"Video generation timed out after {total_budget:.0f}s."
+    # Known once the request has been submitted; the deadline error names it,
+    # because a render that outlives the deadline may still complete and bill.
+    operation_name: str | None = None
 
     def _remaining() -> float:
         left = deadline - loop.time()
         if left <= 0:
-            raise TimeoutError(expired)
+            if operation_name:
+                raise VeoTimeoutError(
+                    f"{expired} Operation {operation_name} was submitted and may "
+                    "still complete and bill; reconcile it in the console.",
+                    operation_name=operation_name,
+                )
+            raise VeoTimeoutError(
+                f"{expired} The request had not been submitted, so nothing was billed."
+            )
         return left
 
     operation = await run_off_loop(
@@ -760,6 +800,7 @@ async def generate_video(
         message="Video generation timed out submitting the request.",
     )
 
+    operation_name = getattr(operation, "name", None)
     if log_callback:
         await log_callback(f"Polling operation: {operation.name}")
     while not operation.done:
@@ -767,7 +808,10 @@ async def generate_video(
         operation = await run_off_loop(
             functools.partial(client.operations.get, operation),
             timeout=min(_VEO_POLL_TIMEOUT_SECONDS, _remaining()),
-            message="Video generation timed out polling the operation.",
+            message=(
+                f"Video generation timed out polling operation {operation_name}; "
+                "it may still complete and bill."
+            ),
         )
 
     if operation.error:

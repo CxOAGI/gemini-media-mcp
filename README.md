@@ -245,6 +245,7 @@ Generate videos using VEO models. Video works on **both** credential modes: Veo 
 - `negative_prompt`: Things to avoid in the video
 - `seed`: Random seed for reproducibility
 - `image_uri`: First frame image URI for image-to-video generation
+- `timeout_seconds` (default `210`): Overall deadline for the render. Common MCP hosts cap one tool call at roughly four minutes; a render that outlives the *host's* limit is cancelled by the host — the caller sees a bare "Tool execution failed" with no message, cost or operation name, and the Veo operation completes and bills anyway (a 4K render did exactly this). Under the host ceiling the server answers first: a timeout returns a structured error naming the `generation_mode`, the `attempted_cost` and the `operation_name` to reconcile in the console. Raise it if your host allows a longer call; 4K is the slowest tier.
 - `draft` (default `false`): When `true`, routes the request to `gemini-omni-1.1-flash` for a fast 720p draft instead of Veo. Iterate fast, then re-run with `draft=false` to finalize on Veo. At 720p this buys speed, not savings (omni is $0.10136/s against Veo Fast's $0.10/s) — add `draft_resolution="360p"` and it buys both. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
 - `draft_resolution`: Resolution for a `draft=true` pass. Naming one renders the draft on `gemini-omni-1.1-flash`, the model that has a resolution parameter; `360p` is about a third of the 720p price and the cheapest render this server can issue. Unset keeps the preview model's fixed 720p.
 

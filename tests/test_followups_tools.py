@@ -1017,3 +1017,233 @@ async def test_a_cancelled_storyboard_records_the_shots_it_paid_for(
     joined = " ".join(r.getMessage() for r in caplog.records)
     assert "cancelled after 2 of 4" in joined, joined
     assert "shot1.png" in joined and "shot2.png" in joined
+
+
+# ===========================================================================
+# P0: a Veo render that outlives the deadline must answer, structured
+# ===========================================================================
+
+
+def _small_mp4(path: Path, *, size: tuple[int, int] = (64, 64), frames: int = 8) -> Path:
+    import imageio.v3 as iio
+    import numpy as np
+    from io import BytesIO
+
+    h, w = size[1], size[0]
+    buf = BytesIO()
+    iio.imwrite(
+        buf,
+        [np.full((h, w, 3), (i * 20) % 255, dtype=np.uint8) for i in range(frames)],
+        extension=".mp4",
+        fps=2,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(buf.getvalue())
+    return path
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_generate_video_hands_its_deadline_to_the_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_video exposed no timeout at all while the omni tools default to
+    210s to stay under the host's ceiling. The default and an explicit value
+    both reach the impl."""
+    from src.__main__ import generate_video
+    from src.video import VEO_DEFAULT_TIMEOUT_SECONDS
+
+    seen: list[dict[str, Any]] = []
+    out = _small_mp4(tmp_path / "videos" / "v.mp4")
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        seen.append(kwargs)
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "model": kwargs["model"],
+            "aspect_ratio": "16:9",
+            "duration_seconds": 4,
+            "resolution": kwargs.get("resolution"),
+            "generation_mode": "text_to_video",
+            "audio_enabled": False,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+    ctx = _ctx(_app_ctx(tmp_path))
+    await generate_video(ctx=ctx, prompt="a leaf", model="veo-3.1-fast-generate-001")
+    assert seen[-1]["timeout_seconds"] == VEO_DEFAULT_TIMEOUT_SECONDS == 210.0
+    await generate_video(
+        ctx=ctx, prompt="a leaf", model="veo-3.1-fast-generate-001", timeout_seconds=30
+    )
+    assert seen[-1]["timeout_seconds"] == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_veo_timeout_names_the_mode_the_cost_and_the_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 4K render on Vertex came back as a bare "Tool execution failed": no
+    message, no cost, no backend, no operation -- and $1.20 billed, twice. The
+    server's own deadline now fires first and the error is a document."""
+    from src.__main__ import generate_video
+    from src.video import VeoTimeoutError
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        raise VeoTimeoutError(
+            "Video generation timed out after 210s. Operation operations/abc123 was "
+            "submitted and may still complete and bill; reconcile it in the console.",
+            operation_name="operations/abc123",
+        )
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+    app_ctx = _app_ctx(tmp_path)
+    app_ctx.client._api_client.vertexai = True
+    body = json.loads(
+        await generate_video(
+            ctx=_ctx(app_ctx),
+            prompt="A single red maple leaf on wet pavement",
+            model="veo-3.1-fast-generate-001",
+            duration_seconds=4,
+            resolution="4K",
+        )
+    )
+    assert body["timed_out"] is True
+    assert body["operation_name"] == "operations/abc123"
+    assert body["generation_mode"] == "text_to_video"
+    assert body["model"] == "veo-3.1-fast-generate-001"
+    assert body["resolution"] == "4K"
+    assert body["attempted_cost"]["usd"] == pytest.approx(1.2)  # 4s @ $0.30/s
+    assert body["backend"] == "vertex"
+    assert "may still complete and bill" in body["note"]
+    assert "operations/abc123" in body["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_any_veo_failure_names_what_was_attempted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not only timeouts: every failure on the paid path carries the mode and
+    the attempted cost, so it can be reconciled against the console."""
+    from src.__main__ import generate_video
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("VEO error: internal")
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+    body = json.loads(
+        await generate_video(
+            ctx=_ctx(_app_ctx(tmp_path)),
+            prompt="x",
+            model="veo-3.1-fast-generate-001",
+            duration_seconds=8,
+            reference_image_uris=[f"file://{_small_mp4(tmp_path / 'r.mp4')}"],
+        )
+    )
+    assert body["error"] == "VEO error: internal"
+    assert body["generation_mode"] == "reference_to_video"
+    assert body["attempted_cost"]["usd"] == pytest.approx(0.8)  # forced 8s @ $0.10/s
+    assert "timed_out" not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20.0)
+async def test_a_4k_render_assembles_and_reports_its_dimensions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hypothesis (b) from the triage -- an exception in response assembly that
+    is 4K-specific -- ruled out: a real 3840x2160 file goes through the
+    tool's assembly and is measured, dimensioned and metered."""
+    from src.__main__ import generate_video
+
+    out = _small_mp4(tmp_path / "videos" / "fourk.mp4", size=(3840, 2160), frames=8)
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "model": kwargs["model"],
+            "aspect_ratio": "16:9",
+            "duration_seconds": 4,
+            "resolution": kwargs.get("resolution"),
+            "generation_mode": "text_to_video",
+            "audio_enabled": False,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+    app_ctx = _app_ctx(tmp_path)
+    app_ctx.client._api_client.vertexai = True
+    body = json.loads(
+        await generate_video(
+            ctx=_ctx(app_ctx),
+            prompt="a leaf",
+            model="veo-3.1-fast-generate-001",
+            duration_seconds=4,
+            resolution="4K",
+        )
+    )
+    assert "error" not in body, body
+    assert body["rendered_dimensions"] == [3840, 2160]
+    assert body["resolution"] == "4K"
+    assert body["resolution_source"] == "measured from the rendered video"
+    assert body["cost"]["usd"] == pytest.approx(1.2)
+    assert body["cost"]["is_estimate"] is False
+
+
+# ===========================================================================
+# P2: in-clip bridges carry the provenance beats carry
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_clip_bridges_carry_the_same_provenance_as_beats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Beats reported resolution, resolution_source and duration_source; the
+    bridge between them carried a bare `duration_seconds: 4` and none of the
+    three, while standalone generate_bridge reported all of them. And the
+    top-level total was a sum of snapped requests with no source label."""
+    from src.__main__ import generate_clip
+
+    monkeypatch.setattr("src.__main__.assert_frame_decoding_available", lambda: None)
+    monkeypatch.setattr("src.__main__.extract_frame_png", lambda *a, **k: _png_bytes())
+    calls = {"n": 0}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        out = _small_mp4(tmp_path / "videos" / f"seg{calls['n']}.mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "model": kwargs["model"],
+            "aspect_ratio": kwargs.get("aspect_ratio", "16:9"),
+            "duration_seconds": kwargs.get("duration_seconds", 4),
+            "resolution": kwargs.get("resolution"),
+            "generation_mode": "text_to_video",
+            "audio_enabled": False,
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+    # Bridges are first/last-frame renders, which Veo serves on Vertex only.
+    app_ctx = _app_ctx(tmp_path)
+    app_ctx.client._api_client.vertexai = True
+    body = json.loads(
+        await generate_clip(
+            ctx=_ctx(app_ctx),
+            beats=[{"prompt": "a"}, {"prompt": "b"}],
+            add_bridges=True,
+            model="veo-3.1-fast-generate-001",
+        )
+    )
+    assert "error" not in body, body
+    bridges = [s for s in body["segments"] if s.get("kind") == "bridge"]
+    assert bridges, body["segments"]
+    for bridge in bridges:
+        for key in ("resolution", "resolution_source", "duration_source"):
+            assert bridge.get(key), (key, bridge)
+        assert isinstance(bridge["duration_seconds"], float)
+    assert body["total_duration_source"]
+    assert body["total_duration_source"].startswith("sum of")

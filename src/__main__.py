@@ -26,6 +26,7 @@ from aiohttp.abc import AbstractResolver, ResolveResult
 from google import genai
 
 from . import credentials
+from .video import VEO_DEFAULT_TIMEOUT_SECONDS
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
@@ -1132,6 +1133,74 @@ async def _emit_warnings(
             continue
         seen.add(warning)
         await ctx.warning(warning)
+
+
+def _veo_request_mode(
+    *,
+    extend_video_uri: str | None,
+    reference_image_uris: list[str] | None,
+    has_first_frame: bool,
+    has_last_frame: bool,
+) -> str:
+    """The Veo generation mode a request will run in, from the inputs given."""
+    if extend_video_uri:
+        return "extend_video"
+    if reference_image_uris:
+        return "reference_to_video"
+    if has_first_frame and has_last_frame:
+        return "first_last_frame"
+    if has_first_frame:
+        return "image_to_video"
+    return "text_to_video"
+
+
+def _veo_attempt_facts(
+    *,
+    model: str,
+    draft: bool,
+    draft_resolution: str | None,
+    mode: str,
+    duration_seconds: float,
+    resolution: str | None,
+    include_audio: bool,
+) -> dict[str, Any]:
+    """Name what a failed render was trying to do, and what it would have cost.
+
+    Losing the error text on the most expensive tier is the worst place to
+    lose it: a 4K render that outlived the host's ceiling came back as a bare
+    "Tool execution failed" -- no mode, no cost, no operation -- and billed
+    $1.20 anyway. Every failure on this path now names the mode, the model,
+    the resolution and the attempted (quoted) cost, so the spend can be
+    reconciled. Best effort, and never raises: this runs inside an error
+    handler.
+    """
+    facts: dict[str, Any] = {
+        "generation_mode": "draft (omni)" if draft else mode,
+        "model": model,
+        "resolution": resolution or "720p",
+    }
+    try:
+        if draft:
+            est_model, draft_res = _omni_preview_model(draft_resolution)
+            facts["model"] = est_model
+            facts["resolution"] = draft_res or "720p"
+            facts["attempted_cost"] = _video_cost(
+                est_model, float(duration_seconds), resolution=draft_res or "720p",
+                include_audio=False,
+            )
+        else:
+            # The modes with a forced length are priced at it; the others snap.
+            forced = {"reference_to_video": 8.0, "extend_video": 7.0}.get(mode)
+            facts["attempted_cost"] = _video_cost(
+                model,
+                forced if forced is not None else float(duration_seconds),
+                resolution=resolution or "720p",
+                include_audio=include_audio,
+                presnapped=forced is not None,
+            )
+    except Exception:  # noqa: BLE001 - a failure to price must not mask the error
+        facts["attempted_cost"] = None
+    return facts
 
 
 def _draft_ignored_veo_params(
@@ -2872,6 +2941,21 @@ _SHOT_KEY_SUGGESTIONS: dict[str, str] = {
 }
 
 
+def _clip_total_source(segments: list[dict[str, Any]]) -> str:
+    """Where a clip's total_duration_seconds comes from.
+
+    The total was a bare sum of the snapped requests while every segment
+    beside it carried a duration_source; a number without a source cannot be
+    told apart from a measured one.
+    """
+    sources = [str(seg.get("duration_source") or "") for seg in segments]
+    if sources and all(src.startswith("measured") for src in sources):
+        return "sum of the measured segment durations"
+    if not any(src.startswith("measured") for src in sources):
+        return "sum of the snapped requested beat lengths and fixed 4s bridges, not measured"
+    return "sum of measured and unmeasured segments; see each segment's duration_source"
+
+
 def _assemble_clip_manifest(
     *,
     aspect_ratio: str,
@@ -2897,6 +2981,7 @@ def _assemble_clip_manifest(
         "animatic": animatic,
         "segments": segments,
         "total_duration_seconds": total_duration,
+        "total_duration_source": _clip_total_source(segments),
         "beat_count": beat_count,
     }
     # Total what the segments actually rendered, segment by segment —
@@ -4017,6 +4102,7 @@ async def generate_video(
     output_gcs_uri: str | None = None,
     draft: bool = False,
     draft_resolution: str | None = None,
+    timeout_seconds: float = VEO_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
 ) -> str:
     """Generate a video using Google VEO models.
@@ -4086,6 +4172,17 @@ async def generate_video(
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
             Vertex AI only — on the Gemini API, output is always returned inline
             and an explicit output_gcs_uri is rejected.
+        timeout_seconds: Overall deadline for the render (submit + polling +
+            download), default 210s -- the same figure the omni tools use, for
+            the same reason: common MCP hosts cap one tool call at roughly four
+            minutes, and a render that outlives the HOST's limit is cancelled
+            by the host. The server never answers, the caller sees a bare
+            "Tool execution failed" with no message, cost or operation, and
+            the Veo operation completes and bills regardless -- which is what
+            a 4K render did, twice. Under the host ceiling the server answers
+            first, with the operation name, the mode and the attempted cost.
+            Raise it when your host allows a longer call; 4K is the slowest
+            tier.
         dry_run: When True, generate nothing and return only the cost
             estimate for the call that would run (the omni draft price when
             draft=True). Free and instant. A real run reports the actual
@@ -4542,6 +4639,7 @@ async def generate_video(
             reference_images=reference_images if reference_images else None,
             extend_video_uri=extend_video_uri,
             output_gcs_uri=gcs_uri,
+            timeout_seconds=timeout_seconds,
         )
         await ctx.info("Video generated successfully")
 
@@ -4698,10 +4796,65 @@ async def generate_video(
             result["manifest"] = manifest
 
         return _respond(app_ctx, result)
+    except asyncio.CancelledError:
+        # The HOST's ceiling, not ours. A cancellation is a BaseException, so the
+        # handler below never ran and the caller saw a bare "Tool execution
+        # failed" -- no message, no cost, no operation name. That is exactly
+        # what a 4K render on Vertex produced, twice, while billing $1.20 each
+        # time. Record what was attempted, then let the cancellation continue.
+        facts = _veo_attempt_facts(
+            model=model, draft=draft, draft_resolution=draft_resolution,
+            mode=_veo_request_mode(
+                extend_video_uri=extend_video_uri,
+                reference_image_uris=reference_image_uris,
+                has_first_frame=bool(image_uri or image_base64),
+                has_last_frame=bool(last_frame_uri or last_frame_base64),
+            ),
+            duration_seconds=duration_seconds, resolution=resolution,
+            include_audio=include_audio,
+        )
+        logger.warning(
+            "generate_video cancelled by the host (timeout_seconds=%s): %s -- the "
+            "render may still complete and bill",
+            timeout_seconds,
+            json.dumps(facts, default=str),
+        )
+        raise
     except Exception as e:
         await ctx.error(f"Video generation failed: {e}")
         logger.exception("Tool error")
-        return json.dumps({"error": str(e)})
+        # Structured, naming the mode, the attempted cost and -- for a timeout
+        # -- the operation that may still complete and bill.
+        body: dict[str, Any] = {"error": str(e)}
+        body.update(
+            _veo_attempt_facts(
+                model=model, draft=draft, draft_resolution=draft_resolution,
+                mode=_veo_request_mode(
+                    extend_video_uri=extend_video_uri,
+                    reference_image_uris=reference_image_uris,
+                    has_first_frame=bool(image_uri or image_base64),
+                    has_last_frame=bool(last_frame_uri or last_frame_base64),
+                ),
+                duration_seconds=duration_seconds, resolution=resolution,
+                include_audio=include_audio,
+            )
+        )
+        if isinstance(e, TimeoutError):
+            body["timed_out"] = True
+            body["timeout_seconds"] = timeout_seconds
+            operation_name = getattr(e, "operation_name", None)
+            body["operation_name"] = operation_name
+            body["note"] = (
+                "The deadline passed before the render finished. "
+                + (
+                    f"Operation {operation_name} was submitted and may still "
+                    "complete and bill; reconcile it in the console."
+                    if operation_name
+                    else "The request had not been submitted, so nothing was billed."
+                )
+                + " Raise timeout_seconds if your host allows a longer call."
+            )
+        return _respond(ctx.request_context.lifespan_context, body)
 
 
 @mcp.tool()
@@ -5689,13 +5842,30 @@ async def generate_clip(
                             }
                         )
                     else:
+                        # The same provenance a Veo BEAT carries, under the same
+                        # policy: Veo renders exactly the length it is sent, so
+                        # the request is the fact and nothing is measured (only
+                        # omni beats are, because there the length is the
+                        # service's choice). In-clip bridges had a bare
+                        # `duration_seconds: 4` and none of resolution,
+                        # resolution_source or duration_source -- flagged in
+                        # live testing more than once -- while beats beside
+                        # them carried all three.
                         bridge_manifest = {
                             "kind": "bridge",
                             "between_beats": [idx - 1, idx],
                             "model": bridge_result.get("model", model),
                             "aspect_ratio": aspect_ratio,
-                            "duration_seconds": bridge_result.get(
-                                "duration_seconds", 4.0
+                            "duration_seconds": float(
+                                bridge_result.get("duration_seconds", 4.0)
+                            ),
+                            "duration_source": (
+                                "the fixed 4s request: Veo renders exactly the "
+                                "length it is sent"
+                            ),
+                            "resolution": "720p",
+                            "resolution_source": (
+                                "fixed: generate_clip takes no resolution parameter"
                             ),
                             "video_url": bridge_result.get("video_url"),
                         }
