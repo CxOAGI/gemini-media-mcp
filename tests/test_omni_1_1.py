@@ -3323,3 +3323,186 @@ def test_a_remote_record_stays_findable_whatever_the_prompt_length(
     assert entry.stat().st_size < 4096
     prior = _prior_interaction(videos_dir, "remote-long")
     assert (prior.backend, prior.model, prior.duration_seconds) == ("vertex", OMNI_1_1_MODEL, 9.0)
+
+
+# ============================================================================
+# Which backend serves omni -- and saying so
+# ============================================================================
+
+
+def _vertex_with_key_ctx(tmp_path: Path) -> Any:
+    """A Vertex-primary deployment that ALSO holds a GEMINI_API_KEY."""
+    ctx = _vertex_ctx(tmp_path)
+    gemini = MagicMock()
+    gemini._api_client.vertexai = False
+    ctx.request_context.lifespan_context.gemini_api_client = gemini
+    return ctx
+
+
+def _body(out: Any) -> dict[str, Any]:
+    return json.loads(out[0].text if isinstance(out, list) else out)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_omni_on_a_vertex_server_with_a_key_says_where_it_went_and_why(
+    tmp_path: Path,
+) -> None:
+    """The default sends omni to the Gemini Developer API whenever a key is
+    present, even on a Vertex server -- a different project, billing path and
+    quota pool -- and the response used to say only where the call went, not
+    that it could have gone elsewhere or how to make it."""
+    from src.__main__ import generate_video_omni
+
+    quote = _body(
+        await generate_video_omni(ctx=_vertex_with_key_ctx(tmp_path), prompt="a cat", dry_run=True)
+    )
+    assert quote["backend"] == "gemini_api"
+    assert "GEMINI_API_KEY is set" in quote["backend_reason"]
+    assert "OMNI_BACKEND=vertex" in quote["backend_reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_omni_backend_vertex_keeps_the_call_in_the_vertex_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.__main__ import generate_video_omni
+
+    vertex_client = MagicMock()
+    vertex_client._api_client.vertexai = True
+    monkeypatch.setattr("src.__main__._get_omni_vertex_global_client", lambda: vertex_client)
+    seen: dict[str, Any] = {}
+
+    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
+        seen.update(kwargs)
+        out = tmp_path / "videos" / "v.mp4"
+        out.write_bytes(b"mp4")
+        return {
+            "message": "ok",
+            "video_url": f"file://{out}",
+            "interaction_id": "i-v",
+            "model": OMNI_1_1_MODEL,
+            "task": "generate",
+            "duration_seconds": 6.0,
+            "aspect_ratio": "16:9",
+            "resolution": "720p",
+            "rendered_resolution": "720p",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
+    result = _body(
+        await generate_video_omni(
+            ctx=_vertex_with_key_ctx(tmp_path), prompt="a cat", omni_backend="vertex"
+        )
+    )
+    assert "error" not in result, result
+    assert result["backend"] == "vertex"
+    assert result["backend_reason"] == "omni_backend=vertex was requested"
+    assert seen["client"] is vertex_client  # the Vertex client, not the Gemini one
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_unsatisfiable_omni_backend_is_refused_not_substituted(
+    tmp_path: Path,
+) -> None:
+    from src.__main__ import generate_video_omni
+
+    on_gemini = _body(
+        await generate_video_omni(
+            ctx=_ctx(tmp_path), prompt="a cat", omni_backend="vertex", dry_run=True
+        )
+    )
+    assert "GOOGLE_GENAI_USE_VERTEXAI" in on_gemini["error"]
+
+    on_vertex_no_key = _body(
+        await generate_video_omni(
+            ctx=_vertex_ctx(tmp_path), prompt="a cat", omni_backend="gemini_api", dry_run=True
+        )
+    )
+    assert "GEMINI_API_KEY" in on_vertex_no_key["error"]
+
+    bogus = _body(
+        await generate_video_omni(
+            ctx=_ctx(tmp_path), prompt="a cat", omni_backend="aws", dry_run=True
+        )
+    )
+    assert "auto, vertex, gemini_api" in bogus["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_an_interaction_cannot_be_moved_to_the_other_backend(tmp_path: Path) -> None:
+    """An id minted on one backend does not resolve on the other."""
+    from src.__main__ import edit_video
+
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    (tmp_path / "videos" / "p.json").write_text(
+        json.dumps({"interaction_id": "i-vx", "backend": "vertex", "model": OMNI_1_1_MODEL})
+    )
+    refused = _body(
+        await edit_video(
+            ctx=_vertex_with_key_ctx(tmp_path),
+            previous_interaction_id="i-vx",
+            prompt="anime",
+            omni_backend="gemini_api",
+            dry_run=True,
+        )
+    )
+    assert "minted on Vertex AI" in refused["error"]
+    # Without a request, the continuation follows the interaction home.
+    followed = _body(
+        await edit_video(
+            ctx=_vertex_with_key_ctx(tmp_path), previous_interaction_id="i-vx", prompt="anime", dry_run=True
+        )
+    )
+    assert followed["backend"] == "vertex"
+    assert "continuing an interaction minted on Vertex AI" in followed["backend_reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_the_operator_default_pins_omni_server_wide(tmp_path: Path) -> None:
+    from src.__main__ import extend_video_omni, generate_video_omni
+
+    ctx = _vertex_with_key_ctx(tmp_path)
+    ctx.request_context.lifespan_context.omni_backend_default = "vertex"
+    quote = _body(await generate_video_omni(ctx=ctx, prompt="a cat", dry_run=True))
+    assert quote["backend"] == "vertex"
+    assert "OMNI_BACKEND=vertex is this server's default" in quote["backend_reason"]
+    # The extension quote follows the same pin, and prices Vertex's ceiling.
+    chain = _body(
+        await extend_video_omni(
+            ctx=ctx, prompt="go on", previous_interaction_id="i-none", times=1, dry_run=True
+        )
+    )
+    assert chain["backend"] == "vertex"
+    assert chain["turn_output_seconds"] == [40.0]
+
+
+@pytest.mark.parametrize(
+    ("value", "primary_is_vertex", "has_key", "ok"),
+    [
+        ("", True, True, True),
+        ("AUTO", False, True, True),
+        ("vertex", True, False, True),
+        ("vertex", False, True, False),
+        ("gemini_api", True, False, False),
+        ("gemini_api", True, True, True),
+        ("aws", True, True, False),
+    ],
+)
+def test_omni_backend_env_is_validated_at_startup(
+    monkeypatch: pytest.MonkeyPatch, value: str, primary_is_vertex: bool, has_key: bool, ok: bool
+) -> None:
+    """A pin the deployment cannot honour fails once, at startup, by name."""
+    from src.__main__ import _parse_omni_backend_env
+
+    monkeypatch.setenv("OMNI_BACKEND", value)
+    if ok:
+        got = _parse_omni_backend_env(primary_is_vertex=primary_is_vertex, gemini_api_available=has_key)
+        assert got == (value.lower() or "auto")
+    else:
+        with pytest.raises(ValueError, match="OMNI_BACKEND"):
+            _parse_omni_backend_env(primary_is_vertex=primary_is_vertex, gemini_api_available=has_key)

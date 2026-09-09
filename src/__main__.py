@@ -174,6 +174,10 @@ class AppContext:
     temp_creds_path: Path | None = None
     video_gcs_bucket: str | None = None  # Default GCS bucket for video output
     allowed_gcs_buckets: frozenset[str] = frozenset()  # Allowlist for gs:// URIs
+    # Server-wide default for which backend serves omni: "auto", "vertex" or
+    # "gemini_api" (env OMNI_BACKEND). A tool's omni_backend argument wins over
+    # it. See _omni_backend_decision for what "auto" does and why this exists.
+    omni_backend_default: str = "auto"
 
 
 def _parse_gcs_bucket(uri: str) -> str | None:
@@ -520,7 +524,8 @@ def _backend_of(app_ctx: AppContext, model: str | None) -> str:
     """
     name = str(model or "")
     if is_omni_model(name):
-        return _omni_backend_choice(app_ctx)
+        pin = app_ctx.omni_backend_default
+        return _omni_backend_choice(app_ctx, requested=None if pin == "auto" else pin)
     try:
         # Defer to the real routing rule rather than restating it here; a
         # second copy of "which client serves Lite" is a copy that drifts.
@@ -566,13 +571,25 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
             if getattr(app_ctx.client._api_client, "vertexai", False)
             else "gemini_api"
         )
-        if _backend_of(app_ctx, model_name) != primary:
+        # The backend the CALL decided, when the tool recorded one; the
+        # server-wide answer otherwise. A per-call omni_backend must not be
+        # described by a note computed from the default.
+        served = payload.get("backend") or _backend_of(app_ctx, model_name)
+        if served != primary:
+            # This used to end "This split is deliberate, not a
+            # misconfiguration" -- true of the default, but it presented a
+            # choice with no control as settled, and said nothing about the
+            # project, billing path and quota pool the traffic had left.
             payload["backend_note"] = (
-                "Omni runs on the Gemini API even though this server's primary "
-                f"client is {primary}: omni 1.1 is GA on the Gemini API and "
-                "allowlist-gated Preview on Vertex. Veo tools in the same "
-                f"session report {primary}. This split is deliberate, not a "
-                "misconfiguration."
+                "Omni ran on the Gemini Developer API even though this server's "
+                f"primary client is {primary}: with a GEMINI_API_KEY set, omni "
+                "defaults there (Interactions is GA on that API and allowlist-gated "
+                "Preview on Vertex AI), which means omni traffic leaves the Vertex "
+                "project's billing, quota and credentials. Veo tools in the same "
+                f"session report {primary}. To keep omni on Vertex AI, pass "
+                'omni_backend="vertex" or set OMNI_BACKEND=vertex server-wide; '
+                "note that this project's live tests do not exercise omni on "
+                "Vertex. See backend_reason for this call's decision."
             )
     return json.dumps(
         _stamp_provenance(
@@ -588,13 +605,44 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
     )
 
 
-def _omni_backend_choice(
+OMNI_BACKENDS = ("auto", "vertex", "gemini_api")
+
+
+def _parse_omni_backend_env(
+    *, primary_is_vertex: bool, gemini_api_available: bool
+) -> str:
+    """Read and validate OMNI_BACKEND at startup.
+
+    A pin the deployment cannot honour fails here, once, with the variable
+    named -- not on the first omni call, and not by quietly serving the other
+    backend.
+    """
+    raw = os.environ.get("OMNI_BACKEND", "auto").strip().lower() or "auto"
+    if raw not in OMNI_BACKENDS:
+        raise ValueError(
+            f"OMNI_BACKEND={raw!r} is not one of {', '.join(OMNI_BACKENDS)}."
+        )
+    if raw == "vertex" and not primary_is_vertex:
+        raise ValueError(
+            "OMNI_BACKEND=vertex, but this server's primary client is not "
+            "Vertex AI (GOOGLE_GENAI_USE_VERTEXAI is not true)."
+        )
+    if raw == "gemini_api" and primary_is_vertex and not gemini_api_available:
+        raise ValueError(
+            "OMNI_BACKEND=gemini_api, but this Vertex server has no "
+            "GEMINI_API_KEY to reach the Gemini Developer API with."
+        )
+    return raw
+
+
+def _omni_backend_decision(
     app_ctx: AppContext,
     *,
     need_gcs: bool = False,
     prefer_backend: str | None = None,
-) -> str:
-    """Which backend an omni call will use: "vertex" or "gemini_api".
+    requested: str | None = None,
+) -> tuple[str, str]:
+    """Which backend an omni call will use, and WHY: ``(backend, reason)``.
 
     The DECISION, split out from the construction it used to be entangled
     with. Pre-flights need the answer to apply the right backend's documented
@@ -604,23 +652,105 @@ def _omni_backend_choice(
     memoized when it fails, so every subsequent call retries and blocks again.
     A blocked event loop hangs every request in the process, not just this one.
 
-    See _client_for_omni for what each branch means.
+    The reason is part of the answer because the default is not obvious from
+    the outside. On a Vertex-primary server that also holds a GEMINI_API_KEY
+    (any deployment that wants Veo Lite does), omni went to the Gemini
+    Developer API on every call, with nothing an operator or caller could
+    set to keep it in the Vertex project, and the response's ``backend``
+    field said where the call went but not that it could have gone elsewhere.
+    For an enterprise deployment that is a different billing path, quota pool
+    and credential model, chosen silently. ``requested`` is the explicit
+    choice (a tool's ``omni_backend`` or the OMNI_BACKEND default) and is
+    HARD: an unsatisfiable request raises rather than falling through.
+    ``prefer_backend`` is the SOFT continuity hint from a prior interaction's
+    recorded backend, and outranks ``need_gcs`` because an interaction lives
+    on one backend: an id minted by the Developer API does not resolve on
+    Vertex, whereas an unhonoured output_gcs_uri is dropped with a warning and
+    the render still lands.
     """
     primary_is_vertex = bool(getattr(app_ctx.client._api_client, "vertexai", False))
-    if prefer_backend == "vertex" and primary_is_vertex:
-        return "vertex"
-    if prefer_backend == "gemini_api":
-        if app_ctx.gemini_api_client is not None:
-            return "gemini_api"
+    has_gemini = app_ctx.gemini_api_client is not None
+    if requested == "vertex":
         if not primary_is_vertex:
-            return "gemini_api"
+            raise ValueError(
+                "omni_backend=vertex was requested, but this server's primary "
+                "client is not Vertex AI (GOOGLE_GENAI_USE_VERTEXAI is not true)."
+            )
+        return "vertex", "omni_backend=vertex was requested"
+    if requested == "gemini_api":
+        if primary_is_vertex and not has_gemini:
+            raise ValueError(
+                "omni_backend=gemini_api was requested, but this Vertex server "
+                "has no GEMINI_API_KEY to reach the Gemini Developer API with."
+            )
+        return "gemini_api", "omni_backend=gemini_api was requested"
+    if prefer_backend == "vertex" and primary_is_vertex:
+        return "vertex", "continuing an interaction minted on Vertex AI"
+    if prefer_backend == "gemini_api" and (has_gemini or not primary_is_vertex):
+        return "gemini_api", "continuing an interaction minted on the Gemini Developer API"
     if need_gcs and primary_is_vertex:
-        return "vertex"
-    if app_ctx.gemini_api_client is not None:
-        return "gemini_api"
+        return "vertex", "output_gcs_uri was given, and GCS delivery is Vertex-only"
+    if has_gemini:
+        if primary_is_vertex:
+            return "gemini_api", (
+                "GEMINI_API_KEY is set, so omni uses the Gemini Developer API (where "
+                "the Interactions API is GA) rather than this server's Vertex "
+                "project; pass omni_backend=\"vertex\", or set OMNI_BACKEND=vertex "
+                "server-wide, to keep omni traffic on Vertex AI"
+            )
+        return "gemini_api", "this server's primary client is the Gemini Developer API"
     if primary_is_vertex:
-        return "vertex"
-    return "gemini_api"
+        return "vertex", "no GEMINI_API_KEY is set, and the primary client is Vertex AI"
+    return "gemini_api", "this server's primary client is the Gemini Developer API"
+
+
+def _omni_backend_choice(
+    app_ctx: AppContext,
+    *,
+    need_gcs: bool = False,
+    prefer_backend: str | None = None,
+    requested: str | None = None,
+) -> str:
+    """The backend half of _omni_backend_decision."""
+    return _omni_backend_decision(
+        app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend, requested=requested
+    )[0]
+
+
+async def _resolve_omni_backend(
+    app_ctx: AppContext,
+    omni_backend: str | None,
+    *,
+    need_gcs: bool,
+    previous_interaction_id: str | None,
+) -> tuple[str, str]:
+    """A tool's omni_backend argument, resolved and validated: ``(backend, reason)``.
+
+    ``None`` means the server default (OMNI_BACKEND); ``"auto"`` means the
+    documented preference order. A request that contradicts the backend a
+    prior interaction was minted on is refused here, before anything is
+    billed, because that continuation cannot succeed.
+    """
+    if omni_backend is not None and omni_backend not in OMNI_BACKENDS:
+        raise ValueError(
+            f"omni_backend={omni_backend!r} is not one of {', '.join(OMNI_BACKENDS)}."
+        )
+    effective = omni_backend or app_ctx.omni_backend_default
+    requested = None if effective == "auto" else effective
+    prior = await _prior_interaction_or_empty(app_ctx.videos_dir, previous_interaction_id)
+    if requested is not None and prior.backend and prior.backend != requested:
+        minted_on = "Vertex AI" if prior.backend == "vertex" else "the Gemini Developer API"
+        raise ValueError(
+            f"previous_interaction_id was minted on {minted_on}, and an interaction "
+            f"lives on one backend, so omni_backend={requested} cannot continue it. "
+            "Drop omni_backend, or start a new generation."
+        )
+    backend, reason = _omni_backend_decision(
+        app_ctx, need_gcs=need_gcs, prefer_backend=prior.backend, requested=requested
+    )
+    if omni_backend is None and requested is not None:
+        reason = f"{reason} (OMNI_BACKEND={requested} is this server's default)"
+    return backend, reason
 
 
 def _omni_backend_is_vertex(
@@ -697,6 +827,7 @@ async def _omni_generate_and_manifest(
     resolution: str | None = None,
     output_gcs_uri: str | None = None,
     prefer_backend: str | None = None,
+    backend_reason: str | None = None,
     timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     manifest_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -725,6 +856,10 @@ async def _omni_generate_and_manifest(
         app_ctx, need_gcs=bool(output_gcs_uri), prefer_backend=prefer_backend
     )
     client_is_vertex = bool(getattr(client._api_client, "vertexai", False))
+    if backend_reason is None:
+        backend_reason = _omni_backend_decision(
+            app_ctx, need_gcs=bool(output_gcs_uri), prefer_backend=prefer_backend
+        )[1]
 
     # GCS delivery only works on Vertex; on the Gemini API omni returns bytes
     # inline. Drop an explicit output_gcs_uri on a non-Vertex omni client with
@@ -798,6 +933,8 @@ async def _omni_generate_and_manifest(
     # media dir) and a chain must not fall back to re-deciding the backend
     # from the next turn's needs.
     result["backend"] = "vertex" if client_is_vertex else "gemini_api"
+    # Not just where the call went, but why -- and how to change it.
+    result["backend_reason"] = backend_reason
     # Cost from the duration the interaction actually rendered (clamped by
     # the impl), not the request — covers omni, edit_video and draft mode.
     # Prefer the rendered artifact over any inference. Everything else here is
@@ -935,6 +1072,7 @@ async def _omni_generate_and_manifest(
         # continuation so a chain cannot drift onto a backend that has never
         # heard of it.
         "backend": "vertex" if client_is_vertex else "gemini_api",
+        "backend_reason": backend_reason,
         "aspect_ratio": aspect_ratio,
         "resolution": result.get("rendered_resolution"),
         "resolution_source": result.get("resolution_source"),
@@ -1717,6 +1855,12 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         gemini_api_client = create_gemini_api_client()
         video_gcs_bucket = os.environ.get("VIDEO_GCS_BUCKET")
         allowed_gcs_buckets = _compute_allowed_gcs_buckets()
+        omni_backend_default = _parse_omni_backend_env(
+            primary_is_vertex=bool(
+                getattr(getattr(client, "_api_client", None), "vertexai", False)
+            ),
+            gemini_api_available=gemini_api_client is not None,
+        )
 
         yield AppContext(
             data_folder=data_folder,
@@ -1727,6 +1871,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             temp_creds_path=temp_creds_path,
             video_gcs_bucket=video_gcs_bucket,
             allowed_gcs_buckets=allowed_gcs_buckets,
+            omni_backend_default=omni_backend_default,
         )
     finally:
         cleanup_credentials(temp_creds_path)
@@ -3487,6 +3632,11 @@ async def plan_generation(
             backend="vertex" if primary_is_vertex else "gemini_api",
             gemini_api_key_available=(
                 not primary_is_vertex or app_ctx.gemini_api_client is not None
+            ),
+            omni_backend=(
+                None
+                if app_ctx.omni_backend_default == "auto"
+                else app_ctx.omni_backend_default
             ),
             budget=budget,
             media_kind=media_kind,
@@ -5629,6 +5779,7 @@ async def generate_video_omni(
     ctx: Context[ServerSession, AppContext],
     prompt: str,
     omni_model: str = DEFAULT_OMNI_MODEL,
+    omni_backend: str | None = None,
     image_uris: list[str] | None = None,
     first_frame_uri: str | None = None,
     last_frame_uri: str | None = None,
@@ -5715,6 +5866,15 @@ async def generate_video_omni(
             naming the interaction_id, which is recoverable. Raise it only if
             your host waits longer.
 
+        omni_backend: Which backend serves this call: "auto" (default), "vertex"
+            or "gemini_api". Unset, the server's OMNI_BACKEND applies. "auto"
+            uses the Gemini Developer API whenever a GEMINI_API_KEY is set,
+            even on a Vertex server -- a different project, billing path and
+            quota pool -- so an enterprise deployment that must keep omni
+            traffic on Vertex AI passes "vertex" here or sets OMNI_BACKEND=
+            vertex. The response reports `backend` and `backend_reason`. An
+            unsatisfiable choice is refused, as is one that contradicts the
+            backend a previous_interaction_id was minted on.
         dry_run: When True, return only the cost estimate for the clamped
             duration and generate nothing.
 
@@ -5724,6 +5884,14 @@ async def generate_video_omni(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        # Which backend serves this call, decided once and reported; see
+        # _omni_backend_decision.
+        omni_backend_resolved, omni_backend_reason = await _resolve_omni_backend(
+            app_ctx,
+            omni_backend,
+            need_gcs=bool(output_gcs_uri),
+            previous_interaction_id=previous_interaction_id,
+        )
         # Every pre-flight runs before any fetch or interaction work: the omni
         # impl clamps to [3, 10]s, which would turn a negative or NaN duration
         # into a billed 3s render instead of an error, and a capability the
@@ -5775,7 +5943,7 @@ async def generate_video_omni(
             )
             if allowlist_warning:
                 gcs_warnings.append(allowlist_warning)
-            if _omni_backend_choice(app_ctx, need_gcs=True) == "gemini_api":
+            if omni_backend_resolved == "gemini_api":
                 # The docstring promised this notice and only the allowlist
                 # warning ever fired, so a caller's destination was dropped in
                 # silence. Omni prefers the Gemini API whenever a key is
@@ -5783,7 +5951,8 @@ async def generate_video_omni(
                 gcs_warnings.append(
                     "output_gcs_uri is ignored: this call runs on the Gemini "
                     "Developer API, which returns media inline and has no GCS "
-                    "destination. Configure Vertex credentials to deliver to "
+                    "destination. Pass omni_backend=\"vertex\" (or set "
+                    "OMNI_BACKEND=vertex) on a Vertex server to deliver to "
                     "Cloud Storage."
                 )
 
@@ -5844,15 +6013,13 @@ async def generate_video_omni(
                         _ = await _check_omni_source_video(
                             spec,
                             source_bytes,
-                            vertexai=_omni_backend_is_vertex(
-                                app_ctx, bool(output_gcs_uri)
-                            ),
+                            vertexai=(omni_backend_resolved == "vertex"),
                         )
                 quoted = omni_continuation_upper_bound(
                     spec,
                     "edit",
                     prior_duration,
-                    vertexai=_omni_backend_is_vertex(app_ctx, bool(output_gcs_uri)),
+                    vertexai=(omni_backend_resolved == "vertex"),
                 )
                 return _respond(
                     app_ctx,
@@ -5860,6 +6027,8 @@ async def generate_video_omni(
                         "dry_run": True,
                         "message": "Estimate only — nothing was generated",
                         "model": spec.model,
+                        "backend": omni_backend_resolved,
+                        "backend_reason": omni_backend_reason,
                         **_omni_requested_model(omni_model, spec),
                         "resolution": billed_resolution,
                         "duration_seconds": quoted,
@@ -5889,6 +6058,8 @@ async def generate_video_omni(
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
                     "model": spec.model,
+                    "backend": omni_backend_resolved,
+                    "backend_reason": omni_backend_reason,
                     **_omni_requested_model(omni_model, spec),
                     "resolution": billed_resolution,
                     # Report both, like generate_video and edit_video: a caller
@@ -5942,7 +6113,7 @@ async def generate_video_omni(
                 await _check_omni_source_video(
                     spec,
                     input_video_bytes,
-                    vertexai=_omni_backend_is_vertex(app_ctx, bool(output_gcs_uri)),
+                    vertexai=(omni_backend_resolved == "vertex"),
                 )
             )
 
@@ -5950,6 +6121,8 @@ async def generate_video_omni(
         result = await _omni_generate_and_manifest(
             app_ctx,
             ctx,
+            prefer_backend=omni_backend_resolved,
+            backend_reason=omni_backend_reason,
             prompt=prompt,
             model=spec.model,
             image_bytes_list=image_bytes_list or None,
@@ -5995,6 +6168,7 @@ async def edit_video(
     previous_interaction_id: str,
     prompt: str,
     omni_model: str = DEFAULT_OMNI_MODEL,
+    omni_backend: str | None = None,
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
     resolution: str | None = None,
@@ -6034,6 +6208,15 @@ async def edit_video(
             render the edit at; omitted keeps the service default.
         timeout_seconds: Overall deadline for the edit render, default 210s
             — see generate_video_omni on why it sits under the host ceiling
+        omni_backend: Which backend serves this call: "auto" (default), "vertex"
+            or "gemini_api". Unset, the server's OMNI_BACKEND applies. "auto"
+            uses the Gemini Developer API whenever a GEMINI_API_KEY is set,
+            even on a Vertex server -- a different project, billing path and
+            quota pool -- so an enterprise deployment that must keep omni
+            traffic on Vertex AI passes "vertex" here or sets OMNI_BACKEND=
+            vertex. The response reports `backend` and `backend_reason`. An
+            unsatisfiable choice is refused, as is one that contradicts the
+            backend a previous_interaction_id was minted on.
         dry_run: When True, return only the cost estimate and generate
             nothing. Because the rendered length is unpredictable, the quote
             is Omni's 10s maximum as an upper bound — a pre-flight may
@@ -6049,6 +6232,14 @@ async def edit_video(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        # Which backend serves this call, decided once and reported; see
+        # _omni_backend_decision.
+        omni_backend_resolved, omni_backend_reason = await _resolve_omni_backend(
+            app_ctx,
+            omni_backend,
+            need_gcs=False,
+            previous_interaction_id=previous_interaction_id,
+        )
         # Fail fast before any fetch or interaction work; the omni impl
         # clamps to [3, 10]s, which would turn a negative or NaN duration
         # into a billed 3s render instead of an error.
@@ -6079,20 +6270,22 @@ async def edit_video(
             source_duration = await _source_duration_or_none(
                 app_ctx.videos_dir, previous_interaction_id
             )
-            # The edit runs on the backend that minted the interaction, and
-            # that backend's upload ceiling is what bounds an unrecorded
-            # source's length -- 30s on Vertex, 10s on the Developer API.
-            prior = await _prior_interaction_or_empty(app_ctx.videos_dir, previous_interaction_id)
+            # The upload ceiling of the backend that will serve the edit is
+            # what bounds an unrecorded source's length -- 30s on Vertex, 10s
+            # on the Developer API. That backend was decided above, from the
+            # prior interaction's record and any omni_backend request.
             quoted = omni_continuation_upper_bound(
                 spec,
                 "edit",
                 source_duration,
-                vertexai=_omni_backend_is_vertex(app_ctx, False, prior.backend),
+                vertexai=(omni_backend_resolved == "vertex"),
             )
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
                 "model": spec.model,
+                "backend": omni_backend_resolved,
+                "backend_reason": omni_backend_reason,
                 "resolution": billed_resolution,
                 "previous_interaction_id": previous_interaction_id,
                 "duration_seconds": quoted,
@@ -6123,6 +6316,8 @@ async def edit_video(
         result = await _omni_generate_and_manifest(
             app_ctx,
             ctx,
+            prefer_backend=omni_backend_resolved,
+            backend_reason=omni_backend_reason,
             prompt=prompt,
             model=spec.model,
             previous_interaction_id=previous_interaction_id,
@@ -6147,6 +6342,7 @@ async def extend_video_omni(
     previous_interaction_id: str | None = None,
     input_video_uri: str | None = None,
     omni_model: str = OMNI_1_1_MODEL,
+    omni_backend: str | None = None,
     times: int = 1,
     resolution: str | None = None,
     reference_image_uris: list[str] | None = None,
@@ -6224,6 +6420,15 @@ async def extend_video_omni(
             chain of turns can still exceed a host's ceiling in total; each
             completed turn is returned as it finishes, so a cut-off chain is
             resumable from the last interaction_id.
+        omni_backend: Which backend serves this call: "auto" (default), "vertex"
+            or "gemini_api". Unset, the server's OMNI_BACKEND applies. "auto"
+            uses the Gemini Developer API whenever a GEMINI_API_KEY is set,
+            even on a Vertex server -- a different project, billing path and
+            quota pool -- so an enterprise deployment that must keep omni
+            traffic on Vertex AI passes "vertex" here or sets OMNI_BACKEND=
+            vertex. The response reports `backend` and `backend_reason`. An
+            unsatisfiable choice is refused, as is one that contradicts the
+            backend a previous_interaction_id was minted on.
         dry_run: When True, return only the cost estimate. A turn renders the
             assembled clip, so the quote is the source plus one 10s increment
             per turn, summed across turns. It needs the source's length to be
@@ -6240,6 +6445,14 @@ async def extend_video_omni(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        # Which backend serves this call, decided once and reported; see
+        # _omni_backend_decision.
+        omni_backend_resolved, omni_backend_reason = await _resolve_omni_backend(
+            app_ctx,
+            omni_backend,
+            need_gcs=bool(output_gcs_uri),
+            previous_interaction_id=previous_interaction_id,
+        )
         spec = _validate_omni_model(omni_model)
         normalized_resolution = _validate_omni_resolution(spec, resolution)
         reference_images = list(reference_image_uris or [])
@@ -6344,9 +6557,7 @@ async def extend_video_omni(
                         _ = await _check_omni_source_video(
                             spec,
                             source_bytes,
-                            vertexai=_omni_backend_is_vertex(
-                                app_ctx, bool(output_gcs_uri), prior.backend
-                            ),
+                            vertexai=(omni_backend_resolved == "vertex"),
                         )
             # Each turn renders the ASSEMBLED clip, so the source is the base
             # every turn is billed on top of and the chain stops when it
@@ -6361,9 +6572,7 @@ async def extend_video_omni(
             # below runs every requested turn, so every one is priced, at the
             # ceiling past the fallback. The fallback itself is the BACKEND's
             # upload limit -- 30s on Vertex, not the model's 10s.
-            chain_is_vertex = _omni_backend_is_vertex(
-                app_ctx, bool(output_gcs_uri), prior.backend
-            )
+            chain_is_vertex = (omni_backend_resolved == "vertex")
             turn_lengths = omni_extension_priced_lengths(
                 spec, source_duration, times, vertexai=chain_is_vertex
             )
@@ -6372,6 +6581,8 @@ async def extend_video_omni(
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
                 "model": spec.model,
+                "backend": omni_backend_resolved,
+                "backend_reason": omni_backend_reason,
                 **_omni_requested_model(omni_model, spec),
                 "resolution": billed_resolution,
                 "times": times,
@@ -6457,9 +6668,7 @@ async def extend_video_omni(
                 await _check_omni_source_video(
                     spec,
                     input_video_bytes,
-                    vertexai=_omni_backend_is_vertex(
-                        app_ctx, bool(output_gcs_uri), prior.backend
-                    ),
+                    vertexai=(omni_backend_resolved == "vertex"),
                 )
             )
             source_duration = await _probe_media(
@@ -6476,9 +6685,7 @@ async def extend_video_omni(
         # The turns that fit under the ceiling -- the same list the quote
         # prices, computed once here so the loop below, this warning and the
         # max_cost_usd projection cannot disagree about how many turns run.
-        chain_is_vertex = _omni_backend_is_vertex(
-            app_ctx, bool(output_gcs_uri), prior.backend
-        )
+        chain_is_vertex = (omni_backend_resolved == "vertex")
         turn_lengths = omni_extension_priced_lengths(
             spec, source_duration, times, vertexai=chain_is_vertex
         )
@@ -6523,7 +6730,7 @@ async def extend_video_omni(
         # turn, because every turn after it carries a previous_interaction_id
         # that only the minting backend can resolve — and the last turn's
         # output_gcs_uri would otherwise have pulled it onto Vertex on its own.
-        chain_backend = prior.backend
+        chain_backend = omni_backend_resolved
 
         segments: list[dict[str, Any]] = []
         chain_id = previous_interaction_id
@@ -6636,6 +6843,7 @@ async def extend_video_omni(
                     # final clip landed locally.
                     output_gcs_uri=output_gcs_uri if turn == effective_times else None,
                     prefer_backend=chain_backend,
+                    backend_reason=omni_backend_reason,
                     timeout_seconds=timeout_seconds,
                     manifest_extra={
                         "kind": "omni_extension",

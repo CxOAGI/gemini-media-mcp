@@ -1686,6 +1686,10 @@ class RoutingConstraints:
     wants_gcs_output: bool | None = None
     backend: Backend = "unknown"
     gemini_api_key_available: bool | None = None
+    # The server's OMNI_BACKEND pin, when it has one ("vertex" / "gemini_api");
+    # None means "auto". Omni's backend is otherwise inferred from the two
+    # fields above, and a pinned server would price the wrong ceiling.
+    omni_backend: str | None = None
     num_beats: int | None = None
     is_draft: bool | None = None
     is_iterating: bool | None = None
@@ -1758,6 +1762,7 @@ class ResolvedRequest:
     media_kind: MediaKind
     budget: BudgetPreference
     backend: Backend
+    omni_backend: str | None
     # None when the caller did not say, i.e. a Gemini-API-only model might
     # work; False is a positive statement that it cannot.
     gemini_api_key_available: bool | None
@@ -2001,6 +2006,7 @@ def resolve_request(
         media_kind=media_kind,
         budget=budget,
         backend=given.backend,
+        omni_backend=given.omni_backend,
         gemini_api_key_available=given.gemini_api_key_available,
         needs_text_rendering=bool(needs_text_rendering),
         needs_4k=needs_4k,
@@ -2823,14 +2829,19 @@ def _route_tool(tool: ToolName, model: str) -> ToolName:
 def _omni_serves_on_vertex(request: ResolvedRequest) -> bool:
     """Whether an omni call from this request will run on Vertex AI.
 
-    Mirrors the server's own choice (_omni_backend_choice): omni goes to the
-    Gemini Developer API whenever a key is present, even on a Vertex-primary
-    deployment, so "backend is vertex" alone is not the question. Pricing the
+    Mirrors the server's own choice (_omni_backend_decision): an explicit
+    OMNI_BACKEND pin wins; otherwise omni goes to the Gemini Developer API
+    whenever a key is present, even on a Vertex-primary deployment, so
+    "backend is vertex" alone is not the question. Pricing the
     Vertex upload ceiling off that alone had the plan saying $12.18 for a
     chain the tool quoted at $9.14 on the same server. An UNKNOWN key
     (None) is read as absent, which prices the higher Vertex ceiling -- the
     direction a quote may err in.
     """
+    if request.omni_backend == "vertex":
+        return True
+    if request.omni_backend == "gemini_api":
+        return False
     return request.backend == "vertex" and request.gemini_api_key_available is not True
 
 

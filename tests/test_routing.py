@@ -2441,3 +2441,31 @@ def test_a_bare_unit_may_sit_one_link_word_from_its_noun(
     intent: str, expected: float | None
 ) -> None:
     assert infer_signals(intent).duration_seconds == expected
+
+
+def test_the_planner_honours_a_server_wide_omni_backend_pin() -> None:
+    """With OMNI_BACKEND=vertex the server keeps omni on Vertex even though a
+    key is present; the planner must price Vertex's ceiling for the same
+    deployment, or the plan and the tool disagree again."""
+    from src.omni import OMNI_1_1_MODEL, omni_extension_priced_lengths, omni_spec
+
+    base = dict(backend="vertex", gemini_api_key_available=True, needs_extension=True,
+                previous_interaction_id="abc")
+    span = "extend my omni clip from interaction abc by another 30 seconds"
+    auto = plan_generation(span, RoutingConstraints(**base))
+    pinned = plan_generation(span, RoutingConstraints(**base, omni_backend="vertex"))
+    pick = lambda plan: next(  # noqa: E731
+        r for r in plan.routes if r.tool == "extend_video_omni" and r.model == OMNI_1_1_MODEL
+    )
+    a, v = pick(auto), pick(pinned)
+    assert a.cost is not None and v.cost is not None
+    # Auto (a key is present) prices the Developer API's 10s fallback: three
+    # turns, [20, 30, 40]. Pinned to Vertex, the assumed 30s source fills the
+    # 40s ceiling in ONE turn -- fewer turns, each at the ceiling -- so the plan
+    # recommends times=1 priced at 40s, exactly what the tool quotes there.
+    assert int(a.params["times"]) == 3
+    assert int(v.params["times"]) == 1
+    spec = omni_spec(OMNI_1_1_MODEL)
+    assert omni_extension_priced_lengths(spec, None, 3, vertexai=False) == [20.0, 30.0, 40.0]
+    assert omni_extension_priced_lengths(spec, None, 1, vertexai=True) == [40.0]
+    assert v.cost.usd < a.cost.usd  # one 40s turn against 90s over three
