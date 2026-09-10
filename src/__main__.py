@@ -1154,6 +1154,51 @@ def _veo_request_mode(
     return "text_to_video"
 
 
+def _veo_access_advice(exc: BaseException) -> str | None:
+    """Turn a Vertex IAM refusal into the grant that fixes it, or None.
+
+    A 403 from Veo arrives as a wall of SDK traceback ending in a
+    troubleshooter URL, and says nothing about WHICH identity was refused --
+    which is the one fact the operator needs, because the server may be
+    running as a service account they did not expect. omni already does this
+    for its own allowlist refusals (see omni._access_refusal); Veo did not,
+    and a denial on the most expensive tier is the worst place to leave a raw
+    error.
+
+    Deliberately narrow: a 403 that is not an IAM permission denial, and any
+    other status, are left exactly as the service reported them.
+    """
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    text = str(exc)
+    if code != 403 and "PERMISSION_DENIED" not in text:
+        return None
+    if "aiplatform" not in text:
+        return None
+    identity = ""
+    try:
+        found = credentials.service_account_credentials()
+        email = getattr(found[0], "service_account_email", None) if found else None
+        if email:
+            identity = f" The server is authenticating as {email}."
+    except Exception:  # noqa: BLE001 - advice must never mask the real error
+        pass
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    grant = (
+        f"gcloud projects add-iam-policy-binding {project or '<project>'} \\\n"
+        f"    --member=serviceAccount:{'<service-account-email>' if not identity else identity.split()[-1].rstrip('.')} \\\n"
+        "    --role=roles/aiplatform.user"
+    )
+    return (
+        "Vertex AI refused this call for lack of IAM permission, not for "
+        f"anything about the request.{identity} The missing permission is "
+        "aiplatform.endpoints.predict, granted by roles/aiplatform.user:\n"
+        f"{grant}\n"
+        "Check too that the Vertex AI API is enabled on the project and that "
+        "GOOGLE_CLOUD_LOCATION names a region where the model is served. "
+        "Nothing was rendered or billed."
+    )
+
+
 def _veo_attempt_facts(
     *,
     model: str,
@@ -4839,6 +4884,9 @@ async def generate_video(
                 include_audio=include_audio,
             )
         )
+        advice = _veo_access_advice(e)
+        if advice:
+            body["advice"] = advice
         if isinstance(e, TimeoutError):
             body["timed_out"] = True
             body["timeout_seconds"] = timeout_seconds

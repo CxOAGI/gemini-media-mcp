@@ -1247,3 +1247,79 @@ async def test_clip_bridges_carry_the_same_provenance_as_beats(
         assert isinstance(bridge["duration_seconds"], float)
     assert body["total_duration_source"]
     assert body["total_duration_source"].startswith("sum of")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_vertex_iam_refusal_names_the_grant_that_fixes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 403 from Veo arrived as a wall of SDK traceback ending in a
+    troubleshooter URL, saying nothing about which identity was refused --
+    the one fact the operator needs, since the server may be running as a
+    service account they did not expect. omni already translated its own
+    allowlist refusals; Veo did not."""
+    from src.__main__ import generate_video
+
+    class Denied(Exception):
+        def __init__(self) -> None:
+            super().__init__(
+                "403 PERMISSION_DENIED. {'error': {'code': 403, 'message': "
+                "\"Permission 'aiplatform.endpoints.predict' denied on resource "
+                "'//aiplatform.googleapis.com/projects/p/locations/us-central1/"
+                "publishers/google/models/veo-3.1-fast-generate-001'\"}}"
+            )
+            self.code = 403
+
+    async def denied(**kwargs: Any) -> dict[str, Any]:
+        raise Denied()
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", denied)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "cxo-agi")
+    app_ctx = _app_ctx(tmp_path)
+    app_ctx.client._api_client.vertexai = True
+
+    body = json.loads(
+        await generate_video(
+            ctx=_ctx(app_ctx),
+            prompt="a leaf",
+            model="veo-3.1-fast-generate-001",
+            duration_seconds=4,
+            resolution="4K",
+        )
+    )
+    assert "aiplatform.endpoints.predict" in body["advice"]
+    assert "roles/aiplatform.user" in body["advice"]
+    assert "cxo-agi" in body["advice"]
+    assert "Nothing was rendered or billed" in body["advice"]
+    # The attempt facts are still there, so the refusal is fully described.
+    assert body["generation_mode"] == "text_to_video"
+    assert body["resolution"] == "4K"
+    assert body["attempted_cost"]["usd"] == pytest.approx(1.2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_non_iam_failure_is_left_exactly_as_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The translator must not attach IAM advice to unrelated errors."""
+    from src.__main__ import generate_video
+
+    class Other(Exception):
+        def __init__(self) -> None:
+            super().__init__("403 quota exceeded for requests")
+            self.code = 403
+
+    async def failing(**kwargs: Any) -> dict[str, Any]:
+        raise Other()
+
+    monkeypatch.setattr("src.__main__.generate_video_impl", failing)
+    body = json.loads(
+        await generate_video(
+            ctx=_ctx(_app_ctx(tmp_path)), prompt="a leaf",
+            model="veo-3.1-fast-generate-001", duration_seconds=4,
+        )
+    )
+    assert "advice" not in body
+    assert body["error"] == "403 quota exceeded for requests"
