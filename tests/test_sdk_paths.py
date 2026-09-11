@@ -190,7 +190,7 @@ async def test_extend_rejects_non_regular_file(
 
     with pytest.raises(ValueError, match="not a regular file"):
         await generate_video(
-            client=FakeVeoClient(),  # type: ignore[arg-type]
+            client=FakeVeoClient(vertexai=True),  # type: ignore[arg-type]
             prompt="extend it",
             videos_dir=videos_dir,
             model="veo-3.1-generate-001",
@@ -211,7 +211,7 @@ async def test_extend_rejects_oversize_file(
 
     with pytest.raises(ValueError, match="over the 16 byte limit"):
         await generate_video(
-            client=FakeVeoClient(),  # type: ignore[arg-type]
+            client=FakeVeoClient(vertexai=True),  # type: ignore[arg-type]
             prompt="extend it",
             videos_dir=videos_dir,
             model="veo-3.1-generate-001",
@@ -246,7 +246,7 @@ async def test_extend_read_does_not_block_the_event_loop(
     tick_task = asyncio.create_task(ticker())
     try:
         await generate_video(
-            client=FakeVeoClient(),  # type: ignore[arg-type]
+            client=FakeVeoClient(vertexai=True),  # type: ignore[arg-type]
             prompt="extend it",
             videos_dir=videos_dir,
             model="veo-3.1-generate-001",
@@ -280,7 +280,7 @@ async def test_extend_read_times_out_instead_of_hanging(
     try:
         with pytest.raises(TimeoutError, match="Timed out reading the video"):
             await generate_video(
-                client=FakeVeoClient(),  # type: ignore[arg-type]
+                client=FakeVeoClient(vertexai=True),  # type: ignore[arg-type]
                 prompt="extend it",
                 videos_dir=videos_dir,
                 model="veo-3.1-generate-001",
@@ -468,7 +468,9 @@ async def test_references_with_frames_raise_and_name_both(
 async def test_extra_reference_images_warn(videos_dir: Path) -> None:
     """Truncating to three references is reported, not silent."""
     result = await generate_video(
-        client=FakeVeoClient(),  # type: ignore[arg-type]
+        client=FakeVeoClient(
+            vertexai=True,
+        ),  # type: ignore[arg-type]
         prompt="a clip",
         videos_dir=videos_dir,
         model="veo-3.1-generate-001",

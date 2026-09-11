@@ -850,7 +850,14 @@ def test_write_storyboard_writes_both_artifacts(tmp_path: Path) -> None:
     frames = make_frames(4, notes=True)
     result = write_storyboard(frames, tmp_path / "boards", title="Reel 01")
 
-    assert set(result) == {"sheet_path", "sheet_url", "html_path", "html_url"}
+    assert set(result) == {
+        "sheet_path",
+        "sheet_url",
+        "html_path",
+        "html_url",
+        "undecodable_shots",
+    }
+    assert result["undecodable_shots"] == ""  # these frames all decode
     sheet = Path(result["sheet_path"])
     page = Path(result["html_path"])
     assert sheet.is_file() and page.is_file()
@@ -1115,3 +1122,218 @@ def test_theme_literal_matches_what_render_accepts() -> None:
     from src.storyboard import Theme
 
     assert set(get_args(Theme)) == {"dark", "light"}
+
+
+# ============================================================================
+# Text-layout cost
+#
+# The panel text layout was superlinear in the length of ONE unbroken token,
+# on a paid render, with no length cap upstream. These pin the complexity, not
+# just the output: an assertion on the wrapped lines passes just as well when
+# the function takes a minute to produce them.
+# ============================================================================
+
+
+def _layout_font():
+    """A real TrueType face, since metrics drive the cost being measured."""
+    from PIL import ImageFont
+
+    from src.storyboard import _load_font
+
+    try:
+        return _load_font(14)
+    except Exception:  # pragma: no cover - fallback if the loader changes
+        return ImageFont.load_default()
+
+
+def test_wrapping_one_unbroken_token_is_not_superlinear() -> None:
+    """`_split_overlong` walked down one character at a time.
+
+    That is O(n) measurements per split, and `_wrap_text` called it again on
+    what was left, so the pair was cubic: measured at max_width=300 with
+    max_lines=3, one token cost 0.80s at 1000 characters, 2.45s at 1500 and
+    60.5s at 4000 -- per field, three fields a panel, up to 24 panels a board.
+    `_wrap_text` also split the WHOLE remainder before throwing all but three
+    lines of it away.
+
+    Also not merely adversarial: str.split() finds no boundary in CJK, so a
+    few-thousand-character Chinese or Japanese prompt is one "word".
+    """
+    import time
+
+    from src.storyboard import _wrap_text
+
+    font = _layout_font()
+
+    # Would have taken ~50s before; the bound is loose enough to survive a
+    # slow CI box and still fail a return to quadratic behaviour.
+    start = time.perf_counter()
+    lines = _wrap_text("x" * 4000, font, 300, 3)
+    elapsed = time.perf_counter() - start
+    assert len(lines) == 3
+    assert elapsed < 2.0, f"4000-char token took {elapsed:.2f}s"
+
+    # Growth check: 8x the input must not cost anywhere near 8^2.
+    start = time.perf_counter()
+    _wrap_text("x" * 32000, font, 300, 3)
+    big = time.perf_counter() - start
+    assert big < 4.0, f"32000-char token took {big:.2f}s"
+
+
+def test_wrapping_an_unspaced_cjk_prompt_is_not_superlinear() -> None:
+    """The realistic form of the same input."""
+    import time
+
+    from src.storyboard import _wrap_text
+
+    font = _layout_font()
+    text = "一本の木が風に揺れている" * 400  # 4800 chars, no spaces
+
+    start = time.perf_counter()
+    lines = _wrap_text(text, font, 300, 3)
+    elapsed = time.perf_counter() - start
+    assert len(lines) == 3
+    assert elapsed < 2.0, f"4800-char CJK prompt took {elapsed:.2f}s"
+
+
+def test_ellipsizing_a_long_title_is_not_quadratic() -> None:
+    """`_ellipsize` trimmed one character per pass, re-measuring each time.
+
+    It is called on the raw `title` argument of generate_storyboard, which had
+    no length check anywhere upstream: a 16,000-character title cost 18.3s in
+    this function alone.
+    """
+    import time
+
+    from src.storyboard import _ellipsize
+
+    font = _layout_font()
+    start = time.perf_counter()
+    out = _ellipsize("y" * 16000, font, 400)
+    elapsed = time.perf_counter() - start
+    assert out.endswith(_ellipsis_suffix(font))
+    assert elapsed < 1.0, f"16000-char title took {elapsed:.2f}s"
+
+
+def _ellipsis_suffix(font) -> str:
+    from src.storyboard import _ellipsis_for
+
+    return _ellipsis_for(font)
+
+
+def test_the_faster_layout_returns_what_the_slow_one_returned() -> None:
+    """Binary search must not move the break, only find it faster.
+
+    Both functions assume prefix width is non-decreasing in the cut, so this
+    compares against the linear scan they replaced across a spread of widths
+    and scripts.
+    """
+    import random
+    import string
+
+    from src.storyboard import (
+        _ellipsis_for,
+        _ellipsize,
+        _split_overlong,
+        _text_width,
+    )
+
+    font = _layout_font()
+
+    def slow_split(word: str, max_width: float) -> tuple[str, str]:
+        for cut in range(len(word) - 1, 0, -1):
+            if _text_width(font, word[:cut]) <= max_width:
+                return word[:cut], word[cut:]
+        return word[:1], word[1:]
+
+    def slow_ellipsize(line: str, max_width: float) -> str:
+        ellipsis = _ellipsis_for(font)
+        trimmed = line
+        while trimmed and _text_width(font, trimmed + ellipsis) > max_width:
+            trimmed = trimmed[:-1]
+        return trimmed.rstrip() + ellipsis
+
+    random.seed(7)
+    alphabet = string.ascii_letters + string.digits + " .,!-" + "ÁQgjy一本の木が風"
+    for _ in range(600):
+        word = "".join(random.choice(alphabet) for _ in range(random.randint(1, 60)))
+        max_width = random.choice([1, 5, 20, 60, 120, 300])
+        assert _split_overlong(word, font, max_width) == slow_split(word, max_width)
+        assert _ellipsize(word, font, max_width) == slow_ellipsize(word, max_width)
+
+
+def test_an_undecodable_frame_counts_as_failed_everywhere() -> None:
+    """The panel drew "SHOT NOT GENERATED"; every count called it a success.
+
+    `failed` only asked whether image_bytes is None, so bytes that exist but
+    do not decode were a hole in the sheet and a rendered shot in the header
+    chip, in render_html's summary, in the panel badge colour, and in
+    generate_storyboard's "3/3 shots" message.
+    """
+    from src.storyboard import (
+        StoryboardFrame,
+        normalize_frames,
+        render_html,
+    )
+
+    good = make_image(64, 64)
+    frames = [
+        StoryboardFrame(index=1, image_bytes=good, prompt="ok one"),
+        StoryboardFrame(index=2, image_bytes=b"not an image at all", prompt="broken"),
+        StoryboardFrame(index=3, image_bytes=good, prompt="ok two"),
+    ]
+
+    normalized, undecodable = normalize_frames(frames)
+    assert undecodable == [2]
+    assert [f.failed for f in normalized] == [False, True, False]
+    assert "could not be decoded" in (normalized[1].error or "")
+
+    # The HTML summary counts it too.
+    assert "1 failed" in render_html(normalized, title="T")
+
+
+def test_normalize_frames_leaves_a_decodable_board_alone() -> None:
+    """It must not invent failures."""
+    from src.storyboard import StoryboardFrame, normalize_frames
+
+    good = make_image(32, 32)
+    frames = [
+        StoryboardFrame(index=1, image_bytes=good, prompt="a"),
+        StoryboardFrame(index=2, image_bytes=None, prompt="b", error="boom"),
+    ]
+    normalized, undecodable = normalize_frames(frames)
+    assert undecodable == []
+    assert [f.failed for f in normalized] == [False, True]
+    # The pre-existing error is preserved, not overwritten.
+    assert normalized[1].error == "boom"
+
+
+def test_write_storyboard_reports_undecodable_shots(tmp_path: Path) -> None:
+    """So the single caller can keep its rendered-shot count honest."""
+    from src.storyboard import StoryboardFrame, write_storyboard
+
+    frames = [
+        StoryboardFrame(index=1, image_bytes=make_image(48, 48), prompt="ok"),
+        StoryboardFrame(index=2, image_bytes=b"garbage", prompt="broken"),
+    ]
+    artifacts = write_storyboard(frames, tmp_path, title="T")
+    assert artifacts["undecodable_shots"] == "2"
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP"])
+def test_a_truncated_frame_is_flagged_whatever_its_format(fmt: str) -> None:
+    """verify() does not detect truncation for JPEG; load() does.
+
+    A half-written JPEG passed the first normalize_frames, _render_panel drew
+    "SHOT NOT GENERATED" for it, and the board still reported every shot
+    rendered -- the defect the function exists to close, for the one format
+    image.py is most likely to write verbatim.
+    """
+    from src.storyboard import StoryboardFrame, normalize_frames
+
+    whole = make_image(400, 300, fmt=fmt)
+    truncated = whole[: len(whole) // 2]
+    _, undecodable = normalize_frames(
+        [StoryboardFrame(index=1, image_bytes=truncated, prompt="broken")]
+    )
+    assert undecodable == [1], fmt

@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 import logging
 import time
 from io import BytesIO
@@ -171,12 +172,16 @@ class FakeContextManager:
             None,
             id="vertexai_true_no_json",
         ),
+        # Inline JSON no longer produces a temp file: credentials are built
+        # in-process and handed to each client, because on the HTTP transports
+        # the lifespan runs per session and a per-session file was deleted
+        # from under every other live session. setup now only validates.
         pytest.param(
             {
                 "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 "GOOGLE_SERVICE_ACCOUNT_JSON": '{"type": "service_account", "project_id": "test"}',
             },
-            Path,
+            None,
             id="vertexai_with_sa_json",
         ),
         pytest.param(
@@ -184,7 +189,7 @@ class FakeContextManager:
                 "GOOGLE_GENAI_USE_VERTEXAI": "true",
                 "GOOGLE_APPLICATION_CREDENTIALS": '{"type": "service_account", "project_id": "test2"}',
             },
-            Path,
+            None,
             id="vertexai_with_gac_json",
         ),
         # The invalid-JSON case no longer returns None: a malformed
@@ -212,15 +217,18 @@ def test_setup_vertex_credentials(
     for key, value in input.items():
         monkeypatch.setenv(key, value)
 
+    import glob
+    import tempfile
+
+    before = set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json")))
     result = setup_vertex_credentials()
+    after = set(glob.glob(str(Path(tempfile.gettempdir()) / "gcp_sa_*.json")))
 
     if expected is None:
         assert result is None
-    else:
+        assert after == before, "no credentials file may be written"
+    else:  # pragma: no cover - no parameter expects a path any more
         assert isinstance(result, Path)
-        assert result.exists()
-        # Cleanup
-        result.unlink()
 
 
 # ============================================================================
@@ -794,30 +802,37 @@ async def test_app_lifespan_default_dirs(
 async def test_app_lifespan_cleanup_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    service_account_json: str,
 ) -> None:
-    """Test app_lifespan cleans up temporary credentials."""
+    """The lifespan hands the client a credentials OBJECT and writes no file.
+
+    A placeholder key ("private_key": "K") is no longer enough here: the
+    credentials are really built, so the fixture mints a real-shaped one.
+    """
     monkeypatch.setenv("DATA_FOLDER", str(tmp_path))
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
-    monkeypatch.setenv(
-        "GOOGLE_SERVICE_ACCOUNT_JSON",
-        '{"type": "service_account", "project_id": "test"}',
-    )
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON", service_account_json)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
 
-    # Mock genai.Client
+    seen: list[dict[str, Any]] = []
     mock_client = MagicMock()
-    monkeypatch.setattr("src.__main__.genai.Client", lambda **kwargs: mock_client)
+
+    def fake_client(**kwargs: Any) -> MagicMock:
+        seen.append(kwargs)
+        return mock_client
+
+    monkeypatch.setattr("src.__main__.genai.Client", fake_client)
 
     server = FakeFastMCP()
-    temp_creds_path: Path | None = None
-
     async with app_lifespan(server) as ctx:  # type: ignore[arg-type]
-        temp_creds_path = ctx.temp_creds_path
-        if temp_creds_path:
-            assert temp_creds_path.exists()
+        assert ctx.temp_creds_path is None
+        vertex_calls = [k for k in seen if k.get("vertexai")]
+        assert vertex_calls, seen
+        assert vertex_calls[0]["credentials"] is not None
+        assert vertex_calls[0]["project"] == "proj-x"
 
-    # After context exit, temp credentials should be cleaned up
-    if temp_creds_path:
-        assert not temp_creds_path.exists()
+    # And the environment was never repointed at anything.
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ
 
 
 # ============================================================================
@@ -2170,6 +2185,7 @@ def _video_ctx(
     tmp_path: Path,
     allowed_gcs_buckets: frozenset[str] = frozenset(),
     vertexai: bool = False,
+    video_gcs_bucket: str | None = None,
 ) -> MagicMock:
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
@@ -2189,6 +2205,7 @@ def _video_ctx(
         videos_dir=videos_dir,
         client=client,
         allowed_gcs_buckets=allowed_gcs_buckets,
+        video_gcs_bucket=video_gcs_bucket,
     )
     return ctx
 
@@ -2596,6 +2613,26 @@ async def test_generate_video_extend_requires_gcs_output(
 # ============================================================================
 # Regression tests for the post-review fixes
 # ============================================================================
+
+
+def _vertex_app_ctx(tmp_path: Path) -> Any:
+    """AppContext on Vertex, with a destination so extension can run.
+
+    Veo serves extension and first/last-frame only on Vertex (measured: the
+    Gemini Developer API answers "encodedVideo isn't supported by this model").
+    A test whose subject is chaining or warning propagation is not a test about
+    a backend, so it belongs on the one where the mode exists.
+    """
+    client = MagicMock()
+    client._api_client.vertexai = True
+    return AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=client,
+        video_gcs_bucket="gs://bkt/out/",
+        allowed_gcs_buckets=frozenset({"bkt"}),
+    )
 
 
 def _gemini_api_app_ctx(tmp_path: Path, video_gcs_bucket: str | None = None) -> Any:
@@ -3643,7 +3680,9 @@ async def test_generate_clip_animatic_uses_omni_and_skips_bridges(
         )
     )
     assert result["animatic"] is True
-    assert result["model"] == "gemini-omni-flash-preview"
+    # The animatic previews on whatever the omni default is, and that moved
+    # to the GA model when the preview endpoint got a shutdown date.
+    assert result["model"] == "gemini-omni-1.1-flash"
     beat_segs = [s for s in result["segments"] if s.get("kind") == "beat"]
     assert len(beat_segs) == 2
     assert all(s["generation_mode"] == "animatic" for s in beat_segs)
@@ -3662,7 +3701,7 @@ async def test_loop_extend_chains_extensions(
     (tmp_path / "images").mkdir()
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    ctx = _ctx_wrapping(_vertex_app_ctx(tmp_path))
 
     extend_uris: list[str] = []
     n = {"i": 0}
@@ -3844,7 +3883,7 @@ async def test_loop_extend_passes_audio_and_propagates_warnings(
     (tmp_path / "images").mkdir()
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
+    ctx = _ctx_wrapping(_vertex_app_ctx(tmp_path))
 
     audio_flags: list[bool] = []
     n = {"i": 0}
@@ -3874,7 +3913,10 @@ async def test_loop_extend_passes_audio_and_propagates_warnings(
         )
     )
     assert audio_flags == [True, True]
-    assert result["warnings"] == ["same warning each step"]
+    # Containment, not equality: the test's fake steps are not measurable
+    # files, so the chain also (correctly) labels its cost a floor. What this
+    # test is about is that the impl's own warning survives the chain.
+    assert "same warning each step" in result["warnings"]
 
 
 def test_client_for_omni_routing(
@@ -4892,9 +4934,12 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
             "edit_video",
             {"previous_interaction_id": "i", "prompt": "x"},
             # An edit's rendered length is chosen by the service, so the quote
-            # is Omni's 10s maximum, plus one frame of encoder overhang so the
+            # is the longest clip it could produce: on Vertex (this case runs
+            # there) an unrecorded source may be a 30s upload, so the bound is
+            # 30s -- not Omni's 10s per-render figure, which is the Developer
+            # API's upload ceiling -- plus one frame of encoder overhang so the
             # bound is a true ceiling.
-            (10 + 1 / 24) * 0.10136,
+            (30 + 1 / 24) * 0.10136,
             id="edit_quotes_the_worst_case",
         ),
     ],
@@ -4919,8 +4964,19 @@ async def test_video_dry_runs_quote_without_spending(
     for impl in ("generate_video_impl", "generate_video_omni_impl"):
         monkeypatch.setattr(main_mod, impl, must_not_spend)
 
+    # Lite is served only by the Gemini API; first/last-frame and extension
+    # only by Vertex. One shared backend cannot serve both, so the case decides.
+    on_vertex = "lite" not in json.dumps(kwargs).lower()
     payload = json.loads(
-        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+        await getattr(main_mod, tool)(
+            ctx=_video_ctx(
+                tmp_path,
+                vertexai=on_vertex,
+                video_gcs_bucket="gs://bkt/out/" if on_vertex else None,
+            ),
+            dry_run=True,
+            **kwargs,
+        )
     )
     assert payload["dry_run"] is True
     assert payload["estimated_cost"]["usd"] == pytest.approx(expected_usd)
@@ -4944,24 +5000,30 @@ async def test_clip_dry_run_prices_beats_and_bridges(
 
     plain = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True), beats=beats, dry_run=True
         )
     )
     bridged = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=beats,
+            add_bridges=True,
+            dry_run=True,
         )
     )
     animatic = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, animatic=True, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=beats,
+            animatic=True,
+            dry_run=True,
         )
     )
     assert plain["estimated_cost"]["usd"] == pytest.approx(3 * 0.8)
     # Two 4s bridge renders on the fast tier.
     assert bridged["bridge_count"] == 2
     assert bridged["estimated_cost"]["usd"] == pytest.approx(3 * 0.8 + 2 * 0.4)
-    assert animatic["model"] == "gemini-omni-flash-preview"
+    assert animatic["model"] == "gemini-omni-1.1-flash"
     # Writing this test surfaced the real economics: omni ($0.10136/s) is
     # price-PARITY with the fast tier ($0.10/s), not cheaper. The animatic's
     # value against the default model is avoiding a wasted full render, and
@@ -5066,8 +5128,19 @@ async def test_dry_run_refuses_what_the_real_run_would_refuse(
     """
     import src.__main__ as main_mod
 
+    # Lite is served only by the Gemini API; first/last-frame and extension
+    # only by Vertex. One shared backend cannot serve both, so the case decides.
+    on_vertex = "lite" not in json.dumps(kwargs).lower()
     payload = json.loads(
-        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
+        await getattr(main_mod, tool)(
+            ctx=_video_ctx(
+                tmp_path,
+                vertexai=on_vertex,
+                video_gcs_bucket="gs://bkt/out/" if on_vertex else None,
+            ),
+            dry_run=True,
+            **kwargs,
+        )
     )
     assert expected_error in payload["error"]
 
@@ -5079,7 +5152,12 @@ async def test_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
     disallowed bucket must fail exactly like running it would."""
     import src.__main__ as main_mod
 
-    ctx = _video_ctx(tmp_path, allowed_gcs_buckets=frozenset({"trusted"}))
+    ctx = _video_ctx(
+        tmp_path,
+        vertexai=True,
+        video_gcs_bucket="gs://trusted/out/",
+        allowed_gcs_buckets=frozenset({"trusted"}),
+    )
     denied = json.loads(
         await main_mod.loop_extend(
             ctx=ctx, video_uri="gs://evil/x.mp4", times=2, dry_run=True
@@ -5457,7 +5535,7 @@ async def test_bridge_quote_reports_that_the_ffmpeg_check_ran(tmp_path: Path) ->
 
     payload = json.loads(
         await main_mod.generate_bridge(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True, video_gcs_bucket="gs://bkt/out/"),
             # gs:// clips are uncheckable offline and still price; local dummy
             # paths would now be refused as outside DATA_FOLDER. This test is
             # about the ffmpeg preflight, not the source scheme.
@@ -5629,14 +5707,17 @@ async def test_clip_quote_reports_the_ffmpeg_check_when_bridging(
     beats = [{"prompt": "b", "duration_seconds": 8}] * 3
     bridged = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, add_bridges=True, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            beats=beats,
+            add_bridges=True,
+            dry_run=True,
         )
     )
     assert any("ffmpeg" in c for c in bridged["preflight_checks"])
 
     plain = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path), beats=beats, dry_run=True
+            ctx=_video_ctx(tmp_path, vertexai=True), beats=beats, dry_run=True
         )
     )
     assert plain["preflight_checks"] == []
