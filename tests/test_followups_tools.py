@@ -1327,3 +1327,47 @@ async def test_a_non_iam_failure_is_left_exactly_as_reported(
     )
     assert "advice" not in body
     assert body["error"] == "403 quota exceeded for requests"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_4k_quote_warns_that_the_deadline_cannot_cover_it(
+    tmp_path: Path,
+) -> None:
+    """A 4s 4K render MEASURED 335s end to end -- longer than the 210s default
+    and longer than the ~240s ceiling that default exists to stay under. So 4K
+    does not fit in one tool call on a typical host at any timeout the host
+    allows, and the caller learns that as a cancelled call after paying. The
+    quote says it first."""
+    from src.__main__ import generate_video
+
+    app_ctx = _app_ctx(tmp_path)
+    app_ctx.client._api_client.vertexai = True
+    payload = json.loads(
+        await generate_video(
+            ctx=_ctx(app_ctx), prompt="a leaf", model="veo-3.1-fast-generate-001",
+            duration_seconds=4, resolution="4K", dry_run=True,
+        )
+    )
+    warning = next(w for w in payload["warnings"] if "335s" in w)
+    assert "MEASURED" in warning
+    assert "timeout_seconds" in warning
+    assert "240s" in warning  # the host ceiling, which no timeout can beat
+
+    # A deadline that does cover it says nothing...
+    ok = json.loads(
+        await generate_video(
+            ctx=_ctx(app_ctx), prompt="a leaf", model="veo-3.1-fast-generate-001",
+            duration_seconds=4, resolution="4K", timeout_seconds=900, dry_run=True,
+        )
+    )
+    assert not any("335s" in w for w in ok.get("warnings", []))
+
+    # ...nor does a tier that is not slow.
+    hd = json.loads(
+        await generate_video(
+            ctx=_ctx(app_ctx), prompt="a leaf", model="veo-3.1-fast-generate-001",
+            duration_seconds=4, resolution="1080p", dry_run=True,
+        )
+    )
+    assert not any("335s" in w for w in hd.get("warnings", []))

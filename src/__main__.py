@@ -27,7 +27,7 @@ from aiohttp.abc import AbstractResolver, ResolveResult
 from google import genai
 
 from . import credentials
-from .video import VEO_DEFAULT_TIMEOUT_SECONDS
+from .video import VEO_DEFAULT_TIMEOUT_SECONDS, VEO_MEASURED_4K_SECONDS
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
@@ -1153,6 +1153,32 @@ def _veo_request_mode(
     if has_first_frame:
         return "image_to_video"
     return "text_to_video"
+
+
+def _veo_slow_tier_warning(resolution: str | None, timeout_seconds: float) -> str | None:
+    """Warn when the deadline cannot cover the tier being asked for.
+
+    A 4-second 4K render MEASURED 335s end to end. The default deadline is
+    210s, and the MCP host ceiling that default exists to stay under is about
+    240s -- so a 4K render does not fit in one tool call on a typical host at
+    any timeout the host will allow, and the failure arrives as a cancelled
+    call AFTER the render has been billed. Said before the spend, not after.
+    """
+    if str(resolution or "").upper() != "4K":
+        return None
+    if timeout_seconds >= VEO_MEASURED_4K_SECONDS * 1.2:
+        return None
+    return (
+        "4K is the slowest tier: a 4-second 4K render MEASURED "
+        f"{VEO_MEASURED_4K_SECONDS:.0f}s end to end. This call's deadline is "
+        f"{timeout_seconds:g}s, so it will very likely be cut short after the "
+        "render has been billed. Raise timeout_seconds past "
+        f"{VEO_MEASURED_4K_SECONDS * 1.2:.0f}s -- and note that many MCP hosts "
+        "cap a single tool call near 240s, in which case no timeout_seconds "
+        "value will help and 4K cannot be rendered through this tool on that "
+        "host. Render at 1080p, or drive the tool from a client without that "
+        "ceiling."
+    )
 
 
 def _veo_access_advice(exc: BaseException) -> str | None:
@@ -4480,6 +4506,9 @@ async def generate_video(
                 )
                 if ext_billing.warning:
                     payload.setdefault("warnings", []).append(ext_billing.warning)
+            slow_tier = _veo_slow_tier_warning(resolution, timeout_seconds)
+            if slow_tier:
+                payload.setdefault("warnings", []).append(slow_tier)
             # Disclose the Veo-only params a draft will drop, exactly as the
             # real draft run does — a quote that hid them let a caller price a
             # render believing paid controls (seed, negative_prompt, ...) were
@@ -4674,6 +4703,9 @@ async def generate_video(
                     "combined videos that exceed inline response limits."
                 )
 
+        slow_tier_notice = _veo_slow_tier_warning(resolution, timeout_seconds)
+        if slow_tier_notice:
+            await _emit_warnings(ctx, [slow_tier_notice])
         await ctx.info(f"Generating video with model={model}")
         # Only the Veo path reaches this: the draft branch returned above.
         assert video_client is not None
@@ -4705,6 +4737,8 @@ async def generate_video(
         # not, and a session spent three calls working out a backend confusion
         # that this field answers in one.
         result["backend"] = "vertex" if is_vertex_client else "gemini_api"
+        if slow_tier_notice:
+            result.setdefault("warnings", []).append(slow_tier_notice)
         # Veo bills by resolution too, and this response named one nowhere:
         # the manifest recorded the raw request — null whenever the caller
         # defaulted — while the cost line below priced 720p. Measured, the

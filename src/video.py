@@ -300,6 +300,16 @@ _VEO_TOTAL_TIMEOUT_SECONDS = 1800.0
 # reconciled in the console. Callers whose host allows longer can raise it.
 VEO_DEFAULT_TIMEOUT_SECONDS = 210.0
 
+# MEASURED, not estimated: a 4-second 4K render on veo-3.1-fast-generate-001
+# took 335.05s wall-clock, Vertex AI, submit to downloaded file. That is longer
+# than VEO_DEFAULT_TIMEOUT_SECONDS above AND longer than the ~240s ceiling that
+# default exists to stay under -- so a 4K render cannot complete inside one
+# tool call on a typical MCP host, at any timeout the host will tolerate. It is
+# not a slow-network accident: 4K is the slowest tier and this is the only
+# measurement of it there has ever been. Callers get told, rather than
+# discovering it as a timeout after paying $1.20.
+VEO_MEASURED_4K_SECONDS = 335.0
+
 
 class VeoTimeoutError(TimeoutError):
     """A Veo render ran past its deadline.
