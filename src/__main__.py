@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import sys
 import threading
@@ -1188,14 +1189,26 @@ def _veo_access_advice(exc: BaseException) -> str | None:
         f"    --member=serviceAccount:{'<service-account-email>' if not identity else identity.split()[-1].rstrip('.')} \\\n"
         "    --role=roles/aiplatform.user"
     )
+    model_hint = ""
+    match = re.search(r"models/([A-Za-z0-9._-]+)", text)
+    if match:
+        model_hint = f" for {match.group(1)}"
     return (
-        "Vertex AI refused this call for lack of IAM permission, not for "
-        f"anything about the request.{identity} The missing permission is "
-        "aiplatform.endpoints.predict, granted by roles/aiplatform.user:\n"
+        f"Vertex AI refused this call{model_hint} with "
+        f"aiplatform.endpoints.predict denied.{identity} That message covers two "
+        "different problems, and they have different fixes.\n"
+        "1. The identity lacks the permission. Then EVERY Vertex model fails "
+        "the same way, and the grant is:\n"
         f"{grant}\n"
-        "Check too that the Vertex AI API is enabled on the project and that "
-        "GOOGLE_CLOUD_LOCATION names a region where the model is served. "
-        "Nothing was rendered or billed."
+        "2. The identity has it, but this MODEL OR TIER is not enabled for the "
+        "project. Then other models and other resolutions of the same model "
+        "still render, and no IAM change helps -- Veo 4K in particular needs "
+        "per-project access, separate from any role. Request it for the "
+        "project, or render at a tier it already serves.\n"
+        "Tell them apart by rendering the same model at 720p: if that works, "
+        "it is (2). Check too that the Vertex AI API is enabled and that "
+        "GOOGLE_CLOUD_LOCATION names a region serving the model. Nothing was "
+        "rendered or billed."
     )
 
 

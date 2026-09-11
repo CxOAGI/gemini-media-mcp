@@ -1288,10 +1288,14 @@ async def test_a_vertex_iam_refusal_names_the_grant_that_fixes_it(
             resolution="4K",
         )
     )
-    assert "aiplatform.endpoints.predict" in body["advice"]
-    assert "roles/aiplatform.user" in body["advice"]
-    assert "cxo-agi" in body["advice"]
-    assert "Nothing was rendered or billed" in body["advice"]
+    advice = body["advice"]
+    assert "aiplatform.endpoints.predict" in advice
+    assert "roles/aiplatform.user" in advice          # the role-gap reading
+    assert "not enabled for the project" in advice    # the tier-gap reading
+    assert "720p" in advice                           # how to tell them apart
+    assert "veo-3.1-fast-generate-001" in advice      # the model it names
+    assert "cxo-agi" in advice
+    assert "Nothing was rendered or billed" in advice
     # The attempt facts are still there, so the refusal is fully described.
     assert body["generation_mode"] == "text_to_video"
     assert body["resolution"] == "4K"
