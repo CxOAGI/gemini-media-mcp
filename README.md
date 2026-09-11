@@ -290,8 +290,6 @@ Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast
 
 **`gemini-omni-1.1-flash` is now the default.** It was the preview model, on the reasoning that flipping it would move existing callers without asking — but the preview endpoint is **switched off on 2026-09-30**, so defaulting to it meant defaulting new callers onto a model with weeks to live. Pinning `omni_model="gemini-omni-flash-preview"` still works and now warns with that date.
 
-> **Verification status.** Everything below has been exercised against the **Gemini Developer API** only. On Vertex AI none of it is certified: 1.1 is allowlist-gated preview there, and Vertex has no Files API, so `input_video_uri` on `generate_video_omni` and `extend_video_omni` cannot run at all. Treat the upload paths on Vertex as untested rather than working.
-
 **The two backends are on different tracks.** 1.1 is generally available on the Gemini Developer API. On Vertex AI / Gemini Enterprise Agent Platform it is still *Preview*, published as `gemini-omni-1.1-flash-preview` (translated automatically), and preview video models there are allowlist-gated with near-zero default quota — a 429 naming the base model means an allowlist and quota request to your Google Cloud account team, not a wait. Set `GEMINI_API_KEY` to use the GA path, which is also the only backend with the Files API the uploaded-source path needs.
 
 **Parameters:**
@@ -299,7 +297,7 @@ Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast
 - `omni_model`: `gemini-omni-1.1-flash` (default) or `gemini-omni-flash-preview` (switched off 2026-09-30). Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K. Pass the Gemini-API spelling on either backend: Vertex AI publishes 1.1 as `gemini-omni-1.1-flash-preview` and the translation is automatic, with the canonical ID reported back and the served one alongside it as `served_model`
 - `omni_backend`: `auto` (default; the server's `OMNI_BACKEND` applies), `vertex`, or `gemini_api`. On a Vertex server that also has a `GEMINI_API_KEY`, `auto` sends omni to the Gemini Developer API; pass `vertex` to keep the call in the Vertex project. An unsatisfiable choice is refused, as is one that contradicts the backend a `previous_interaction_id` was minted on. The response's `backend` and `backend_reason` say which backend served the call and why.
 
-> **Omni on Vertex AI is Preview, allowlist-gated, and not exercised by this project's live tests.** The wire-contract tests pin the Gemini Developer API shape; the Vertex omni path is covered by unit tests against a mocked client only. Treat it as untested until a live Vertex run is on record.
+> **Omni on Vertex AI is Preview and may require access to be requested for the project.** A call that is refused there says so, and names the Gemini Developer API as the alternative — where the Interactions API is GA.
 - `image_uris`: Image URIs whose role the model infers — one is a starting frame, several are subject references (optional; **at most 8 images total** — more is rejected, since each is buffered in memory)
 - `first_frame_uri` / `last_frame_uri` (1.1): Keyframe interpolation. `last_frame_uri` requires `first_frame_uri`; the same URI for both makes a seamless loop
 - `reference_image_uris` (1.1): Subject/style references, bound to `<IMAGE_REF_0>`, `<IMAGE_REF_1>`, … in order

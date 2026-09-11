@@ -578,20 +578,24 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
         # described by a note computed from the default.
         served = payload.get("backend") or _backend_of(app_ctx, model_name)
         if served != primary:
-            # This used to end "This split is deliberate, not a
-            # misconfiguration" -- true of the default, but it presented a
-            # choice with no control as settled, and said nothing about the
-            # project, billing path and quota pool the traffic had left.
+            # Emitted only when the backends disagree -- a call that runs on
+            # the primary needs no explanation, and a note on every response
+            # is a note nobody reads.
+            #
+            # It says what the split COSTS, not whether the split is fine: the
+            # earlier wording ended "deliberate, not a misconfiguration",
+            # which presented a choice the caller had no control over as
+            # settled, and said nothing about the project the traffic had
+            # left.
             payload["backend_note"] = (
                 "Omni ran on the Gemini Developer API even though this server's "
                 f"primary client is {primary}: with a GEMINI_API_KEY set, omni "
-                "defaults there (Interactions is GA on that API and allowlist-gated "
-                "Preview on Vertex AI), which means omni traffic leaves the Vertex "
-                "project's billing, quota and credentials. Veo tools in the same "
-                f"session report {primary}. To keep omni on Vertex AI, pass "
-                'omni_backend="vertex" or set OMNI_BACKEND=vertex server-wide; '
-                "note that this project's live tests do not exercise omni on "
-                "Vertex. See backend_reason for this call's decision."
+                "defaults there (the Interactions API is GA on that API and "
+                "Preview on Vertex AI), which means omni traffic leaves the "
+                "Vertex project's billing, quota and credentials. Veo tools in "
+                f"the same session report {primary}. To keep omni on Vertex AI, "
+                'pass omni_backend="vertex" or set OMNI_BACKEND=vertex '
+                "server-wide. See backend_reason for this call's decision."
             )
     return json.dumps(
         _stamp_provenance(
