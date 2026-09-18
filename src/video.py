@@ -121,21 +121,155 @@ GenerationMode = Literal[
 ]
 
 
+# Wall-clock ceiling on decoding a request's image inputs off the loop. Generous:
+# the pixel cap below bounds the work, and this exists so a pathological codec
+# path releases the caller rather than parking it.
+_IMAGE_PREP_TIMEOUT_SECONDS = 60.0
+
+
 def _prepare_image_input(image_bytes: bytes) -> types.Image:
-    """Convert image bytes to types.Image for API input."""
-    pil_img = Image.open(BytesIO(image_bytes))
-    fmt = "PNG" if pil_img.mode in ("RGB", "RGBA") else "JPEG"
-    if fmt == "JPEG" and pil_img.mode != "RGB":
-        pil_img = pil_img.convert("RGB")
-    buf = BytesIO()
-    pil_img.save(buf, format=fmt)
-    pil_img.close()
+    """Convert image bytes to types.Image for API input.
+
+    Header-checked, and passed through when it can be. The previous version
+    fully decoded EVERY input and re-encoded it as PNG whenever the mode was
+    RGB -- so a 5 MB 4000x4000 JPEG went onto the wire as a 28.5 MB PNG, and a
+    308 KB 9999x9999 PNG (under the fetch cap, under Pillow's hard bomb
+    threshold) cost +382 MB RSS in 1.6s. With no pixel check at all this was
+    the one caller-image decode path left unguarded; image.py's inputs go
+    through _open_input_image and its 40 MP ceiling.
+
+    The size is read from the header before anything is materialised, so an
+    oversized source is refused without ever being decoded. A PNG or JPEG in a
+    mode the service accepts is sent as the bytes it arrived as -- decoded once
+    to prove they are whole, but not re-encoded: the caller's encoding is
+    already the right one, and re-encoding bought nothing but CPU and, for
+    JPEG, a many-fold larger payload. That decode is deliberate. The first
+    cut of the pass-through skipped it, and a truncated or data-less file
+    that the old code refused locally ("image file is truncated") went onto
+    the wire to fail as an opaque 400 after the upload; with the pixel cap
+    enforced first and this running off the loop, the decode is bounded and
+    cheap. Other formats and modes are converted -- to PNG, never to lossy
+    JPEG, so a lossless WEBP, BMP or TIFF reference keeps its fidelity (the
+    first cut recompressed those at JPEG q75); only a JPEG source is
+    re-encoded as JPEG.
+    """
+    from .image import _MAX_SOURCE_PIXELS, _megapixels  # shared ceiling
+
+    with Image.open(BytesIO(image_bytes)) as probe:
+        width, height = probe.size
+        pixels = width * height
+        if pixels > _MAX_SOURCE_PIXELS:
+            raise ValueError(
+                f"Image input is {width}x{height} ({_megapixels(pixels)}), above "
+                f"the {_megapixels(_MAX_SOURCE_PIXELS)} limit for input images. "
+                "Downscale it before sending."
+            )
+        source_format = probe.format
+        mode = probe.mode
+        # Whole-file check: a truncated stream raises here, locally, as before.
+        probe.load()
+        if source_format == "PNG" and mode in ("RGB", "RGBA"):
+            return types.Image(image_bytes=image_bytes, mime_type="image/png")
+        if source_format == "JPEG" and mode == "RGB":
+            return types.Image(image_bytes=image_bytes, mime_type="image/jpeg")
+        # Anything else is normalised. Lossless stays lossless: PNG unless
+        # the source was itself a JPEG.
+        fmt = "JPEG" if source_format == "JPEG" else "PNG"
+        converted = probe.convert("RGB" if fmt == "JPEG" else "RGBA")
+    try:
+        buf = BytesIO()
+        converted.save(buf, format=fmt)
+    finally:
+        converted.close()
     return types.Image(image_bytes=buf.getvalue(), mime_type=f"image/{fmt.lower()}")
+
+
+def _prepare_frame_inputs(
+    generation_mode: str,
+    image_bytes: bytes | None,
+    last_frame_bytes: bytes | None,
+    reference_images: list[bytes] | None,
+) -> tuple[
+    types.Image | None,
+    types.Image | None,
+    list[types.VideoGenerationReferenceImage],
+    list[str],
+]:
+    """Build every image input for one render. Synchronous; run it off-loop.
+
+    Returns ``(first_frame, last_frame, references, warnings)``.
+    """
+    warnings: list[str] = []
+    first_frame_input: types.Image | None = None
+    last_frame_input: types.Image | None = None
+    reference_image_inputs: list[types.VideoGenerationReferenceImage] = []
+
+    if generation_mode == "image_to_video" and image_bytes:
+        first_frame_input = _prepare_image_input(image_bytes)
+    elif generation_mode == "first_last_frame":
+        if image_bytes:
+            first_frame_input = _prepare_image_input(image_bytes)
+        if last_frame_bytes:
+            last_frame_input = _prepare_image_input(last_frame_bytes)
+    elif generation_mode == "reference_to_video" and reference_images:
+        # VEO 3.1 supports up to 3 reference images (asset type)
+        # Must wrap in VideoGenerationReferenceImage with reference_type="asset"
+        if len(reference_images) > _MAX_REFERENCE_IMAGES:
+            # A truncation, not a conflict: the render the caller asked for
+            # still happens, just without the extras. Say so rather than
+            # letting a reference the caller explicitly supplied vanish and
+            # quietly change the generation result.
+            warnings.append(
+                f"{len(reference_images)} reference images were supplied but "
+                f"Veo 3.1 accepts {_MAX_REFERENCE_IMAGES}; the last "
+                f"{len(reference_images) - _MAX_REFERENCE_IMAGES} were not "
+                "sent and did not influence this render."
+            )
+        for ref_bytes in reference_images[:_MAX_REFERENCE_IMAGES]:
+            reference_image_inputs.append(
+                types.VideoGenerationReferenceImage(
+                    image=_prepare_image_input(ref_bytes),
+                    reference_type="asset",  # asset for subject preservation
+                )
+            )
+    return first_frame_input, last_frame_input, reference_image_inputs, warnings
 
 
 # Generation modes Veo 3.1 Lite cannot serve. It handles text-to-video and
 # image-to-video only.
 _LITE_UNSUPPORTED_MODES = ("extend_video", "reference_to_video", "first_last_frame")
+
+# MEASURED against the live service: on the Gemini Developer API, Veo refuses
+# every mode that conditions on existing footage. first_last_frame comes back
+# "Your use case is currently not supported" (generate_transition,
+# generate_bridge) and extend_video comes back "encodedVideo isn't supported by
+# this model" (loop_extend). The identical calls succeed on Vertex.
+#
+# reference_to_video joined these after a live test: it does not answer with a
+# usable error at all, just an empty result the tool surfaced as "No videos
+# returned", and it appears to have billed for the attempt — the worst possible
+# failure shape, and the one most worth gating. image_to_video was tested in the
+# same round and RENDERS FINE, so the caution once emitted for it is gone: this
+# backend is not "text-to-video only", and a warning that fires on a working
+# call is noise that teaches callers to ignore warnings.
+_GEMINI_API_UNSUPPORTED_MODES = (
+    "first_last_frame",
+    "extend_video",
+    "reference_to_video",
+)
+
+_GEMINI_API_MODE_ERRORS = {
+    "first_last_frame": (
+        'the service answers "Your use case is currently not supported"'
+    ),
+    "extend_video": (
+        'the service answers "encodedVideo isn\'t supported by this model"'
+    ),
+    "reference_to_video": (
+        "the service returns an empty result with no usable error, and bills "
+        "for the attempt"
+    ),
+}
 
 # Veo 3.1 accepts at most this many reference images; extras are not sent.
 _MAX_REFERENCE_IMAGES = 3
@@ -153,6 +287,41 @@ _EXTEND_READ_TIMEOUT_SECONDS = 30.0
 # against the monotonic clock so blocked time counts — the previous counter
 # only added the sleep interval, so a stalled call could never reach it.
 _VEO_TOTAL_TIMEOUT_SECONDS = 1800.0
+
+# The caller-facing default deadline for ONE Veo render, and the reason it is
+# far below the 1800s budget above. Common MCP hosts cap a single tool call at
+# roughly four minutes. A render that outlives the HOST's limit is cancelled by
+# the host: this server never gets to answer, the caller sees a bare "Tool
+# execution failed" with no message, no cost and no operation name -- and the
+# Veo operation completes and bills anyway. A 4K render ($1.20) did exactly
+# that, twice. The omni tools already default to 210s for this reason; Veo did
+# not, and exposed no timeout at all. Under the host's ceiling the server
+# answers first, structured, with the operation name that lets the spend be
+# reconciled in the console. Callers whose host allows longer can raise it.
+VEO_DEFAULT_TIMEOUT_SECONDS = 210.0
+
+# MEASURED, not estimated: a 4-second 4K render on veo-3.1-fast-generate-001
+# took 335.05s wall-clock, Vertex AI, submit to downloaded file. That is longer
+# than VEO_DEFAULT_TIMEOUT_SECONDS above AND longer than the ~240s ceiling that
+# default exists to stay under -- so a 4K render cannot complete inside one
+# tool call on a typical MCP host, at any timeout the host will tolerate. It is
+# not a slow-network accident: 4K is the slowest tier and this is the only
+# measurement of it there has ever been. Callers get told, rather than
+# discovering it as a timeout after paying $1.20.
+VEO_MEASURED_4K_SECONDS = 335.0
+
+
+class VeoTimeoutError(TimeoutError):
+    """A Veo render ran past its deadline.
+
+    Carries the operation name when the request had been submitted, because
+    that is the handle a caller needs to find -- and reconcile -- a render
+    that may well finish and bill after this error is returned.
+    """
+
+    def __init__(self, message: str, *, operation_name: str | None = None) -> None:
+        super().__init__(message)
+        self.operation_name = operation_name
 _VEO_POLL_INTERVAL_SECONDS = 10.0
 
 # Per-call ceilings. google-genai hands timeout=None straight to httpx when
@@ -213,6 +382,7 @@ def validate_render_options(
     model: str,
     resolution: str | None = None,
     generation_mode: str | None = None,
+    backend: str | None = None,
 ) -> None:
     """Raise for a model/resolution/mode combination Veo cannot render.
 
@@ -221,6 +391,11 @@ def validate_render_options(
     single-source rule as resolve_image_model on the image side. Every Lite
     restriction lives here; enforcing them per tool is what let a dry run
     price an extension on a model that cannot extend.
+
+    ``backend`` extends that rule from the model to the deployment. Veo on the
+    Gemini Developer API refuses every mode that conditions on existing
+    footage, and the tools were quoting those calls cleanly — printing the very
+    backend that made them impossible in the same response as the price.
     """
     if resolution is not None:
         valid_resolutions = ("720p", "1080p", "4K")
@@ -234,6 +409,16 @@ def validate_render_options(
                 f"Model {model} does not support 4K resolution. "
                 "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
             )
+        if resolution == "4K" and backend == "gemini_api":
+            # Gating covered modes but not resolutions, so this quoted $1.20 at
+            # the 4K rate and then 400'd: the highest-value false quote in the
+            # server. Veo-specific — omni renders 4K on this backend fine.
+            raise ValueError(
+                "Veo cannot render 4K on the Gemini Developer API: the service "
+                'answers "The string value 4K for resolution is invalid". '
+                "Render at 720p or 1080p here, or run against Vertex AI. "
+                "(Omni does render 4K on this backend.)"
+            )
     if (
         generation_mode is not None
         and model in _VEO_LITE_MODELS
@@ -243,6 +428,20 @@ def validate_render_options(
             f"Model {model} does not support {generation_mode}. "
             "Veo 3.1 Lite supports only text-to-video and image-to-video; "
             "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
+        )
+    if (
+        backend == "gemini_api"
+        and generation_mode is not None
+        and generation_mode in _GEMINI_API_UNSUPPORTED_MODES
+    ):
+        detail = _GEMINI_API_MODE_ERRORS.get(generation_mode, "")
+        raise ValueError(
+            f"Veo cannot render {generation_mode} on the Gemini Developer API"
+            + (f": {detail}" if detail else "")
+            + ". This mode works on Vertex AI — configure Vertex credentials "
+            "(GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, with "
+            "output_gcs_uri or VIDEO_GCS_BUCKET for delivery) and retry. "
+            "Text-to-video works on this backend."
         )
 
 
@@ -330,6 +529,7 @@ async def generate_video(
     resolution: str | None = None,
     person_generation: str | None = None,
     output_gcs_uri: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Generate a video using VEO models.
 
@@ -410,42 +610,35 @@ async def generate_video(
     # extension, reference images, or first/last-frame control — fail fast
     # with a clear message instead of an opaque API error. Shared with the
     # tools' dry_run quotes so both refuse the same combinations.
-    validate_render_options(model, generation_mode=generation_mode)
+    validate_render_options(
+        model,
+        generation_mode=generation_mode,
+        backend="vertex" if is_vertexai else "gemini_api",
+    )
 
-    # Prepare image inputs
-    first_frame_input: types.Image | None = None
-    last_frame_input: types.Image | None = None
-    reference_image_inputs: list[types.VideoGenerationReferenceImage] = []
-
-    if generation_mode == "image_to_video" and image_bytes:
-        first_frame_input = _prepare_image_input(image_bytes)
-    elif generation_mode == "first_last_frame":
-        if image_bytes:
-            first_frame_input = _prepare_image_input(image_bytes)
-        if last_frame_bytes:
-            last_frame_input = _prepare_image_input(last_frame_bytes)
-    elif generation_mode == "reference_to_video" and reference_images:
-        # VEO 3.1 supports up to 3 reference images (asset type)
-        # Must wrap in VideoGenerationReferenceImage with reference_type="asset"
-        if len(reference_images) > _MAX_REFERENCE_IMAGES:
-            # A truncation, not a conflict: the render the caller asked for
-            # still happens, just without the extras. Say so rather than
-            # letting a reference the caller explicitly supplied vanish and
-            # quietly change the generation result.
-            warnings.append(
-                f"{len(reference_images)} reference images were supplied but "
-                f"Veo 3.1 accepts {_MAX_REFERENCE_IMAGES}; the last "
-                f"{len(reference_images) - _MAX_REFERENCE_IMAGES} were not "
-                "sent and did not influence this render."
-            )
-        for ref_bytes in reference_images[:_MAX_REFERENCE_IMAGES]:
-            ref_image = _prepare_image_input(ref_bytes)
-            reference_image_inputs.append(
-                types.VideoGenerationReferenceImage(
-                    image=ref_image,
-                    reference_type="asset",  # asset for subject preservation
-                )
-            )
+    # Prepare image inputs -- off the event loop. Decoding five near-limit
+    # inputs (first, last, three references) inline measured ~8s of frozen
+    # loop from a ~1.5 MB request; see _prepare_image_input.
+    (
+        first_frame_input,
+        last_frame_input,
+        reference_image_inputs,
+        prep_warnings,
+    ) = await run_off_loop(
+        functools.partial(
+            _prepare_frame_inputs,
+            generation_mode,
+            image_bytes,
+            last_frame_bytes,
+            reference_images,
+        ),
+        timeout=_IMAGE_PREP_TIMEOUT_SECONDS,
+        message=(
+            f"Preparing the image inputs took longer than "
+            f"{_IMAGE_PREP_TIMEOUT_SECONDS:g}s."
+        ),
+    )
+    warnings.extend(prep_warnings)
 
     # Aspect ratio must match source clips for transitions/bridges, so an
     # unsupported value is a hard error rather than a silent coercion.
@@ -524,7 +717,11 @@ async def generate_video(
         config_kwargs["output_gcs_uri"] = output_gcs_uri
 
     if resolution is not None:
-        validate_render_options(model, resolution)
+        # With the backend: the dry run refused Veo 4K on the Gemini API and
+        # this, the real call, let it through to a 400 on the wire.
+        validate_render_options(
+            model, resolution, backend="vertex" if is_vertexai else "gemini_api"
+        )
         config_kwargs["resolution"] = resolution
 
     if person_generation is not None:
@@ -584,13 +781,27 @@ async def generate_video(
     # accumulated the sleep interval, which meant a stalled call could never
     # reach the limit and the request hung indefinitely.
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _VEO_TOTAL_TIMEOUT_SECONDS
-    expired = f"Video generation timed out after {_VEO_TOTAL_TIMEOUT_SECONDS:.0f}s."
+    total_budget = (
+        float(timeout_seconds) if timeout_seconds else _VEO_TOTAL_TIMEOUT_SECONDS
+    )
+    deadline = loop.time() + total_budget
+    expired = f"Video generation timed out after {total_budget:.0f}s."
+    # Known once the request has been submitted; the deadline error names it,
+    # because a render that outlives the deadline may still complete and bill.
+    operation_name: str | None = None
 
     def _remaining() -> float:
         left = deadline - loop.time()
         if left <= 0:
-            raise TimeoutError(expired)
+            if operation_name:
+                raise VeoTimeoutError(
+                    f"{expired} Operation {operation_name} was submitted and may "
+                    "still complete and bill; reconcile it in the console.",
+                    operation_name=operation_name,
+                )
+            raise VeoTimeoutError(
+                f"{expired} The request had not been submitted, so nothing was billed."
+            )
         return left
 
     operation = await run_off_loop(
@@ -599,6 +810,7 @@ async def generate_video(
         message="Video generation timed out submitting the request.",
     )
 
+    operation_name = getattr(operation, "name", None)
     if log_callback:
         await log_callback(f"Polling operation: {operation.name}")
     while not operation.done:
@@ -606,7 +818,10 @@ async def generate_video(
         operation = await run_off_loop(
             functools.partial(client.operations.get, operation),
             timeout=min(_VEO_POLL_TIMEOUT_SECONDS, _remaining()),
-            message="Video generation timed out polling the operation.",
+            message=(
+                f"Video generation timed out polling operation {operation_name}; "
+                "it may still complete and bill."
+            ),
         )
 
     if operation.error:
@@ -664,3 +879,38 @@ async def generate_video(
         result["warnings"] = warnings
 
     return result
+
+
+VEO_EXTENSION_STEP_SECONDS = 7.0
+# Veo caps a chain at 20 extensions; the tool exposes the same range.
+VEO_MAX_EXTENSIONS = 20
+
+
+def veo_extension_output_lengths(
+    source_seconds: float | None,
+    times: int,
+    step: float = VEO_EXTENSION_STEP_SECONDS,
+) -> list[float]:
+    """Billable OUTPUT length of each turn of a Veo extension chain.
+
+    MEASURED: a 4.0s source extended once returned an 11.0s file billed at
+    11s, not at the 7s it appended. Veo re-bills the assembled clip on every
+    turn, exactly as omni was measured to do, so turn i outputs
+    ``source + step*i`` and the cost of a chain grows QUADRATICALLY in the
+    number of turns.
+
+    This was quoted as ``times * 7`` — the appended footage alone — which
+    under-billed a single extension of a 4s source by 57% and a 20-turn chain
+    by an order of magnitude ($56 quoted against $620 actual on
+    veo-3.1-generate-001). The three numbers are distinct and conflating them
+    is the whole bug: what gets BILLED is the sum of these lengths, what the
+    caller ENDS UP WITH is the last one, and what is NEW is only ``times *
+    step``.
+
+    Returns [] when the source length is unknown, because there is no honest
+    point estimate without it — the caller must say so rather than quoting the
+    floor as if it were the price.
+    """
+    if source_seconds is None or source_seconds <= 0:
+        return []
+    return [round(source_seconds + step * i, 3) for i in range(1, times + 1)]

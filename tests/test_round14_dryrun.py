@@ -21,11 +21,16 @@ VEO = "veo-3.1-generate-001"
 VEO_FAST = "veo-3.1-fast-generate-001"
 
 
-def _make_ctx(tmp_path: Path) -> MagicMock:
+def _make_ctx(tmp_path: Path, *, vertexai: bool = True) -> MagicMock:
     """A mock MCP context whose AppContext points at real directories.
 
     tmp_path is DATA_FOLDER, so a file written under it is a legitimate local
     source and a path elsewhere is out-of-sandbox.
+
+    Vertex by default: Veo refuses first/last-frame and extension on the
+    Gemini Developer API (measured against the live service), and these
+    exercise exactly those modes. A quote for a call that cannot run is the
+    thing this file exists to prevent.
     """
     images_dir = tmp_path / "images"
     videos_dir = tmp_path / "videos"
@@ -33,7 +38,7 @@ def _make_ctx(tmp_path: Path) -> MagicMock:
     videos_dir.mkdir(exist_ok=True)
 
     client = MagicMock()
-    client._api_client.vertexai = False
+    client._api_client.vertexai = vertexai
 
     ctx = MagicMock()
     ctx.info = AsyncMock()
@@ -44,6 +49,10 @@ def _make_ctx(tmp_path: Path) -> MagicMock:
         images_dir=images_dir,
         videos_dir=videos_dir,
         client=client,
+        # Vertex refuses to extend without a destination, and extension is one
+        # of the modes that exists only on Vertex.
+        video_gcs_bucket="gs://bkt/out/" if vertexai else None,
+        allowed_gcs_buckets=frozenset({"bkt", "bucket"}) if vertexai else frozenset(),
     )
     return ctx
 

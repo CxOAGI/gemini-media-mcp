@@ -11,7 +11,7 @@ from typing import Any, cast
 import pytest
 
 from src.image import _IMAGE_SIZE_SUPPORT, ImageModel, ImageSize
-from src.omni import OMNI_MODEL
+from src.omni import OMNI_1_1_MODEL, OMNI_MODEL, OMNI_MODELS, is_omni_model
 from src.routing import (
     _VIDEO_CAPABILITY_RULES,
     _VIDEO_CAPABILITIES,
@@ -91,8 +91,8 @@ def test_image_profiles_cover_the_live_catalog_exactly() -> None:
 
 
 def test_video_profiles_cover_the_live_catalog_plus_omni() -> None:
-    """Veo models plus omni are routable; capabilities exist for each."""
-    assert set(_VIDEO_PROFILES) == set(LIVE_VIDEO_MODELS) | {OMNI_MODEL}
+    """Veo models plus both omni models are routable; capabilities exist."""
+    assert set(_VIDEO_PROFILES) == set(LIVE_VIDEO_MODELS) | set(OMNI_MODELS)
     assert set(_VIDEO_CAPABILITIES) == set(_VIDEO_PROFILES)
 
 
@@ -676,6 +676,13 @@ _RULE_CASES: tuple[tuple[str, str, RoutingConstraints, str, str], ...] = (
         "cannot produce 4K",
     ),
     (
+        "360p_unsupported",
+        "veo has no 360p draft tier",
+        RoutingConstraints(media_kind="video", resolution="360p"),
+        "veo-3.1-fast-generate-001",
+        "360p",
+    ),
+    (
         "1080p_unsupported",
         "omni renders 720p only",
         RoutingConstraints(media_kind="video", resolution="1080p"),
@@ -924,7 +931,10 @@ def test_expensive_multi_beat_clips_recommend_an_animatic_first() -> None:
     assert first.params["animatic"] is True
     assert first.params["add_bridges"] is False
     assert second.params.get("animatic") is not True
-    assert OMNI_MODEL in first.rationale
+    # The preview renders on the model with a 360p tier, which is what makes it
+    # cheaper than the delivery render rather than level with it.
+    assert OMNI_1_1_MODEL in first.rationale
+    assert "360p" in first.rationale
 
 
 def test_a_draft_clip_gets_the_animatic_as_the_deliverable() -> None:
@@ -1292,7 +1302,12 @@ def test_a_size_demand_every_survivor_meets_still_resolves_on_budget() -> None:
     assert "4K output" in recommended.rationale
 
 
-def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
+def _omni_animatic_usd(
+    beats: int,
+    beat_seconds: float,
+    model: str = OMNI_1_1_MODEL,
+    resolution: str = "360p",
+) -> float:
     """What an omni animatic of ``beats`` x ``beat_seconds`` really costs.
 
     Computed from the price book rather than restated, so a test cannot pass
@@ -1300,7 +1315,7 @@ def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
     """
     from src.pricing import estimate_video_cost, quote_duration_for
 
-    probe = estimate_video_cost(OMNI_MODEL, beat_seconds, "720p", False)
+    probe = estimate_video_cost(model, beat_seconds, resolution, False)
     assert probe is not None
     # Each render carries one frame of encoder allowance (omni lands ~0.01s
     # over nominal), so the plan's figure is per-render quoted seconds — the
@@ -1308,28 +1323,31 @@ def _omni_animatic_usd(beats: int, beat_seconds: float) -> float:
     return (
         probe.breakdown["usd_per_second"]
         * beats
-        * quote_duration_for(OMNI_MODEL, beat_seconds)
+        * quote_duration_for(model, beat_seconds)
     )
 
 
 @pytest.mark.parametrize(
     ("budget", "expected_model", "animatic_is_cheaper"),
     [
-        # Only the standard tier is dearer than the animatic; against Fast the
-        # preview costs slightly more, and against Lite about double.
+        # At 360p on omni 1.1 the preview is a third of omni's own 720p rate,
+        # which puts it under every Veo tier — including Lite, which it used to
+        # cost double. That is the point of previewing at 360p.
         pytest.param("best", VEO, True, id="standard_tier_saves"),
-        pytest.param(None, VEO_FAST, False, id="fast_tier_costs_more"),
-        pytest.param("cheap", VEO_LITE, False, id="lite_tier_costs_double"),
+        pytest.param(None, VEO_FAST, True, id="fast_tier_saves"),
+        pytest.param("cheap", VEO_LITE, True, id="lite_tier_saves"),
     ],
 )
 def test_the_animatic_claims_a_saving_only_when_it_saves(
     budget: str | None, expected_model: str, animatic_is_cheaper: bool
 ) -> None:
-    """The animatic was sold as the cheap preflight for every Veo tier, but
-    omni bills $0.10136/s against Veo Fast's $0.10/s: 3 x 8s beats cost ~$2.45
-    as an animatic (allowance included) and $2.40 as the real render. The step is still worth
-    recommending — it catches a bad creative call before the delivery render —
-    but it may not claim a saving the numbers contradict."""
+    """The rationale may only claim a saving the arithmetic supports.
+
+    It used to oversell an animatic that cost about what the delivery render
+    cost: omni bills $0.10136/s against Veo Fast's $0.10/s, so 3 x 8s beats
+    were ~$2.45 as a preview and $2.40 as the real thing. Previewing at 360p on
+    omni 1.1 is a third of that, so the saving is now real against every tier —
+    and the assertion that it be *stated* only when true is unchanged."""
     plan = plan_generation(
         "a 3 beat reel about coffee",
         RoutingConstraints(
@@ -1349,6 +1367,8 @@ def test_the_animatic_claims_a_saving_only_when_it_saves(
     assert len(plan.workflow) == 2
     animatic = plan.workflow[0]
     assert animatic.params["animatic"] is True
+    # Naming the resolution is what selects the model that has one.
+    assert animatic.params["animatic_resolution"] == "360p"
 
     animatic_usd = _omni_animatic_usd(3, 8.0)
     render_usd = top.cost.usd
@@ -1377,7 +1397,7 @@ def test_the_animatic_makes_no_economic_claim_when_pricing_is_unavailable(
     rationale = plan.workflow[0].rationale
     assert "$" not in rationale
     assert "sav" not in rationale
-    assert OMNI_MODEL in rationale
+    assert OMNI_1_1_MODEL in rationale
 
 
 @pytest.mark.parametrize("backend", ["vertex", "unknown", "gemini_api"])
@@ -1553,3 +1573,899 @@ def test_a_single_render_is_not_described_in_the_plural() -> None:
     top = plan.recommended
     assert top is not None and top.cost is not None
     assert "1 render totalling" in top.cost.detail
+
+
+# ============================================================================
+# gemini-omni-1.1-flash routing
+# ============================================================================
+
+
+def test_the_new_omni_model_is_routable_and_names_itself_in_the_params() -> None:
+    """A route the caller cannot reproduce is worse than no route.
+
+    generate_video_omni defaults to the preview model, so a plan that
+    recommends 1.1 has to emit omni_model or the call it hands over renders
+    on a different model than the one it priced.
+    """
+    plan = plan_generation("a video of a cat", RoutingConstraints(media_kind="video"))
+    omni_routes = [r for r in plan.routes if r.tool == "generate_video_omni"]
+    assert {r.model for r in omni_routes} == set(OMNI_MODELS)
+    for route in omni_routes:
+        assert route.params["omni_model"] == route.model
+
+
+def test_a_360p_request_reaches_only_the_model_that_has_360p() -> None:
+    """360p is 1.1's draft tier alone.
+
+    Veo publishes no 360p output and no 360p rate, and the preview model
+    renders 720p whatever it is asked — so letting either through would quote
+    a render that cannot happen, at a price that is not its own.
+    """
+    plan = plan_generation(
+        "a draft clip of a robot",
+        RoutingConstraints(media_kind="video", resolution="360p"),
+    )
+    assert {route.model for route in plan.routes} == {OMNI_1_1_MODEL}
+    assert plan.routes[0].params["resolution"] == "360p"
+    rejected = {r.model for r in plan.rejected}
+    assert OMNI_MODEL in rejected
+    assert "veo-3.1-fast-generate-001" in rejected
+
+
+def test_the_360p_route_is_the_cheapest_video_render_planned() -> None:
+    """The draft tier's whole point: a third of 720p, under even Veo Lite."""
+    draft = plan_generation(
+        "a clip of a robot",
+        RoutingConstraints(media_kind="video", resolution="360p"),
+    ).routes[0]
+    others = plan_generation(
+        "a clip of a robot", RoutingConstraints(media_kind="video")
+    ).routes
+    assert draft.cost is not None
+    assert all(
+        route.cost is None or draft.cost.usd < route.cost.usd
+        for route in others
+        if route.model != OMNI_1_1_MODEL
+    )
+
+
+def test_extending_from_an_interaction_offers_the_omni_extension_tool() -> None:
+    """ "Make it longer" is an extension, even when an interaction id is present.
+
+    An interaction id is a source, not a verb — omni can both edit AND extend
+    from one. Ranking the id first routed every "extend this, from interaction
+    X" to edit_video, which does not lengthen anything.
+    """
+    plan = plan_generation(
+        "extend this clip by 20 seconds",
+        RoutingConstraints(media_kind="video", previous_interaction_id="int-9"),
+    )
+    omni = [r for r in plan.routes if r.tool == "extend_video_omni"]
+    assert omni, [r.tool for r in plan.routes]
+    assert omni[0].model == OMNI_1_1_MODEL
+    assert omni[0].params["previous_interaction_id"] == "int-9"
+    # 20s of continuation at 10s a turn.
+    assert omni[0].params["times"] == 2
+    # The preview model is excluded by capability, not silently absent.
+    assert any(
+        r.model == OMNI_MODEL and "cannot extend" in r.reason for r in plan.rejected
+    )
+
+
+def test_an_omni_extension_is_capped_at_the_turns_that_actually_fit() -> None:
+    """The 40s ceiling is on the ASSEMBLED clip, so the source eats into it.
+
+    The planner cannot see the source and has to assume the documented 10s
+    maximum, which leaves room for three 10s turns, not four. Planning a
+    fourth priced three and told the caller to run four.
+    """
+    plan = plan_generation(
+        "extend this clip by 5 minutes",
+        RoutingConstraints(media_kind="video", previous_interaction_id="int-9"),
+    )
+    omni = next(r for r in plan.routes if r.tool == "extend_video_omni")
+    assert omni.params["times"] == 3
+    assert any("40s" in caveat for caveat in omni.caveats)
+
+
+def test_a_plain_edit_still_routes_to_edit_video() -> None:
+    """The extension check must not swallow ordinary conversational edits."""
+    plan = plan_generation(
+        "make the sky stormy", RoutingConstraints(previous_interaction_id="int-1")
+    )
+    assert plan.routes[0].tool == "edit_video"
+
+
+def test_the_extension_route_sends_the_resolution_it_is_priced_at() -> None:
+    """It was the one omni branch that quoted a resolution it never asked for.
+
+    A 360p extension plan handed over params with no `resolution` key at all:
+    running them verbatim renders 720p and bills three times the quote — the
+    under-quote this module's docstring says must never happen.
+    """
+    plan = plan_generation(
+        "extend this clip so it is 30 seconds long",
+        RoutingConstraints(
+            media_kind="video", resolution="360p", previous_interaction_id="abc123"
+        ),
+    )
+    route = next(r for r in plan.routes if r.tool == "extend_video_omni")
+    assert route.params["resolution"] == "360p"
+    assert route.cost is not None
+    assert "@ 360p" in route.cost.detail
+
+
+def test_an_extension_chain_is_priced_at_the_clip_each_turn_assembles() -> None:
+    """A turn renders the ASSEMBLED clip, so the turns grow and so does the bill.
+
+    MEASURED: a 3.01s source extended once returned 13.01s. Pricing the 10s
+    increment instead under-billed a 2-turn chain 36s against a 20s quote.
+    The planner cannot see the source, so it assumes the documented maximum —
+    assuming a shorter one would under-quote.
+    """
+    from src.omni import omni_extension_output_lengths, omni_spec
+    from src.pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
+    plan = plan_generation(
+        "extend this clip by 40 seconds",
+        RoutingConstraints(media_kind="video", previous_interaction_id="abc123"),
+    )
+    route = next(r for r in plan.routes if r.tool == "extend_video_omni")
+    turns = route.params["times"]
+    assert route.cost is not None
+    expected = omni_extension_output_lengths(omni_spec(route.model), None, turns)
+    # The plan may not ask for more turns than it prices.
+    assert len(expected) == turns, f"planned {turns} turns, priced {len(expected)}"
+    assert route.cost.breakdown["seconds"] == pytest.approx(
+        sum(expected) + turns * OMNI_ENCODER_ALLOWANCE_SECONDS
+    )
+    # Growing, not flat — the defect this replaced quoted turns * 10s.
+    assert sum(expected) > 10.0 * turns
+    assert any("re-bills" in caveat for caveat in route.caveats)
+
+
+def test_an_interaction_id_excludes_every_model_that_cannot_read_one() -> None:
+    """An interaction id is a source only the omni family can resolve.
+
+    Gating the conversational capability on `tool == "edit_video"` alone let an
+    extension-flavoured request top out with a Veo `loop_extend` route that had
+    silently dropped the interaction id and told the caller to supply a clip
+    they do not have.
+    """
+    plan = plan_generation(
+        "make this clip longer, continue the scene",
+        RoutingConstraints(media_kind="video", previous_interaction_id="abc123"),
+    )
+    top = plan.recommended
+    assert top is not None
+    assert top.tool == "extend_video_omni"
+    assert top.model == OMNI_1_1_MODEL
+    assert top.params["previous_interaction_id"] == "abc123"
+    # No route may survive that cannot use the only source the caller gave.
+    assert all(is_omni_model(route.model) for route in plan.routes)
+    veo = {r.model for r in plan.rejected if r.model.startswith("veo")}
+    assert veo, "the Veo tiers must be excluded, not merely out-ranked"
+
+
+# ============================================================================
+# Enumeration: a capability nobody can find is not exposed
+# ============================================================================
+
+
+def test_two_stills_offer_the_omni_interpolation_route_with_its_frames() -> None:
+    """1.1 interpolates between a first and last frame; the planner never said so.
+
+    A transition-shaped request produced Veo routes only, because omni was a
+    candidate for four tools and generate_transition was not one of them — so a
+    capability reachable on the tool was undiscoverable through the planner.
+    And routing omni for two stills without EMITTING the stills would hand over
+    a plan that renders something else entirely.
+    """
+    plan = plan_generation(
+        "a smooth transition from sunrise to snowfall",
+        RoutingConstraints(
+            media_kind="video",
+            first_frame_uri="gs://b/a.png",
+            last_frame_uri="gs://b/b.png",
+        ),
+    )
+    omni = [r for r in plan.routes if r.tool == "generate_video_omni"]
+    assert omni, [(r.tool, r.model) for r in plan.routes]
+    route = omni[0]
+    assert route.model == OMNI_1_1_MODEL
+    assert route.params["first_frame_uri"] == "gs://b/a.png"
+    assert route.params["last_frame_uri"] == "gs://b/b.png"
+    assert any("FIRST_FRAME" in caveat for caveat in route.caveats)
+    # Veo still competes; this adds an option rather than replacing one.
+    assert any(r.tool == "generate_transition" for r in plan.routes)
+    # And the preview model is excluded by capability, not merely out-ranked.
+    assert any(
+        r.model == OMNI_MODEL and "first+last-frame" in r.reason for r in plan.rejected
+    )
+
+
+def test_a_dear_single_render_is_offered_a_360p_draft_first() -> None:
+    """ "Draft at 360p, finalize at 4K" is the workflow the tier exists for.
+
+    Nothing enumerated it: plan.workflow was empty for every single-render
+    plan, so the cheapest preview this server can issue was reachable only by
+    a caller who already knew to ask for it.
+    """
+    plan = plan_generation(
+        "a cinematic drone shot over mountains",
+        RoutingConstraints(media_kind="video", resolution="4K"),
+    )
+    assert len(plan.workflow) == 2
+    draft, delivery = plan.workflow
+    assert draft.tool == "generate_video_omni"
+    assert draft.params["omni_model"] == OMNI_1_1_MODEL
+    assert draft.params["resolution"] == "360p"
+    # Reviewed in the deliverable's framing, or the review is of the wrong frame.
+    assert draft.params["aspect_ratio"] == delivery.params["aspect_ratio"]
+    assert "saving ~$" in draft.rationale
+    assert delivery.params.get("resolution") == "4K"
+
+
+def test_the_draft_step_is_not_offered_when_it_would_not_help() -> None:
+    """No preview of a preview, and none where it saves nothing."""
+    # Already a throwaway render.
+    assert (
+        plan_generation(
+            "a clip of a robot",
+            RoutingConstraints(media_kind="video", is_draft=True, resolution="4K"),
+        ).workflow
+        == ()
+    )
+    # A 360p omni render IS the draft; it needs no draft of its own.
+    assert (
+        plan_generation(
+            "a clip of a robot",
+            RoutingConstraints(media_kind="video", resolution="360p"),
+        ).workflow
+        == ()
+    )
+
+
+def test_the_animatic_previews_on_the_model_with_a_360p_tier() -> None:
+    """The saving is the whole reason to recommend the step.
+
+    At 720p on the preview model the animatic cost about what the delivery
+    render cost, and the rationale had to concede it. At 360p it is a third of
+    that, under every Veo tier.
+    """
+    plan = plan_generation(
+        "a 5 beat reel about coffee",
+        RoutingConstraints(media_kind="video", num_beats=5, duration_seconds=8),
+    )
+    animatic = plan.workflow[0]
+    assert animatic.params["animatic"] is True
+    assert animatic.params["animatic_resolution"] == "360p"
+    assert OMNI_1_1_MODEL in animatic.rationale
+    assert "does NOT save money" not in animatic.rationale
+
+
+# ============================================================================
+# Planner defects found by live harness testing
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "a cinematic drone shot over a coastline",
+        "a drone shot",
+        "a tracking shot of a runner",
+        "slow motion water droplet",
+        "an establishing shot of the city",
+        "the camera pans across a desk",
+    ],
+)
+def test_camera_vocabulary_settles_a_brief_that_names_no_medium(intent: str) -> None:
+    """ "A cinematic drone shot over a coastline" planned as an IMAGE.
+
+    The video vocabulary had no cinematography in it, so a brief written the
+    way a director writes one matched nothing at all.
+    """
+    assert plan_generation(intent).media_kind == "video"
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "a cinematic portrait of a chef",
+        "a wide shot photo of the logo",
+        "a poster with a drone shot aesthetic",
+        "a photograph, cinematic lighting",
+        "a product shot with cinematic lighting",
+    ],
+)
+def test_camera_vocabulary_does_not_overrule_someone_who_said_photo(
+    intent: str,
+) -> None:
+    """Camera words sit in the weaker tier for exactly this reason.
+
+    A strong video hit wins outright over an image word, so putting
+    "cinematic" there would have turned every cinematic still into a video.
+    """
+    assert plan_generation(intent).media_kind == "image"
+
+
+def test_a_transition_brief_excludes_models_that_cannot_interpolate() -> None:
+    """The module docstring names this as an example it catches.
+
+    It ranked Veo 3.1 Lite anyway: the need was keyed on the chosen tool, and
+    with no endpoint URIs yet — which is how an agent asks before it has the
+    stills — the tool was generate_video and nothing needed anything.
+    """
+    plan = plan_generation("a smooth transition from sunrise to snowfall")
+    rejected = {r.model for r in plan.rejected}
+    assert VEO_LITE in rejected, [r.model for r in plan.routes]
+    assert OMNI_MODEL in rejected, "the preview model cannot interpolate either"
+    assert all(
+        "first+last-frame" in r.reason
+        for r in plan.rejected
+        if r.model in (VEO_LITE, OMNI_MODEL)
+    )
+
+
+def test_the_missing_endpoint_conflict_is_a_sentence() -> None:
+    """It read "but only neither frame is available"."""
+    both = plan_generation("a smooth transition from sunrise to snowfall")
+    detail = next(
+        c.detail
+        for c in both.conflicts
+        if c.code == "transition_requires_two_endpoints"
+    )
+    assert "but neither frame is available" in detail
+    assert "only neither" not in detail
+
+    one = plan_generation("a crossfade", RoutingConstraints(first_frame_uri="a"))
+    detail = next(
+        c.detail for c in one.conflicts if c.code == "transition_requires_two_endpoints"
+    )
+    assert "only the first frame is available" in detail
+
+
+def test_a_brief_naming_a_prior_interaction_excludes_veo() -> None:
+    """loop_extend needs a Veo video_uri and cannot take an interaction_id.
+
+    It out-ranked the omni route 0.5875 to 0.5425 on a brief that says the
+    source IS an interaction, so the top-ranked route could not run at all.
+    """
+    plan = plan_generation(
+        "continuing from the interaction I already rendered, make it longer"
+    )
+    top = plan.recommended
+    assert top is not None
+    assert top.tool == "extend_video_omni"
+    assert all(is_omni_model(route.model) for route in plan.routes)
+    assert any(r.model.startswith("veo") for r in plan.rejected)
+
+
+def test_a_file_based_extension_still_offers_veo() -> None:
+    """The interaction signal must not exclude Veo from ordinary extensions."""
+    plan = plan_generation(
+        "make this clip longer",
+        RoutingConstraints(media_kind="video", source_video_uri="file:///d/a.mp4"),
+    )
+    assert any(r.tool == "loop_extend" for r in plan.routes)
+
+
+def test_a_deprecated_model_never_outranks_its_replacement() -> None:
+    """They scored level, so the dying endpoint was offered as an equal choice.
+
+    33 days from shutdown at the time this was found.
+    """
+    plan = plan_generation("a video of a cat", RoutingConstraints(media_kind="video"))
+    omni = [r for r in plan.routes if is_omni_model(r.model)]
+    assert [r.model for r in omni][0] == OMNI_1_1_MODEL
+    deprecated = next(r for r in omni if r.model == OMNI_MODEL)
+    assert any("deprecated" in c and "2026-09-30" in c for c in deprecated.caveats)
+    # The GA model carries no such caveat.
+    ga = next(r for r in omni if r.model == OMNI_1_1_MODEL)
+    assert not any("deprecated" in c for c in ga.caveats)
+
+
+def test_the_deprecation_demotion_is_what_orders_a_tie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercised with synthetic ids, because the real pair cannot show it.
+
+    "gemini-omni-1.1-flash" already sorts before "gemini-omni-flash-preview",
+    so for the only model deprecated today the model-ID tie-break reaches the
+    right answer on its own and the demotion is a no-op — a plan-level
+    assertion passes with it removed. It is defensive code for the next
+    deprecation, whose id may sort the other way, so it is tested the only way
+    that can fail: with ids where alphabetical order is wrong.
+    """
+    import src.routing as routing
+    from src.routing import ModelProfile, RoutedCall, _rank
+
+    deprecated, replacement = "aaa-old-model", "zzz-new-model"
+    monkeypatch.setattr(routing, "DEPRECATED_VIDEO_MODELS", {deprecated: "2026-09-30"})
+
+    def profile(model: str) -> ModelProfile:
+        return ModelProfile(
+            model=model,
+            media_kind="video",
+            cost_index=0.5,
+            fidelity_index=0.5,
+            speed_index=0.5,
+            text_rendering_index=0.0,
+            summary=model,
+        )
+
+    # Alphabetically the deprecated id comes FIRST, so only the demotion can
+    # put the replacement on top.
+    assert deprecated < replacement
+    routes = [
+        RoutedCall(
+            tool="generate_video_omni",
+            model=m,
+            params={},
+            score=0.5,
+            rationale="",
+            caveats=(),
+            cost=None,
+        )
+        for m in (deprecated, replacement)
+    ]
+    profiles = {deprecated: profile(deprecated), replacement: profile(replacement)}
+    # Identical fidelity, identical score: the only separator left is the
+    # shutdown date.
+    ranked = _rank(routes, profiles)
+    assert ranked[0].model == replacement
+    assert ranked[1].model == deprecated
+
+
+# ============================================================================
+# Signal-parsing defects found reviewing this PR
+#
+# Every case below was a wrong number or a wrong claim handed to a calling
+# agent, and none of them raised: the plan looked well-formed and said
+# something false. They are grouped here because they share one shape --
+# a pattern or a note that was right about the case it was written for and
+# never checked the case next to it.
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The bug: the digit after the colon read as a shot count, so a
+        # one-render vertical brief planned a 16-beat clip quoted at $9.60.
+        ("a 9:16 shot of a dancer", None),
+        ("a 16:9 shot", None),
+        ("a 1920x1080 panel", None),
+        ("2.5 scenes", None),
+        # Still counted, or the guard has gone too far.
+        ("3 beats", 3),
+        ("5 shots", 5),
+        ("4 keyframe panels", 4),
+        ("10 shots", 10),
+        ("render 9:16 with 3 shots", 3),
+        # Pre-existing guards that must survive.
+        ("a 4k panel", None),
+        ("24 frames per second", None),
+    ],
+)
+def test_a_digit_inside_another_number_is_not_a_shot_count(
+    intent: str, expected: int | None
+) -> None:
+    """Only a digit that is not part of a larger number counts segments."""
+    assert infer_signals(intent).beat_count == expected
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The bug: seconds won outright, so the minutes were dropped and a
+        # 2.5-minute brief was planned as one sub-8s render.
+        ("a 2 minute 30 second trailer", 150.0),
+        ("a 2 min 30 sec trailer", 150.0),
+        ("a 1 minute 5 second clip", 65.0),
+        # Single-unit runtimes are unchanged.
+        ("a 90 second promo", 90.0),
+        ("a 2 minute trailer", 120.0),
+        ("a 6 second clip", 6.0),
+    ],
+)
+def test_a_runtime_naming_both_units_sums_them(intent: str, expected: float) -> None:
+    """"2 minute 30 second" is 150s, not 30s."""
+    assert infer_signals(intent).duration_seconds == expected
+
+
+def test_a_gcs_uri_in_prose_is_recognised() -> None:
+    """The "gs://" term could never match a real URI.
+
+    Every term was wrapped in a trailing ``(?!\\w)``, so ``gs://`` required a
+    non-word character after the final slash -- and a real URI has a letter
+    there. The conflict and the Vertex advice that depend on this signal were
+    both silently unreachable; it only appeared to work when the URI happened
+    to contain the separate term ``bucket``.
+    """
+    assert infer_signals("render the video to gs://renders/out.mp4").wants_gcs_output
+    assert infer_signals("render a video of a cat").wants_gcs_output is False
+
+
+def test_punctuated_terms_still_anchor_on_the_side_that_has_a_word_char() -> None:
+    """The fix must not turn the boundary check off wholesale."""
+    from src.routing import _term_pattern
+
+    assert _term_pattern("gs://").search("upload to gs://renders/out.mp4")
+    assert _term_pattern("gs://").search("xgs://nope") is None
+    assert _term_pattern("b-roll").search("some b-roll here")
+    assert _term_pattern("b-roll").search("ab-roll") is None
+    assert _term_pattern("9:16").search("shoot 9:16 please")
+    assert _term_pattern("9:16").search("19:164") is None
+
+
+def test_a_ten_second_ask_is_one_omni_render_not_an_extension_chain() -> None:
+    """Omni renders natively up to 10s; the planner measured against Veo's 8s.
+
+    A "10 second video" was capped to an 8s clip, flagged needs_extension and
+    routed to loop_extend -- which needs a video_uri the caller does not have
+    -- plus a two-step seed+extend workflow, when
+    generate_video_omni(duration_seconds=10) is a single call.
+    """
+    plan = plan_generation("a 10 second video of a sunset over the ocean")
+    assert plan.request.needs_extension is False
+    assert plan.request.clip_duration_seconds == 10.0
+    tools = [route.tool for route in plan.routes]
+    assert "generate_video_omni" in tools
+    assert "loop_extend" not in tools
+    omni = next(r for r in plan.routes if r.tool == "generate_video_omni")
+    assert omni.params["duration_seconds"] == 10.0
+
+
+def test_a_runtime_past_every_single_render_still_plans_an_extension() -> None:
+    """The cap moved from 8s to 10s; it did not go away."""
+    plan = plan_generation("a 30 second video of a sunset over the ocean")
+    assert plan.request.needs_extension is True
+    assert plan.request.clip_duration_seconds == 8.0
+
+
+def test_the_no_keyword_note_names_the_kind_that_was_planned() -> None:
+    """The note said "an image" even when a video was planned.
+
+    It was gated only on "no keyword matched", ignoring resolve_request's
+    structurally_video fallback -- and the MCP tool forwards `notes` verbatim,
+    so a calling agent was handed the opposite of what happened.
+    """
+    video = plan_generation(
+        "a golden retriever running on a beach",
+        RoutingConstraints(duration_seconds=6.0),
+    )
+    assert video.request.media_kind == "video"
+    assert any("planned as a video" in note for note in video.notes)
+    assert not any("planned as an image" in note for note in video.notes)
+
+    image = plan_generation("a golden retriever running on a beach")
+    assert image.request.media_kind == "image"
+    assert any("planned as an image" in note for note in image.notes)
+
+
+def test_a_reference_route_is_priced_and_parameterised_for_the_mode_it_runs() -> None:
+    """Veo forces reference_to_video to 8s, and the route priced the request.
+
+    src/video.py sets `effective_duration = 8` for this mode, so 3 references
+    at duration_seconds=4 was quoted $0.40 (4s) while generate_video's own
+    dry_run quoted $0.80 (8s) for the same intent. The emitted params also
+    omitted reference_image_uris entirely while the rationale read "picked for
+    subject consistency from reference images" -- a plan recommending a model
+    for inputs it never asks for.
+    """
+    plan = plan_generation(
+        "a product spinning on a turntable",
+        RoutingConstraints(
+            media_kind="video",
+            num_reference_images=3,
+            duration_seconds=4.0,
+            backend="vertex",
+        ),
+    )
+    route = next(r for r in plan.routes if r.tool == "generate_video")
+    assert route.params["duration_seconds"] == 8.0
+    assert route.cost is not None
+    assert route.cost.usd == pytest.approx(0.8)
+    assert any("reference_image_uris" in c for c in route.caveats)
+    assert any("exactly 8s" in c for c in route.caveats)
+
+
+def test_a_mode_the_gemini_api_bills_but_cannot_serve_is_called_out() -> None:
+    """reference_to_video returns an empty result there and bills anyway.
+
+    The worst failure shape in the table, and the route recommended it with
+    caveats=().
+    """
+    plan = plan_generation(
+        "a product spinning on a turntable",
+        RoutingConstraints(
+            media_kind="video",
+            num_reference_images=3,
+            backend="unknown",
+        ),
+    )
+    route = next(r for r in plan.routes if r.tool == "generate_video")
+    assert any("reference_to_video" in c for c in route.caveats)
+
+
+def test_a_plain_text_to_video_route_gains_no_reference_caveats() -> None:
+    """The new caveats must be scoped to the mode that earns them."""
+    plan = plan_generation(
+        "a sunset over the ocean",
+        RoutingConstraints(media_kind="video", duration_seconds=6.0, backend="vertex"),
+    )
+    route = next(r for r in plan.routes if r.tool == "generate_video")
+    assert route.params["duration_seconds"] == 6.0
+    assert not any("reference_image_uris" in c for c in route.caveats)
+    assert not any("reference_to_video" in c for c in route.caveats)
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The bug: two bare words with a common non-format meaning silently
+        # chose a vertical frame.
+        ("an illustration telling the story of a rabbit", None),
+        ("a short video of a cat", None),
+        # The platform senses still count.
+        ("an instagram story of a cat", "9:16"),
+        ("the stories format for ig", "9:16"),
+        ("a youtube shorts clip", "9:16"),
+        ("a tiktok of a cat", "9:16"),
+        ("a reel of a cat", "9:16"),
+        ("a vertical video", "9:16"),
+        ("a portrait photo", "9:16"),
+        ("a 9:16 video", "9:16"),
+        # And the other orientations are untouched.
+        ("a widescreen landscape shot", "16:9"),
+        ("a square logo", "1:1"),
+    ],
+)
+def test_a_format_word_is_not_read_out_of_a_narrative(
+    intent: str, expected: str | None
+) -> None:
+    """"story" is a narrative unless a platform is named; "short" is a length."""
+    assert infer_signals(intent).aspect_ratio == expected
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # One runtime in two units: summed.
+        ("a 2 minute 30 second trailer", 150.0),
+        ("a 2 min 30 sec trailer", 150.0),
+        ("2 minutes and 30 seconds of footage", 150.0),
+        ("a 1 minute, 5 second clip", 65.0),
+        # A minute figure that is NOT part of the runtime: seconds win, as
+        # they did before the first fix over-corrected. "I need it in 5
+        # minutes" read as 306s and planned a $14 extension chain for a 6s clip.
+        ("a 6 second clip of a cat, I need it in 5 minutes", 6.0),
+        ("a 2 minute video made of 8 second clips", 8.0),
+        ("a 2 minute trailer and a 30 second teaser", 30.0),
+        ("a 30 second loop, keep it under 2 minutes of render time", 30.0),
+        # Single units unchanged.
+        ("a 2 minute trailer", 120.0),
+        ("a 90 second promo", 90.0),
+    ],
+)
+def test_two_duration_units_are_summed_only_when_adjacent(
+    intent: str, expected: float
+) -> None:
+    """"2 minute 30 second" is one number; a deadline elsewhere is not."""
+    assert infer_signals(intent).duration_seconds == expected
+
+
+@pytest.mark.asyncio
+async def test_the_planners_extension_quote_matches_the_tools_on_vertex(
+    tmp_path: Any,
+) -> None:
+    """The plan priced the model's 10s fallback list on both backends, so on a
+    Vertex-only server it said $9.14 for three turns while extend_video_omni's
+    own dry_run said $12.18 -- and a max_cost_usd taken from the plan was
+    refused. Parity is asserted against the tool itself, on a matching
+    deployment, for both backends."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.__main__ import AppContext, extend_video_omni
+    from src.omni import OMNI_1_1_MODEL
+
+    def tool_ctx(*, vertex: bool) -> Any:
+        (tmp_path / "images").mkdir(exist_ok=True)
+        (tmp_path / "videos").mkdir(exist_ok=True)
+        client = MagicMock()
+        client._api_client.vertexai = vertex
+        ctx = MagicMock()
+        ctx.info = AsyncMock()
+        ctx.error = AsyncMock()
+        ctx.warning = AsyncMock()
+        ctx.request_context.lifespan_context = AppContext(
+            data_folder=tmp_path,
+            images_dir=tmp_path / "images",
+            videos_dir=tmp_path / "videos",
+            client=client,
+            gemini_api_client=None if vertex else client,
+        )
+        return ctx
+
+    span = "extend my omni clip from interaction abc by another 30 seconds"
+    for backend in ("vertex", "gemini_api"):
+        plan = plan_generation(
+            span,
+            RoutingConstraints(
+                backend=backend,
+                gemini_api_key_available=backend != "vertex",
+                needs_extension=True,
+                previous_interaction_id="abc",
+            ),
+        )
+        route = next(
+            r for r in plan.routes if r.tool == "extend_video_omni" and r.model == OMNI_1_1_MODEL
+        )
+        quote = json.loads(
+            await extend_video_omni(
+                ctx=tool_ctx(vertex=backend == "vertex"),
+                prompt=span,
+                previous_interaction_id="abc",
+                times=int(route.params["times"]),
+                omni_model=OMNI_1_1_MODEL,
+                dry_run=True,
+            )
+        )
+        assert "error" not in quote, quote
+        assert route.cost is not None
+        assert route.cost.usd == pytest.approx(quote["estimated_cost"]["usd"], abs=0.005), (
+            backend,
+            quote["turn_output_seconds"],
+        )
+        if backend == "vertex":
+            assert quote["turn_output_seconds"] == [40.0] * int(route.params["times"])
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected_added"),
+    [
+        ("extend my 8 second clip by another 2 minutes 30 seconds", 150.0),
+        ("extend it by 2 min 30 sec", 150.0),
+        ("extend it by 30 seconds", 30.0),
+        ("add another 2 minutes", 120.0),
+        # A seconds delta followed by an unrelated seconds figure is not a
+        # compound.
+        ("extend by 10 seconds and 5 seconds of credits", 10.0),
+    ],
+)
+def test_the_delta_reads_a_compound_the_way_the_total_does(
+    intent: str, expected_added: float
+) -> None:
+    """duration and added_duration came from one phrase and disagreed:
+    "by another 2 minutes 30 seconds" -> total 150s, delta 120s."""
+    signals = infer_signals(intent)
+    assert signals.added_duration_seconds == expected_added
+    if "2 min" in intent and "30" in intent:
+        assert signals.duration_seconds == signals.added_duration_seconds
+
+
+# ============================================================================
+# Second review pass: planner inputs
+# ============================================================================
+
+
+def test_a_fully_negated_intent_is_linear_in_its_length() -> None:
+    """_is_negated handed the ENTIRE prefix to _negator_precedes on every match
+    and re-split it each time, so a negated intent cost O(matches x length):
+    "no video " x 6000 took 2.6s, x 12000 took 9.9s, inline on the loop with
+    no length cap anywhere. Only the last clause's last three words are ever
+    read, so a bounded window is exact -- and this pins the complexity, since
+    an assertion on the result passes just as well when it takes ten seconds.
+    """
+    import time
+
+    text = "no video " * 12000  # 108k chars, every term negated
+    start = time.perf_counter()
+    signals = infer_signals(text)
+    elapsed = time.perf_counter() - start
+    assert signals.media_kind != "video"
+    assert elapsed < 1.5, f"{elapsed:.2f}s"
+
+
+def test_the_negation_window_is_counted_in_words_not_characters() -> None:
+    """The first bounded window was 120 characters, and a single token longer
+    than that between the negator and the term cut the negator off: "no " +
+    130-char hashtag + " video" stopped reading as negated. Counting back in
+    whitespace-delimited words is exact whatever the token lengths, and a cut
+    token can never read as a negator ("techno" -> "no") because the window
+    always starts on a boundary.
+    """
+    from src.routing import _is_negated
+
+    assert _is_negated("no " + "x" * 130 + " video please", "video") is True
+    assert _is_negated("without " + "y" * 60 + " " + "z" * 60 + " video", "video") is True
+    assert _is_negated("x techno beat video", "video") is False
+    assert _is_negated("a loud track with no video", "video") is True
+    # A clause break inside the window still ends the negator's reach.
+    assert _is_negated("no audio, a video of rain", "video") is False
+
+
+def test_an_intent_past_the_length_cap_is_refused() -> None:
+    from src.routing import MAX_INTENT_CHARS
+
+    with pytest.raises(ValueError, match=str(MAX_INTENT_CHARS)):
+        plan_generation("a" * (MAX_INTENT_CHARS + 1))
+    # At the cap is fine.
+    plan_generation("a video of a cat " + "x" * (MAX_INTENT_CHARS - 40))
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "a 24 frames per second animation",
+        "a 24 frames per sec animation",
+        "a 24 frames/second animation",
+        "a 24 frames-per-second animation",
+        "a 24 frames / sec animation",
+        "24 frames/s of a running horse",
+        # The "per" spelled another way: one word from the guard's list still
+        # planned 20 paid beats.
+        "a 24 frames a second animation",
+        "a 24 frames every second animation",
+        "24 frames each second",
+        "24 frames per minute",
+    ],
+)
+def test_a_frame_rate_is_not_a_shot_count_however_it_is_spelled(intent: str) -> None:
+    """The guard knew only "per second"; "24 frames per sec" planned 20 beats
+    at $12.00 in place of one $0.60 render."""
+    assert infer_signals(intent).beat_count is None
+
+
+def test_a_frame_count_still_counts() -> None:
+    assert infer_signals("4 frames").beat_count == 4
+    assert infer_signals("4 keyframes of a sunrise").beat_count == 4
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        # The comment's own example, which failed: _word_after saw "of".
+        ("30s of video of a beach", 30.0),
+        ("an 8s clip", 8.0),
+        ("8s of footage", 8.0),
+        # Bare units without a runtime noun still do not count.
+        ("the 1970s diner", None),
+        ("a 3 m tall robot", None),
+    ],
+)
+def test_a_bare_unit_may_sit_one_link_word_from_its_noun(
+    intent: str, expected: float | None
+) -> None:
+    assert infer_signals(intent).duration_seconds == expected
+
+
+def test_the_planner_honours_a_server_wide_omni_backend_pin() -> None:
+    """With OMNI_BACKEND=vertex the server keeps omni on Vertex even though a
+    key is present; the planner must price Vertex's ceiling for the same
+    deployment, or the plan and the tool disagree again."""
+    from src.omni import OMNI_1_1_MODEL, omni_extension_priced_lengths, omni_spec
+
+    base = dict(backend="vertex", gemini_api_key_available=True, needs_extension=True,
+                previous_interaction_id="abc")
+    span = "extend my omni clip from interaction abc by another 30 seconds"
+    auto = plan_generation(span, RoutingConstraints(**base))
+    pinned = plan_generation(span, RoutingConstraints(**base, omni_backend="vertex"))
+    pick = lambda plan: next(  # noqa: E731
+        r for r in plan.routes if r.tool == "extend_video_omni" and r.model == OMNI_1_1_MODEL
+    )
+    a, v = pick(auto), pick(pinned)
+    assert a.cost is not None and v.cost is not None
+    # Auto (a key is present) prices the Developer API's 10s fallback: three
+    # turns, [20, 30, 40]. Pinned to Vertex, the assumed 30s source fills the
+    # 40s ceiling in ONE turn -- fewer turns, each at the ceiling -- so the plan
+    # recommends times=1 priced at 40s, exactly what the tool quotes there.
+    assert int(a.params["times"]) == 3
+    assert int(v.params["times"]) == 1
+    spec = omni_spec(OMNI_1_1_MODEL)
+    assert omni_extension_priced_lengths(spec, None, 3, vertexai=False) == [20.0, 30.0, 40.0]
+    assert omni_extension_priced_lengths(spec, None, 1, vertexai=True) == [40.0]
+    assert v.cost.usd < a.cost.usd  # one 40s turn against 90s over three

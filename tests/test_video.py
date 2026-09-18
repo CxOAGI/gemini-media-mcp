@@ -755,7 +755,7 @@ async def test_generate_video_first_last_frame(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -825,7 +825,7 @@ async def test_generate_video_reference_images(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -858,7 +858,7 @@ async def test_generate_video_reference_images_limited_to_3(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -891,7 +891,7 @@ async def test_generate_video_extend(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -1017,12 +1017,13 @@ async def test_generate_video_still_picks_a_mode_when_inputs_do_not_conflict(
         ({}, "text_to_video"),
     ):
         client = FakeGenaiClient(
+            vertexai=True,
             operation=FakeOperation(
                 done=True,
                 result=FakeVideoResult(
                     [FakeGeneratedVideo(FakeVideoObject(video_bytes=b"video content"))]
                 ),
-            )
+            ),
         )
         gen_result = await generate_video(
             client=client,  # type: ignore[arg-type]
@@ -1165,7 +1166,7 @@ async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> N
     gen_video = FakeGeneratedVideo(video_obj)
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     with pytest.raises(ValueError, match="outside the permitted data folder"):
         await generate_video(
@@ -1183,13 +1184,13 @@ async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> N
 # ============================================================================
 
 
-def _basic_client() -> "FakeGenaiClient":
+def _basic_client(vertexai: bool = False) -> "FakeGenaiClient":
     """Build a client whose fake operation returns a single video with bytes."""
     video_obj = FakeVideoObject(video_bytes=b"fake video content")
     gen_video = FakeGeneratedVideo(video_obj)
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
-    return FakeGenaiClient(operation=operation)
+    return FakeGenaiClient(operation=operation, vertexai=vertexai)
 
 
 @pytest.mark.parametrize(
@@ -1232,7 +1233,7 @@ async def test_generate_video_reference_duration_forced_to_8(tmp_path: Path) -> 
     videos_dir.mkdir()
 
     gen_result = await generate_video(
-        client=_basic_client(),  # type: ignore[arg-type]
+        client=_basic_client(vertexai=True),  # type: ignore[arg-type]
         prompt="Reference",
         videos_dir=videos_dir,
         model="veo-3.1-generate-001",
@@ -1251,7 +1252,7 @@ async def test_generate_video_extend_duration_forced_to_7(tmp_path: Path) -> Non
     videos_dir.mkdir()
 
     gen_result = await generate_video(
-        client=_basic_client(),  # type: ignore[arg-type]
+        client=_basic_client(vertexai=True),  # type: ignore[arg-type]
         prompt="Extend",
         videos_dir=videos_dir,
         model="veo-3.1-generate-001",
@@ -1375,7 +1376,7 @@ async def test_generate_video_resolution_passed_through(
     gen_video = FakeGeneratedVideo(video_obj)
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
-    client = FakeGenaiClient(operation=operation)
+    client = FakeGenaiClient(vertexai=True, operation=operation)
 
     def capturing_generate_videos(**kwargs: Any) -> FakeOperation:
         captured["config"] = kwargs.get("config")
@@ -1636,3 +1637,118 @@ async def test_generate_video_vertex_sends_generate_audio_false(
 
     assert captured["config"].generate_audio is False
     assert result["audio_enabled"] is False
+
+
+# ============================================================================
+# Image inputs: header-checked, passed through, off the loop
+# ============================================================================
+
+
+def _encoded(fmt: str, size: tuple[int, int] = (64, 64), mode: str = "RGB") -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    color = {"RGB": (1, 2, 3), "RGBA": (1, 2, 3, 4)}.get(mode, 5)
+    buf = BytesIO()
+    Image.new(mode, size, color).save(buf, fmt)  # pyright: ignore[reportArgumentType]
+    return buf.getvalue()
+
+
+def test_png_and_jpeg_inputs_are_sent_as_the_bytes_they_arrived_as() -> None:
+    """Every input used to be decoded and re-encoded as PNG whenever the mode
+    was RGB -- a 5 MB 4000x4000 JPEG went onto the wire as a 28.5 MB PNG. The
+    caller's encoding is already the right one."""
+    from src.video import _prepare_image_input
+
+    png = _encoded("PNG")
+    jpeg = _encoded("JPEG")
+    out_png = _prepare_image_input(png)
+    out_jpeg = _prepare_image_input(jpeg)
+    assert out_png.image_bytes is png and out_png.mime_type == "image/png"
+    assert out_jpeg.image_bytes is jpeg and out_jpeg.mime_type == "image/jpeg"
+
+
+def test_other_formats_are_normalised_to_something_the_service_accepts() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from src.video import _prepare_image_input
+
+    # Lossless stays lossless: an RGB WEBP/BMP/TIFF reference is converted to
+    # PNG, never to JPEG q75 (the first cut of the pass-through did that).
+    webp = _prepare_image_input(_encoded("WEBP"))
+    assert webp.mime_type == "image/png"
+    assert Image.open(BytesIO(webp.image_bytes)).format == "PNG"
+    bmp = _prepare_image_input(_encoded("BMP"))
+    assert bmp.mime_type == "image/png"
+    palette = _prepare_image_input(_encoded("PNG", mode="P"))
+    assert palette.mime_type == "image/png"
+    assert Image.open(BytesIO(palette.image_bytes)).mode == "RGBA"
+    # Only a JPEG source is re-encoded as JPEG (e.g. a CMYK JPEG).
+    cmyk = _prepare_image_input(_encoded("JPEG", mode="CMYK"))
+    assert cmyk.mime_type == "image/jpeg"
+
+
+def test_an_oversized_input_is_refused_from_its_header_without_decoding() -> None:
+    """A 308 KB 9999x9999 solid PNG is under the fetch cap and under Pillow's
+    hard bomb threshold, and cost +382 MB RSS in 1.6s on the loop. The size
+    is in the header; nothing is materialised."""
+    import time
+
+    from src.video import _prepare_image_input
+
+    from PIL import Image
+
+    huge = _encoded("PNG", size=(9999, 9999))
+    start = time.perf_counter()
+    # Pillow flags the header size on open; that signal is expected, and our
+    # own 40 MP refusal fires before anything is decoded.
+    with pytest.warns(Image.DecompressionBombWarning):
+        with pytest.raises(ValueError, match="above the 40.0MP limit"):
+            _prepare_image_input(huge)
+    assert time.perf_counter() - start < 1.0
+
+
+def test_reference_inputs_are_capped_with_a_warning() -> None:
+    from src.video import _MAX_REFERENCE_IMAGES, _prepare_frame_inputs
+
+    first, last, refs, warnings = _prepare_frame_inputs(
+        "reference_to_video", None, None, [_encoded("JPEG")] * 5
+    )
+    assert first is None and last is None
+    assert len(refs) == _MAX_REFERENCE_IMAGES
+    assert warnings and "were not" in warnings[0]
+
+
+def test_image_inputs_are_prepared_off_the_event_loop() -> None:
+    """Source-level, like the other executor guards: five near-limit inputs
+    measured ~8s of frozen loop when prepared inline in async generate_video.
+    Scanned across line breaks -- ruff wraps the call."""
+    import re
+    from pathlib import Path
+
+    source = Path("src/video.py").read_text()
+    assert re.search(
+        r"await\s+run_off_loop\(\s*functools\.partial\(\s*_prepare_frame_inputs", source
+    ), "_prepare_frame_inputs must run through run_off_loop"
+    # And no bare call is left in the coroutine body.
+    body = source[source.index("async def generate_video(") :]
+    assert not re.search(r"^\s+\w+ = _prepare_image_input\(", body, re.M)
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
+def test_a_truncated_input_is_refused_locally_not_on_the_wire(fmt: str) -> None:
+    """The old full decode refused a truncated file with "image file is
+    truncated". The first cut of the pass-through skipped the decode, so the
+    same file went onto the wire to fail as an opaque API 400 after the
+    upload. The bytes are decoded once (off the loop, under the pixel cap) to
+    prove they are whole, and still sent as they arrived."""
+    from src.video import _prepare_image_input
+
+    whole = _encoded(fmt, size=(400, 300))
+    with pytest.raises(OSError):
+        _prepare_image_input(whole[: len(whole) // 2])
+    # A whole file is still passed through untouched.
+    assert _prepare_image_input(whole).image_bytes is whole

@@ -1712,3 +1712,31 @@ def test_resolve_image_model_does_not_log(caplog: pytest.LogCaptureFixture) -> N
     assert model_id == "gemini-3.1-flash-image"
     assert warnings, "the substitution must still be reported to the caller"
     assert not caplog.records, "resolving a model must not write to the log"
+
+
+def test_input_image_decoding_does_not_run_on_the_event_loop() -> None:
+    """`_prepare_input_images` decodes and LANCZOS-resamples its inputs.
+
+    `generate_image` already offloaded the generate_content call but not this,
+    and the guards around it cap PIXELS, not CPU: 14 references plus one edit
+    input just under `_MAX_SOURCE_PIXELS` is a ~128 KB solid PNG each -- under
+    any byte cap -- and measured 8.7s of straight-line decode and resample.
+    Run inline that froze the whole server for those 8.7s, since one blocked
+    coroutine blocks every request: no other render, no Veo LRO polling, no
+    ctx.info progress.
+
+    Source-level, matching the ffmpeg executor guard in test_omni_1_1.py:
+    calling the real thing with fifteen near-limit images to prove it takes
+    seconds would cost those seconds on every run.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path("src/image.py").read_text()
+    # Scanned across line breaks: ruff wraps the call, so a line-by-line grep
+    # would miss `await asyncio.to_thread(\n    _prepare_input_images, ...)`.
+    assert re.search(
+        r"await\s+asyncio\.to_thread\(\s*_prepare_input_images", source
+    ), "_prepare_input_images must be awaited off the event loop"
+    # And nothing calls it straight from the coroutine any more.
+    assert not re.search(r"^\s*pil_images = _prepare_input_images\(", source, re.M)

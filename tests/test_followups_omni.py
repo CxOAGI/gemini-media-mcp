@@ -10,7 +10,11 @@ from typing import Any
 
 import pytest
 
-from src.omni import _MAX_DELIVERED_VIDEO_BYTES, generate_video_omni
+from src.omni import (
+    _MAX_DELIVERED_VIDEO_BYTES,
+    OMNI_PREVIEW_MODEL,
+    generate_video_omni,
+)
 
 
 # ============================================================================
@@ -100,6 +104,7 @@ async def test_oversize_downloaded_body_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="exceeds cap"):
         await generate_video_omni(
+            model=OMNI_PREVIEW_MODEL,
             client=client,  # type: ignore[arg-type]
             prompt="p",
             videos_dir=videos_dir,
@@ -124,6 +129,7 @@ async def test_oversize_advertised_size_rejected_before_download(
 
     with pytest.raises(ValueError, match="exceeds cap"):
         await generate_video_omni(
+            model=OMNI_PREVIEW_MODEL,
             client=client,  # type: ignore[arg-type]
             prompt="p",
             videos_dir=videos_dir,
@@ -143,6 +149,9 @@ async def test_download_at_cap_succeeds(
     with a token payload well under it (which proves nothing about the edge):
     cap bytes must pass, cap+1 must raise.
     """
+    # The preview model is the one whose cap is this constant; 1.1 can emit
+    # 4K and 40s chains and gets a larger one, so patching this and then
+    # calling the default model would exercise neither boundary.
     monkeypatch.setattr("src.omni._MAX_DELIVERED_VIDEO_BYTES", 64)
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
@@ -150,6 +159,7 @@ async def test_download_at_cap_succeeds(
     at_cap = b"\x01" * 64
     result = await generate_video_omni(
         client=_uri_delivery_client(download_bytes=at_cap),  # type: ignore[arg-type]
+        model=OMNI_PREVIEW_MODEL,
         prompt="p",
         videos_dir=videos_dir,
     )
@@ -160,6 +170,7 @@ async def test_download_at_cap_succeeds(
     with pytest.raises(ValueError, match="exceeds cap"):
         await generate_video_omni(
             client=_uri_delivery_client(download_bytes=b"\x01" * 65),  # type: ignore[arg-type]
+            model=OMNI_PREVIEW_MODEL,
             prompt="p",
             videos_dir=tmp_path / "over",
         )
@@ -230,6 +241,7 @@ async def test_empty_downloaded_body_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="empty"):
         await generate_video_omni(
+            model=OMNI_PREVIEW_MODEL,
             client=client,  # type: ignore[arg-type]
             prompt="p",
             videos_dir=videos_dir,
@@ -258,6 +270,7 @@ async def test_empty_inline_data_falls_through_to_uri(tmp_path: Path) -> None:
     )
 
     result = await generate_video_omni(
+        model=OMNI_PREVIEW_MODEL,
         client=client,  # type: ignore[arg-type]
         prompt="p",
         videos_dir=videos_dir,

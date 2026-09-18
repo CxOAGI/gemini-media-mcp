@@ -4,13 +4,14 @@ import argparse
 import asyncio
 import base64
 import ipaddress
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import socket
 import sys
-import tempfile
 import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -18,12 +19,15 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from google import genai
+
+from . import credentials
+from .video import VEO_DEFAULT_TIMEOUT_SECONDS, VEO_MEASURED_4K_SECONDS
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.server.session import ServerSession
@@ -33,23 +37,45 @@ from PIL import Image as PILImage
 
 from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
-from .omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+from .omni import (
+    omni_extension_refusal,
+    omni_model_reroute_warning,
+    omni_model_refusal,
+    OMNI_1_1_MODEL,
+    OMNI_DEFAULT_TIMEOUT_SECONDS,
+    OMNI_MAX_DURATION_SECONDS,
+    DEFAULT_OMNI_MODEL,
+    OMNI_MODELS,
+    is_omni_model,
+    normalize_omni_resolution,
+    omni_extension_appended_seconds,
+    omni_extension_priced_lengths,
+    omni_continuation_upper_bound,
+    omni_source_limit_seconds,
+    omni_spec,
+    validate_omni_request,
+    wants_uri_delivery,
+)
 from .routing import BudgetPreference, MediaKind
 from .storyboard import Theme
 from .omni import generate_video_omni as generate_video_omni_impl
 from .video import (
     _MAX_REFERENCE_IMAGES,
     _VEO_LITE_MODELS,
+    VEO_EXTENSION_STEP_SECONDS,
     TranslatedVideoModel,
     VideoModel,
-    resolve_served_video_model,
     validate_video_request_inputs,
+    veo_extension_output_lengths,
 )
 from .video import generate_video as generate_video_impl
 from .video_utils import (
     assert_frame_decoding_available,
+    classify_video_resolution,
     extract_frame_png,
+    measure_video_dimensions,
     measure_video_duration,
+    measure_video_duration_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,16 +87,32 @@ MAX_FETCH_BYTES = 50 * 1024 * 1024
 # target is re-validated against the SSRF guard before it is requested.
 MAX_HTTP_REDIRECTS = 5
 
-# Cap on a thought-signature file read. A signature is an opaque token of at
-# most a few kilobytes, but the path is caller-supplied and the strongest
-# target is a large file the server itself wrote into DATA_FOLDER — an
-# uncapped read_text() of a 157 MB render added ~150 MB RSS in one call.
-MAX_THOUGHT_SIGNATURE_BYTES = 256 * 1024
+# Cap on a thought-signature file read. The path is caller-supplied and the
+# strongest target is a large file the server itself wrote into DATA_FOLDER —
+# an uncapped read_text() of a 157 MB render added ~150 MB RSS in one call.
+#
+# "At most a few kilobytes" was the original premise and it is wrong. MEASURED:
+# gemini-3-pro-image writes 2,828,040 bytes and gemini-3.1-flash-image
+# 1,634,388, so a 256 KB cap refused every signature the server itself had just
+# written and made multi-turn editing unreachable on both models — the
+# docstring's own two-step example could not execute. Sized to the largest
+# observed signature with generous headroom, still two orders of magnitude
+# below the render that motivated the cap.
+MAX_THOUGHT_SIGNATURE_BYTES = 16 * 1024 * 1024
 
 # Upper bound on shots in one storyboard. Every shot is a billed image
 # generation, so an unbounded list is an unbounded bill; exceeding this is an
 # error rather than a silent truncation.
 MAX_STORYBOARD_SHOTS = 24
+
+# Per-field ceiling on the text a storyboard draws. Deliberately far above any
+# real prompt: the panel shows about three wrapped lines, but `prompt` is also
+# what the image model receives, and a detailed prompt is legitimately long, so
+# this refuses only input that cannot be meant seriously. The layout cost is
+# linear now (`_split_overlong` and `_ellipsize` binary-search their cuts), so
+# this is a bound on memory and wasted work rather than the fix for the
+# quadratic blow-up it used to be.
+MAX_STORYBOARD_TEXT_CHARS = 20_000
 
 # Upper bound on beats in one clip. Same reasoning as the storyboard cap, but
 # it matters far more here: a beat is a Veo render costing roughly a hundred
@@ -134,6 +176,10 @@ class AppContext:
     temp_creds_path: Path | None = None
     video_gcs_bucket: str | None = None  # Default GCS bucket for video output
     allowed_gcs_buckets: frozenset[str] = frozenset()  # Allowlist for gs:// URIs
+    # Server-wide default for which backend serves omni: "auto", "vertex" or
+    # "gemini_api" (env OMNI_BACKEND). A tool's omni_backend argument wins over
+    # it. See _omni_backend_decision for what "auto" does and why this exists.
+    omni_backend_default: str = "auto"
 
 
 def _parse_gcs_bucket(uri: str) -> str | None:
@@ -142,6 +188,92 @@ def _parse_gcs_bucket(uri: str) -> str | None:
         return None
     remainder = uri[5:].split("/", 1)[0]
     return remainder or None
+
+
+# Where the interaction-id index lives, relative to the media directory. A
+# subdirectory rather than a name prefix so the `*.json` sidecar glob -- which
+# is not recursive -- cannot see these entries and mistake one for a manifest.
+_INTERACTION_INDEX_DIRNAME = ".interactions"
+
+
+def _interaction_index_path(media_dir: Path, interaction_id: str) -> Path:
+    """Path of the index entry for ``interaction_id``.
+
+    Hashed, not used verbatim: an interaction id is minted by the service and
+    is not guaranteed to be a safe filename (a "/" in one would silently write
+    outside the index, or fail).
+    """
+    digest = hashlib.sha256(interaction_id.encode("utf-8")).hexdigest()[:32]
+    return media_dir / _INTERACTION_INDEX_DIRNAME / f"{digest}.json"
+
+
+def _write_interaction_index(sidecar: Path, metadata: dict[str, Any]) -> None:
+    """Record which sidecar holds ``interaction_id``, if there is one.
+
+    Makes the by-id lookup a single read instead of a directory scan. Stores
+    the sidecar's NAME rather than a copy of the manifest, so the manifest has
+    exactly one home.
+
+    Best-effort: a failure here costs the fast path and falls back to the
+    scan, so it must never fail a render that already succeeded.
+    """
+    interaction_id = metadata.get("interaction_id")
+    if not isinstance(interaction_id, str) or not interaction_id:
+        return
+    entry = _interaction_index_path(sidecar.parent, interaction_id)
+    try:
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(
+            json.dumps(
+                {"interaction_id": interaction_id, "sidecar": sidecar.name},
+                sort_keys=True,
+            )
+        )
+    except OSError as e:  # pragma: no cover - index is an optimisation
+        logger.warning("Failed to write interaction index %s: %s", entry, e)
+
+
+def _write_remote_interaction_record(
+    media_dir: Path, manifest: dict[str, Any]
+) -> None:
+    """Record an interaction whose media did not land locally.
+
+    _write_sidecar writes nothing for a gs:// delivery, so a Vertex omni render
+    sent to a bucket left NO local trace of its interaction_id -- and
+    PriorInteraction, which the index exists to serve, came back empty for
+    exactly the Vertex-minted ids that must never be sent to the Gemini
+    Developer API. A real edit_video(previous_interaction_id=<vertex id>) went
+    out on the Gemini client. The manifest itself goes into the index entry
+    here, since there is no sidecar to point at.
+    """
+    interaction_id = manifest.get("interaction_id")
+    if not isinstance(interaction_id, str) or not interaction_id:
+        return
+    # Only the fields the by-id readers consume -- not the whole manifest,
+    # whose size scales with the caller's prompt. A ~260 KB prompt pushed the
+    # entry past _SIDECAR_MAX_BYTES, the reader skipped it, and with no
+    # sidecar to fall back to the interaction was unfindable: exactly the
+    # cross-backend hazard this record exists to close.
+    record = {
+        key: manifest[key]
+        for key in (
+            "interaction_id",
+            "backend",
+            "model",
+            "duration_seconds",
+            "duration_source",
+            "video_url",
+        )
+        if key in manifest
+    }
+    entry = _interaction_index_path(media_dir, interaction_id)
+    try:
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(
+            json.dumps({"interaction_id": interaction_id, "manifest": record}, sort_keys=True)
+        )
+    except (OSError, TypeError, ValueError) as e:  # pragma: no cover
+        logger.warning("Failed to record remote interaction %s: %s", entry, e)
 
 
 def _write_sidecar(media_url: str, metadata: dict[str, Any]) -> str | None:
@@ -160,6 +292,7 @@ def _write_sidecar(media_url: str, metadata: dict[str, Any]) -> str | None:
     except OSError as e:
         logger.warning("Failed to write sidecar %s: %s", sidecar, e)
         return None
+    _write_interaction_index(sidecar, metadata)
     return f"file://{sidecar}"
 
 
@@ -174,66 +307,35 @@ def _compute_allowed_gcs_buckets() -> frozenset[str]:
     return frozenset(buckets)
 
 
+# Credentials live in one shared module so image.py's Vertex client can be
+# built the same way as every client here; see src/credentials.py.
+_parse_service_account_json = credentials.parse_service_account_json
+_service_account_credentials = credentials.service_account_credentials
+_vertex_client_kwargs = credentials.vertex_client_kwargs
+
+
 def setup_vertex_credentials() -> Path | None:
-    """Setup Vertex AI credentials from service account JSON or environment."""
+    """Validate the Vertex credentials configuration at startup.
+
+    Kept for its name and its two callers; it no longer writes anything.
+    Parsing the inline JSON here means a broken credential fails the lifespan
+    before any client is built, as before. Always returns None: there is no
+    temp file any more (see _service_account_credentials for why).
+    """
     if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() != "true":
         return None
-
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-
-    # Remember which variable the operator actually set so a parse failure
-    # can name it in the error below.
-    sa_json_source = "GOOGLE_SERVICE_ACCOUNT_JSON"
-    if not sa_json and gac.strip().startswith("{"):
-        sa_json = gac
-        sa_json_source = "GOOGLE_APPLICATION_CREDENTIALS"
-        # On an HTTP transport the lifespan re-runs per connection. This
-        # function overwrites GOOGLE_APPLICATION_CREDENTIALS with the temp
-        # file path below, and teardown deletes that file — so the second
-        # connection would find GOOGLE_APPLICATION_CREDENTIALS pointing at a
-        # deleted path and no inline JSON to rebuild from. Persist the JSON to
-        # the primary variable so every subsequent lifespan rebuilds cleanly.
-        os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = sa_json
-
-    if sa_json:
-        try:
-            data = json.loads(sa_json)
-        except json.JSONDecodeError as e:
-            # A configured service-account JSON that does not parse must fail
-            # loudly. Returning None here dropped through to
-            # genai.Client(vertexai=True), which then discovered whatever
-            # ambient ADC happened to exist — so a typo'd credential silently
-            # ran the server as a DIFFERENT identity than configured, with one
-            # log line as the only signal.
-            raise ValueError(
-                f"{sa_json_source} is set but is not valid JSON: {e}. "
-                "Refusing to fall back to ambient application-default "
-                "credentials — that would run the server as a different "
-                "identity than configured. Fix the JSON or unset the variable."
-            ) from e
-        try:
-            fd, path_str = tempfile.mkstemp(suffix=".json", prefix="gcp_sa_")
-            path = Path(path_str)
-            with open(fd, "w") as f:
-                json.dump(data, f)
-            # mkstemp creates 0600 on POSIX; make it explicit for clarity.
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
-            logger.info("Created temp credentials file: %s", path)
-            return path
-        except OSError as e:
-            logger.error("Failed to setup credentials: %s", e)
-            return None
-
+    _parse_service_account_json()
+    # Key text out of the path variable before anything can reach ADC.
+    credentials.normalize_environment()
     return None
 
 
 def cleanup_credentials(path: Path | None) -> None:
-    """Clean up temporary credentials file."""
+    """Remove a temporary credentials file, if one was ever written.
+
+    None is what setup_vertex_credentials returns now; this stays as a no-op
+    for that case so the lifespan's finally reads as it always did.
+    """
     if path and path.exists():
         try:
             path.unlink()
@@ -254,7 +356,7 @@ def check_credentials() -> bool:
 def create_client() -> genai.Client:
     """Create a Google GenAI client."""
     if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true":
-        return genai.Client(vertexai=True)
+        return genai.Client(**_vertex_client_kwargs())
     api_key = os.environ.get("GEMINI_API_KEY")
     if api_key:
         return genai.Client(api_key=api_key)
@@ -306,12 +408,378 @@ def _get_omni_vertex_global_client() -> genai.Client:
     """Return a memoized Vertex client pinned to the global location."""
     global _omni_vertex_global_client
     if _omni_vertex_global_client is None:
-        _omni_vertex_global_client = genai.Client(vertexai=True, location="global")
+        _omni_vertex_global_client = genai.Client(
+            **_vertex_client_kwargs(location="global")
+        )
     return _omni_vertex_global_client
 
 
-def _client_for_omni(app_ctx: AppContext, *, need_gcs: bool = False) -> genai.Client:
-    """Pick the genai.Client for gemini-omni-flash (Interactions API).
+class _RenderedFacts(NamedTuple):
+    """What a probe could establish about a file that actually rendered."""
+
+    duration_seconds: float | None
+    duration_source: str | None
+    resolution_source: str | None
+
+
+async def _measure_rendered_video(
+    result: dict[str, Any],
+    *,
+    resolution_key: str,
+    requested_resolution: str | None,
+) -> _RenderedFacts:
+    """Replace echoes of the request with measurements of the artifact.
+
+    Both families bill by resolution, and both used to report the resolution
+    the caller ASKED for — a figure indistinguishable from a report of what
+    rendered. Omni was given a probe; Veo was not, so generate_video billed at
+    a resolution its response never named. Keeping one copy is the point:
+    the divergence is what produced the gap.
+
+    Mutates `result` with the measured dimensions, the classified resolution
+    and a warning when the render disagrees with the request. Returns the
+    facts the caller needs for its own cost line.
+    """
+    duration_source: str | None = None
+    resolution_source: str | None = None
+    raw = result.get("duration_seconds")
+    duration = float(raw) if isinstance(raw, (int, float)) else None
+
+    video_url = result.get("video_url") or ""
+    if not isinstance(video_url, str) or not video_url.startswith("file://"):
+        # A remote render is not opened here: a probe would have to download
+        # it, and silence is why an unmeasured number needs a stated source.
+        return _RenderedFacts(duration, None, None)
+
+    rendered_path = Path(video_url[7:])
+    measured = await _probe_media(measure_video_duration, rendered_path)
+    if measured is not None:
+        duration = measured
+        duration_source = "measured from the rendered video"
+    size = await _probe_media(measure_video_dimensions, rendered_path)
+    if size is not None:
+        result["rendered_dimensions"] = list(size)
+        classified = classify_video_resolution(size)
+        if classified is not None:
+            result[resolution_key] = classified
+            resolution_source = "measured from the rendered video"
+            if requested_resolution and requested_resolution != classified:
+                result.setdefault("warnings", []).append(
+                    f"Requested {requested_resolution} but the render measured "
+                    f"{classified} ({size[0]}x{size[1]}). The cost below "
+                    "prices what rendered, not what was asked for."
+                )
+    return _RenderedFacts(duration, duration_source, resolution_source)
+
+
+def _stamp_provenance(
+    payload: dict[str, Any],
+    *,
+    backend: str | None = None,
+    duration_source: str | None = None,
+    resolution_source: str | None = None,
+) -> dict[str, Any]:
+    """Fill in the provenance fields a response is required to carry.
+
+    Three fields are meant to be uniform across every media response —
+    `backend`, `duration_source`, `resolution_source` — because a number
+    without a source cannot be told apart from a measured one, and the backend
+    is the question a whole debugging session went to answer. They were being
+    added tool by tool, which is how `backend` ended up on exactly one of
+    eight. Setting them in one place means a new tool gets the contract for
+    free instead of having to remember it.
+
+    Existing values always win: a caller that has MEASURED something has said
+    something stronger than this default can.
+    """
+    if backend is not None:
+        payload.setdefault("backend", backend)
+    if duration_source is not None and "duration_seconds" in payload:
+        payload.setdefault("duration_source", duration_source)
+    if resolution_source is not None and "resolution" in payload:
+        payload.setdefault("resolution_source", resolution_source)
+    return payload
+
+
+# What a dry run's numbers are, in one phrase: nothing has rendered, so every
+# figure in the payload is a projection of the call that would be made. These
+# are the weakest true statement about a quoted number; any tool that can say
+# something more specific sets its own and wins, because _stamp_provenance
+# never overwrites.
+QUOTE_DURATION_PROVENANCE = (
+    "the request, snapped to a length the model accepts: a dry run renders "
+    "nothing to measure"
+)
+QUOTE_RESOLUTION_PROVENANCE = (
+    "the request: a dry run renders nothing whose resolution could be measured"
+)
+
+
+def _backend_of(app_ctx: AppContext, model: str | None) -> str:
+    """Which backend a model would run on, without building a client.
+
+    Covers both families, because `backend` is meant to be on every media
+    response and a caller should not have to know which family a model belongs
+    to in order to read it. Never raises: a model this cannot place is
+    reported as the primary client's own mode rather than failing a response
+    that is otherwise complete.
+    """
+    name = str(model or "")
+    if is_omni_model(name):
+        pin = app_ctx.omni_backend_default
+        return _omni_backend_choice(app_ctx, requested=None if pin == "auto" else pin)
+    try:
+        # Defer to the real routing rule rather than restating it here; a
+        # second copy of "which client serves Lite" is a copy that drifts.
+        client = _client_for_video_model(app_ctx, name)
+    except RuntimeError:
+        # No client serves this model on this deployment. The call itself
+        # refuses with the actionable message; report where it would have run.
+        client = app_ctx.client
+    return "vertex" if getattr(client._api_client, "vertexai", False) else "gemini_api"
+
+
+def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
+    """Serialize a tool response, stamping the provenance it must carry.
+
+    `backend` belongs on every media response — it is the question a whole
+    debugging session went to answer — and adding it tool by tool is how it
+    ended up on one of eight. Routed through here it cannot be forgotten.
+    """
+    quote = bool(payload.get("dry_run"))
+    # One response, one model name. The impl returns the SERVED id — the
+    # Gemini API is fed `-preview` spellings, Vertex `-001` — and reporting
+    # that beside a cost line priced on the canonical name had two fields
+    # naming different models. The quote was fixed for this once and the
+    # rendered path grew it back, so it is settled here instead of per tool.
+    # The served spelling is kept, not dropped: it is what went on the wire.
+    raw_model = payload.get("model")
+    if isinstance(raw_model, str) and raw_model:
+        from .pricing import resolve_model_id
+
+        canonical = resolve_model_id(raw_model)
+        if canonical != raw_model:
+            payload["model"] = canonical
+            payload.setdefault("served_model", raw_model)
+    # "We are on Vertex" is not a whole-server statement, and reading it as one
+    # cost several rounds of confusion: omni prefers the Gemini API whenever a
+    # key is configured, because 1.1 is GA there and allowlist-gated Preview on
+    # Vertex, while Veo stays on the primary client. Say so on the response
+    # where the two disagree, rather than leaving a reader to infer a bug.
+    model_name = str(payload.get("model") or "")
+    if is_omni_model(model_name) and "backend_note" not in payload:
+        primary = (
+            "vertex"
+            if getattr(app_ctx.client._api_client, "vertexai", False)
+            else "gemini_api"
+        )
+        # The backend the CALL decided, when the tool recorded one; the
+        # server-wide answer otherwise. A per-call omni_backend must not be
+        # described by a note computed from the default.
+        served = payload.get("backend") or _backend_of(app_ctx, model_name)
+        if served != primary:
+            # Emitted only when the backends disagree -- a call that runs on
+            # the primary needs no explanation, and a note on every response
+            # is a note nobody reads.
+            #
+            # It says what the split COSTS, not whether the split is fine: the
+            # earlier wording ended "deliberate, not a misconfiguration",
+            # which presented a choice the caller had no control over as
+            # settled, and said nothing about the project the traffic had
+            # left.
+            payload["backend_note"] = (
+                "Omni ran on the Gemini Developer API even though this server's "
+                f"primary client is {primary}: with a GEMINI_API_KEY set, omni "
+                "defaults there (the Interactions API is GA on that API and "
+                "Preview on Vertex AI), which means omni traffic leaves the "
+                "Vertex project's billing, quota and credentials. Veo tools in "
+                f"the same session report {primary}. To keep omni on Vertex AI, "
+                'pass omni_backend="vertex" or set OMNI_BACKEND=vertex '
+                "server-wide. See backend_reason for this call's decision."
+            )
+    return json.dumps(
+        _stamp_provenance(
+            payload,
+            backend=_backend_of(app_ctx, payload.get("model")),
+            # A quoted number needs a source as much as a billed one does —
+            # more so, since it is the figure a caller decides on. Defaulting
+            # here is what stops the next tool from shipping a bare integer.
+            duration_source=QUOTE_DURATION_PROVENANCE if quote else None,
+            resolution_source=QUOTE_RESOLUTION_PROVENANCE if quote else None,
+        ),
+        indent=2,
+    )
+
+
+OMNI_BACKENDS = ("auto", "vertex", "gemini_api")
+
+
+def _parse_omni_backend_env(
+    *, primary_is_vertex: bool, gemini_api_available: bool
+) -> str:
+    """Read and validate OMNI_BACKEND at startup.
+
+    A pin the deployment cannot honour fails here, once, with the variable
+    named -- not on the first omni call, and not by quietly serving the other
+    backend.
+    """
+    raw = os.environ.get("OMNI_BACKEND", "auto").strip().lower() or "auto"
+    if raw not in OMNI_BACKENDS:
+        raise ValueError(
+            f"OMNI_BACKEND={raw!r} is not one of {', '.join(OMNI_BACKENDS)}."
+        )
+    if raw == "vertex" and not primary_is_vertex:
+        raise ValueError(
+            "OMNI_BACKEND=vertex, but this server's primary client is not "
+            "Vertex AI (GOOGLE_GENAI_USE_VERTEXAI is not true)."
+        )
+    if raw == "gemini_api" and primary_is_vertex and not gemini_api_available:
+        raise ValueError(
+            "OMNI_BACKEND=gemini_api, but this Vertex server has no "
+            "GEMINI_API_KEY to reach the Gemini Developer API with."
+        )
+    return raw
+
+
+def _omni_backend_decision(
+    app_ctx: AppContext,
+    *,
+    need_gcs: bool = False,
+    prefer_backend: str | None = None,
+    requested: str | None = None,
+) -> tuple[str, str]:
+    """Which backend an omni call will use, and WHY: ``(backend, reason)``.
+
+    The DECISION, split out from the construction it used to be entangled
+    with. Pre-flights need the answer to apply the right backend's documented
+    limits, and asking for it by building a client meant a yes/no question
+    could construct a Vertex client on the event loop — credential resolution
+    and all, which can reach for the metadata server, and which is not
+    memoized when it fails, so every subsequent call retries and blocks again.
+    A blocked event loop hangs every request in the process, not just this one.
+
+    The reason is part of the answer because the default is not obvious from
+    the outside. On a Vertex-primary server that also holds a GEMINI_API_KEY
+    (any deployment that wants Veo Lite does), omni went to the Gemini
+    Developer API on every call, with nothing an operator or caller could
+    set to keep it in the Vertex project, and the response's ``backend``
+    field said where the call went but not that it could have gone elsewhere.
+    For an enterprise deployment that is a different billing path, quota pool
+    and credential model, chosen silently. ``requested`` is the explicit
+    choice (a tool's ``omni_backend`` or the OMNI_BACKEND default) and is
+    HARD: an unsatisfiable request raises rather than falling through.
+    ``prefer_backend`` is the SOFT continuity hint from a prior interaction's
+    recorded backend, and outranks ``need_gcs`` because an interaction lives
+    on one backend: an id minted by the Developer API does not resolve on
+    Vertex, whereas an unhonoured output_gcs_uri is dropped with a warning and
+    the render still lands.
+    """
+    primary_is_vertex = bool(getattr(app_ctx.client._api_client, "vertexai", False))
+    has_gemini = app_ctx.gemini_api_client is not None
+    if requested == "vertex":
+        if not primary_is_vertex:
+            raise ValueError(
+                "omni_backend=vertex was requested, but this server's primary "
+                "client is not Vertex AI (GOOGLE_GENAI_USE_VERTEXAI is not true)."
+            )
+        return "vertex", "omni_backend=vertex was requested"
+    if requested == "gemini_api":
+        if primary_is_vertex and not has_gemini:
+            raise ValueError(
+                "omni_backend=gemini_api was requested, but this Vertex server "
+                "has no GEMINI_API_KEY to reach the Gemini Developer API with."
+            )
+        return "gemini_api", "omni_backend=gemini_api was requested"
+    if prefer_backend == "vertex" and primary_is_vertex:
+        return "vertex", "continuing an interaction minted on Vertex AI"
+    if prefer_backend == "gemini_api" and (has_gemini or not primary_is_vertex):
+        return "gemini_api", "continuing an interaction minted on the Gemini Developer API"
+    if need_gcs and primary_is_vertex:
+        return "vertex", "output_gcs_uri was given, and GCS delivery is Vertex-only"
+    if has_gemini:
+        if primary_is_vertex:
+            return "gemini_api", (
+                "GEMINI_API_KEY is set, so omni uses the Gemini Developer API (where "
+                "the Interactions API is GA) rather than this server's Vertex "
+                "project; pass omni_backend=\"vertex\", or set OMNI_BACKEND=vertex "
+                "server-wide, to keep omni traffic on Vertex AI"
+            )
+        return "gemini_api", "this server's primary client is the Gemini Developer API"
+    if primary_is_vertex:
+        return "vertex", "no GEMINI_API_KEY is set, and the primary client is Vertex AI"
+    return "gemini_api", "this server's primary client is the Gemini Developer API"
+
+
+def _omni_backend_choice(
+    app_ctx: AppContext,
+    *,
+    need_gcs: bool = False,
+    prefer_backend: str | None = None,
+    requested: str | None = None,
+) -> str:
+    """The backend half of _omni_backend_decision."""
+    return _omni_backend_decision(
+        app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend, requested=requested
+    )[0]
+
+
+async def _resolve_omni_backend(
+    app_ctx: AppContext,
+    omni_backend: str | None,
+    *,
+    need_gcs: bool,
+    previous_interaction_id: str | None,
+) -> tuple[str, str]:
+    """A tool's omni_backend argument, resolved and validated: ``(backend, reason)``.
+
+    ``None`` means the server default (OMNI_BACKEND); ``"auto"`` means the
+    documented preference order. A request that contradicts the backend a
+    prior interaction was minted on is refused here, before anything is
+    billed, because that continuation cannot succeed.
+    """
+    if omni_backend is not None and omni_backend not in OMNI_BACKENDS:
+        raise ValueError(
+            f"omni_backend={omni_backend!r} is not one of {', '.join(OMNI_BACKENDS)}."
+        )
+    effective = omni_backend or app_ctx.omni_backend_default
+    requested = None if effective == "auto" else effective
+    prior = await _prior_interaction_or_empty(app_ctx.videos_dir, previous_interaction_id)
+    if requested is not None and prior.backend and prior.backend != requested:
+        minted_on = "Vertex AI" if prior.backend == "vertex" else "the Gemini Developer API"
+        raise ValueError(
+            f"previous_interaction_id was minted on {minted_on}, and an interaction "
+            f"lives on one backend, so omni_backend={requested} cannot continue it. "
+            "Drop omni_backend, or start a new generation."
+        )
+    backend, reason = _omni_backend_decision(
+        app_ctx, need_gcs=need_gcs, prefer_backend=prior.backend, requested=requested
+    )
+    if omni_backend is None and requested is not None:
+        reason = f"{reason} (OMNI_BACKEND={requested} is this server's default)"
+    return backend, reason
+
+
+def _omni_backend_is_vertex(
+    app_ctx: AppContext, need_gcs: bool = False, prefer_backend: str | None = None
+) -> bool:
+    """Whether the call this pre-flight is checking will run on Vertex AI.
+
+    Reads the same decision the client picker reads, without building
+    anything — see _omni_backend_choice.
+    """
+    return (
+        _omni_backend_choice(app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend)
+        == "vertex"
+    )
+
+
+def _client_for_omni(
+    app_ctx: AppContext,
+    *,
+    need_gcs: bool = False,
+    prefer_backend: str | None = None,
+) -> genai.Client:
+    """Pick the genai.Client for an omni call (Interactions API).
 
     Omni + the Interactions API are documented on BOTH backends: the Gemini
     Developer API (where Interactions is GA) and Vertex AI / Gemini Enterprise
@@ -325,14 +793,24 @@ def _client_for_omni(app_ctx: AppContext, *, need_gcs: bool = False) -> genai.Cl
     GA there, the safest path). Falls back to a global-location Vertex client
     for a Vertex primary (omni's interactions collection is location `global`),
     or the primary client as-is on the Gemini API.
+
+    ``prefer_backend`` overrides all of that, and outranks ``need_gcs``,
+    because an interaction lives on ONE backend: an id minted by the Gemini
+    Developer API does not resolve on Vertex AI. A continuation sent to the
+    other backend fails outright, whereas an unhonored output_gcs_uri is
+    dropped with a warning and the render still lands — so when the two
+    conflict, the one that can still succeed wins. It is honored only where
+    the backend is actually reachable; otherwise the usual choice applies and
+    the call is left to fail with the service's own error rather than one this
+    function invents.
     """
-    primary_is_vertex = getattr(app_ctx.client._api_client, "vertexai", False)
-    if need_gcs and primary_is_vertex:
+    if (
+        _omni_backend_choice(app_ctx, need_gcs=need_gcs, prefer_backend=prefer_backend)
+        == "vertex"
+    ):
         return _get_omni_vertex_global_client()
     if app_ctx.gemini_api_client is not None:
         return app_ctx.gemini_api_client
-    if primary_is_vertex:
-        return _get_omni_vertex_global_client()
     return app_ctx.client
 
 
@@ -341,30 +819,60 @@ async def _omni_generate_and_manifest(
     ctx: Context[ServerSession, AppContext],
     *,
     prompt: str,
+    model: str = DEFAULT_OMNI_MODEL,
     image_bytes_list: list[bytes] | None = None,
+    first_frame_bytes: bytes | None = None,
+    last_frame_bytes: bytes | None = None,
+    reference_image_bytes_list: list[bytes] | None = None,
     input_video_bytes: bytes | None = None,
+    reference_video_bytes_list: list[bytes] | None = None,
     previous_interaction_id: str | None = None,
+    task: str | None = None,
     aspect_ratio: str = "16:9",
-    duration_seconds: float = 6.0,
+    duration_seconds: float | None = 6.0,
+    resolution: str | None = None,
     output_gcs_uri: str | None = None,
-    timeout_seconds: int = 600,
+    prefer_backend: str | None = None,
+    backend_reason: str | None = None,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     manifest_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the omni impl and attach a sidecar manifest, returning the result.
 
-    Shared by generate_video_omni, edit_video, the generate_video draft path,
-    and generate_clip's animatic mode so they all produce consistent output.
+    Shared by generate_video_omni, edit_video, extend_video_omni, the
+    generate_video draft path, and generate_clip's animatic mode so they all
+    produce consistent output.
     """
+    # A continuation has to reach the backend that holds its context, so an
+    # interaction id resolves to a backend before anything else is decided.
+    # Without this the client was chosen from the CURRENT call's needs alone,
+    # and a chain whose last turn wanted GCS output moved to Vertex for that
+    # turn, carrying a previous_interaction_id the Gemini Developer API had
+    # minted and Vertex cannot resolve — every earlier turn billed, the last
+    # one dead. Callers that already know the backend (a chain pins it once)
+    # pass it in rather than re-scanning per turn.
+    prior = await _prior_interaction_or_empty(
+        app_ctx.videos_dir, previous_interaction_id
+    )
+    if prefer_backend is None:
+        prefer_backend = prior.backend
     # Route to the Vertex client when GCS output is requested (delivery only
     # works there), otherwise prefer the Gemini API client.
-    client = _client_for_omni(app_ctx, need_gcs=bool(output_gcs_uri))
+    client = _client_for_omni(
+        app_ctx, need_gcs=bool(output_gcs_uri), prefer_backend=prefer_backend
+    )
+    client_is_vertex = bool(getattr(client._api_client, "vertexai", False))
+    if backend_reason is None:
+        backend_reason = _omni_backend_decision(
+            app_ctx, need_gcs=bool(output_gcs_uri), prefer_backend=prefer_backend
+        )[1]
 
     # GCS delivery only works on Vertex; on the Gemini API omni returns bytes
     # inline. Drop an explicit output_gcs_uri on a non-Vertex omni client with
     # a warning rather than sending an unsupported field.
     effective_gcs = output_gcs_uri
     gcs_warning: str | None = None
-    if output_gcs_uri and not getattr(client._api_client, "vertexai", False):
+    if output_gcs_uri and not client_is_vertex:
         effective_gcs = None
         gcs_warning = (
             "output_gcs_uri is ignored: omni on the Gemini API returns video "
@@ -375,17 +883,64 @@ async def _omni_generate_and_manifest(
         client=client,
         prompt=prompt,
         videos_dir=app_ctx.videos_dir,
+        model=model,
         image_bytes_list=image_bytes_list or None,
+        first_frame_bytes=first_frame_bytes,
+        last_frame_bytes=last_frame_bytes,
+        reference_image_bytes_list=reference_image_bytes_list or None,
         input_video_bytes=input_video_bytes,
+        reference_video_bytes_list=reference_video_bytes_list or None,
         previous_interaction_id=previous_interaction_id,
+        task=task,
         aspect_ratio=aspect_ratio,
         duration_seconds=duration_seconds,
+        resolution=resolution,
         output_gcs_uri=effective_gcs,
+        # A bare delivery='uri' is a Gemini-Developer-API shape: Vertex
+        # requires a gcs_uri alongside it, which is the effective_gcs branch.
+        # Only this layer knows which backend the call landed on.
+        allow_uri_delivery=not client_is_vertex,
         timeout_seconds=timeout_seconds,
         log_callback=ctx.info,
     )
+    if not effective_gcs and wants_uri_delivery(
+        omni_spec(model), resolution, result.get("task")
+    ):
+        # Either way this is worth saying: the render is past the 4 MB inline
+        # response limit the reference warns about, and where it came from is
+        # not where a caller would assume.
+        if not client_is_vertex:
+            # A Google-hosted file this server then downloaded, rather than
+            # base64 in the response. Retention of that file is the service's
+            # business, so a caller who wants the render kept somewhere they
+            # control needs GCS — which needs Vertex.
+            result.setdefault("warnings", []).append(
+                "This render exceeds the 4 MB inline response limit, so it was "
+                "delivered as a Google-hosted URI and downloaded here. On "
+                "Vertex AI, pass output_gcs_uri to have the service write it "
+                "straight to a bucket you control instead."
+            )
+        else:
+            # Vertex has no bare delivery='uri' — the API requires a gcs_uri
+            # alongside it — so there is nothing this layer can substitute.
+            # Silence here left a request that violates the reference's own
+            # rule going out with no disclosure at all.
+            result.setdefault("warnings", []).append(
+                "This render exceeds the 4 MB inline response limit and was "
+                "requested inline anyway: on Vertex AI, URI delivery requires "
+                "a destination bucket. Pass output_gcs_uri to deliver it to "
+                "Cloud Storage, or render at 720p or below."
+            )
     if gcs_warning:
         result.setdefault("warnings", []).append(gcs_warning)
+    # Which backend minted this interaction_id. Read by the caller chaining
+    # onto it, and written into the manifest below. Returned on the result too
+    # because a sidecar is not always written (a remote render, an unwritable
+    # media dir) and a chain must not fall back to re-deciding the backend
+    # from the next turn's needs.
+    result["backend"] = "vertex" if client_is_vertex else "gemini_api"
+    # Not just where the call went, but why -- and how to change it.
+    result["backend_reason"] = backend_reason
     # Cost from the duration the interaction actually rendered (clamped by
     # the impl), not the request — covers omni, edit_video and draft mode.
     # Prefer the rendered artifact over any inference. Everything else here is
@@ -394,18 +949,24 @@ async def _omni_generate_and_manifest(
     # propagates down the whole chain. Measuring settles what actually
     # rendered; an unmeasurable edit bills the service maximum as a labelled
     # upper bound, never a guessed figure presented as fact.
-    raw_duration: Any = result.get("duration_seconds")
-    effective_duration: float | None = (
-        float(raw_duration) if isinstance(raw_duration, (int, float)) else None
+    billed_model = result.get("model") or model
+    # The resolution needs the same treatment the duration got, and for a
+    # sharper reason: `rendered_resolution` was an echo of the REQUEST,
+    # indistinguishable from a report of what rendered, while omni's
+    # per-second rate differs threefold across its tiers. One extra probe on a
+    # file already open turns the billing basis into evidence.
+    facts = await _measure_rendered_video(
+        result,
+        resolution_key="rendered_resolution",
+        requested_resolution=(
+            str(result["rendered_resolution"])
+            if result.get("rendered_resolution")
+            else None
+        ),
     )
-    duration_source: str | None = None
-
-    video_url = result.get("video_url") or ""
-    if isinstance(video_url, str) and video_url.startswith("file://"):
-        measured = await asyncio.to_thread(measure_video_duration, Path(video_url[7:]))
-        if measured is not None:
-            effective_duration = measured
-            duration_source = "measured from the rendered video"
+    effective_duration = facts.duration_seconds
+    duration_source = facts.duration_source
+    resolution_source = facts.resolution_source
 
     # An edit is any turn that continues existing footage — a prior
     # interaction OR an input video — mirroring omni's own _select_task_type.
@@ -415,22 +976,39 @@ async def _omni_generate_and_manifest(
     # which billed the raw request (3.3x low) and labelled it "the length
     # asked for" — the falsified inherit model, resurrected on the second
     # edit form.
-    is_edit = bool(previous_interaction_id) or input_video_bytes is not None
+    # An extension is a continuation like an edit: neither sends a duration,
+    # and the service picks the rendered length.
+    is_edit = (
+        bool(previous_interaction_id)
+        or input_video_bytes is not None
+        or task == "extend"
+    )
     billed_upper_bound = False
     if effective_duration is None and is_edit:
-        # An edit whose render cannot be measured (e.g. gs:// delivery). Two
-        # measurements put the render at Omni's maximum regardless of the
-        # source (3.00s and 3.01s sources both rendered 10.01s), so billing
-        # the source's length here would under-bill ~3.3x — the same falsified
-        # inherit model, resurrected on the one branch measurement cannot
-        # reach. Bill the maximum as an upper bound and label it an estimate.
-        effective_duration = float(OMNI_MAX_DURATION_SECONDS)
+        # A continuation whose render cannot be measured (e.g. gs://
+        # delivery). Two measurements put an EDIT at Omni's per-render maximum
+        # regardless of the source (3.00s and 3.01s sources both rendered
+        # 10.01s), so billing the source's length would under-bill ~3.3x. An
+        # EXTENSION is the other way round: it returns the whole growing clip,
+        # so that same per-render maximum under-bills a chain by up to 3x —
+        # turn four of a chain renders 40s, not 10s. One rule, keyed on which
+        # kind of continuation this was and on the source when it is known.
+        effective_duration = omni_continuation_upper_bound(
+            omni_spec(billed_model),
+            result.get("task"),
+            prior.duration_seconds,
+            # The backend this render actually ran on. The parameter was added
+            # and then passed by no caller, so a Vertex edit of an unrecorded
+            # source delivered to gs:// was still billed at the 10s Developer
+            # API bound (~$1.02) against Vertex's 30s (~$3.04).
+            vertexai=client_is_vertex,
+        )
         billed_upper_bound = True
         duration_source = (
-            "upper bound: the render could not be measured, and an edit's "
-            f"length is chosen by the service, so this bills Omni's "
-            f"{OMNI_MAX_DURATION_SECONDS}s maximum rather than a figure "
-            "inherited from the request or the source"
+            "upper bound: the render could not be measured, and a "
+            "continuation's length is chosen by the service, so this bills "
+            f"the longest clip it could have produced ({effective_duration:g}s) "
+            "rather than a figure inherited from the request"
         )
     elif duration_source is None:
         # Delivered somewhere this process cannot open (a gs:// URI), so the
@@ -445,6 +1023,11 @@ async def _omni_generate_and_manifest(
             "asked for, not the length measured"
         )
 
+    if resolution_source is None:
+        resolution_source = (
+            "the request: the rendered file could not be opened to measure it"
+        )
+    result["resolution_source"] = resolution_source
     duration_is_measured = duration_source == "measured from the rendered video"
     if effective_duration is not None:
         result["duration_seconds"] = effective_duration
@@ -452,11 +1035,19 @@ async def _omni_generate_and_manifest(
         result["duration_source"] = duration_source
 
     cost = _video_cost(
-        result.get("model") or OMNI_MODEL,
+        billed_model,
         effective_duration
         if effective_duration is not None
-        else float(duration_seconds),
-        resolution="720p",
+        else float(
+            duration_seconds
+            if duration_seconds is not None
+            else OMNI_MAX_DURATION_SECONDS
+        ),
+        # What the render actually came back as, not what was asked: the
+        # preview model renders 720p whatever it is sent, and 1.1 reports the
+        # resolution it used. Quoting the request would price a 4K render that
+        # the preview model never produced.
+        resolution=str(result.get("rendered_resolution") or "720p"),
         include_audio=False,
         # Only a measured length is a metered cost; anything else is an
         # estimate and must say so rather than presenting a bound as fact.
@@ -482,7 +1073,15 @@ async def _omni_generate_and_manifest(
         "kind": "omni_video",
         "prompt": prompt,
         "model": result.get("model"),
+        "task": result.get("task"),
+        # Which backend minted this interaction_id. Read back by the next
+        # continuation so a chain cannot drift onto a backend that has never
+        # heard of it.
+        "backend": "vertex" if client_is_vertex else "gemini_api",
+        "backend_reason": backend_reason,
         "aspect_ratio": aspect_ratio,
+        "resolution": result.get("rendered_resolution"),
+        "resolution_source": result.get("resolution_source"),
         "duration_seconds": result.get("duration_seconds", duration_seconds),
         "interaction_id": result.get("interaction_id"),
         "previous_interaction_id": previous_interaction_id,
@@ -491,6 +1090,11 @@ async def _omni_generate_and_manifest(
     }
     if duration_source:
         manifest["duration_source"] = duration_source
+    if result.get("effective_prompt"):
+        # The role declarations the server generated changed what the model
+        # was asked; the sidecar is what an operator reads back later, so the
+        # text that actually rendered belongs in it.
+        manifest["effective_prompt"] = result["effective_prompt"]
     manifest_cost = result.get("cost")
     if manifest_cost:
         # Same as the Veo tools and loop_extend: the sidecar is what an
@@ -510,6 +1114,9 @@ async def _omni_generate_and_manifest(
         # manifest inline so interaction lineage (previous_interaction_id,
         # ignored params) isn't lost. Matches the Veo tools' fallback.
         result["manifest"] = manifest
+        # And keep it findable by id, or the next continuation cannot learn
+        # which backend minted it.
+        _write_remote_interaction_record(app_ctx.videos_dir, manifest)
     return result
 
 
@@ -533,6 +1140,157 @@ async def _emit_warnings(
         await ctx.warning(warning)
 
 
+def _veo_request_mode(
+    *,
+    extend_video_uri: str | None,
+    reference_image_uris: list[str] | None,
+    has_first_frame: bool,
+    has_last_frame: bool,
+) -> str:
+    """The Veo generation mode a request will run in, from the inputs given."""
+    if extend_video_uri:
+        return "extend_video"
+    if reference_image_uris:
+        return "reference_to_video"
+    if has_first_frame and has_last_frame:
+        return "first_last_frame"
+    if has_first_frame:
+        return "image_to_video"
+    return "text_to_video"
+
+
+def _veo_slow_tier_warning(resolution: str | None, timeout_seconds: float) -> str | None:
+    """Warn when the deadline cannot cover the tier being asked for.
+
+    A 4-second 4K render MEASURED 335s end to end. The default deadline is
+    210s, and the MCP host ceiling that default exists to stay under is about
+    240s -- so a 4K render does not fit in one tool call on a typical host at
+    any timeout the host will allow, and the failure arrives as a cancelled
+    call AFTER the render has been billed. Said before the spend, not after.
+    """
+    if str(resolution or "").upper() != "4K":
+        return None
+    if timeout_seconds >= VEO_MEASURED_4K_SECONDS * 1.2:
+        return None
+    return (
+        "4K is the slowest tier: a 4-second 4K render MEASURED "
+        f"{VEO_MEASURED_4K_SECONDS:.0f}s end to end. This call's deadline is "
+        f"{timeout_seconds:g}s, so it will very likely be cut short after the "
+        "render has been billed. Raise timeout_seconds past "
+        f"{VEO_MEASURED_4K_SECONDS * 1.2:.0f}s -- and note that many MCP hosts "
+        "cap a single tool call near 240s, in which case no timeout_seconds "
+        "value will help and 4K cannot be rendered through this tool on that "
+        "host. Render at 1080p, or drive the tool from a client without that "
+        "ceiling."
+    )
+
+
+def _veo_access_advice(exc: BaseException) -> str | None:
+    """Turn a Vertex IAM refusal into the grant that fixes it, or None.
+
+    A 403 from Veo arrives as a wall of SDK traceback ending in a
+    troubleshooter URL, and says nothing about WHICH identity was refused --
+    which is the one fact the operator needs, because the server may be
+    running as a service account they did not expect. omni already does this
+    for its own allowlist refusals (see omni._access_refusal); Veo did not,
+    and a denial on the most expensive tier is the worst place to leave a raw
+    error.
+
+    Deliberately narrow: a 403 that is not an IAM permission denial, and any
+    other status, are left exactly as the service reported them.
+    """
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    text = str(exc)
+    if code != 403 and "PERMISSION_DENIED" not in text:
+        return None
+    if "aiplatform" not in text:
+        return None
+    identity = ""
+    try:
+        found = credentials.service_account_credentials()
+        email = getattr(found[0], "service_account_email", None) if found else None
+        if email:
+            identity = f" The server is authenticating as {email}."
+    except Exception:  # noqa: BLE001 - advice must never mask the real error
+        pass
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    grant = (
+        f"gcloud projects add-iam-policy-binding {project or '<project>'} \\\n"
+        f"    --member=serviceAccount:{'<service-account-email>' if not identity else identity.split()[-1].rstrip('.')} \\\n"
+        "    --role=roles/aiplatform.user"
+    )
+    model_hint = ""
+    match = re.search(r"models/([A-Za-z0-9._-]+)", text)
+    if match:
+        model_hint = f" for {match.group(1)}"
+    return (
+        f"Vertex AI refused this call{model_hint} with "
+        f"aiplatform.endpoints.predict denied.{identity} That message covers two "
+        "different problems, and they have different fixes.\n"
+        "1. The identity lacks the permission. Then EVERY Vertex model fails "
+        "the same way, and the grant is:\n"
+        f"{grant}\n"
+        "2. The identity has it, but this MODEL OR TIER is not enabled for the "
+        "project. Then other models and other resolutions of the same model "
+        "still render, and no IAM change helps -- Veo 4K in particular needs "
+        "per-project access, separate from any role. Request it for the "
+        "project, or render at a tier it already serves.\n"
+        "Tell them apart by rendering the same model at 720p: if that works, "
+        "it is (2). Check too that the Vertex AI API is enabled and that "
+        "GOOGLE_CLOUD_LOCATION names a region serving the model. Nothing was "
+        "rendered or billed."
+    )
+
+
+def _veo_attempt_facts(
+    *,
+    model: str,
+    draft: bool,
+    draft_resolution: str | None,
+    mode: str,
+    duration_seconds: float,
+    resolution: str | None,
+    include_audio: bool,
+) -> dict[str, Any]:
+    """Name what a failed render was trying to do, and what it would have cost.
+
+    Losing the error text on the most expensive tier is the worst place to
+    lose it: a 4K render that outlived the host's ceiling came back as a bare
+    "Tool execution failed" -- no mode, no cost, no operation -- and billed
+    $1.20 anyway. Every failure on this path now names the mode, the model,
+    the resolution and the attempted (quoted) cost, so the spend can be
+    reconciled. Best effort, and never raises: this runs inside an error
+    handler.
+    """
+    facts: dict[str, Any] = {
+        "generation_mode": "draft (omni)" if draft else mode,
+        "model": model,
+        "resolution": resolution or "720p",
+    }
+    try:
+        if draft:
+            est_model, draft_res = _omni_preview_model(draft_resolution)
+            facts["model"] = est_model
+            facts["resolution"] = draft_res or "720p"
+            facts["attempted_cost"] = _video_cost(
+                est_model, float(duration_seconds), resolution=draft_res or "720p",
+                include_audio=False,
+            )
+        else:
+            # The modes with a forced length are priced at it; the others snap.
+            forced = {"reference_to_video": 8.0, "extend_video": 7.0}.get(mode)
+            facts["attempted_cost"] = _video_cost(
+                model,
+                forced if forced is not None else float(duration_seconds),
+                resolution=resolution or "720p",
+                include_audio=include_audio,
+                presnapped=forced is not None,
+            )
+    except Exception:  # noqa: BLE001 - a failure to price must not mask the error
+        facts["attempted_cost"] = None
+    return facts
+
+
 def _draft_ignored_veo_params(
     *,
     seed: int | None,
@@ -545,7 +1303,7 @@ def _draft_ignored_veo_params(
     output_gcs_uri: str | None,
     include_audio: bool,
 ) -> list[str]:
-    """Veo-only params gemini-omni-flash drops on a draft render.
+    """Veo-only params the omni draft model drops on a draft render.
 
     Shared by generate_video's dry_run and real draft paths so a quote
     discloses exactly the ignored paid parameters the real run reports —
@@ -577,15 +1335,13 @@ def _draft_ignored_veo_params(
 
 def _draft_ignored_warning(ignored: list[str]) -> str:
     """The single warning line naming the Veo-only params a draft dropped."""
-    return "draft mode (gemini-omni-flash) ignored Veo-only params: " + ", ".join(
-        ignored
-    )
+    return "draft mode (omni) ignored Veo-only params: " + ", ".join(ignored)
 
 
 def _animatic_mode_warnings(
     *, add_bridges: bool, output_gcs_uri: str | None, include_audio: bool
 ) -> list[str]:
-    """Clip-level params gemini-omni-flash drops in animatic mode.
+    """Clip-level params the omni animatic model drops in animatic mode.
 
     Shared by generate_clip's dry_run and real run so a quote discloses the
     ignored inputs (add_bridges, output_gcs_uri, include_audio) the render
@@ -605,7 +1361,7 @@ def _animatic_mode_warnings(
     if include_audio:
         warnings.append(
             "include_audio is ignored in animatic mode "
-            "(gemini-omni-flash previews carry no controllable audio)."
+            "(omni previews carry no controllable audio)."
         )
     return warnings
 
@@ -638,6 +1394,452 @@ def _validate_aspect_ratio(aspect_ratio: str) -> None:
             f"Unsupported aspect_ratio '{aspect_ratio}'. "
             "Supported values are '16:9' and '9:16'."
         )
+
+
+# Cap on the images one omni request may carry. Every one is buffered whole
+# (each up to MAX_FETCH_BYTES) and base64-inflated into the request body, and
+# the reference's largest worked example uses six.
+MAX_OMNI_INPUT_IMAGES = 8
+
+
+def _omni_preview_model(resolution: str | None) -> tuple[str, str | None]:
+    """The (model, resolution) a draft or animatic pass should render at.
+
+    Asking for a resolution at all means asking for the model that HAS one, so
+    naming a resolution implies gemini-omni-1.1-flash. Leaving it unset takes
+    DEFAULT_OMNI_MODEL at its own default resolution — this is the one knob,
+    not a second model argument to keep in sync.
+
+    That default USED to be the preview model, and this docstring still said
+    so after it moved: the preview endpoint is switched off on
+    OMNI_PREVIEW_SUNSET, so a draft path pinned to it would have started
+    failing on that date. The code was already correct; only the description
+    was stale.
+
+    360p is the point of the knob: it is a third of the 720p price, which is
+    what turns a preview pass from "costs about what the delivery render
+    costs" into a real saving on a 20-beat reel.
+    """
+    if resolution is None:
+        return DEFAULT_OMNI_MODEL, None
+    spec = _validate_omni_model(OMNI_1_1_MODEL)
+    return OMNI_1_1_MODEL, _validate_omni_resolution(spec, resolution)
+
+
+async def _omni_local_reference_video_warnings(
+    ctx: Context[ServerSession, AppContext],
+    spec: Any,
+    uris: list[str],
+) -> list[str]:
+    """The reference-clip ceiling check, run at the PRE-FLIGHT on local files.
+
+    The check itself only ran on the real render, so a 23.02s clip against a
+    documented 3s ceiling drew a clean quote and said nothing — the caller
+    learned about the violation after paying for it. "A dry run is offline" is
+    no defence here: the clip is a local file, and loop_extend's own dry run
+    measures exactly this way. Remote clips are still left to the real run,
+    which is where they are fetched.
+    """
+    warnings: list[str] = []
+    for index, uri in enumerate(uris):
+        measured = await _probe_local_video_seconds(ctx, uri)
+        if measured is not None and measured > (
+            spec.max_reference_video_seconds + _encoder_allowance_seconds()
+        ):
+            warnings.append(_reference_video_over_ceiling(spec, index, measured))
+    return warnings
+
+
+def _reference_video_over_ceiling(spec: Any, index: int, measured: float) -> str:
+    """One wording for the ceiling breach, whichever path found it.
+
+    Shared so a quote and a render cannot describe the same violation
+    differently — the divergence this codebase keeps producing.
+    """
+    return (
+        f"reference_video_uris[{index}] is {measured:.2f}s, over the "
+        f"documented {spec.max_reference_video_seconds:g}s ceiling for "
+        "a video reference; the service may truncate it or refuse the "
+        "request."
+    )
+
+
+async def _omni_reference_video_warnings(spec: Any, clips: list[bytes]) -> list[str]:
+    """Warn about reference clips longer than the documented ceiling.
+
+    "Video references support a maximum of 3 clips, up to 3 seconds each." The
+    count is refused outright (a fourth clip has nowhere to go); an over-long
+    clip is a warning instead, because the reference does not say whether the
+    service truncates it or rejects the request, and guessing wrong would
+    refuse a call that works.
+
+    Each probe spawns an ffmpeg subprocess, so it goes off the loop like every
+    other probe in this server. Run inline, three reference clips on a slow
+    mount would block every other request in flight — the exact hazard
+    _source_duration_or_none is built around.
+    """
+    warnings: list[str] = []
+    for index, clip in enumerate(clips):
+        measured = await _probe_media(measure_video_duration_bytes, clip)
+        if measured is not None and measured > (
+            spec.max_reference_video_seconds + _encoder_allowance_seconds()
+        ):
+            warnings.append(_reference_video_over_ceiling(spec, index, measured))
+    return warnings
+
+
+def _encoder_allowance_seconds() -> float:
+    """One frame, for ceilings compared against a measured file (see #14)."""
+    from .pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
+    return float(OMNI_ENCODER_ALLOWANCE_SECONDS)
+
+
+async def _check_omni_source_video(
+    spec: Any, data: bytes, *, vertexai: bool = False
+) -> list[str]:
+    """Refuse an uploaded source longer than omni will accept; else warn-free.
+
+    "Input videos for editing and extension must be 10 seconds or less when
+    uploading (unless extending videos generated by the model in multi-turn)."
+    That is a measurable property of the bytes in hand, so it is checked
+    before anything is uploaded or billed rather than left to a 400 after the
+    transfer. A probe that cannot read the clip returns None and the call
+    proceeds — an unreadable container is not evidence of an over-long one.
+
+    A model that documents no such ceiling gets no check. Reading the absent
+    value as a limit of zero seconds refused EVERY input video on
+    gemini-omni-flash-preview — which was the default model at the time, and
+    whose input_video_uri path had always worked — with "must be 0s or
+    shorter".
+
+    The ceiling itself is the BACKEND's: the Developer API documents 10s "when
+    uploading", Vertex documents 1-30s for the same operation. Applying the
+    stricter figure to both refused a legitimate 20s Vertex source.
+
+    Returns an empty list; it exists to raise, and returns a warning list so
+    the call sites read like the other pre-flights.
+    """
+    from .pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
+    limit = omni_source_limit_seconds(spec, vertexai=vertexai)
+    if not limit:
+        return []
+    measured = await _probe_media(measure_video_duration_bytes, data)
+    # One frame of tolerance. This server's own 10s omni renders measure
+    # 10.01s (pricing.py documents the allowance for exactly that reason), so
+    # a strict comparison refused to edit or extend a file this server had
+    # just produced, at all four call sites, on both dry_run and real run.
+    if measured is not None and measured > limit + OMNI_ENCODER_ALLOWANCE_SECONDS:
+        raise ValueError(
+            f"The source video is {measured:.2f}s. An UPLOADED video to edit "
+            f"or extend must be {limit:g}s or shorter on "
+            f"{'Vertex AI' if vertexai else 'the Gemini Developer API'}. "
+            "Extend a clip this server generated instead (pass its "
+            "previous_interaction_id, which has no such limit), or trim the "
+            "source first."
+        )
+    return []
+
+
+def _omni_cumulative_cap_warning(
+    spec: Any, source_seconds: float, times: int, planned_turns: int
+) -> list[str]:
+    """Warn when omni's 40s ceiling cuts a chain of extensions short.
+
+    Two distinct things go wrong at the ceiling, and they need different
+    warnings:
+
+    * turns that cannot run at all, because the clip is already at the
+      ceiling when they come up -- a count the caller did not choose;
+    * a chain where every turn runs but the last cannot append a full step,
+      so the finished clip is shorter than "source + turns x 10s" -- a length
+      the caller did not choose.
+
+    A warning rather than a refusal in both cases: the turns that fit still
+    render, so there is no failure to report.
+
+    This used to hedge ("later turns may be refused or truncated by the
+    service"), because the quote clamped the chain at the ceiling while the
+    render looped the full ``times`` regardless. That disagreement was the
+    defect: a 10s source with ``times=4`` was quoted for 3 turns (~$9.14) and
+    billed for 4 (~$13.19), and because ``max_cost_usd`` was projected off the
+    clamped list, a $10 cap passed and then billed ~$14. Both paths stop at
+    ``planned_turns`` now, so this states what happens instead of guessing.
+
+    Args:
+        planned_turns: Turns that fit under the ceiling -- what both the quote
+            and the render will actually do.
+    """
+    ceiling = spec.max_extended_seconds
+    if planned_turns < times:
+        # Turns that cannot run at all: the clip reaches the ceiling before
+        # the chain is done, so the rest would append nothing.
+        dropped = times - planned_turns
+        return [
+            f"The source is {source_seconds:g}s, so only {planned_turns} of the "
+            f"{times} requested turn(s) fit under {spec.model}'s documented "
+            f"{ceiling}s ceiling for an extended video. The remaining "
+            f"{dropped} turn(s) would append nothing to a clip already at the "
+            "ceiling, so they are not rendered and not billed."
+        ]
+    projected = source_seconds + float(spec.extension_step_seconds) * times
+    if projected > ceiling:
+        # Every turn runs, but the last one cannot append a full step: the
+        # ceiling is on the assembled clip, so the finished video stops there.
+        # Distinct from the case above -- nothing is dropped, so this is about
+        # the LENGTH the caller gets, not the number of turns.
+        return [
+            f"The source is {source_seconds:g}s and {times} turn(s) would append "
+            f"up to {float(spec.extension_step_seconds) * times:g}s, reaching "
+            f"{projected:g}s against omni's documented {ceiling}s ceiling — so "
+            f"the assembled clip stops at {ceiling}s and the last turn appends "
+            f"less than a full {spec.extension_step_seconds:g}s step. The quote "
+            f"clamps each turn at {ceiling}s."
+        ]
+    return []
+
+
+def _omni_extension_quote(
+    model: str, resolution: str, turn_lengths: list[float]
+) -> dict[str, Any] | None:
+    """Quote one omni extension turn per entry in ``turn_lengths``, or None.
+
+    One estimate per TURN, then summed, for two separate reasons. Quoting the
+    combined runtime as a single render loses a per-render encoder allowance
+    for every turn but the first, which put this quote a hair under the
+    planner's figure for the same plan. And the turns are not the same length:
+    an extension returns the whole growing clip, so turn 2 renders (and bills)
+    longer than turn 1 — see omni_extension_output_lengths.
+    """
+    try:
+        from .pricing import sum_costs
+
+        per_turn = [
+            _video_cost_estimate(
+                model,
+                length,
+                resolution=resolution,
+                include_audio=False,
+                presnapped=True,
+            )
+            for length in turn_lengths
+        ]
+        if not per_turn or any(estimate is None for estimate in per_turn):
+            return None
+        return _cost_payload(sum_costs(per_turn, label="extension"))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not quote omni extension cost", exc_info=True)
+        return None
+
+
+def _sum_omni_segment_costs(
+    segments: list[dict[str, Any]], *, model: str, resolution: str
+) -> dict[str, Any] | None:
+    """Total the per-turn costs of a chained omni run, or None.
+
+    Priced turn by turn rather than by summing the runtime: each turn is its
+    own render with its own metered-or-bounded length, and a measured turn
+    must not be re-priced as an estimate just because the turn beside it was
+    unmeasurable. Mirrors the per-beat totalling in _assemble_clip_manifest.
+    """
+    try:
+        from .pricing import sum_costs
+
+        estimates = [
+            _video_cost_estimate(
+                str(seg.get("model") or model),
+                float(seg.get("duration_seconds") or OMNI_MAX_DURATION_SECONDS),
+                resolution=str(seg.get("rendered_resolution") or resolution),
+                include_audio=False,
+                actual=_segment_is_metered(seg),
+                presnapped=not _segment_is_metered(seg),
+            )
+            for seg in segments
+            if seg.get("video_url")
+        ]
+        if not estimates:
+            return None
+        return _cost_payload(sum_costs(estimates, label="extension"))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not total omni extension cost", exc_info=True)
+        return None
+
+
+def _validate_omni_model(omni_model: str) -> Any:
+    """Return the spec for ``omni_model``, or raise naming the alternatives.
+
+    Front-loaded like every other video pre-flight: a typo'd model must fail
+    before any fetch, and before a dry_run quotes a model that cannot run.
+    """
+    if not is_omni_model(omni_model):
+        raise ValueError(
+            f"Unsupported omni_model '{omni_model}'. "
+            f"Supported values are {', '.join(OMNI_MODELS)}."
+        )
+    refusal = omni_model_refusal(omni_model)
+    if refusal:
+        # A dead endpoint must fail here, where it is free, not after a fetch.
+        raise ValueError(refusal)
+    return omni_spec(omni_model)
+
+
+def _omni_requested_model(requested: str, spec: Any) -> dict[str, str]:
+    """`requested_model` for a response, or nothing when no ID was folded."""
+    return {"requested_model": str(requested)} if str(requested) != spec.model else {}
+
+
+def _validate_omni_resolution(spec: Any, resolution: str | None) -> str | None:
+    """Normalize a requested omni resolution, or raise.
+
+    Refusing beats dropping: the preview model renders 720p whatever it is
+    asked for, so silently accepting `resolution='4K'` there would quote and
+    bill a render nobody can produce.
+    """
+    if resolution is None:
+        return None
+    if not spec.supports_resolution:
+        raise ValueError(
+            f"{spec.model} has no resolution parameter — it renders "
+            f"{spec.rendered_resolution} only. Pass "
+            f"omni_model='{OMNI_1_1_MODEL}' to choose a resolution."
+        )
+    normalized = normalize_omni_resolution(resolution)
+    if normalized is None or normalized not in spec.resolutions:
+        raise ValueError(
+            f"Unsupported resolution '{resolution}' for {spec.model}. "
+            f"Supported values are {', '.join(spec.resolutions)}."
+        )
+    return normalized
+
+
+def _omni_billed_resolution(spec: Any, resolution: str | None) -> str:
+    """The resolution an omni quote should price, given what was asked.
+
+    The preview model bills at what it renders (720p) no matter what the
+    request said; 1.1 bills at the resolution it is given, defaulting to the
+    documented 720p when none is.
+    """
+    if not spec.supports_resolution:
+        return spec.rendered_resolution
+    return resolution or spec.rendered_resolution
+
+
+async def _probe_local_video_seconds(
+    ctx: Context[ServerSession, AppContext],
+    uri: str | None,
+) -> float | None:
+    """Duration of a LOCAL video for a pre-flight or a projection, or None.
+
+    Path-based: ffprobe reads the container header, so there is no reason to
+    load the whole file — up to the 50 MB fetch cap — into memory first, which
+    is what routing this through the bytes fetch did. Containment is enforced
+    the same way every other caller-supplied path is. Never raises: a source
+    that cannot be probed falls back to a labelled floor, not a failure.
+    """
+    if not uri or not uri.startswith("file://"):
+        return None
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        path = _validate_local_path(Path(uri[7:]), app_ctx.data_folder)
+    except Exception:
+        logger.debug("Could not resolve %s for a probe", uri, exc_info=True)
+        return None
+    return await _probe_media(measure_video_duration, path)
+
+
+async def _extension_source_seconds(
+    ctx: Context[ServerSession, AppContext],
+    uri: str | None,
+    *,
+    allow_remote: bool,
+) -> float | None:
+    """Length of an extension source, or None.
+
+    Local always. Remote only on a REAL run: a dry run is documented free,
+    instant and offline, so it does not download — but a real run is already
+    committing to a render, and a capped read of the source is the difference
+    between a labelled floor and a projection. On Vertex this is the common
+    case, not an edge one: extension REQUIRES a GCS destination there, so the
+    source is usually gs:// too, and quoting the appended 7s against a 4s
+    source under-states the bill by 57%.
+
+    Never raises: a source that cannot be read falls back to the floor.
+    """
+    if not uri:
+        return None
+    local = await _probe_local_video_seconds(ctx, uri)
+    if local is not None or not allow_remote or uri.startswith("file://"):
+        return local
+    app_ctx = ctx.request_context.lifespan_context
+    try:
+        data = await fetch(
+            uri,
+            allowed_dir=app_ctx.data_folder,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+    except Exception:
+        logger.debug(
+            "Could not read %s to measure an extension source", uri, exc_info=True
+        )
+        return None
+    if data is None:
+        return None
+    return await _probe_media(measure_video_duration_bytes, data)
+
+
+async def _fetch_local_source(
+    ctx: Context[ServerSession, AppContext],
+    uri: str,
+) -> bytes | None:
+    """Read a LOCAL source for a pre-flight, or None.
+
+    Used by both families: a dry run is documented as free, instant and
+    offline, so it reads a file:// source the caller already has and leaves
+    gs:// and http(s):// to the real run. Never raises: a quote that cannot open the file falls back
+    to the documented maximum and says so, rather than failing a call that
+    generates nothing.
+    """
+    if not uri.startswith("file://"):
+        return None
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        return await fetch(
+            uri,
+            allowed_dir=app_ctx.data_folder,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        )
+    except Exception:
+        logger.debug("Could not read %s for a pre-flight", uri, exc_info=True)
+        return None
+
+
+async def _fetch_omni_media(
+    ctx: Context[ServerSession, AppContext],
+    uri: str,
+    param: str,
+) -> bytes:
+    """Fetch one omni input, or raise a message naming the parameter."""
+    app_ctx = ctx.request_context.lifespan_context
+    data = await fetch(
+        uri,
+        allowed_dir=app_ctx.data_folder,
+        allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+    )
+    if data is None:
+        raise ValueError(_fetch_failure(param, uri, app_ctx.data_folder))
+    return data
+
+
+async def _fetch_optional_omni_media(
+    ctx: Context[ServerSession, AppContext],
+    uri: str | None,
+    param: str,
+) -> bytes | None:
+    """Same, for an input the caller may simply not have supplied."""
+    if uri is None:
+        return None
+    return await _fetch_omni_media(ctx, uri, param)
 
 
 def _fetch_failure(param: str, uri: str, data_dir: Path) -> str:
@@ -798,19 +2000,24 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     images_dir.mkdir(parents=True, exist_ok=True)
     videos_dir.mkdir(parents=True, exist_ok=True)
 
-    # The credential file is written BEFORE the client is built, and building
-    # a Vertex client can fail (bad service-account JSON, no ambient project).
-    # With the write outside the try, that failure left the service-account
-    # private key in /tmp — and on an HTTP transport the lifespan re-runs per
-    # connection, so a misconfigured server that stays up accumulated one
-    # leaked key file per connection attempt. Everything that can fail after
-    # the write now lives under the finally.
+    # Validates the inline service-account JSON before any client is built,
+    # so a broken credential fails here and names its variable. Nothing is
+    # written: credentials are a process-wide object now (see
+    # _service_account_credentials), because on an HTTP transport this
+    # lifespan runs once PER SESSION and a per-session temp file was deleted
+    # from under every other live session on teardown.
     temp_creds_path = setup_vertex_credentials()
     try:
         client = create_client()
         gemini_api_client = create_gemini_api_client()
         video_gcs_bucket = os.environ.get("VIDEO_GCS_BUCKET")
         allowed_gcs_buckets = _compute_allowed_gcs_buckets()
+        omni_backend_default = _parse_omni_backend_env(
+            primary_is_vertex=bool(
+                getattr(getattr(client, "_api_client", None), "vertexai", False)
+            ),
+            gemini_api_available=gemini_api_client is not None,
+        )
 
         yield AppContext(
             data_folder=data_folder,
@@ -821,6 +2028,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             temp_creds_path=temp_creds_path,
             video_gcs_bucket=video_gcs_bucket,
             allowed_gcs_buckets=allowed_gcs_buckets,
+            omni_backend_default=omni_backend_default,
         )
     finally:
         cleanup_credentials(temp_creds_path)
@@ -860,7 +2068,9 @@ def _read_thought_signature(path: Path, allowed_dir: Path) -> str:
     if size > MAX_THOUGHT_SIGNATURE_BYTES:
         raise ValueError(
             f"thought_signature_url file is {size} bytes, over the "
-            f"{MAX_THOUGHT_SIGNATURE_BYTES}-byte cap: {path}"
+            f"{MAX_THOUGHT_SIGNATURE_BYTES}-byte cap: {path}. Signatures the "
+            "server writes are a few megabytes; a file this size is more "
+            "likely a rendered image or video than a signature."
         )
     return validated.read_text()
 
@@ -880,12 +2090,28 @@ def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     and GKE — so `http://100.64.1.1/` was fetched and its content returned to
     the caller. `is_global` is the allowlist form of the same question and
     closes the whole class, including ranges IANA has not allocated yet.
+
+    `is_global` alone is NOT sufficient, though, and the enumeration it
+    replaced was right about one flag: `is_reserved`. CPython reports
+    `is_global=True` for the IPv6 ranges that embed an IPv4 destination, so
+    dropping `is_reserved` reopened the exact hole this guard exists to
+    close. `64:ff9b::a9fe:a9fe` is NAT64-mapped 169.254.169.254 -- the cloud
+    metadata service -- and on any host with a NAT64/DNS64 route (the
+    IPv6-only pod case) it reaches it and returns the body. `::7f00:1` and
+    `::a00:1` (IPv4-compatible, deprecated but still routed by some stacks)
+    and `5f00::/16` are the same shape. None is `is_private`, `is_loopback`
+    or `is_link_local`; every one is `is_reserved`. Checked the other way
+    too: no real public address is `is_reserved`, so this costs nothing.
     """
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         # ::ffff:a.b.c.d reaches the same host as a.b.c.d, so it must be
         # judged as the IPv4 address it wraps rather than as an IPv6 one.
         ip = mapped
+    if ip.is_reserved:
+        # See the docstring: the IPv4-embedding IPv6 ranges are is_global=True,
+        # so this is the only check standing between them and a fetch.
+        return False
     if getattr(ip, "is_site_local", False):
         # Deprecated IPv6 site-local (fec0::/10) is absent from CPython's
         # private-networks table, so `is_global` reports it as public even on
@@ -1061,7 +2287,12 @@ def _get_storage_client() -> storage.Client:
     global _storage_client
     with _storage_client_lock:
         if _storage_client is None:
-            _storage_client = storage.Client()
+            found = _service_account_credentials()
+            if found is not None:
+                creds, project = found
+                _storage_client = storage.Client(credentials=creds, project=project)
+            else:
+                _storage_client = storage.Client()
         return _storage_client
 
 
@@ -1246,10 +2477,6 @@ def _image_cost(
     return _cost_payload(_image_cost_estimate(model, image_size, usage=usage, n=n))
 
 
-# Bounds on the sidecar scan behind an edit_video quote. A media directory is
-# user-controlled and may sit on a network mount, so the lookup is capped in
-# every dimension rather than trusted to finish.
-_SIDECAR_SCAN_LIMIT = 200
 _SIDECAR_MAX_BYTES = 256 * 1024
 _SIDECAR_SCAN_TIMEOUT_SECONDS = 5.0
 
@@ -1269,6 +2496,75 @@ _SIDECAR_SCAN_TIMEOUT_SECONDS = 5.0
 _PROBE_EXECUTOR_MAX_WORKERS = 4
 _probe_executor: ThreadPoolExecutor | None = None
 _probe_executor_lock = threading.Lock()
+
+# Media probes get their own pool for the same reason, one step further out.
+# Each one shells out to ffmpeg through imageio; a malformed or half-written
+# file, a stalled mount or a container under memory pressure can leave that
+# subprocess unreaped and the worker parked, and a parked worker cannot be
+# cancelled. Run on asyncio.to_thread — which is what these did — they draw on
+# the loop's single shared default executor, the same twelve threads every
+# fetch, every image render and every frame extraction also use, so a burst of
+# probes can starve work that has nothing to do with media at all.
+#
+# Sized above the probe pool because probes are per-CALL (one duration, one
+# dimension, one per reference clip) rather than per-request, and a chained
+# extension issues several in a row.
+_MEDIA_PROBE_MAX_WORKERS = 6
+_MEDIA_PROBE_TIMEOUT_SECONDS = 30.0
+_media_probe_executor: ThreadPoolExecutor | None = None
+_media_probe_lock = threading.Lock()
+
+
+def _get_media_probe_executor() -> ThreadPoolExecutor:
+    """Return the process-wide media-probe pool, created on first use."""
+    global _media_probe_executor
+    with _media_probe_lock:
+        if _media_probe_executor is None:
+            _media_probe_executor = ThreadPoolExecutor(
+                max_workers=_MEDIA_PROBE_MAX_WORKERS,
+                thread_name_prefix="media-probe",
+            )
+        return _media_probe_executor
+
+
+async def _decode_media(func: Any, /, *args: Any) -> Any:
+    """Run one ffmpeg-backed DECODE off the loop, bounded and deadlined.
+
+    Same pool as _probe_media, opposite error contract: frame extraction has
+    no honest "not measured" answer — a bridge without its endpoints is not a
+    degraded bridge, it is a different render — so a failure propagates to the
+    per-beat handler that already knows what to do with it.
+    """
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(_get_media_probe_executor(), func, *args),
+        timeout=_MEDIA_PROBE_TIMEOUT_SECONDS,
+    )
+
+
+async def _probe_media(func: Any, /, *args: Any) -> Any:
+    """Run one ffmpeg-backed probe off the loop, bounded and deadlined.
+
+    Returns None on timeout rather than raising: every caller of these probes
+    already treats "not measured" as a legitimate answer and reports it as
+    such, so a slow probe degrades the provenance of a figure instead of
+    failing a render that has already been paid for.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_get_media_probe_executor(), func, *args),
+            timeout=_MEDIA_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            "Media probe %s timed out or failed after %.0fs; continuing without "
+            "a measurement",
+            getattr(func, "__name__", func),
+            _MEDIA_PROBE_TIMEOUT_SECONDS,
+            exc_info=True,
+        )
+        return None
 
 
 def _get_probe_executor() -> ThreadPoolExecutor:
@@ -1298,9 +2594,9 @@ def _source_duration_for_interaction(
     Hardened because the media directory is caller-controlled and may live on
     a network mount: a named pipe among the sidecars made ``read_text`` block
     forever, hanging every edit_video quote. Only regular files are opened,
-    reads are size-capped, and the scan stops after a fixed number of
-    candidates. Anything unreadable is skipped, never fatal — the caller's
-    fallback already reports an unknown source honestly.
+    reads are size-capped, and the index is consulted before any scan.
+    Anything unreadable is skipped, never fatal — the caller's fallback
+    already reports an unknown source honestly.
 
     Args:
         videos_dir: Directory the video sidecars are written to.
@@ -1309,6 +2605,76 @@ def _source_duration_for_interaction(
     Returns:
         The recorded duration in seconds, or None if it cannot be determined.
     """
+    manifest = _manifest_for_interaction(videos_dir, interaction_id)
+    if manifest is None:
+        return None
+    if str(manifest.get("duration_source", "")).startswith("upper bound"):
+        # That render's length was never established — the manifest holds
+        # the billing ceiling. Reporting it as the source's real length
+        # would launder a bound into a fact one hop later.
+        return None
+    duration = manifest.get("duration_seconds")
+    if isinstance(duration, (int, float)) and duration > 0:
+        return float(duration)
+    return None
+
+
+def _manifest_for_interaction(
+    videos_dir: Path, interaction_id: str
+) -> dict[str, Any] | None:
+    """The newest sidecar manifest naming ``interaction_id``, or None.
+
+    The hardened half of the lookup above, split out because a second caller
+    needs a different field off the same record: which backend the interaction
+    was created on. The scan stays paranoid — the media directory is
+    caller-controlled and may live on a network mount, so only regular files
+    are opened, reads are size-capped, and anything unreadable is skipped
+    rather than raised. The scan reads every candidate -- an earlier cap of
+    200 on the reads made it lose any record older than that, and a lookup
+    that answers None for an id the directory holds is not bounded, it is
+    wrong. A hit backfills the index, so the full walk is paid once per id.
+
+    The index is tried first. Before it existed, an interaction past the
+    newest 200 sidecars returned None from a directory that plainly contained
+    it -- and every fact `PriorInteraction` exists to carry went with it:
+    `prefer_backend` fell back to None, so the last turn of a chain carrying
+    output_gcs_uri could be routed to Vertex holding a Gemini-API-minted id
+    (the exact failure PriorInteraction was added to fix), and
+    extend_video_omni's `prior.model != spec.model` refusal was disabled too.
+    """
+    entry_path = _interaction_index_path(videos_dir, interaction_id)
+    try:
+        entry_stat = entry_path.stat()
+        if S_ISREG(entry_stat.st_mode) and entry_stat.st_size <= _SIDECAR_MAX_BYTES:
+            entry = json.loads(entry_path.read_text())
+            # The id is re-checked against the manifest below, so a truncated
+            # digest that collided would fall through to the scan rather than
+            # return the wrong interaction.
+            if isinstance(entry, dict) and isinstance(entry.get("manifest"), dict):
+                # A remote delivery: the manifest lives in the entry, there
+                # being no local sidecar to point at.
+                inline = entry["manifest"]
+                if inline.get("interaction_id") == interaction_id:
+                    return inline
+            if isinstance(entry, dict) and isinstance(entry.get("sidecar"), str):
+                # Name only: joining a stored path would let a tampered index
+                # read outside the media directory.
+                named = videos_dir / Path(str(entry["sidecar"])).name
+                named_stat = named.stat()
+                if S_ISREG(named_stat.st_mode) and (
+                    named_stat.st_size <= _SIDECAR_MAX_BYTES
+                ):
+                    manifest = json.loads(named.read_text())
+                    if (
+                        isinstance(manifest, dict)
+                        and manifest.get("interaction_id") == interaction_id
+                    ):
+                        return manifest
+    except (OSError, ValueError):
+        # No index entry, an unreadable one, or a sidecar that has since been
+        # deleted: fall through to the scan.
+        pass
+
     candidates: list[tuple[float, Path]] = []
     try:
         for entry in videos_dir.glob("*.json"):
@@ -1327,22 +2693,77 @@ def _source_duration_for_interaction(
     # Newest first: an interaction id is chained forward by edits, so the most
     # recent manifest naming it is the closest ancestor of this edit.
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    for _mtime, sidecar in candidates[:_SIDECAR_SCAN_LIMIT]:
+    # Every candidate, not the newest 200. That cap made the scan bounded and
+    # wrong: a directory with more than 200 renders written
+    # before the index existed could not find any older one, and the first
+    # version of the index left that as it was while claiming the scan was
+    # "still correct for everything written before the index existed". Reads
+    # stay size-capped and regular-file-only; a hit writes the index entry the
+    # record never had, so this full walk happens at most once per id.
+    for _mtime, sidecar in candidates:
         try:
             manifest = json.loads(sidecar.read_text())
         except (OSError, ValueError):
             continue
-        if manifest.get("interaction_id") != interaction_id:
+        if not isinstance(manifest, dict):
             continue
-        if str(manifest.get("duration_source", "")).startswith("upper bound"):
-            # That render's length was never established — the manifest holds
-            # the billing ceiling. Reporting it as the source's real length
-            # would launder a bound into a fact one hop later.
-            continue
-        duration = manifest.get("duration_seconds")
-        if isinstance(duration, (int, float)) and duration > 0:
-            return float(duration)
+        if manifest.get("interaction_id") == interaction_id:
+            _write_interaction_index(sidecar, manifest)
+            return manifest
     return None
+
+
+@dataclass(frozen=True)
+class PriorInteraction:
+    """What this server recorded about an interaction it is asked to continue.
+
+    Three facts, one sidecar scan, because a continuation needs all of them
+    and the scan is the expensive part:
+
+    * ``backend`` — an interaction lives on ONE backend: an id minted by the
+      Gemini Developer API does not resolve on Vertex AI and vice versa. But
+      _client_for_omni picks from the CURRENT call's needs, chiefly whether it
+      wants GCS output, so without this a continuation could be sent somewhere
+      the interaction it names has never existed.
+    * ``model`` — extension exists on one omni model. Continuing a
+      preview-model interaction under a 1.1 request would go out as a bare
+      conversational edit (the task cannot ride alongside a
+      previous_interaction_id) and be billed as an extension.
+    * ``duration_seconds`` — the source's real length, which bounds what a
+      continuation delivered somewhere unmeasurable could have rendered.
+
+    Every field is None when nothing was recorded (an older sidecar, a remote
+    render that never got one), in which case the caller falls back rather
+    than refusing.
+    """
+
+    backend: str | None = None
+    model: str | None = None
+    duration_seconds: float | None = None
+
+
+def _prior_interaction(videos_dir: Path, interaction_id: str) -> PriorInteraction:
+    """Read back what was recorded about ``interaction_id``."""
+    manifest = _manifest_for_interaction(videos_dir, interaction_id)
+    if manifest is None:
+        return PriorInteraction()
+    backend = manifest.get("backend")
+    model = manifest.get("model")
+    duration = manifest.get("duration_seconds")
+    if str(manifest.get("duration_source", "")).startswith("upper bound"):
+        # That render's length was never established; the manifest holds a
+        # billing ceiling. Passing it on as a measured length would launder a
+        # bound into a fact one hop later.
+        duration = None
+    return PriorInteraction(
+        backend=backend if backend in ("vertex", "gemini_api") else None,
+        model=model if is_omni_model(model) else None,
+        duration_seconds=(
+            float(duration)
+            if isinstance(duration, (int, float)) and duration > 0
+            else None
+        ),
+    )
 
 
 async def _source_duration_or_none(
@@ -1389,6 +2810,43 @@ async def _source_duration_or_none(
             exc_info=True,
         )
         return None
+
+
+async def _prior_interaction_or_empty(
+    videos_dir: Path, interaction_id: str | None
+) -> PriorInteraction:
+    """Run the sidecar lookup off the event loop, with a deadline.
+
+    Same reasoning as _source_duration_or_none: bounded or not, this is
+    filesystem work on a caller-controlled directory that may live on a slow
+    mount, and one blocked coroutine blocks every request. A timeout degrades
+    to "nothing recorded" — the fallbacks each caller already has — rather
+    than hanging a call.
+    """
+    if not interaction_id:
+        return PriorInteraction()
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                _get_probe_executor(),
+                _prior_interaction,
+                videos_dir,
+                interaction_id,
+            ),
+            timeout=_SIDECAR_SCAN_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        # Deliberately broad, for the same reason the duration lookup is: the
+        # fallbacks are what this server would have done anyway.
+        logger.warning(
+            "Sidecar lookup for interaction %s failed or exceeded %.0fs; "
+            "continuing without what it recorded",
+            interaction_id,
+            _SIDECAR_SCAN_TIMEOUT_SECONDS,
+            exc_info=True,
+        )
+        return PriorInteraction()
 
 
 def _video_cost_estimate(
@@ -1462,7 +2920,7 @@ def _segment_is_metered(segment: dict[str, Any]) -> bool:
     """
     if segment.get("duration_source") == "measured from the rendered video":
         return True
-    return str(segment.get("model") or "") != OMNI_MODEL
+    return not is_omni_model(str(segment.get("model") or ""))
 
 
 def _video_cost(
@@ -1571,6 +3029,21 @@ _SHOT_KEY_SUGGESTIONS: dict[str, str] = {
 }
 
 
+def _clip_total_source(segments: list[dict[str, Any]]) -> str:
+    """Where a clip's total_duration_seconds comes from.
+
+    The total was a bare sum of the snapped requests while every segment
+    beside it carried a duration_source; a number without a source cannot be
+    told apart from a measured one.
+    """
+    sources = [str(seg.get("duration_source") or "") for seg in segments]
+    if sources and all(src.startswith("measured") for src in sources):
+        return "sum of the measured segment durations"
+    if not any(src.startswith("measured") for src in sources):
+        return "sum of the snapped requested beat lengths and fixed 4s bridges, not measured"
+    return "sum of measured and unmeasured segments; see each segment's duration_source"
+
+
 def _assemble_clip_manifest(
     *,
     aspect_ratio: str,
@@ -1596,6 +3069,7 @@ def _assemble_clip_manifest(
         "animatic": animatic,
         "segments": segments,
         "total_duration_seconds": total_duration,
+        "total_duration_source": _clip_total_source(segments),
         "beat_count": beat_count,
     }
     # Total what the segments actually rendered, segment by segment —
@@ -1607,7 +3081,7 @@ def _assemble_clip_manifest(
             _video_cost_estimate(
                 seg.get("model", beat_model),
                 float(seg.get("duration_seconds") or 0),
-                resolution="720p",
+                resolution=str(seg.get("resolution") or "720p"),
                 include_audio=bool(seg.get("audio_enabled", include_audio)),
                 actual=_segment_is_metered(seg),
                 presnapped=not _segment_is_metered(seg),
@@ -1630,6 +3104,143 @@ def _assemble_clip_manifest(
     return manifest
 
 
+class _ExtensionBilling(NamedTuple):
+    """How a Veo extension should be billed, and on what evidence."""
+
+    billed_seconds: float
+    turn_output_seconds: list[float]
+    appended_seconds: float
+    duration_source: str
+    is_metered: bool
+    warning: str | None
+
+
+def veo_extension_billing(
+    *,
+    turns: int,
+    measured_turns: list[float] | None = None,
+    source_seconds: float | None = None,
+) -> _ExtensionBilling:
+    """Bill a Veo extension for what it renders, on the best evidence to hand.
+
+    MEASURED: a Veo turn renders and bills the ASSEMBLED clip, so turn i is
+    the source plus 7s per turn and a chain costs the SUM of those lengths.
+    Billing the appended footage alone under-billed a single 4s-source
+    extension by 57%.
+
+    Three tiers, best evidence first: every turn measured, else a projection
+    from a measured source, else the appended footage as a labelled floor. The
+    projection matters because only the OUTPUT of a GCS-delivered render is out
+    of reach — a local source still pins every turn's length, and skipping
+    straight to the floor made a real run report less than its own pre-flight.
+
+    Shared, because this is the second path to need it. generate_video's
+    extend_video_uri mode had none of it: it billed the appended footage,
+    asserted is_estimate=False for a file it never opened, and labelled the
+    figure with the TEXT-TO-VIDEO rule ("Veo renders exactly the length it is
+    sent") in the one mode where that rule is known to be false. Two
+    implementations of one service's billing is what produced that.
+    """
+    measured = [t for t in (measured_turns or []) if t is not None]
+    everything_measured = bool(turns) and len(measured) == turns
+    projected = veo_extension_output_lengths(source_seconds, turns)
+    appended = turns * VEO_EXTENSION_STEP_SECONDS
+
+    if everything_measured:
+        return _ExtensionBilling(
+            billed_seconds=round(sum(measured), 3),
+            turn_output_seconds=[round(t, 3) for t in measured],
+            appended_seconds=appended,
+            duration_source="measured from each rendered turn",
+            is_metered=True,
+            warning=None,
+        )
+    if projected:
+        return _ExtensionBilling(
+            billed_seconds=round(sum(projected), 3),
+            turn_output_seconds=projected,
+            appended_seconds=appended,
+            duration_source=(
+                "PROJECTED from a measured "
+                f"{source_seconds:g}s source: the render was delivered "
+                "remotely so it could not be opened, but a Veo turn renders "
+                "the assembled clip, so turn i is the source plus "
+                f"{VEO_EXTENSION_STEP_SECONDS:g}s per turn. This is the same "
+                "figure the pre-flight quoted."
+            ),
+            is_metered=False,
+            warning=None,
+        )
+    return _ExtensionBilling(
+        billed_seconds=appended,
+        turn_output_seconds=[],
+        appended_seconds=appended,
+        duration_source=(
+            "FLOOR, not a metered figure: the render was delivered remotely "
+            "and not opened, its source is remote too, and a Veo turn bills "
+            "the assembled clip rather than the footage it appends. The true "
+            "bill is higher by the source's length charged once per turn."
+        ),
+        is_metered=False,
+        warning=(
+            "This cost is a FLOOR. Neither the render nor its source could be "
+            "measured, and Veo bills each turn's assembled length rather than "
+            f"the {VEO_EXTENSION_STEP_SECONDS:g}s it appends."
+        ),
+    )
+
+
+def _usd_of(cost: Any) -> float:
+    """The dollar figure of a cost payload, whatever shape it came in."""
+    if cost is None:
+        return 0.0
+    value = cost.get("usd") if isinstance(cost, dict) else getattr(cost, "usd", None)
+    return float(value or 0.0)
+
+
+def _over_budget_message(
+    projected_usd: float,
+    max_cost_usd: float,
+    times: int,
+    *,
+    floor: bool = False,
+    unmeasured: bool = False,
+) -> str:
+    """Why a chain was (or would be) refused against its caller's cap.
+
+    Extension chains are the one place a cap earns its keep: the bill grows
+    with the SQUARE of `times`, because every turn re-renders the footage
+    before it, and `times` accepts 20. Twenty turns off a 10s source bills
+    ~1670s — several hundred dollars from one call with only a warning
+    between the caller and the invoice.
+    """
+    # `times` here is the number of turns PRICED, which the caller takes from
+    # the priced list -- not the number requested. The two differ when the
+    # ceiling cuts a measured chain short, and quoting the requested count
+    # against the clamped sum ("for 4 turn(s) is $9.14") named a number the
+    # adjacent warning had just said would not be billed.
+    # Two callers, two different honest labels. loop_extend (Veo) passes
+    # `floor` when its projection genuinely under-states; extend_video_omni
+    # passes `unmeasured`, where every unmeasured turn is priced at the
+    # ceiling and the figure is therefore an upper bound, not a floor.
+    if unmeasured:
+        basis = (
+            "an UPPER BOUND (the source could not be measured, so every turn is "
+            "priced at the ceiling; the true bill is at most this)"
+        )
+    elif floor:
+        basis = "a FLOOR (the source could not be measured, so the true bill is higher)"
+    else:
+        basis = "the projected bill"
+    return (
+        f"Refused before rendering: {basis} for {times} extension turn(s) is "
+        f"${projected_usd:.2f}, over the max_cost_usd of ${max_cost_usd:.2f} you "
+        "set. Fewer turns cost far less than proportionally less — each turn "
+        "re-bills everything before it — so reduce `times` first, or raise the "
+        "cap deliberately."
+    )
+
+
 def _assemble_loop_extend_manifest(
     *,
     source_video_uri: str,
@@ -1640,6 +3251,9 @@ def _assemble_loop_extend_manifest(
     final_video_url: str,
     include_audio: bool,
     warnings: list[str],
+    resolution: str = "720p",
+    turn_seconds: list[float] | None = None,
+    source_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Build loop_extend's manifest for the extensions that actually ran.
 
@@ -1659,12 +3273,33 @@ def _assemble_loop_extend_manifest(
         "final_video_url": final_video_url,
         "extension_steps": list(steps),
     }
+    manifest["resolution"] = resolution
+    billing = veo_extension_billing(
+        turns=len(steps),
+        measured_turns=turn_seconds,
+        source_seconds=source_seconds,
+    )
+    everything_measured = billing.is_metered
+    billed = billing.billed_seconds
+    manifest["billed_seconds"] = billed
+    manifest["appended_seconds"] = billing.appended_seconds
+    if billing.turn_output_seconds:
+        manifest["turn_output_seconds"] = billing.turn_output_seconds
+    manifest["billed_seconds_source"] = billing.duration_source
+    if billing.warning:
+        warnings.append(billing.warning)
     cost = _video_cost(
         served_model,
-        float(len(steps) * 7),
-        resolution="720p",
+        float(billed),
+        # Priced at what the assembled clip measured, not at an assumption.
+        # The tool cannot request a resolution, which says nothing about what
+        # Veo handed back.
+        resolution=resolution,
         include_audio=include_audio,
-        actual=True,
+        # Only a fully measured chain is a metered figure; anything else stays
+        # an estimate, which is what is_estimate exists to say.
+        actual=everything_measured,
+        presnapped=not everything_measured,
     )
     if cost:
         manifest["cost"] = cost
@@ -1842,9 +3477,12 @@ async def generate_image(
             actual cost, derived from the token counts the API metered.
             Note: a quote covers output tokens only. Input tokens are not
             knowable before the call, so a multi-turn edit (which resends the
-            conversation via thought_signature_url) costs slightly more than
-            quoted — measured at ~1% on a real edit, 1527 input tokens against
-            14 for a fresh call. The real run reports the metered figure.
+            conversation via thought_signature_url) costs more than quoted.
+            How much more is not stated here: an earlier note put it near
+            one percent, and that cannot be squared with what the signatures
+            were later measured to weigh (1.6-2.8 MB), so the figure is
+            withdrawn rather than repeated. The real run reports the metered
+            input and output counts.
 
     Returns:
         Two content blocks: a JPEG preview of the image, then JSON with
@@ -1932,7 +3570,7 @@ async def generate_image(
             if warnings:
                 payload["warnings"] = warnings
                 await _emit_warnings(ctx, warnings)
-            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+            return [TextContent(type="text", text=_respond(app_ctx, payload))]
 
         image_bytes = None
         if image_uri:
@@ -2012,7 +3650,7 @@ async def generate_image(
             for warning in result.get("warnings", []):
                 await ctx.warning(warning)
             await ctx.info("Model returned text only")
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            return [TextContent(type="text", text=_respond(app_ctx, result))]
 
         await ctx.info("Image generated successfully")
 
@@ -2081,10 +3719,7 @@ async def generate_image(
         preview_bytes = base64.b64decode(preview_b64)
         return [
             Image(data=preview_bytes, format="jpeg"),
-            TextContent(
-                type="text",
-                text=json.dumps(response_data, indent=2),
-            ),
+            TextContent(type="text", text=_respond(app_ctx, response_data)),
         ]
     except Exception as e:
         await ctx.error(f"Image generation failed: {e}")
@@ -2171,6 +3806,11 @@ async def plan_generation(
             gemini_api_key_available=(
                 not primary_is_vertex or app_ctx.gemini_api_client is not None
             ),
+            omni_backend=(
+                None
+                if app_ctx.omni_backend_default == "auto"
+                else app_ctx.omni_backend_default
+            ),
             budget=budget,
             media_kind=media_kind,
             aspect_ratio=aspect_ratio,
@@ -2186,7 +3826,10 @@ async def plan_generation(
             is_draft=is_draft,
             pinned_model=pinned_model,
         )
-        plan = plan_impl(intent, constraints)
+        # Off the loop: the planner is pure string work, but a long intent is
+        # not free (see routing.MAX_INTENT_CHARS), and one blocked coroutine
+        # blocks every request.
+        plan = await asyncio.to_thread(plan_impl, intent, constraints)
 
         def _route(route: Any) -> dict[str, Any]:
             return {
@@ -2277,11 +3920,22 @@ async def generate_storyboard(
         (HTML), sheet_url (the full-resolution PNG), per-shot results, total
         cost and total runtime.
     """
+    # Accumulators live outside the try so the cancellation handler below can
+    # still see what was rendered -- and billed -- before the caller vanished.
+    frames: list[Any] = []  # StoryboardFrame; the module is imported lazily below
+    shot_results: list[dict[str, Any]] = []
     try:
         app_ctx = ctx.request_context.lifespan_context
 
         if not shots:
             raise ValueError("shots list must not be empty")
+        for name, value in (("title", title), ("subtitle", subtitle)):
+            if isinstance(value, str) and len(value) > MAX_STORYBOARD_TEXT_CHARS:
+                raise ValueError(
+                    f"{name} is {len(value)} characters; the limit is "
+                    f"{MAX_STORYBOARD_TEXT_CHARS}. It is drawn as a single "
+                    "ellipsized line."
+                )
         # Each shot is a paid image generation, so an oversized board is a real
         # bill. Refuse loudly rather than truncating: silently dropping shots
         # would render a board that looks complete but is not.
@@ -2312,6 +3966,13 @@ async def generate_storyboard(
                         f"shots[{i}].{field} must be a string, "
                         f"got {type(value).__name__}"
                     )
+                if isinstance(value, str) and len(value) > MAX_STORYBOARD_TEXT_CHARS:
+                    raise ValueError(
+                        f"shots[{i}].{field} is {len(value)} characters; the "
+                        f"limit is {MAX_STORYBOARD_TEXT_CHARS}. A panel draws "
+                        "about three wrapped lines, so text this long cannot "
+                        "be shown and is more likely a mistake than a prompt."
+                    )
             _validate_duration_seconds(
                 shot.get("duration_seconds"), f"shots[{i}].duration_seconds"
             )
@@ -2341,12 +4002,10 @@ async def generate_storyboard(
                 # model reroute understated what the real run discloses.
                 for warning in plan_warnings:
                     await ctx.warning(warning)
-            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+            return [TextContent(type="text", text=_respond(app_ctx, payload))]
 
         from .storyboard import StoryboardFrame, render_sheet_preview, write_storyboard
 
-        frames: list[StoryboardFrame] = []
-        shot_results: list[dict[str, Any]] = []
         costs: list[Any] = []
         warnings_seen: list[str] = list(plan_warnings)
 
@@ -2441,6 +4100,17 @@ async def generate_storyboard(
 
         inline_preview = await asyncio.to_thread(_sheet_preview)
 
+        # A frame whose bytes exist but do not decode renders as "SHOT NOT
+        # GENERATED" on the sheet, so it must not be counted as a rendered
+        # shot here — this message said "3/3 shots" for a board with a hole
+        # in it. write_storyboard reports them because it is the one place
+        # that has tried to decode them.
+        undecodable = {
+            int(i) for i in (artifacts.get("undecodable_shots") or "").split(",") if i
+        }
+        for result in shot_results:
+            if result["shot"] in undecodable and "error" not in result:
+                result["error"] = "Image could not be decoded"
         failed = [r for r in shot_results if "error" in r]
         total_runtime = sum(float(s.get("duration_seconds") or 0) for s in shots)
         response_data: dict[str, Any] = {
@@ -2474,10 +4144,24 @@ async def generate_storyboard(
         blocks: list[Any] = []
         if inline_preview:
             blocks.append(Image(data=inline_preview, format="jpeg"))
-        blocks.append(
-            TextContent(type="text", text=json.dumps(response_data, indent=2))
-        )
+        blocks.append(TextContent(type="text", text=_respond(app_ctx, response_data)))
         return blocks
+    except asyncio.CancelledError:
+        # A cancellation is a BaseException, so the handler below never sees
+        # it -- and unlike loop_extend, generate_clip and extend_video_omni,
+        # this tool had no handler of its own. Cancel after 2 of 4 paid shots
+        # left two orphan PNGs on disk with no sidecar and no cost record.
+        # Say what was rendered, then let the cancellation continue.
+        rendered = [r for r in shot_results if "image_url" in r]
+        if rendered:
+            logger.warning(
+                "generate_storyboard cancelled after %d of %d shot(s) rendered "
+                "and billed; frames: %s",
+                len(rendered),
+                len(shots),
+                ", ".join(str(r["image_url"]) for r in rendered),
+            )
+        raise
     except Exception as e:
         await ctx.error(f"Storyboard failed: {e}")
         logger.exception("Tool error")
@@ -2505,6 +4189,8 @@ async def generate_video(
     extend_video_uri: str | None = None,
     output_gcs_uri: str | None = None,
     draft: bool = False,
+    draft_resolution: str | None = None,
+    timeout_seconds: float = VEO_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
 ) -> str:
     """Generate a video using Google VEO models.
@@ -2550,17 +4236,53 @@ async def generate_video(
         extend_video_uri: URI of existing VEO-generated video to extend.
             Extends the final second of the video and continues the action.
             Note: Cannot be used together with other image inputs.
-            On Vertex AI, extension requires output_gcs_uri (the larger combined
-            video exceeds inline limits). On the Gemini API the extended clip is
-            returned inline, so no GCS target is needed.
+            Vertex AI only: extension requires output_gcs_uri there (the larger
+            combined video exceeds inline limits), and the Gemini Developer API
+            refuses the mode outright ("encodedVideo isn't supported by this
+            model"), so the tool rejects it before spending. Billed on the
+            ASSEMBLED clip, not the ~7s appended: a 4s source extended once
+            renders and bills 11s.
+
+            A REMOTE source (gs://, http://) makes the dry-run estimate a
+            FLOOR rather than a ceiling. This is the one place a pre-flight in
+            this server can under-state, and it is deliberate: the bill
+            depends on the source's length, a dry run is documented offline so
+            it does not download the source to measure it, and Veo publishes
+            no maximum source length to assume in its place — so there is no
+            honest ceiling to quote. MEASURED: an 11.01s remote source quoted
+            $0.70 and billed $1.80, 61% under. billed_seconds_source says
+            "FLOOR, not an estimate" when it applies, and the real run
+            measures the source and reports the true figure. For a ceiling
+            before you spend, quote against a local copy, or compute it:
+            billed = source + ~7s per turn. (Omni's extension quote has no
+            such exception — omni documents a maximum source length, so an
+            unmeasurable source is quoted at that maximum and over-states.)
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
             Vertex AI only — on the Gemini API, output is always returned inline
             and an explicit output_gcs_uri is rejected.
+        timeout_seconds: Overall deadline for the render (submit + polling +
+            download), default 210s -- the same figure the omni tools use, for
+            the same reason: common MCP hosts cap one tool call at roughly four
+            minutes, and a render that outlives the HOST's limit is cancelled
+            by the host. The server never answers, the caller sees a bare
+            "Tool execution failed" with no message, cost or operation, and
+            the Veo operation completes and bills regardless -- which is what
+            a 4K render did, twice. Under the host ceiling the server answers
+            first, with the operation name, the mode and the attempted cost.
+            Raise it when your host allows a longer call; 4K is the slowest
+            tier.
         dry_run: When True, generate nothing and return only the cost
             estimate for the call that would run (the omni draft price when
             draft=True). Free and instant. A real run reports the actual
             cost, derived from the effective duration the API rendered.
-        draft: When True, route to gemini-omni-flash for a fast 720p draft
+            With extend_video_uri and a REMOTE source the estimate is a
+            FLOOR, not a ceiling — see the note under extend_video_uri.
+        draft_resolution: Resolution for a `draft=True` pass. Naming one
+            renders the draft on gemini-omni-1.1-flash, which is the model
+            with a resolution parameter; "360p" is about a third of the 720p
+            price and the cheapest preview this server can render. Left unset,
+            the draft keeps the preview model's fixed 720p.
+        draft: When True, route to the omni draft model for a fast draft
             instead of Veo, then re-run with draft=False to finalize.
             Faster, but NOT cheaper than veo-3.1-fast-generate-001: omni is
             $0.10136/s against Fast's $0.10/s. The saving is real only against
@@ -2613,6 +4335,37 @@ async def generate_video(
                 has_extend=bool(extend_video_uri),
             )
 
+        # Resolved BEFORE the dry_run branch, so a quote applies every
+        # rejection the render applies. GCS output is Vertex-only and an
+        # explicit output_gcs_uri on the Gemini API is documented as rejected —
+        # but the check lived past the dry_run return, so a quote priced a call
+        # the real path refuses, with no warning and no warnings field at all.
+        # Same defect class as the over-length extension source.
+        #
+        # Skipped for a draft, which is not a Veo call at all: it routes to
+        # omni. Hoisting these above the draft branch made draft=True fail on
+        # inputs it documents as IGNORED — `_draft_ignored_veo_params` lists
+        # output_gcs_uri, yet _resolve_video_gcs raised on a Gemini-API
+        # deployment before the warning naming it could ever be built, and
+        # _client_for_video_model raised for a Lite model on Vertex without
+        # GEMINI_API_KEY over a Veo client the draft never uses. The backend a
+        # draft reports is omni's, which is the one that will serve it.
+        video_client: genai.Client | None = None
+        if draft:
+            is_vertex_client = _omni_backend_is_vertex(app_ctx)
+            gcs_uri = None
+        else:
+            video_client = _client_for_video_model(app_ctx, model)
+            is_vertex_client = bool(
+                getattr(video_client._api_client, "vertexai", False)
+            )
+            gcs_uri = _resolve_video_gcs(
+                output_gcs_uri,
+                app_ctx.video_gcs_bucket,
+                app_ctx.allowed_gcs_buckets,
+                is_vertex_client,
+            )
+
         if dry_run:
             # Draft mode routes to omni, which serves a plain text/image
             # request and snaps on its own [3, 10]s clamp — the Veo modes
@@ -2638,7 +4391,16 @@ async def generate_video(
                     quoted_mode = "image_to_video"
                 else:
                     quoted_mode = "text_to_video"
-                validate_render_options(model, resolution, quoted_mode)
+                # The backend is as much a constraint as the model: Veo on
+                # the Gemini Developer API refuses every mode that conditions
+                # on existing footage, and this quote used to price those
+                # calls cleanly while reporting that very backend beside them.
+                validate_render_options(
+                    model,
+                    resolution,
+                    quoted_mode,
+                    backend=_backend_of(app_ctx, str(model)),
+                )
 
                 # Refuse a local source the real run would reject, so a quote
                 # does not price a render that cannot fetch its inputs. AFTER
@@ -2654,18 +4416,33 @@ async def generate_video(
                 _assert_local_source(extend_video_uri, data_dir, "extend_video_uri")
                 for ref_uri in (reference_image_uris or [])[:_MAX_REFERENCE_IMAGES]:
                     _assert_local_source(ref_uri, data_dir, "reference image")
+            else:
+                # The draft takes image_uri too (omni accepts a prompt plus
+                # images) and its real run refuses a missing or unconfined
+                # one -- but every source check above sat under `if not
+                # draft`, so generate_video(draft=True, dry_run=True,
+                # image_uri=<missing file, or /etc/passwd>) quoted $0.815 for
+                # a render that cannot fetch its input. Same invariant.
+                _assert_local_source(image_uri, data_dir, "image_uri")
             # Report the model the real run will report, not the raw input: a
             # caller who pinned (or fed back) a `-preview` id saw the quote say
             # `-preview` while the render reported the resolved `-001` name.
             # Resolve it the way the impl does for the primary backend.
+            draft_res: str | None = None
             if draft:
-                est_model = OMNI_MODEL
+                est_model, draft_res = _omni_preview_model(draft_resolution)
             else:
-                est_model = resolve_served_video_model(
-                    str(model),
-                    getattr(app_ctx.client._api_client, "vertexai", False),
-                )
-            est_res = "720p" if draft else (resolution or "720p")
+                # The id that will actually be BILLED, which is the same
+                # resolver cost.detail uses — so the two can never name
+                # different models in one response. Reporting the served
+                # spelling here did exactly that: "model" said
+                # veo-3.1-fast-generate-preview while the detail beside it
+                # said -001. It also folds a -preview id the caller fed back
+                # from a previous response onto its canonical name.
+                from .pricing import resolve_model_id
+
+                est_model = resolve_model_id(str(model))
+            est_res = (draft_res or "720p") if draft else (resolution or "720p")
             # Report the duration that will actually render. Returning the
             # request beside a price for the snapped value (5s quoted as "4s
             # of video") made the payload contradict itself.
@@ -2683,6 +4460,11 @@ async def generate_video(
                 "model": est_model,
                 "resolution": est_res,
                 "generation_mode": "draft" if draft else quoted_mode,
+                # Which backend this will actually run on. Omni's responses
+                # carry it; Veo's did not, and a session spent three calls
+                # working out a backend confusion that this field answers in
+                # one.
+                "backend": "vertex" if is_vertex_client else "gemini_api",
                 "requested_duration_seconds": duration_seconds,
                 "duration_seconds": quoted_duration,
                 "estimated_cost": _video_cost(
@@ -2693,6 +4475,44 @@ async def generate_video(
                     generation_mode=quoted_mode,
                 ),
             }
+            if quoted_mode == "extend_video":
+                # The real run was corrected to bill the ASSEMBLED clip and the
+                # quote beside it was not: 7s / $0.70 for a 4s source whose
+                # extension renders and bills 11s — a quote BELOW its own real
+                # run's figure. Same rule, same shared function, both ends.
+                quoted_source_seconds = await _probe_local_video_seconds(
+                    ctx, extend_video_uri
+                )
+                ext_billing = veo_extension_billing(
+                    turns=1, source_seconds=quoted_source_seconds
+                )
+                payload["billed_seconds"] = ext_billing.billed_seconds
+                payload["appended_seconds"] = ext_billing.appended_seconds
+                if ext_billing.turn_output_seconds:
+                    payload["turn_output_seconds"] = ext_billing.turn_output_seconds
+                    payload["duration_seconds"] = ext_billing.turn_output_seconds[-1]
+                payload["billed_seconds_source"] = ext_billing.duration_source
+                if ext_billing.turn_output_seconds:
+                    payload["duration_source"] = (
+                        "projected from a measured "
+                        f"{quoted_source_seconds:g}s source: an extension "
+                        "renders the assembled clip (source + ~7s)"
+                        if quoted_source_seconds is not None
+                        else "projected: an extension renders the assembled "
+                        "clip (source + ~7s)"
+                    )
+                payload["estimated_cost"] = _video_cost(
+                    est_model,
+                    float(ext_billing.billed_seconds),
+                    resolution=est_res,
+                    include_audio=include_audio,
+                    presnapped=True,  # a measured/projected length must not re-snap
+                )
+                if ext_billing.warning:
+                    payload.setdefault("warnings", []).append(ext_billing.warning)
+            slow_tier = _veo_slow_tier_warning(resolution, timeout_seconds)
+            if slow_tier:
+                payload.setdefault("warnings", []).append(slow_tier)
             # Disclose the Veo-only params a draft will drop, exactly as the
             # real draft run does — a quote that hid them let a caller price a
             # render believing paid controls (seed, negative_prompt, ...) were
@@ -2700,7 +4520,7 @@ async def generate_video(
             if draft:
                 ignored = _draft_ignored_veo_params(
                     seed=seed,
-                    negative_prompt=negative_prompt,
+                    negative_prompt=None,  # folded inline, see below
                     resolution=resolution,
                     person_generation=person_generation,
                     last_frame=last_frame_uri or last_frame_base64,
@@ -2728,7 +4548,7 @@ async def generate_video(
                 )
                 payload["warnings"] = [warning]
                 await _emit_warnings(ctx, [warning])
-            return json.dumps(payload, indent=2)
+            return _respond(app_ctx, payload)
 
         # Draft mode: hand off to the fast omni path. Omni supports only a
         # text prompt + optional input image(s), so Veo-only controls are
@@ -2736,7 +4556,7 @@ async def generate_video(
         if draft:
             ignored = _draft_ignored_veo_params(
                 seed=seed,
-                negative_prompt=negative_prompt,
+                negative_prompt=None,  # folded inline, see below
                 resolution=resolution,
                 person_generation=person_generation,
                 last_frame=last_frame_uri or last_frame_base64,
@@ -2750,6 +4570,12 @@ async def generate_video(
             draft_prompt = prompt
             if audio_prompt:
                 draft_prompt = f"{prompt}\nAudio: {audio_prompt}"
+            if negative_prompt:
+                # Omni has no negative_prompt field, and its docs say to state
+                # negatives inline ("No dialogue"). Folded rather than dropped:
+                # a draft that ignores the caller's exclusions previews the
+                # wrong shot.
+                draft_prompt = f"{draft_prompt}\nNo {negative_prompt}."
             draft_image_bytes: list[bytes] | None = None
             if image_uri:
                 b = await fetch(
@@ -2766,19 +4592,34 @@ async def generate_video(
             extra: dict[str, Any] = {"draft": True}
             if ignored:
                 extra["ignored_veo_params"] = ignored
-            await ctx.info("Generating draft with gemini-omni-flash")
+            if negative_prompt:
+                extra["negative_prompt_inlined"] = negative_prompt
+            draft_model, draft_res = _omni_preview_model(draft_resolution)
+            await ctx.info(f"Generating draft with {draft_model}")
             result = await _omni_generate_and_manifest(
                 app_ctx,
                 ctx,
                 prompt=draft_prompt,
+                model=draft_model,
                 image_bytes_list=draft_image_bytes,
                 aspect_ratio=aspect_ratio,
                 duration_seconds=duration_seconds,
+                resolution=draft_res,
                 manifest_extra=extra,
             )
             if ignored:
                 result.setdefault("warnings", []).append(
                     _draft_ignored_warning(ignored)
+                )
+            if negative_prompt:
+                # On the response too, not only in the manifest: the caller
+                # reading the result should not need the sidecar to learn
+                # their exclusion was honoured.
+                result["negative_prompt_inlined"] = negative_prompt
+                result.setdefault("warnings", []).append(
+                    f"negative_prompt was folded into the prompt as 'No "
+                    f"{negative_prompt}.' — omni has no negative_prompt field; "
+                    "its documentation recommends inline negatives."
                 )
             # The omni impl reports neither of these, so a draft response was
             # missing the two keys this tool's own Returns block names and
@@ -2789,7 +4630,7 @@ async def generate_video(
             # Mirror warnings (ignored Veo params, any GCS notice) onto the
             # notification channel, not just the JSON body.
             await _emit_warnings(ctx, result.get("warnings"))
-            return json.dumps(result, indent=2)
+            return _respond(app_ctx, result)
 
         # Fetch first frame image
         image_bytes = None
@@ -2841,18 +4682,12 @@ async def generate_video(
         # Resolve the client up front: Veo Lite (and pure Gemini-API
         # deployments) route to the Gemini API, which does not support GCS
         # output. GCS behavior below depends on which backend is used.
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        # video_client / is_vertex_client / gcs_uri are resolved in the
+        # pre-flight above, so the quote and the render cannot disagree about
+        # the destination.
 
         # Combine explicit output_gcs_uri with the env default, validate the
         # allowlist, and apply the non-Vertex drop/raise gating.
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
-
         if extend_video_uri:
             # extend_video_uri is handed straight to the API as a video
             # source; a gs:// value must pass the same allowlist as every
@@ -2872,7 +4707,12 @@ async def generate_video(
                     "combined videos that exceed inline response limits."
                 )
 
+        slow_tier_notice = _veo_slow_tier_warning(resolution, timeout_seconds)
+        if slow_tier_notice:
+            await _emit_warnings(ctx, [slow_tier_notice])
         await ctx.info(f"Generating video with model={model}")
+        # Only the Veo path reaches this: the draft branch returned above.
+        assert video_client is not None
         result = await generate_video_impl(
             client=video_client,
             prompt=prompt,
@@ -2893,27 +4733,122 @@ async def generate_video(
             reference_images=reference_images if reference_images else None,
             extend_video_uri=extend_video_uri,
             output_gcs_uri=gcs_uri,
+            timeout_seconds=timeout_seconds,
         )
         await ctx.info("Video generated successfully")
 
-        # Write sidecar manifest alongside local video output.
-        # Cost from what actually rendered where that can be measured, else
-        # the snapped duration the impl sent to Veo. Measuring is the only
-        # figure that cannot drift from the request or a stale record.
-        rendered_url = result.get("video_url") or ""
-        if isinstance(rendered_url, str) and rendered_url.startswith("file://"):
-            measured = await asyncio.to_thread(
-                measure_video_duration, Path(rendered_url[7:])
+        # Which backend actually ran this. Omni's responses carry it; Veo's did
+        # not, and a session spent three calls working out a backend confusion
+        # that this field answers in one.
+        result["backend"] = "vertex" if is_vertex_client else "gemini_api"
+        if slow_tier_notice:
+            result.setdefault("warnings", []).append(slow_tier_notice)
+        # Veo bills by resolution too, and this response named one nowhere:
+        # the manifest recorded the raw request — null whenever the caller
+        # defaulted — while the cost line below priced 720p. Measured, the
+        # two cannot disagree silently.
+        veo_facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=resolution
+        )
+        if veo_facts.duration_source:
+            result["duration_seconds"] = round(veo_facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = veo_facts.duration_source
+        effective_resolution = str(result.get("resolution") or resolution or "720p")
+        result["resolution"] = effective_resolution
+        result["resolution_source"] = veo_facts.resolution_source or (
+            "the request"
+            if resolution
+            else "the default: generate_video renders 720p unless asked otherwise"
+        )
+        # A non-extension render is metered when it was measured; only an
+        # extension can be a projection, and the billing helper says which.
+        extension_metered = True
+        # Keyed on the REQUEST, not on the impl echoing generation_mode back:
+        # a caller who passed extend_video_uri is extending, and the billing
+        # rule must not hinge on a field the response might omit.
+        if extend_video_uri:
+            # An extension is billed on the assembled clip, not on the footage
+            # it appends — the same rule loop_extend applies, which this path
+            # did not. It billed 7s, asserted is_estimate=False for a file it
+            # never opened, and labelled the figure with the TEXT-TO-VIDEO
+            # rule in the one mode where that rule is known to be false.
+            ext_source_seconds = await _extension_source_seconds(
+                ctx, extend_video_uri, allow_remote=True
             )
-            if measured is not None:
-                result["duration_seconds"] = round(measured, 3)
-                result["duration_source"] = "measured from the rendered video"
+            billing = veo_extension_billing(
+                turns=1,
+                measured_turns=(
+                    [veo_facts.duration_seconds]
+                    if veo_facts.duration_source and veo_facts.duration_seconds
+                    else None
+                ),
+                source_seconds=ext_source_seconds,
+            )
+            extension_metered = billing.is_metered
+            result["billed_seconds"] = billing.billed_seconds
+            result["appended_seconds"] = billing.appended_seconds
+            if billing.turn_output_seconds:
+                result["turn_output_seconds"] = billing.turn_output_seconds
+                if not veo_facts.duration_source:
+                    # The delivered clip is the ASSEMBLED one. The impl reports
+                    # the 7s it was asked to append, which is neither what was
+                    # delivered nor what is billed, and labelling that number
+                    # with the projection described a length it did not hold.
+                    result["duration_seconds"] = billing.turn_output_seconds[-1]
+                    # Names the measurement, as billed_seconds_source does.
+                    # Two fields agreeing on a number while only one says
+                    # where it came from reads like they disagree.
+                    result["duration_source"] = (
+                        "projected from a measured "
+                        f"{ext_source_seconds:g}s source: an extension delivers "
+                        "the assembled clip (source + ~7s), and this one was "
+                        "delivered remotely so it could not be measured"
+                        if ext_source_seconds is not None
+                        else "projected: an extension delivers the assembled "
+                        "clip (source + ~7s), and this one was delivered "
+                        "remotely so it could not be measured"
+                    )
+            result["billed_seconds_source"] = billing.duration_source
+            if billing.warning:
+                result.setdefault("warnings", []).append(billing.warning)
+        result.setdefault(
+            "duration_source",
+            # The snapped-request rule is TEXT-TO-VIDEO's. Asserting it over an
+            # extension is the one place it is known to be false: an extension
+            # delivers the assembled clip, not the length it was sent. When
+            # nothing could be measured, say that rather than borrow a rule.
+            "not measured: the render was delivered remotely, and an extension "
+            "delivers the assembled clip (source + ~7s) rather than the length "
+            "it was sent, so its length is not known here"
+            if extend_video_uri
+            else "the snapped request: Veo renders exactly the length it is sent",
+        )
+        is_extension = bool(extend_video_uri)
+        raw_billed = (
+            result.get("billed_seconds")
+            if is_extension
+            else result.get("duration_seconds", duration_seconds)
+        )
+        # An extension always sets billed_seconds just above, but falling back
+        # to the request rather than asserting keeps a missing key from
+        # becoming a 500 on a render the caller has already paid for.
+        billed_seconds = (
+            float(raw_billed)
+            if isinstance(raw_billed, (int, float))
+            else float(duration_seconds)
+        )
+        # Metered only where the figure was measured. An extension projected
+        # from its source is a good number, but it is not a meter reading —
+        # and that is a fact the billing helper states, not one to re-derive
+        # from the wording of a string.
+        metered = extension_metered
         cost = _video_cost(
             result.get("model", model),
-            float(result.get("duration_seconds", duration_seconds)),
-            resolution=resolution or "720p",
+            billed_seconds,
+            resolution=effective_resolution,
             include_audio=result.get("audio_enabled", include_audio),
-            actual=True,
+            actual=metered,
+            presnapped=not metered,
         )
         if cost:
             result["cost"] = cost
@@ -2927,7 +4862,9 @@ async def generate_video(
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
-            "resolution": resolution,
+            "duration_source": result.get("duration_source"),
+            "resolution": result.get("resolution", resolution),
+            "resolution_source": result.get("resolution_source"),
             "person_generation": person_generation,
             "audio_enabled": result.get("audio_enabled", include_audio),
             "generation_mode": result.get("generation_mode"),
@@ -2954,11 +4891,69 @@ async def generate_video(
             # large-video path GCS output is meant for.
             result["manifest"] = manifest
 
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
+    except asyncio.CancelledError:
+        # The HOST's ceiling, not ours. A cancellation is a BaseException, so the
+        # handler below never ran and the caller saw a bare "Tool execution
+        # failed" -- no message, no cost, no operation name. That is exactly
+        # what a 4K render on Vertex produced, twice, while billing $1.20 each
+        # time. Record what was attempted, then let the cancellation continue.
+        facts = _veo_attempt_facts(
+            model=model, draft=draft, draft_resolution=draft_resolution,
+            mode=_veo_request_mode(
+                extend_video_uri=extend_video_uri,
+                reference_image_uris=reference_image_uris,
+                has_first_frame=bool(image_uri or image_base64),
+                has_last_frame=bool(last_frame_uri or last_frame_base64),
+            ),
+            duration_seconds=duration_seconds, resolution=resolution,
+            include_audio=include_audio,
+        )
+        logger.warning(
+            "generate_video cancelled by the host (timeout_seconds=%s): %s -- the "
+            "render may still complete and bill",
+            timeout_seconds,
+            json.dumps(facts, default=str),
+        )
+        raise
     except Exception as e:
         await ctx.error(f"Video generation failed: {e}")
         logger.exception("Tool error")
-        return json.dumps({"error": str(e)})
+        # Structured, naming the mode, the attempted cost and -- for a timeout
+        # -- the operation that may still complete and bill.
+        body: dict[str, Any] = {"error": str(e)}
+        body.update(
+            _veo_attempt_facts(
+                model=model, draft=draft, draft_resolution=draft_resolution,
+                mode=_veo_request_mode(
+                    extend_video_uri=extend_video_uri,
+                    reference_image_uris=reference_image_uris,
+                    has_first_frame=bool(image_uri or image_base64),
+                    has_last_frame=bool(last_frame_uri or last_frame_base64),
+                ),
+                duration_seconds=duration_seconds, resolution=resolution,
+                include_audio=include_audio,
+            )
+        )
+        advice = _veo_access_advice(e)
+        if advice:
+            body["advice"] = advice
+        if isinstance(e, TimeoutError):
+            body["timed_out"] = True
+            body["timeout_seconds"] = timeout_seconds
+            operation_name = getattr(e, "operation_name", None)
+            body["operation_name"] = operation_name
+            body["note"] = (
+                "The deadline passed before the render finished. "
+                + (
+                    f"Operation {operation_name} was submitted and may still "
+                    "complete and bill; reconcile it in the console."
+                    if operation_name
+                    else "The request had not been submitted, so nothing was billed."
+                )
+                + " Raise timeout_seconds if your host allows a longer call."
+            )
+        return _respond(ctx.request_context.lifespan_context, body)
 
 
 @mcp.tool()
@@ -3014,13 +5009,31 @@ async def generate_transition(
         _validate_aspect_ratio(aspect_ratio)
         _validate_duration_seconds(duration_seconds)
 
+        # Resolve the client up front so GCS gating can see which backend is
+        # in play (the Gemini API does not support GCS output).
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        # Resolved BEFORE the quote, as generate_video's already is. Left after
+        # it, the dry run skipped the allowlist and backend checks the real
+        # call applies — a quote for a destination the render would refuse.
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+
         if dry_run:
             # Both tools are first/last-frame renders by definition, which
             # Veo Lite cannot serve — the docstrings said so but nothing
             # enforced it on the quote path.
             from .video import validate_render_options
 
-            validate_render_options(model, generation_mode="first_last_frame")
+            validate_render_options(
+                model,
+                generation_mode="first_last_frame",
+                backend=_backend_of(app_ctx, model),
+            )
 
             # Refuse a local frame the real run would reject, so a quote does
             # not price a transition that cannot fetch its frames. After
@@ -3029,7 +5042,8 @@ async def generate_transition(
             # uncheckable offline and still price.
             _assert_local_source(first_frame_uri, data_dir, "first_frame_uri")
             _assert_local_source(last_frame_uri, data_dir, "last_frame_uri")
-            return json.dumps(
+            return _respond(
+                app_ctx,
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
@@ -3038,6 +5052,8 @@ async def generate_transition(
                     "duration_seconds": _snapped_duration_for_quote(
                         model, duration_seconds, "first_last_frame"
                     ),
+                    "resolution": "720p",
+                    "resolution_source": "fixed: this tool takes no resolution parameter",
                     "estimated_cost": _video_cost(
                         model,
                         duration_seconds,
@@ -3046,13 +5062,7 @@ async def generate_transition(
                         generation_mode="first_last_frame",
                     ),
                 },
-                indent=2,
             )
-
-        # Resolve the client up front so GCS gating can see which backend is
-        # in play (the Gemini API does not support GCS output).
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
 
         first_bytes = await fetch(
             first_frame_uri,
@@ -3071,13 +5081,6 @@ async def generate_transition(
                 + "; "
                 + _fetch_failure("last_frame_uri", last_frame_uri, data_dir)
             )
-
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
 
         await ctx.info(f"Generating transition with model={model}")
         result = await generate_video_impl(
@@ -3099,11 +5102,38 @@ async def generate_transition(
         )
         await ctx.info("Transition generated successfully")
 
-        # Cost from the snapped duration the impl actually sent to Veo.
+        # Measured, like its sibling generate_bridge. Transition was left out
+        # of the round that fixed bridge, and the comment written there — "the
+        # one rendered path with neither a duration_source nor a
+        # resolution_source" — was false as it was written: this path had the
+        # same hole. Two tools with the same shape, one updated.
+        # generate_transition takes no resolution parameter, but "the tool cannot
+        # ask for anything else" is a fact about the tool, not about the file
+        # that came back — and the cost line below prices whatever this says.
+        facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=None
+        )
+        if facts.duration_source:
+            result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = facts.duration_source
+        result.setdefault(
+            "duration_source",
+            "the snapped request: Veo renders exactly the length it is sent",
+        )
+        result.setdefault("resolution", "720p")
+        result.setdefault(
+            "resolution_source",
+            facts.resolution_source
+            or "assumed: generate_transition takes no resolution parameter and the "
+            "render could not be measured",
+        )
+
+        # Cost from the measured length where there is one, else the snapped
+        # duration the impl actually sent to Veo.
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
-            resolution="720p",
+            resolution=str(result.get("resolution") or "720p"),
             include_audio=result.get("audio_enabled", include_audio),
             actual=True,
         )
@@ -3119,6 +5149,9 @@ async def generate_transition(
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "duration_source": result.get("duration_source"),
+            "resolution": result.get("resolution"),
+            "resolution_source": result.get("resolution_source"),
             "audio_enabled": result.get("audio_enabled", include_audio),
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
@@ -3142,7 +5175,7 @@ async def generate_transition(
         result["first_frame_uri"] = first_frame_uri
         result["last_frame_uri"] = last_frame_uri
 
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Transition generation failed: {e}")
         logger.exception("Tool error")
@@ -3208,13 +5241,31 @@ async def generate_bridge(
         # error. Runs before the quote so both agree.
         assert_frame_decoding_available()
 
+        # Resolve the client up front so GCS gating can see which backend is
+        # in play (the Gemini API does not support GCS output).
+        video_client = _client_for_video_model(app_ctx, model)
+        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
+        # Resolved BEFORE the quote, as generate_video's already is. Left after
+        # it, the dry run skipped the allowlist and backend checks the real
+        # call applies — a quote for a destination the render would refuse.
+        gcs_uri = _resolve_video_gcs(
+            output_gcs_uri,
+            app_ctx.video_gcs_bucket,
+            app_ctx.allowed_gcs_buckets,
+            is_vertex_client,
+        )
+
         if dry_run:
             # Both tools are first/last-frame renders by definition, which
             # Veo Lite cannot serve — the docstrings said so but nothing
             # enforced it on the quote path.
             from .video import validate_render_options
 
-            validate_render_options(model, generation_mode="first_last_frame")
+            validate_render_options(
+                model,
+                generation_mode="first_last_frame",
+                backend=_backend_of(app_ctx, model),
+            )
 
             # Refuse a local clip the real run would reject, so a quote does not
             # price a bridge that cannot render. After validate_render_options so
@@ -3228,7 +5279,8 @@ async def generate_bridge(
             # identical to no check at all — which is exactly how a reviewer
             # on an ffmpeg-equipped host read it.
             preflight = ["ffmpeg available for frame decoding"]
-            return json.dumps(
+            return _respond(
+                app_ctx,
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
@@ -3237,6 +5289,8 @@ async def generate_bridge(
                     "duration_seconds": _snapped_duration_for_quote(
                         model, duration_seconds, "first_last_frame"
                     ),
+                    "resolution": "720p",
+                    "resolution_source": "fixed: this tool takes no resolution parameter",
                     "preflight_checks": preflight,
                     "estimated_cost": _video_cost(
                         model,
@@ -3246,13 +5300,7 @@ async def generate_bridge(
                         generation_mode="first_last_frame",
                     ),
                 },
-                indent=2,
             )
-
-        # Resolve the client up front so GCS gating can see which backend is
-        # in play (the Gemini API does not support GCS output).
-        video_client = _client_for_video_model(app_ctx, model)
-        is_vertex_client = getattr(video_client._api_client, "vertexai", False)
 
         from_bytes = await fetch(
             from_clip_uri,
@@ -3273,15 +5321,8 @@ async def generate_bridge(
             )
 
         await ctx.info("Extracting bridge frames")
-        first_frame_png = await asyncio.to_thread(extract_frame_png, from_bytes, "end")
-        last_frame_png = await asyncio.to_thread(extract_frame_png, to_bytes, "start")
-
-        gcs_uri = _resolve_video_gcs(
-            output_gcs_uri,
-            app_ctx.video_gcs_bucket,
-            app_ctx.allowed_gcs_buckets,
-            is_vertex_client,
-        )
+        first_frame_png = await _decode_media(extract_frame_png, from_bytes, "end")
+        last_frame_png = await _decode_media(extract_frame_png, to_bytes, "start")
 
         await ctx.info(f"Generating bridge with model={model}")
         result = await generate_video_impl(
@@ -3303,11 +5344,38 @@ async def generate_bridge(
         )
         await ctx.info("Bridge generated successfully")
 
-        # Cost from the snapped duration the impl actually sent to Veo.
+        # Measured like every other local render. This comment used to call
+        # bridge "the one rendered path" without a duration_source, which was
+        # false as written — generate_transition beside it had the same hole
+        # and kept it for two more rounds. Both now share one helper.
+        # generate_bridge takes no resolution parameter, but "the tool cannot
+        # ask for anything else" is a fact about the tool, not about the file
+        # that came back — and the cost line below prices whatever this says.
+        facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=None
+        )
+        if facts.duration_source:
+            result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = facts.duration_source
+        result.setdefault(
+            "duration_source",
+            "the snapped request: Veo renders exactly the length it is sent",
+        )
+        result.setdefault("resolution", "720p")
+        result.setdefault(
+            "resolution_source",
+            facts.resolution_source
+            or "assumed: generate_bridge takes no resolution parameter and the "
+            "render could not be measured",
+        )
+        result["backend"] = "vertex" if is_vertex_client else "gemini_api"
+
+        # Cost from the measured length where there is one, else the snapped
+        # duration the impl actually sent to Veo.
         cost = _video_cost(
             result.get("model", model),
             float(result.get("duration_seconds", duration_seconds)),
-            resolution="720p",
+            resolution=str(result.get("resolution") or "720p"),
             include_audio=result.get("audio_enabled", include_audio),
             actual=True,
         )
@@ -3323,6 +5391,9 @@ async def generate_bridge(
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
+            "duration_source": result.get("duration_source"),
+            "resolution": result.get("resolution"),
+            "resolution_source": result.get("resolution_source"),
             "audio_enabled": result.get("audio_enabled", include_audio),
             "generation_mode": result.get("generation_mode"),
             "seed": seed,
@@ -3346,7 +5417,7 @@ async def generate_bridge(
         result["from_clip_uri"] = from_clip_uri
         result["to_clip_uri"] = to_clip_uri
 
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Bridge generation failed: {e}")
         logger.exception("Tool error")
@@ -3363,6 +5434,7 @@ async def generate_clip(
     add_bridges: bool = False,
     output_gcs_uri: str | None = None,
     animatic: bool = False,
+    animatic_resolution: str | None = None,
     dry_run: bool = False,
 ) -> str:
     """Generate a multi-beat short clip — the building block for a reel / short.
@@ -3405,9 +5477,17 @@ async def generate_clip(
             bridge when add_bridges is set — and generate nothing. The single
             most useful pre-flight in the server: a clip is the most expensive
             call it can make.
-        animatic: When True, render every beat with gemini-omni-flash (fast,
-            720p) instead of Veo, for a quick storyboard preview of the
-            whole reel before committing to full Veo renders. Bridges are not
+        animatic: When True, render every beat on the omni draft model
+            instead of Veo, for a quick storyboard preview of the whole reel
+            before committing to full Veo renders. 720p unless
+            animatic_resolution says otherwise.
+        animatic_resolution: Resolution for the animatic pass — "360p",
+            "720p" (the default), "1080p" or "4K". Naming one renders the
+            animatic on gemini-omni-1.1-flash, the model that has a resolution
+            parameter. "360p" is about a THIRD of the 720p price, which is
+            what turns the preview from roughly the cost of the delivery
+            render into a real saving: a 5-beat 8s reel is ~$4.09 at 720p and
+            ~$1.36 at 360p. Ignored unless animatic is True. Bridges are not
             available in animatic mode (add_bridges is ignored), and Veo-only
             per-beat controls (seed, negative_prompt) are ignored. Each beat
             is measured from the rendered file, so an animatic's reported cost
@@ -3443,8 +5523,19 @@ async def generate_clip(
     errors: list[dict[str, Any]] = []
     clip_warnings: list[str] = []
     total_duration = 0.0
-    beat_model = OMNI_MODEL if animatic else model
     try:
+        # Inside the try, and only when it applies. This sat above the try and
+        # ran unconditionally, so generate_clip(animatic=False,
+        # animatic_resolution="9000p") raised ValueError straight out of the
+        # tool instead of returning the {"error": ...} body every other failure
+        # here returns — on a parameter the docstring calls "Ignored unless
+        # animatic is True".
+        if animatic:
+            animatic_model, animatic_res = _omni_preview_model(animatic_resolution)
+            beat_model = animatic_model
+        else:
+            animatic_res = None
+            beat_model = model
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
 
@@ -3529,15 +5620,28 @@ async def generate_clip(
             # bridges into the estimate — so the check is reported positively
             # too, exactly as generate_bridge does.
             assert_frame_decoding_available()
+            # A bridge IS a first/last-frame render, so this composite inherits
+            # the backend restriction its standalone sibling already enforces.
+            # Without this the quote came back clean on the Gemini API, the
+            # beats rendered and billed ~$0.80, and only then did the first
+            # bridge fail — a partial-spend trap made worse by a pre-flight
+            # that reassured the caller first. Checked here, before any beat.
+            from .video import validate_render_options
+
+            validate_render_options(
+                model,
+                generation_mode="first_last_frame",
+                backend=_backend_of(app_ctx, str(model)),
+            )
             preflight.append("ffmpeg available for frame decoding (bridges)")
 
         if dry_run:
-            est_model = OMNI_MODEL if animatic else model
+            est_model = animatic_model if animatic else model
             beat_costs = [
                 _video_cost_estimate(
                     est_model,
                     float(b.get("duration_seconds", 4.0)),
-                    resolution="720p",
+                    resolution=(animatic_res or "720p") if animatic else "720p",
                     include_audio=include_audio and not animatic,
                 )
                 for b in beats
@@ -3581,7 +5685,7 @@ async def generate_clip(
                 if dry_warnings:
                     dry_payload["warnings"] = dry_warnings
                     await _emit_warnings(ctx, dry_warnings)
-            return json.dumps(dry_payload, indent=2)
+            return _respond(app_ctx, dry_payload)
 
         # Resolve the client ONCE, before the beat loop. If the model can't be
         # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY, or omni
@@ -3652,13 +5756,19 @@ async def generate_clip(
                     dropped_warning = _animatic_beat_dropped_warning(beat, idx)
                     if dropped_warning:
                         clip_warnings.append(dropped_warning)
+                    omni_client = _client_for_omni(app_ctx)
                     beat_result = await generate_video_omni_impl(
-                        client=_client_for_omni(app_ctx),
+                        client=omni_client,
                         prompt=beat_prompt,
                         videos_dir=app_ctx.videos_dir,
+                        model=animatic_model,
                         image_bytes_list=[image_bytes] if image_bytes else None,
                         aspect_ratio=aspect_ratio,
                         duration_seconds=duration,
+                        resolution=animatic_res,
+                        allow_uri_delivery=not getattr(
+                            omni_client._api_client, "vertexai", False
+                        ),
                         log_callback=ctx.info,
                     )
                 else:
@@ -3694,22 +5804,72 @@ async def generate_clip(
             # probe. Without this, a 20-beat animatic reported a cost nobody
             # measured as though it were metered.
             beat_duration = float(beat_result.get("duration_seconds") or duration)
-            beat_duration_source: str | None = None
+            # Veo renders EXACTLY the length it is sent — the same fact
+            # _segment_is_metered relies on to price a Veo segment without a
+            # probe — so its duration has a provenance, it just is not a
+            # measurement. Leaving the field off made a Veo segment the one
+            # place in the response where a number carried no source at all.
+            beat_duration_source: str | None = (
+                None
+                if animatic
+                else "the snapped request: Veo renders exactly the length it is sent"
+            )
+            beat_resolution_source: str | None = None
+            beat_dimensions: list[int] | None = None
+            beat_resolution = (
+                str(beat_result.get("rendered_resolution") or "720p")
+                if animatic
+                else "720p"
+            )
             if animatic:
                 beat_url_now = beat_result.get("video_url") or ""
                 if isinstance(beat_url_now, str) and beat_url_now.startswith("file://"):
-                    measured_beat = await asyncio.to_thread(
-                        measure_video_duration, Path(beat_url_now[7:])
+                    beat_path = Path(beat_url_now[7:])
+                    measured_beat = await _probe_media(
+                        measure_video_duration, beat_path
                     )
                     if measured_beat is not None:
                         beat_duration = measured_beat
                         beat_duration_source = "measured from the rendered video"
+                    # The resolution needs measuring for the same reason the
+                    # duration does, and more so here: a clip renders many
+                    # files in one call, so an unverified echo is the cheapest
+                    # place for a silent resolution regression to hide — and
+                    # the per-second rate differs threefold across omni's
+                    # tiers, so every beat would be mispriced together.
+                    size = await _probe_media(measure_video_dimensions, beat_path)
+                    if size is not None:
+                        beat_dimensions = list(size)
+                        classified = classify_video_resolution(size)
+                        if classified is not None:
+                            if classified != beat_resolution:
+                                clip_warnings.append(
+                                    f"Beat {idx} requested {beat_resolution} but "
+                                    f"rendered {classified} ({size[0]}x{size[1]}); "
+                                    "the cost prices what rendered."
+                                )
+                            beat_resolution = classified
+                            beat_resolution_source = "measured from the rendered video"
 
             beat_manifest = {
                 "kind": "beat",
                 "index": idx,
                 "prompt": prompt,
                 "model": beat_model,
+                # generate_clip takes no resolution parameter, so a Veo beat
+                # is always 720p; an animatic beat is whatever omni MEASURED.
+                "resolution": beat_resolution,
+                "resolution_source": beat_resolution_source
+                or (
+                    "the request: the rendered file could not be opened to measure it"
+                    if animatic
+                    else "fixed: generate_clip takes no resolution parameter"
+                ),
+                **(
+                    {"rendered_dimensions": beat_dimensions}
+                    if beat_dimensions is not None
+                    else {}
+                ),
                 "aspect_ratio": aspect_ratio,
                 "duration_seconds": beat_duration,
                 "seed": None if animatic else seed,
@@ -3748,10 +5908,10 @@ async def generate_clip(
 
                 if cur_bytes is not None:
                     try:
-                        end_frame = await asyncio.to_thread(
+                        end_frame = await _decode_media(
                             extract_frame_png, prev_video_bytes, "end"
                         )
-                        start_frame = await asyncio.to_thread(
+                        start_frame = await _decode_media(
                             extract_frame_png, cur_bytes, "start"
                         )
                         await ctx.info(f"Generating bridge before beat {idx + 1}")
@@ -3781,13 +5941,30 @@ async def generate_clip(
                             }
                         )
                     else:
+                        # The same provenance a Veo BEAT carries, under the same
+                        # policy: Veo renders exactly the length it is sent, so
+                        # the request is the fact and nothing is measured (only
+                        # omni beats are, because there the length is the
+                        # service's choice). In-clip bridges had a bare
+                        # `duration_seconds: 4` and none of resolution,
+                        # resolution_source or duration_source -- flagged in
+                        # live testing more than once -- while beats beside
+                        # them carried all three.
                         bridge_manifest = {
                             "kind": "bridge",
                             "between_beats": [idx - 1, idx],
                             "model": bridge_result.get("model", model),
                             "aspect_ratio": aspect_ratio,
-                            "duration_seconds": bridge_result.get(
-                                "duration_seconds", 4.0
+                            "duration_seconds": float(
+                                bridge_result.get("duration_seconds", 4.0)
+                            ),
+                            "duration_source": (
+                                "the fixed 4s request: Veo renders exactly the "
+                                "length it is sent"
+                            ),
+                            "resolution": "720p",
+                            "resolution_source": (
+                                "fixed: generate_clip takes no resolution parameter"
                             ),
                             "video_url": bridge_result.get("video_url"),
                         }
@@ -3832,7 +6009,7 @@ async def generate_clip(
         # params, GCS notices) onto the notification channel, not just the JSON
         # manifest — an agent watching the stream saw none of them before.
         await _emit_warnings(ctx, clip_warnings)
-        return json.dumps(clip_manifest, indent=2)
+        return _respond(app_ctx, clip_manifest)
     except asyncio.CancelledError:
         # A cancellation is a BaseException, so the handler below never saw
         # it: a client that disconnected after five beats had rendered took
@@ -3870,29 +6047,77 @@ async def generate_clip(
 async def generate_video_omni(
     ctx: Context[ServerSession, AppContext],
     prompt: str,
+    omni_model: str = DEFAULT_OMNI_MODEL,
+    omni_backend: str | None = None,
     image_uris: list[str] | None = None,
+    first_frame_uri: str | None = None,
+    last_frame_uri: str | None = None,
+    reference_image_uris: list[str] | None = None,
+    reference_video_uris: list[str] | None = None,
     input_video_uri: str | None = None,
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
+    resolution: str | None = None,
     previous_interaction_id: str | None = None,
     output_gcs_uri: str | None = None,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
 ) -> str:
-    """Generate a video fast with gemini-omni-flash (Interactions API).
+    """Generate a video fast with an Omni model (Interactions API).
 
-    Omni is the fast path (720p, 24fps): good for drafts and quick
-    iteration. The Veo tools remain the high-fidelity path (1080p/4K, seeds,
-    first/last-frame control). Omni does not support seeds or negative prompts.
+    Omni is the fast path: good for drafts and quick iteration, and the only
+    family with conversational multi-turn editing. Neither model supports
+    seeds or negative prompts (put negatives in the prompt: "no dialogue").
+
+    Two models, and the default is the one with the controls:
+
+    * `gemini-omni-1.1-flash` (default) — 360p/720p/1080p/4K output,
+      first/last-frame interpolation, image and video references, native
+      audio, and video extension (see extend_video_omni).
+    * `gemini-omni-flash-preview` — 720p/24fps and nothing else. Deprecated;
+      its endpoint is switched off on 2026-09-30.
+
+    A 360p pass costs about a third of 720p, which makes it the cheapest
+    preview this server can render.
 
     Args:
         ctx: MCP context with application state
-        prompt: Text description of the video to generate
-        image_uris: Optional input image URIs to condition on (gs://, http(s)://,
-            file:// within DATA_FOLDER)
-        input_video_uri: Optional video to edit (uploaded via the Files API)
-        aspect_ratio: "16:9" (default) or "9:16". Output is always 720p.
-        duration_seconds: Desired duration, clamped to 3-10s (default 6)
+        prompt: Text description of the video to generate. Role tags you write
+            yourself (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) are
+            passed through untouched; otherwise the declarations are generated
+            from the media arguments below and echoed back as
+            `effective_prompt`. Timecodes work in plain language
+            ("[0-3s] a person walks"), as does audio direction ("include calm
+            background music").
+        omni_model: "gemini-omni-1.1-flash" (default) or the deprecated
+            "gemini-omni-flash-preview", whose endpoint is switched off on
+            2026-09-30. Arguments the chosen model cannot honor are refused,
+            never dropped.
+        image_uris: Optional input images whose role the model infers — one is
+            treated as a starting frame, several as subject references
+            (gs://, http(s)://, file:// within DATA_FOLDER). Cannot be combined
+            with the explicit-role arguments below.
+        first_frame_uri: 1.1 only. Image the video starts on.
+        last_frame_uri: 1.1 only. Image the video ends on; requires
+            first_frame_uri. The pair renders an interpolation between them —
+            the same URI for both makes a seamless loop.
+        reference_image_uris: 1.1 only. Subject/style references, bound to
+            `<IMAGE_REF_0>`, `<IMAGE_REF_1>`, … in order.
+        reference_video_uris: 1.1 only. Up to 3 clips of up to 3s each, bound
+            to `<VIDEO_REF_0>`, … for character or object likeness. Audio in a
+            reference clip is ignored.
+        input_video_uri: Optional video to edit. On 1.1 a clip too large to
+            inline is uploaded through the Files API automatically (which
+            needs a Gemini API key — Vertex has no Files API).
+        aspect_ratio: "16:9" (default) or "9:16". Not sent on an edit, whose
+            source already fixes it.
+        duration_seconds: Desired duration, clamped to 3-10s (default 6).
+            Never sent on an edit.
+        resolution: 1.1 only. "360p", "720p" (default), "1080p" or "4K" —
+            1080p and 4K are upscaled from the base render. Google publishes
+            one token rate, pinned to 720p, so 1080p/4K are quoted at that
+            rate and 360p at the one-third ratio stated in the launch post;
+            the response says so on the estimate.
         previous_interaction_id: Continue a prior omni interaction to edit its
             video conversationally (see also the edit_video tool)
         output_gcs_uri: Optional gs:// destination for the video (Vertex only;
@@ -3901,26 +6126,79 @@ async def generate_video_omni(
             configured (GCS_ALLOWED_BUCKETS / VIDEO_GCS_BUCKET); with no
             allowlist set the server warns and defers to ambient
             credentials, so a dry run quotes rather than refusing.
-        timeout_seconds: Overall deadline for the render (create + polling).
-            Generation typically takes over a minute; raise for long queues.
+        timeout_seconds: Overall deadline for the render (create + polling),
+            default 210s. Generation typically takes over a minute. The default
+            sits under the ~4 minute ceiling common MCP hosts put on one tool
+            call, deliberately: a render that outlives the HOST's limit is
+            billed with no result and no interaction_id, so the spend cannot be
+            reconciled. Under this limit the call fails with a TimeoutError
+            naming the interaction_id, which is recoverable. Raise it only if
+            your host waits longer.
 
+        omni_backend: Which backend serves this call: "auto" (default), "vertex"
+            or "gemini_api". Unset, the server's OMNI_BACKEND applies. "auto"
+            uses the Gemini Developer API whenever a GEMINI_API_KEY is set,
+            even on a Vertex server -- a different project, billing path and
+            quota pool -- so an enterprise deployment that must keep omni
+            traffic on Vertex AI passes "vertex" here or sets OMNI_BACKEND=
+            vertex. The response reports `backend` and `backend_reason`. An
+            unsatisfiable choice is refused, as is one that contradicts the
+            backend a previous_interaction_id was minted on.
         dry_run: When True, return only the cost estimate for the clamped
             duration and generate nothing.
 
     Returns:
-        JSON with video_url, interaction_id (pass to edit_video / this tool to
-        keep editing), and generation details.
+        JSON with video_url, interaction_id (pass to edit_video /
+        extend_video_omni / this tool to keep going), and generation details.
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
-        # Fail fast before any fetch or interaction work; the omni impl
-        # clamps to [3, 10]s, which would turn a negative or NaN duration
-        # into a billed 3s render instead of an error.
+        # Which backend serves this call, decided once and reported; see
+        # _omni_backend_decision.
+        omni_backend_resolved, omni_backend_reason = await _resolve_omni_backend(
+            app_ctx,
+            omni_backend,
+            need_gcs=bool(output_gcs_uri),
+            previous_interaction_id=previous_interaction_id,
+        )
+        # Every pre-flight runs before any fetch or interaction work: the omni
+        # impl clamps to [3, 10]s, which would turn a negative or NaN duration
+        # into a billed 3s render instead of an error, and a capability the
+        # chosen model lacks must fail here rather than after the spend.
         _validate_duration_seconds(duration_seconds)
         # src/omni.py refuses anything but 16:9 / 9:16, so quoting one was
         # the quote accepting what the run refuses — every other video tool
         # front-loads this check and these two did not.
         _validate_aspect_ratio(aspect_ratio)
+        spec = _validate_omni_model(omni_model)
+        normalized_resolution = _validate_omni_resolution(spec, resolution)
+        reference_images = list(reference_image_uris or [])
+        reference_videos = list(reference_video_uris or [])
+        inferred_images = list(image_uris or [])
+        # The same rules the impl enforces on bytes, run here on counts, so a
+        # dry_run never quotes a request the real call would refuse.
+        validate_omni_request(
+            spec.model,
+            resolution=resolution,
+            has_first_frame=first_frame_uri is not None,
+            has_last_frame=last_frame_uri is not None,
+            reference_image_count=len(reference_images),
+            reference_video_count=len(reference_videos),
+            inferred_image_count=len(inferred_images),
+        )
+        # Cap the images: every one is buffered in memory (each up to
+        # MAX_FETCH_BYTES), and omni conditions on a small set.
+        total_images = (
+            len(inferred_images)
+            + len(reference_images)
+            + (first_frame_uri is not None)
+            + (last_frame_uri is not None)
+        )
+        if total_images > MAX_OMNI_INPUT_IMAGES:
+            raise ValueError(
+                f"Too many input images ({total_images}); {spec.model} accepts "
+                f"at most {MAX_OMNI_INPUT_IMAGES} here."
+            )
 
         gcs_warnings: list[str] = []
         if output_gcs_uri:
@@ -3934,6 +6212,20 @@ async def generate_video_omni(
             )
             if allowlist_warning:
                 gcs_warnings.append(allowlist_warning)
+            if omni_backend_resolved == "gemini_api":
+                # The docstring promised this notice and only the allowlist
+                # warning ever fired, so a caller's destination was dropped in
+                # silence. Omni prefers the Gemini API whenever a key is
+                # configured, which is exactly when this bites.
+                gcs_warnings.append(
+                    "output_gcs_uri is ignored: this call runs on the Gemini "
+                    "Developer API, which returns media inline and has no GCS "
+                    "destination. Pass omni_backend=\"vertex\" (or set "
+                    "OMNI_BACKEND=vertex) on a Vertex server to deliver to "
+                    "Cloud Storage."
+                )
+
+        billed_resolution = _omni_billed_resolution(spec, normalized_resolution)
 
         if dry_run:
             # Disclose the GCS-allowlist warning on the notification channel,
@@ -3941,11 +6233,27 @@ async def generate_video_omni(
             await _emit_warnings(ctx, gcs_warnings)
             # Refuse local sources the real run would reject, so a quote does
             # not price a call that cannot run. Remote sources still price.
-            for uri in image_uris or []:
+            for uri in (
+                *inferred_images,
+                *reference_images,
+                *reference_videos,
+                first_frame_uri,
+                last_frame_uri,
+            ):
                 _assert_local_source(uri, app_ctx.data_folder, "image_uri")
             _assert_local_source(
                 input_video_uri, app_ctx.data_folder, "input_video_uri"
             )
+            # Measured here, not only on the render: pre-flighting must buy
+            # the caller something for a violation the server can already see.
+            gcs_warnings.extend(
+                await _omni_local_reference_video_warnings(ctx, spec, reference_videos)
+            )
+            # Disclosed on the render already; a quote that stayed silent left
+            # the caller uninformed while it was still free to act on.
+            quote_reroute = omni_model_reroute_warning(omni_model, spec.model)
+            if quote_reroute:
+                gcs_warnings.append(quote_reroute)
             # An input video (or a prior interaction) makes this an edit —
             # omni._select_task_type keys on either — and an edit sends no
             # duration and renders a service-chosen length that measured 10s
@@ -3953,115 +6261,170 @@ async def generate_video_omni(
             # under-quoted an input-video edit 3.3x, the same defect edit_video
             # already fixed; match it and quote the maximum as an upper bound.
             if previous_interaction_id or input_video_uri:
-                quoted = float(OMNI_MAX_DURATION_SECONDS)
-                return json.dumps(
+                if previous_interaction_id:
+                    prior_duration = await _source_duration_or_none(
+                        app_ctx.videos_dir, previous_interaction_id
+                    )
+                else:
+                    # Measured, like extend_video_omni's dry_run already does
+                    # for a local source. Passing None here quoted the 10s
+                    # bound for every uploaded edit and skipped the source
+                    # ceiling entirely: on Vertex, whose ceiling is 30s, that
+                    # under-quoted an edit by up to 3x and let a quote succeed
+                    # for a source the real run refuses. Remote sources stay
+                    # unmeasured -- a quote does not download one.
+                    prior_duration = None
+                    source_bytes = await _fetch_local_source(ctx, input_video_uri)
+                    if source_bytes is not None:
+                        prior_duration = await _probe_media(
+                            measure_video_duration_bytes, source_bytes
+                        )
+                        _ = await _check_omni_source_video(
+                            spec,
+                            source_bytes,
+                            vertexai=(omni_backend_resolved == "vertex"),
+                        )
+                quoted = omni_continuation_upper_bound(
+                    spec,
+                    "edit",
+                    prior_duration,
+                    vertexai=(omni_backend_resolved == "vertex"),
+                )
+                return _respond(
+                    app_ctx,
                     {
                         "dry_run": True,
                         "message": "Estimate only — nothing was generated",
-                        "model": OMNI_MODEL,
+                        "model": spec.model,
+                        "backend": omni_backend_resolved,
+                        "backend_reason": omni_backend_reason,
+                        **_omni_requested_model(omni_model, spec),
+                        "resolution": billed_resolution,
                         "duration_seconds": quoted,
                         "duration_source": (
                             "upper bound: an edit's rendered length is chosen "
                             "by the service and is not predictable from the "
-                            f"request or the source, so this quotes Omni's "
-                            f"{OMNI_MAX_DURATION_SECONDS}s maximum. The real "
-                            "run reports the measured duration."
+                            f"request or the source, so this quotes the "
+                            f"longest clip it could produce ({quoted:g}s). The "
+                            "real run reports the measured duration."
                         ),
                         "estimated_cost": _video_cost(
-                            OMNI_MODEL,
+                            spec.model,
                             quoted,
-                            resolution="720p",
+                            resolution=billed_resolution,
                             include_audio=False,
                             presnapped=True,
                         ),
                         **({"warnings": gcs_warnings} if gcs_warnings else {}),
                     },
-                    indent=2,
                 )
             # A fresh render honours the clamped request; mirror the impl's
             # clamp so the quote matches what it will bill.
             clamped = min(10, max(3, round(duration_seconds)))
-            return json.dumps(
+            return _respond(
+                app_ctx,
                 {
                     "dry_run": True,
                     "message": "Estimate only — nothing was generated",
-                    "model": OMNI_MODEL,
+                    "model": spec.model,
+                    "backend": omni_backend_resolved,
+                    "backend_reason": omni_backend_reason,
+                    **_omni_requested_model(omni_model, spec),
+                    "resolution": billed_resolution,
                     # Report both, like generate_video and edit_video: a caller
                     # who asked for 2s must see it snapped to 3 here, not a bare
                     # 3 with no sign their request was clamped.
                     "requested_duration_seconds": duration_seconds,
                     "duration_seconds": clamped,
                     "estimated_cost": _video_cost(
-                        OMNI_MODEL,
+                        spec.model,
                         float(clamped),
-                        resolution="720p",
+                        resolution=billed_resolution,
                         include_audio=False,
                         presnapped=True,
                     ),
                     **({"warnings": gcs_warnings} if gcs_warnings else {}),
                 },
-                indent=2,
             )
-        data_dir = app_ctx.data_folder
 
-        image_bytes_list: list[bytes] = []
-        if image_uris:
-            # Cap the list: every image is buffered in memory (each up to
-            # MAX_FETCH_BYTES), and omni conditions on a small set of images.
-            if len(image_uris) > 8:
-                raise ValueError(
-                    f"Too many image_uris ({len(image_uris)}); "
-                    "gemini-omni-flash accepts at most 8 input images here."
-                )
-            for uri in image_uris:
-                b = await fetch(
-                    uri,
-                    allowed_dir=data_dir,
-                    allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
-                )
-                if b is None:
-                    raise ValueError(_fetch_failure("image_uri", uri, data_dir))
-                image_bytes_list.append(b)
+        image_bytes_list = [
+            await _fetch_omni_media(ctx, uri, "image_uri") for uri in inferred_images
+        ]
+        reference_image_bytes = [
+            await _fetch_omni_media(ctx, uri, "reference_image_uri")
+            for uri in reference_images
+        ]
+        reference_video_bytes = [
+            await _fetch_omni_media(ctx, uri, "reference_video_uri")
+            for uri in reference_videos
+        ]
+        first_frame_bytes = await _fetch_optional_omni_media(
+            ctx, first_frame_uri, "first_frame_uri"
+        )
+        last_frame_bytes = await _fetch_optional_omni_media(
+            ctx, last_frame_uri, "last_frame_uri"
+        )
+        input_video_bytes = await _fetch_optional_omni_media(
+            ctx, input_video_uri, "input_video_uri"
+        )
 
-        input_video_bytes = None
-        if input_video_uri:
-            input_video_bytes = await fetch(
-                input_video_uri,
-                allowed_dir=data_dir,
-                allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+        extra_warnings = await _omni_reference_video_warnings(
+            spec, reference_video_bytes
+        )
+        if input_video_bytes is not None:
+            # The same documented 10s ceiling extend_video_omni enforces. An
+            # edit is the other half of "input videos for editing and
+            # extension must be 10 seconds or less when uploading", and
+            # checking it only on one of the two let a 30s clip be fetched,
+            # uploaded through the Files API and rejected by the service for a
+            # limit that was measurable from the bytes before any of that.
+            extra_warnings.extend(
+                await _check_omni_source_video(
+                    spec,
+                    input_video_bytes,
+                    vertexai=(omni_backend_resolved == "vertex"),
+                )
             )
-            if input_video_bytes is None:
-                raise ValueError(
-                    _fetch_failure("input_video_uri", input_video_uri, data_dir)
-                )
 
-        await ctx.info("Generating video with gemini-omni-flash")
+        await ctx.info(f"Generating video with {spec.model}")
         result = await _omni_generate_and_manifest(
             app_ctx,
             ctx,
+            prefer_backend=omni_backend_resolved,
+            backend_reason=omni_backend_reason,
             prompt=prompt,
+            model=spec.model,
             image_bytes_list=image_bytes_list or None,
+            first_frame_bytes=first_frame_bytes,
+            last_frame_bytes=last_frame_bytes,
+            reference_image_bytes_list=reference_image_bytes or None,
             input_video_bytes=input_video_bytes,
+            reference_video_bytes_list=reference_video_bytes or None,
             previous_interaction_id=previous_interaction_id,
             aspect_ratio=aspect_ratio,
             duration_seconds=duration_seconds,
+            resolution=normalized_resolution,
             output_gcs_uri=output_gcs_uri,
             timeout_seconds=timeout_seconds,
             manifest_extra={
                 "image_uris": image_uris,
+                "first_frame_uri": first_frame_uri,
+                "last_frame_uri": last_frame_uri,
+                "reference_image_uris": reference_image_uris,
+                "reference_video_uris": reference_video_uris,
                 "input_video_uri": input_video_uri,
             },
         )
         # The allowlist warning computed above never reached the real-run body
         # (it was only wired into the dry_run payload). Merge it so the body
         # and the notification channel agree, then mirror every warning.
-        if gcs_warnings:
+        if gcs_warnings or extra_warnings:
             body_warnings = result.setdefault("warnings", [])
-            for warning in gcs_warnings:
+            for warning in (*gcs_warnings, *extra_warnings):
                 if warning not in body_warnings:
                     body_warnings.append(warning)
         await _emit_warnings(ctx, result.get("warnings"))
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Omni video generation failed: {e}")
         logger.exception("Tool error")
@@ -4073,12 +6436,15 @@ async def edit_video(
     ctx: Context[ServerSession, AppContext],
     previous_interaction_id: str,
     prompt: str,
+    omni_model: str = DEFAULT_OMNI_MODEL,
+    omni_backend: str | None = None,
     aspect_ratio: str = "16:9",
     duration_seconds: float = 6.0,
-    timeout_seconds: int = 600,
+    resolution: str | None = None,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
 ) -> str:
-    """Conversationally edit a video generated by gemini-omni-flash.
+    """Conversationally edit a video generated by an Omni model.
 
     Pass the `interaction_id` returned by a prior generate_video_omni (or
     edit_video) call plus an instruction describing only the change (e.g.
@@ -4088,10 +6454,17 @@ async def edit_video(
     are kept ~14 days on Vertex; longer on the paid Gemini API) — do not
     assume an interaction_id stays editable indefinitely.
 
+    Simple instructions edit best: "Make this video anime", "Make the phone
+    invisible. Keep everything else the same." Over-describing the scene
+    changes parts you meant to keep.
+
     Args:
         ctx: MCP context with application state
         previous_interaction_id: interaction_id from a prior omni result
         prompt: The edit instruction (describe only what should change)
+        omni_model: The model to run the edit on. Must be the model that
+            produced `previous_interaction_id` — the interaction's video
+            context lives with it.
         aspect_ratio: NOT SENT for edits — the API rejects it on an edit task
             (verified on the wire), so it does not change the output.
         duration_seconds: NOT SENT for edits, and it does not determine the
@@ -4100,7 +6473,19 @@ async def edit_video(
             neither this value nor the source video's length. A measured 3s
             source edited with duration_seconds=4 rendered 10.01s. Google's
             Omni documentation does not state the rule.
-        timeout_seconds: Overall deadline for the edit render (default 600)
+        resolution: gemini-omni-1.1-flash only. The output resolution to
+            render the edit at; omitted keeps the service default.
+        timeout_seconds: Overall deadline for the edit render, default 210s
+            — see generate_video_omni on why it sits under the host ceiling
+        omni_backend: Which backend serves this call: "auto" (default), "vertex"
+            or "gemini_api". Unset, the server's OMNI_BACKEND applies. "auto"
+            uses the Gemini Developer API whenever a GEMINI_API_KEY is set,
+            even on a Vertex server -- a different project, billing path and
+            quota pool -- so an enterprise deployment that must keep omni
+            traffic on Vertex AI passes "vertex" here or sets OMNI_BACKEND=
+            vertex. The response reports `backend` and `backend_reason`. An
+            unsatisfiable choice is refused, as is one that contradicts the
+            backend a previous_interaction_id was minted on.
         dry_run: When True, return only the cost estimate and generate
             nothing. Because the rendered length is unpredictable, the quote
             is Omni's 10s maximum as an upper bound — a pre-flight may
@@ -4116,6 +6501,14 @@ async def edit_video(
     """
     try:
         app_ctx = ctx.request_context.lifespan_context
+        # Which backend serves this call, decided once and reported; see
+        # _omni_backend_decision.
+        omni_backend_resolved, omni_backend_reason = await _resolve_omni_backend(
+            app_ctx,
+            omni_backend,
+            need_gcs=False,
+            previous_interaction_id=previous_interaction_id,
+        )
         # Fail fast before any fetch or interaction work; the omni impl
         # clamps to [3, 10]s, which would turn a negative or NaN duration
         # into a billed 3s render instead of an error.
@@ -4126,6 +6519,9 @@ async def edit_video(
         # keeps the two answers identical instead of deciding the edit case
         # differently from the impl that owns it.
         _validate_aspect_ratio(aspect_ratio)
+        spec = _validate_omni_model(omni_model)
+        normalized_resolution = _validate_omni_resolution(spec, resolution)
+        billed_resolution = _omni_billed_resolution(spec, normalized_resolution)
 
         if dry_run:
             # An edit inherits its duration from the source video, so the
@@ -4143,46 +6539,633 @@ async def edit_video(
             source_duration = await _source_duration_or_none(
                 app_ctx.videos_dir, previous_interaction_id
             )
-            quoted = float(OMNI_MAX_DURATION_SECONDS)
+            # The upload ceiling of the backend that will serve the edit is
+            # what bounds an unrecorded source's length -- 30s on Vertex, 10s
+            # on the Developer API. That backend was decided above, from the
+            # prior interaction's record and any omni_backend request.
+            quoted = omni_continuation_upper_bound(
+                spec,
+                "edit",
+                source_duration,
+                vertexai=(omni_backend_resolved == "vertex"),
+            )
             payload: dict[str, Any] = {
                 "dry_run": True,
                 "message": "Estimate only — nothing was generated",
-                "model": OMNI_MODEL,
+                "model": spec.model,
+                "backend": omni_backend_resolved,
+                "backend_reason": omni_backend_reason,
+                "resolution": billed_resolution,
                 "previous_interaction_id": previous_interaction_id,
                 "duration_seconds": quoted,
                 "duration_source": (
-                    f"upper bound: an edit's rendered length is chosen by the "
-                    f"service and is not predictable from the request or the "
-                    f"source, so this quotes Omni's {OMNI_MAX_DURATION_SECONDS}s "
-                    "maximum. The real run reports the measured duration."
+                    "upper bound: an edit's rendered length is chosen by the "
+                    "service and is not predictable from the request or the "
+                    f"source, so this quotes the longest clip it could produce "
+                    f"({quoted:g}s). The real run reports the measured duration."
                 ),
             }
             if source_duration is not None:
                 payload["source_duration_seconds"] = source_duration
+            payload.update(_omni_requested_model(omni_model, spec))
+            edit_reroute = omni_model_reroute_warning(omni_model, spec.model)
+            if edit_reroute:
+                payload.setdefault("warnings", []).append(edit_reroute)
+                await _emit_warnings(ctx, [edit_reroute])
             payload["estimated_cost"] = _video_cost(
-                OMNI_MODEL,
+                spec.model,
                 quoted,
-                resolution="720p",
+                resolution=billed_resolution,
                 include_audio=False,
                 presnapped=True,
             )
-            return json.dumps(payload, indent=2)
+            return _respond(app_ctx, payload)
 
         await ctx.info(f"Editing video (interaction {previous_interaction_id})")
         result = await _omni_generate_and_manifest(
             app_ctx,
             ctx,
+            prefer_backend=omni_backend_resolved,
+            backend_reason=omni_backend_reason,
             prompt=prompt,
+            model=spec.model,
             previous_interaction_id=previous_interaction_id,
             aspect_ratio=aspect_ratio,
             duration_seconds=duration_seconds,
+            resolution=normalized_resolution,
             timeout_seconds=timeout_seconds,
             manifest_extra={"kind": "omni_edit"},
         )
         await _emit_warnings(ctx, result.get("warnings"))
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except Exception as e:
         await ctx.error(f"Video edit failed: {e}")
+        logger.exception("Tool error")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def extend_video_omni(
+    ctx: Context[ServerSession, AppContext],
+    prompt: str,
+    previous_interaction_id: str | None = None,
+    input_video_uri: str | None = None,
+    omni_model: str = OMNI_1_1_MODEL,
+    omni_backend: str | None = None,
+    times: int = 1,
+    resolution: str | None = None,
+    reference_image_uris: list[str] | None = None,
+    reference_video_uris: list[str] | None = None,
+    output_gcs_uri: str | None = None,
+    timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
+    max_cost_usd: float | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Append a seamless continuation to an existing video (Omni 1.1 only).
+
+    Extension is not editing and it is not a new render: the model reads the
+    last 10 seconds of the source as context and generates what happens next,
+    keeping motion, characters and audio coherent across the join. Some of the
+    source's final frames are altered so the transition is invisible.
+
+    Two sources, with different rules:
+
+    * `previous_interaction_id` — a clip this server already rendered. The
+      video context lives on the service, nothing is uploaded, and spoken
+      dialogue may be added in the continuation.
+    * Editing or extending an UPLOADED video is not available to users in the
+      EEA, Switzerland or the UK (Google's regional restriction). The service
+      refuses; this server cannot pre-check it.
+    * `max_cost_usd`: refuse BEFORE the first turn renders if the projected
+      bill exceeds it. Each turn re-bills the assembled clip, so cost grows
+      with times². A dry run reports `would_be_refused: true` instead.
+    * `input_video_uri` — a clip of your own. It must be 10 seconds or shorter,
+      it cannot gain new dialogue if someone is talking in it, and uploading it
+      to be extended is unavailable in the EEA, Switzerland and the UK.
+
+    Each turn appends a fixed 10s, to a cumulative 40s counting the source.
+    `times` chains that many turns, threading each result into the next.
+
+    COST WARNING. A turn returns the ASSEMBLED clip, not the increment it
+    appended — measured: a 3.01s source extended once came back 13.01s. Omni
+    bills per second of output, so every turn re-bills all the footage before
+    it and a chain costs quadratically, not linearly. From a 3s source:
+
+        turns   billed      360p     720p
+          1      13s       $0.44    $1.32
+          2      36s       $1.22    $3.65
+          3      69s       $2.33    $6.99
+
+    Each turn's `video_url` supersedes the previous one; they are not segments
+    to join. `dry_run` first — the quote is exact once the source's length is
+    known, and this tool measures it.
+
+    Args:
+        ctx: MCP context with application state
+        prompt: How the scene continues — "Extend this video", "The scene
+            continues", "Continue the scene: the camera pans across the
+            mountains". Describe the audio if it should change ("the music
+            continues into the chorus"), and say so if you want a cut to a new
+            scene. In a timecode, 0s is the start of the NEW footage, not of
+            the source.
+        previous_interaction_id: interaction_id of a clip this server rendered.
+        input_video_uri: A video to upload and extend (gs://, http(s)://,
+            file:// within DATA_FOLDER). Give exactly one of this and
+            previous_interaction_id.
+        omni_model: Defaults to gemini-omni-1.1-flash, the only model with
+            video extension.
+        times: How many extension turns to chain (default 1). Each appends a
+            fixed 10s increment; the documented ceiling is a 40s finished
+            clip, counting the source. There is no per-turn duration
+            parameter: the service rejects `duration` on an extend request and
+            the launch post describes extension as fixed 10s increments.
+        resolution: "360p", "720p" (default), "1080p" or "4K".
+        reference_image_uris: Optional references bound to `<IMAGE_REF_0>`, …
+            for introducing a new character or object into the continuation.
+        reference_video_uris: Optional likeness references, up to 3 clips of
+            up to 3s each, bound to `<VIDEO_REF_0>`, …
+        output_gcs_uri: Optional gs:// destination (Vertex only).
+        timeout_seconds: Deadline for EACH extension turn, default 210s. A
+            chain of turns can still exceed a host's ceiling in total; each
+            completed turn is returned as it finishes, so a cut-off chain is
+            resumable from the last interaction_id.
+        omni_backend: Which backend serves this call: "auto" (default), "vertex"
+            or "gemini_api". Unset, the server's OMNI_BACKEND applies. "auto"
+            uses the Gemini Developer API whenever a GEMINI_API_KEY is set,
+            even on a Vertex server -- a different project, billing path and
+            quota pool -- so an enterprise deployment that must keep omni
+            traffic on Vertex AI passes "vertex" here or sets OMNI_BACKEND=
+            vertex. The response reports `backend` and `backend_reason`. An
+            unsatisfiable choice is refused, as is one that contradicts the
+            backend a previous_interaction_id was minted on.
+        dry_run: When True, return only the cost estimate. A turn renders the
+            assembled clip, so the quote is the source plus one 10s increment
+            per turn, summed across turns. It needs the source's length to be
+            right: measured from the bytes for an uploaded clip, read from the
+            sidecar for a prior interaction, and assumed to be the documented
+            maximum when neither is available — because assuming a shorter
+            source than the real one is the one direction a quote may not err
+            in. An earlier version promised "Omni's 10s maximum, an upper
+            bound, never an under-quote" and a 3.01s source rendered 13.01s.
+
+    Returns:
+        JSON with the final video_url, the interaction_id to keep extending
+        from, and one segment record per turn.
+    """
+    try:
+        app_ctx = ctx.request_context.lifespan_context
+        # Which backend serves this call, decided once and reported; see
+        # _omni_backend_decision.
+        omni_backend_resolved, omni_backend_reason = await _resolve_omni_backend(
+            app_ctx,
+            omni_backend,
+            need_gcs=bool(output_gcs_uri),
+            previous_interaction_id=previous_interaction_id,
+        )
+        spec = _validate_omni_model(omni_model)
+        normalized_resolution = _validate_omni_resolution(spec, resolution)
+        reference_images = list(reference_image_uris or [])
+        reference_videos = list(reference_video_uris or [])
+        if len(reference_images) > MAX_OMNI_INPUT_IMAGES:
+            # The same cap generate_video_omni front-loads, and for the same
+            # reason: every image is buffered whole (each up to
+            # MAX_FETCH_BYTES) and base64-inflated into one request body.
+            raise ValueError(
+                f"Too many reference images ({len(reference_images)}); "
+                f"{spec.model} accepts at most {MAX_OMNI_INPUT_IMAGES} here."
+            )
+        validate_omni_request(
+            spec.model,
+            resolution=resolution,
+            task="extend",
+            reference_image_count=len(reference_images),
+            reference_video_count=len(reference_videos),
+        )
+
+        if (previous_interaction_id is None) == (input_video_uri is None):
+            raise ValueError(
+                "Give exactly one source to extend: previous_interaction_id "
+                "(a clip this server generated) or input_video_uri (a clip to "
+                "upload)."
+            )
+
+        max_turns = spec.max_extended_seconds // spec.extension_step_seconds
+        if not isinstance(times, int) or isinstance(times, bool) or times < 1:
+            raise ValueError(f"times must be an integer >= 1, got {times!r}.")
+        if times > max_turns:
+            raise ValueError(
+                f"times={times} exceeds what omni allows: each turn appends up "
+                f"to {spec.extension_step_seconds}s and a clip is capped at "
+                f"{spec.max_extended_seconds}s, so at most {max_turns} turns "
+                "are possible."
+            )
+
+        warnings: list[str] = []
+        if output_gcs_uri:
+            bucket = _parse_gcs_bucket(output_gcs_uri)
+            if bucket is None:
+                raise ValueError(
+                    f"output_gcs_uri must start with gs://: {output_gcs_uri}"
+                )
+            allowlist_warning = _assert_gcs_bucket_allowed(
+                bucket, app_ctx.allowed_gcs_buckets
+            )
+            if allowlist_warning:
+                warnings.append(allowlist_warning)
+
+        billed_resolution = _omni_billed_resolution(spec, normalized_resolution)
+
+        # One lookup, ahead of the dry_run branch so a quote cannot price a
+        # call the real run would refuse: it settles the source's model (a
+        # hard refusal), its length (the projection below) and the backend the
+        # whole chain pins to.
+        prior = await _prior_interaction_or_empty(
+            app_ctx.videos_dir, previous_interaction_id
+        )
+        if prior.model is not None and prior.model != spec.model:
+            # Extension exists on one omni model. Continuing another model's
+            # interaction would go out as a bare conversational edit — the
+            # task cannot ride alongside a previous_interaction_id — and be
+            # billed as an extension of a clip that was never extended.
+            raise ValueError(
+                f"interaction {previous_interaction_id} was created on "
+                f"{prior.model}, and an interaction cannot change models "
+                f"mid-conversation. Pass omni_model='{prior.model}' — but note "
+                f"that only {OMNI_1_1_MODEL} can extend, so a "
+                f"{prior.model} clip has to be re-rendered there first."
+            )
+
+        if dry_run:
+            for uri in (*reference_images, *reference_videos):
+                _assert_local_source(uri, app_ctx.data_folder, "reference_uri")
+            warnings.extend(
+                await _omni_local_reference_video_warnings(ctx, spec, reference_videos)
+            )
+            extend_reroute = omni_model_reroute_warning(omni_model, spec.model)
+            if extend_reroute:
+                warnings.append(extend_reroute)
+            _assert_local_source(
+                input_video_uri, app_ctx.data_folder, "input_video_uri"
+            )
+            source_duration = prior.duration_seconds
+            if source_duration is None and input_video_uri:
+                # An uploaded source's length is the base every turn is billed
+                # on, and it is sitting in a local file the quote can open.
+                # Assuming the documented maximum instead quoted $0.6771 for a
+                # render that billed $0.4396 — over-stating, so the invariant
+                # held, but by 54% on a figure that was free to measure. Only
+                # local sources: a quote does not download a remote one.
+                source_bytes = await _fetch_local_source(ctx, input_video_uri)
+                if source_bytes is not None:
+                    source_duration = await _probe_media(
+                        measure_video_duration_bytes, source_bytes
+                    )
+                    if source_duration is not None:
+                        # And a source the real run would refuse must not be
+                        # quoted as if it would run.
+                        _ = await _check_omni_source_video(
+                            spec,
+                            source_bytes,
+                            vertexai=(omni_backend_resolved == "vertex"),
+                        )
+            # Each turn renders the ASSEMBLED clip, so the source is the base
+            # every turn is billed on top of and the chain stops when it
+            # reaches the documented ceiling.
+            at_ceiling = omni_extension_refusal(spec, source_duration)
+            if at_ceiling:
+                # A quote for a call that cannot run refuses, as every other
+                # pre-flight here does; planned_turns: 0 beside a null cost
+                # said the same thing in a way nothing acts on.
+                raise ValueError(at_ceiling)
+            # Priced, not merely planned: with no measured source the loop
+            # below runs every requested turn, so every one is priced, at the
+            # ceiling past the fallback. The fallback itself is the BACKEND's
+            # upload limit -- 30s on Vertex, not the model's 10s.
+            chain_is_vertex = (omni_backend_resolved == "vertex")
+            turn_lengths = omni_extension_priced_lengths(
+                spec, source_duration, times, vertexai=chain_is_vertex
+            )
+            appended = omni_extension_appended_seconds(source_duration, turn_lengths)
+            payload: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "model": spec.model,
+                "backend": omni_backend_resolved,
+                "backend_reason": omni_backend_reason,
+                **_omni_requested_model(omni_model, spec),
+                "resolution": billed_resolution,
+                "times": times,
+                # Each turn renders the assembled clip, so these three are
+                # different numbers and conflating them was the under-quote:
+                # what gets BILLED is the sum of the assembled lengths, what
+                # the caller ENDS UP WITH is the last one, and what is NEW is
+                # only the growth over the source.
+                "billed_seconds": sum(turn_lengths),
+                "assembled_seconds": turn_lengths[-1] if turn_lengths else 0.0,
+                "turn_output_seconds": turn_lengths,
+                "planned_turns": len(turn_lengths),
+                **({"appended_seconds": appended} if appended is not None else {}),
+                "duration_source": (
+                    "projection: a turn renders the ASSEMBLED clip, not the "
+                    f"{spec.extension_step_seconds}s it appends (measured: a "
+                    "3.01s source came back 13.01s), so every turn re-bills "
+                    "the footage before it"
+                    + (
+                        f" (source measured at {source_duration:g}s, leaving "
+                        f"room for {len(turn_lengths)} turn(s) under omni's "
+                        f"{spec.max_extended_seconds}s total)."
+                        if source_duration is not None
+                        else " (the source's length is not known here, so the "
+                        "documented "
+                        f"{omni_source_limit_seconds(spec, vertexai=chain_is_vertex):g}s "
+                        "upload maximum for this backend is assumed, and every "
+                        "requested turn is priced -- at the ceiling once the "
+                        "assumed chain reaches it -- because the render cannot "
+                        "shorten a chain it cannot measure. A shorter real "
+                        "source bills less; nothing bills more)."
+                    )
+                    + " The real run reports the measured length of each turn."
+                ),
+                "cumulative_cap_seconds": spec.max_extended_seconds,
+            }
+            if source_duration is not None:
+                payload["source_duration_seconds"] = source_duration
+                warnings.extend(
+                    _omni_cumulative_cap_warning(
+                        spec, source_duration, times, len(turn_lengths)
+                    )
+                )
+            payload["estimated_cost"] = _omni_extension_quote(
+                spec.model, billed_resolution, turn_lengths
+            )
+            if warnings:
+                payload["warnings"] = warnings
+            # Emitted last, so the cap warning added above reaches the
+            # notification channel and not just the quote body.
+            await _emit_warnings(ctx, warnings)
+            if max_cost_usd is not None:
+                projected_usd = _usd_of(payload.get("estimated_cost"))
+                if projected_usd > max_cost_usd:
+                    payload["would_be_refused"] = True
+                    payload.setdefault("warnings", []).append(
+                        _over_budget_message(
+                            projected_usd,
+                            max_cost_usd,
+                            len(turn_lengths),
+                            unmeasured=source_duration is None,
+                        )
+                    )
+            return _respond(app_ctx, payload)
+
+        reference_image_bytes = [
+            await _fetch_omni_media(ctx, uri, "reference_image_uri")
+            for uri in reference_images
+        ]
+        reference_video_bytes = [
+            await _fetch_omni_media(ctx, uri, "reference_video_uri")
+            for uri in reference_videos
+        ]
+        input_video_bytes = await _fetch_optional_omni_media(
+            ctx, input_video_uri, "input_video_uri"
+        )
+
+        warnings.extend(
+            await _omni_reference_video_warnings(spec, reference_video_bytes)
+        )
+        if input_video_bytes is not None:
+            warnings.extend(
+                await _check_omni_source_video(
+                    spec,
+                    input_video_bytes,
+                    vertexai=(omni_backend_resolved == "vertex"),
+                )
+            )
+            source_duration = await _probe_media(
+                measure_video_duration_bytes, input_video_bytes
+            )
+        else:
+            source_duration = await _source_duration_or_none(
+                app_ctx.videos_dir, previous_interaction_id or ""
+            )
+        at_ceiling = omni_extension_refusal(spec, source_duration)
+        if at_ceiling:
+            raise ValueError(at_ceiling)
+
+        # The turns that fit under the ceiling -- the same list the quote
+        # prices, computed once here so the loop below, this warning and the
+        # max_cost_usd projection cannot disagree about how many turns run.
+        chain_is_vertex = (omni_backend_resolved == "vertex")
+        turn_lengths = omni_extension_priced_lengths(
+            spec, source_duration, times, vertexai=chain_is_vertex
+        )
+        effective_times = times
+        if source_duration is not None:
+            # Only a MEASURED source may shorten the chain. With no
+            # measurement, omni_extension_output_lengths falls back to the
+            # longest source the model documents -- deliberately pessimistic
+            # for pricing -- and clamping the loop on that would render fewer
+            # turns than a short real source can actually take.
+            effective_times = len(turn_lengths)
+            warnings.extend(
+                _omni_cumulative_cap_warning(
+                    spec, source_duration, times, effective_times
+                )
+            )
+        if max_cost_usd is not None:
+            # Refuse BEFORE the first turn bills — same quadratic hazard as
+            # loop_extend, same cap. Projected off the turns that will really
+            # run: the clamped list when the source was measured, and every
+            # requested turn priced at the ceiling when it was not -- the
+            # first cut of this fix clamped the projection but not the loop on
+            # that path, so a $10 cap passed a 3-turn $9.14 and billed 4.
+            projected_usd = _usd_of(
+                _omni_extension_quote(
+                    spec.model,
+                    billed_resolution,
+                    turn_lengths,
+                )
+            )
+            if projected_usd > max_cost_usd:
+                raise ValueError(
+                    _over_budget_message(
+                        projected_usd,
+                        max_cost_usd,
+                        len(turn_lengths),
+                        unmeasured=source_duration is None,
+                    )
+                )
+
+        # One backend for the whole chain. Resolved once, before the first
+        # turn, because every turn after it carries a previous_interaction_id
+        # that only the minting backend can resolve — and the last turn's
+        # output_gcs_uri would otherwise have pulled it onto Vertex on its own.
+        chain_backend = omni_backend_resolved
+
+        segments: list[dict[str, Any]] = []
+        chain_id = previous_interaction_id
+        pending_video: bytes | None = input_video_bytes
+
+        def _payload(cancelled: bool = False) -> dict[str, Any]:
+            chain_appended = omni_extension_appended_seconds(
+                source_duration,
+                [
+                    float(seg["duration_seconds"])
+                    for seg in segments
+                    if isinstance(seg.get("duration_seconds"), (int, float))
+                ],
+            )
+            """Assemble the response from whatever turns have completed.
+
+            Built as a closure so a cancellation or a mid-chain failure can
+            return the SAME shape as a clean run. Every completed turn was
+            billed; dropping them on the floor would leave the caller unable
+            even to resume from the last interaction_id they paid for — the
+            hole loop_extend and generate_clip each carry an explicit handler
+            for, and which this loop reintroduced.
+            """
+            done = len(segments)
+            final = segments[-1] if segments else {}
+            body: dict[str, Any] = {
+                "message": (
+                    f"Video extended over {done} of {effective_times} turn(s)"
+                    if done != effective_times
+                    else f"Video extended over {effective_times} turn(s)"
+                ),
+                "video_url": final.get("video_url"),
+                "interaction_id": final.get("interaction_id"),
+                "model": spec.model,
+                **_omni_requested_model(omni_model, spec),
+                "resolution": billed_resolution,
+                "times": times,
+                # What the ceiling allowed, which is what ran. Equal to
+                # `times` unless the source was long enough to cut the chain
+                # short; the warning above says so when they differ.
+                "planned_turns": effective_times,
+                "completed_turns": done,
+                # Three different numbers, because a turn renders the
+                # assembled clip: billed is the sum of what each turn
+                # rendered, assembled is the last one (what the caller has),
+                # and appended is only the growth over the source — which is
+                # unknowable without the source, so it is omitted rather than
+                # guessed. Reporting the sum as "appended" overstated a 2-turn
+                # chain off a 3s source as 36s of new footage when it made 20s.
+                "billed_seconds": sum(
+                    float(seg["duration_seconds"])
+                    for seg in segments
+                    if isinstance(seg.get("duration_seconds"), (int, float))
+                ),
+                "assembled_seconds": final.get("duration_seconds"),
+                **(
+                    {"appended_seconds": chain_appended}
+                    if chain_appended is not None
+                    else {}
+                ),
+                "segments": segments,
+                "cost": _sum_omni_segment_costs(
+                    segments, model=spec.model, resolution=billed_resolution
+                ),
+            }
+            if cancelled:
+                body["cancelled"] = True
+            if warnings:
+                body["warnings"] = warnings
+            return body
+
+        try:
+            for turn in range(1, effective_times + 1):
+                await ctx.info(
+                    f"Extending video with {spec.model} "
+                    f"(turn {turn}/{effective_times})"
+                )
+                result = await _omni_generate_and_manifest(
+                    app_ctx,
+                    ctx,
+                    prompt=prompt,
+                    model=spec.model,
+                    # References ride along on the first turn, which is where a
+                    # new character is introduced; later turns continue from the
+                    # interaction, which already holds them.
+                    reference_image_bytes_list=(
+                        reference_image_bytes if turn == 1 else None
+                    ),
+                    input_video_bytes=pending_video,
+                    reference_video_bytes_list=(
+                        reference_video_bytes if turn == 1 else None
+                    ),
+                    previous_interaction_id=chain_id,
+                    # "A prompt plus a video" is otherwise an edit, so the task
+                    # is what makes this an extension. It is passed on EVERY
+                    # turn and SENT on some: _build_create_kwargs drops it
+                    # whenever a previous_interaction_id is present, which the
+                    # API rejects it alongside, so a multi-turn turn relies on
+                    # the prompt exactly as the reference's own example does.
+                    # Passing None there instead made _select_task_type fall
+                    # through to "edit", and every turn after the first went
+                    # into its own sidecar — and its warning text — labelled as
+                    # an edit of a chain the caller had asked to extend.
+                    task="extend",
+                    duration_seconds=None,
+                    resolution=normalized_resolution,
+                    # effective_times, not times: on a chain the ceiling cut
+                    # short no turn ever equalled the requested count, so the
+                    # caller's GCS destination was silently never sent and the
+                    # final clip landed locally.
+                    output_gcs_uri=output_gcs_uri if turn == effective_times else None,
+                    prefer_backend=chain_backend,
+                    backend_reason=omni_backend_reason,
+                    timeout_seconds=timeout_seconds,
+                    manifest_extra={
+                        "kind": "omni_extension",
+                        "turn": turn,
+                        "of_turns": effective_times,
+                        "input_video_uri": input_video_uri if turn == 1 else None,
+                    },
+                )
+                segments.append(result)
+                chain_id = result.get("interaction_id")
+                # Turn 1 decides the backend for every turn after it.
+                chain_backend = chain_backend or result.get("backend")
+                # Every later turn continues the interaction, so the bytes are
+                # sent once and only once.
+                pending_video = None
+                for warning in result.get("warnings") or []:
+                    if warning not in warnings:
+                        warnings.append(warning)
+        except asyncio.CancelledError:
+            # A cancellation is a BaseException, so the tool's own handler
+            # below never sees it. Record what was paid for, then let the
+            # cancellation continue.
+            if segments:
+                logger.warning(
+                    "extend_video_omni cancelled after %d of %d turn(s); "
+                    "resume from interaction %s",
+                    len(segments),
+                    effective_times,
+                    chain_id,
+                )
+            raise
+        except Exception:
+            if not segments:
+                raise
+            # Some turns rendered and were billed. Returning a bare error
+            # would strand them: the caller could not resume, and could not
+            # reconcile the spend either.
+            logger.exception("extend_video_omni failed mid-chain")
+            partial = _payload()
+            partial["error"] = (
+                f"Extension stopped after {len(segments)} of {effective_times} turn(s). "
+                "The turns listed in `segments` rendered and were billed; "
+                "resume by passing the `interaction_id` above back to this "
+                "tool."
+            )
+            await _emit_warnings(ctx, warnings)
+            return _respond(app_ctx, partial)
+
+        payload = _payload()
+        await _emit_warnings(ctx, warnings)
+        return _respond(app_ctx, payload)
+    except Exception as e:
+        await ctx.error(f"Video extension failed: {e}")
         logger.exception("Tool error")
         return json.dumps({"error": str(e)})
 
@@ -4197,9 +7180,16 @@ async def loop_extend(
     aspect_ratio: str = "16:9",
     include_audio: bool = True,
     output_gcs_uri: str | None = None,
+    max_cost_usd: float | None = None,
     dry_run: bool = False,
 ) -> str:
     """Extend a Veo-generated video multiple times in one call.
+
+    max_cost_usd: refuse BEFORE the first turn renders if the projected bill
+    for the whole chain exceeds this. Unset by default. Worth setting: each
+    turn re-bills every second before it, so the cost grows with times²
+    — 20 turns off a 10s source is ~1670 billed seconds. A dry run reports
+    `would_be_refused: true` instead of refusing, so the number is visible.
 
     Each Veo extension continues the video by ~7 seconds; this chains them,
     feeding each extended result back in as the source for the next. Veo
@@ -4210,7 +7200,9 @@ async def loop_extend(
         ctx: MCP context with application state
         video_uri: URI of the existing Veo video to extend (gs://, file://)
         prompt: What the continuation should depict
-        times: Number of ~7s extensions to chain (1-20)
+        times: Number of ~7s extensions to chain (1-20). Each turn APPENDS
+            ~7s but BILLS the whole assembled clip, so cost grows with the
+            square of this — see max_cost_usd.
         model: Veo model (not the Lite model)
         aspect_ratio: 16:9 or 9:16. An extension continues the source, so the
             rendered aspect ratio is the source's; this value must match it.
@@ -4221,8 +7213,23 @@ async def loop_extend(
         include_audio: Generate audio on the extended sections (default True,
             so extending an audio video doesn't go silent; Vertex only)
         output_gcs_uri: GCS output URI (required on Vertex for extensions)
-        dry_run: When True, return only the cost of the extension chain
-            (times x ~7s at the model's rate) and generate nothing.
+        dry_run: When True, return only the cost of the extension chain and
+            generate nothing. The basis is NOT times x ~7s: MEASURED, a Veo
+            turn renders and bills the ASSEMBLED clip (a 4.0s source came
+            back 11s billed at 11s), so the chain costs the SUM of the turn
+            outputs — source + 7i for turn i — and grows with times². The
+            quote reports billed_seconds, assembled_seconds and
+            appended_seconds separately for that reason.
+
+            A REMOTE source makes this quote a FLOOR rather than a ceiling —
+            the one place a pre-flight in this server can under-state, and
+            deliberately so: a dry run is documented offline, and Veo
+            publishes no maximum source length to assume instead. MEASURED:
+            an 11.01s remote source quoted $0.70 and billed $1.80, 61% under.
+            billed_seconds_source says "FLOOR, not an estimate" when it
+            applies; the real run measures the source. For a ceiling before
+            you spend, quote against a local copy, or compute it: billed =
+            sum over turns i of (source + 7i).
 
     Returns:
         JSON with the final video_url and the ordered list of intermediate
@@ -4246,6 +7253,16 @@ async def loop_extend(
 
         if model in _VEO_LITE_MODELS:
             raise ValueError("Veo 3.1 Lite does not support video extension.")
+        # Extension is one of the modes Veo refuses on the Gemini Developer
+        # API. Checked here, before the quote, so a dry run cannot price a
+        # chain that cannot run — the same rule the model restriction follows.
+        from .video import validate_render_options
+
+        validate_render_options(
+            model,
+            generation_mode="extend_video",
+            backend=_backend_of(app_ctx, str(model)),
+        )
         _validate_aspect_ratio(aspect_ratio)
 
         if video_uri.startswith("gs://"):
@@ -4273,27 +7290,140 @@ async def loop_extend(
             # not price an extension that cannot run. A gs:// source was already
             # allowlist-checked above and still prices.
             _assert_local_source(video_uri, data_dir, "video_uri")
-            # Each extension is a ~7s Veo render billed like any other.
-            return json.dumps(
-                {
-                    "dry_run": True,
-                    "message": "Estimate only — nothing was generated",
-                    "model": model,
-                    "times": times,
-                    "added_seconds": times * 7,
-                    "estimated_cost": _video_cost(
-                        model,
-                        float(times * 7),
-                        resolution="720p",
-                        include_audio=include_audio,
-                        presnapped=True,  # 7s steps must not re-snap to 8
-                    ),
-                },
-                indent=2,
-            )
+            # The source is the base the chain grows from, and it is sitting
+            # in a local file the quote can open. extend_video_omni measures
+            # its source here; this one reported added_seconds as a bare
+            # number with no base, so nothing in the quote could be
+            # reconciled against the file that produced it.
+            source_seconds = await _probe_local_video_seconds(ctx, video_uri)
+            # MEASURED: a 4.0s source extended once returned 11.0s and billed
+            # 11s. Each turn re-bills the assembly, so the chain costs the SUM
+            # of the turn outputs, not the footage it added.
+            turn_lengths = veo_extension_output_lengths(source_seconds, times)
+            appended = times * VEO_EXTENSION_STEP_SECONDS
+            quote: dict[str, Any] = {
+                "dry_run": True,
+                "message": "Estimate only — nothing was generated",
+                "model": model,
+                "resolution": "720p",
+                "resolution_source": "fixed: loop_extend takes no resolution parameter",
+                "times": times,
+                # Three different numbers, and conflating them was the bug:
+                # what is BILLED is the sum of the assembled lengths, what the
+                # caller ENDS UP WITH is the last one, and what is NEW is only
+                # the footage the chain appended.
+                "appended_seconds": appended,
+                "added_seconds": appended,  # retained: prior name for appended
+            }
+            if turn_lengths:
+                quote["source_duration_seconds"] = round(source_seconds or 0.0, 3)
+                quote["source_duration_source"] = "measured from the local source"
+                quote["billed_seconds"] = round(sum(turn_lengths), 3)
+                quote["assembled_seconds"] = turn_lengths[-1]
+                quote["final_duration_seconds"] = turn_lengths[-1]
+                quote["turn_output_seconds"] = turn_lengths
+                quote["estimated_cost"] = _video_cost(
+                    model,
+                    float(sum(turn_lengths)),
+                    resolution="720p",
+                    include_audio=include_audio,
+                    presnapped=True,  # measured lengths must not re-snap
+                )
+                quote["billed_seconds_source"] = (
+                    f"projection from a measured {source_seconds:g}s source: a "
+                    "Veo turn renders the ASSEMBLED clip, not the "
+                    f"{VEO_EXTENSION_STEP_SECONDS:g}s it appends (measured: a "
+                    "4.0s source came back 11.0s billed at 11s), so every turn "
+                    "re-bills the footage before it and the cost grows "
+                    "quadratically in `times`."
+                )
+                if times > 1:
+                    step_warnings.append(
+                        f"This chain bills {sum(turn_lengths):g}s to append "
+                        f"{appended:g}s: each turn re-renders everything before "
+                        f"it. Cost grows with times squared — {times} turns is "
+                        f"{sum(turn_lengths) / appended:.1f}x the appended "
+                        "footage, and 20 turns off this source would bill "
+                        f"{sum(veo_extension_output_lengths(source_seconds, 20)):g}s."
+                    )
+            else:
+                # No honest point estimate exists without the source length,
+                # and quoting the floor as if it were the price is the bug
+                # this whole path just had. Say so instead.
+                quote["source_duration_seconds"] = None
+                quote["source_duration_source"] = (
+                    "not measured: the source is remote, so a dry run — which "
+                    "is documented as offline — does not download it"
+                )
+                quote["billed_seconds"] = None
+                quote["minimum_billed_seconds"] = appended
+                quote["estimated_cost_is_floor"] = True
+                quote["estimated_cost"] = _video_cost(
+                    model,
+                    float(appended),
+                    resolution="720p",
+                    include_audio=include_audio,
+                    presnapped=True,
+                )
+                quote["billed_seconds_source"] = (
+                    "FLOOR, not an estimate: a Veo turn re-bills the assembled "
+                    "clip, so the true cost is this plus the source's length "
+                    f"charged once per turn ({times}x). The source is remote "
+                    "and a dry run does not download it, so its length is "
+                    "unknown here. Re-quote against a local copy for a real "
+                    "number."
+                )
+                step_warnings.append(
+                    "loop_extend cost for a remote source is a FLOOR, not an "
+                    f"estimate: add {times}x the source's length to it. A "
+                    "local source is measured and quoted exactly."
+                )
+            if max_cost_usd is not None:
+                projected_usd = _usd_of(quote.get("estimated_cost"))
+                if projected_usd > max_cost_usd:
+                    quote["would_be_refused"] = True
+                    step_warnings.append(
+                        _over_budget_message(
+                            projected_usd, max_cost_usd, times, floor=not turn_lengths
+                        )
+                    )
+            if step_warnings:
+                quote["warnings"] = list(step_warnings)
+                await _emit_warnings(ctx, step_warnings)
+            return _respond(app_ctx, quote)
 
         # Validate the initial gs:// source against the allowlist (intermediate
         # outputs land in the already-validated gcs_uri bucket).
+
+        # Measured up front: the projection below needs it, and the manifest
+        # after the loop reuses it rather than probing twice.
+        source_seconds = await _extension_source_seconds(
+            ctx, video_uri, allow_remote=True
+        )
+        if max_cost_usd is not None:
+            # Refuse BEFORE the first turn bills. This is the tool where a cap
+            # earns its keep: the bill grows with the square of `times`.
+            projection = veo_extension_billing(
+                turns=times, source_seconds=source_seconds
+            )
+            projected_usd = _usd_of(
+                _video_cost(
+                    model,
+                    float(projection.billed_seconds),
+                    resolution="720p",
+                    include_audio=include_audio,
+                    presnapped=True,
+                )
+            )
+            if projected_usd > max_cost_usd:
+                raise ValueError(
+                    _over_budget_message(
+                        projected_usd,
+                        max_cost_usd,
+                        times,
+                        floor=not projection.turn_output_seconds,
+                    )
+                )
 
         for i in range(times):
             await ctx.info(f"Extension {i + 1}/{times}")
@@ -4316,6 +7446,56 @@ async def loop_extend(
             step_warnings.extend(ext_result.get("warnings") or [])
             served_model = ext_result.get("model", model)
 
+        # What the caller ends up with, measured — before the manifest is
+        # assembled, because the manifest's cost line prices this. The chain
+        # reported how many times it ran and what it cost, but never how long
+        # the result was, which is the one number that says whether the
+        # extensions actually landed.
+        result: dict[str, Any] = {
+            "message": f"Extended video {times} time(s)",
+            "video_url": current,
+            "model": served_model,
+            "times": times,
+            "extension_steps": steps,
+        }
+        facts = await _measure_rendered_video(
+            result, resolution_key="resolution", requested_resolution=None
+        )
+        if facts.duration_source:
+            result["duration_seconds"] = round(facts.duration_seconds or 0.0, 3)
+            result["duration_source"] = "measured from the assembled video"
+        # The pre-flight measured this source and projected 11.0s; the real
+        # run then delivered to GCS, could not open the turns, and fell all
+        # the way back to appended-only — reporting a cost BELOW its own quote
+        # for the identical call. Only the OUTPUT went remote. The source is
+        # still local and still measurable, so the floor is the projection,
+        # not the appended footage.
+        # Every turn is billed at its OWN assembled length, so the chain's cost
+        # needs all of them, not just the one the caller keeps.
+        turn_seconds: list[float] = []
+        for step_url in steps:
+            if not (isinstance(step_url, str) and step_url.startswith("file://")):
+                turn_seconds = []
+                break
+            step_measured = await _probe_media(
+                measure_video_duration, Path(step_url[7:])
+            )
+            if step_measured is None:
+                turn_seconds = []
+                break
+            turn_seconds.append(step_measured)
+        result.setdefault(
+            "duration_source",
+            "not measured: the assembled video was delivered to GCS, which a "
+            "local probe does not open",
+        )
+        result.setdefault("resolution", "720p")
+        result.setdefault(
+            "resolution_source",
+            facts.resolution_source
+            or "assumed: loop_extend takes no resolution parameter and the "
+            "assembled video could not be measured",
+        )
         manifest = _assemble_loop_extend_manifest(
             source_video_uri=video_uri,
             prompt=prompt,
@@ -4325,14 +7505,18 @@ async def loop_extend(
             final_video_url=current,
             include_audio=include_audio,
             warnings=step_warnings,
+            resolution=str(result.get("resolution") or "720p"),
+            turn_seconds=turn_seconds,
+            source_seconds=source_seconds,
         )
-        result: dict[str, Any] = {
-            "message": f"Extended video {times} time(s)",
-            "video_url": current,
-            "model": served_model,
-            "times": times,
-            "extension_steps": steps,
-        }
+        for key in (
+            "billed_seconds",
+            "billed_seconds_source",
+            "appended_seconds",
+            "turn_output_seconds",
+        ):
+            if key in manifest:
+                result[key] = manifest[key]
         if manifest.get("cost"):
             result["cost"] = manifest["cost"]
         if manifest.get("warnings"):
@@ -4345,7 +7529,7 @@ async def loop_extend(
             result["sidecar_url"] = sidecar_url
         else:
             result["manifest"] = manifest
-        return json.dumps(result, indent=2)
+        return _respond(app_ctx, result)
     except asyncio.CancelledError:
         # Same hole generate_clip had: a cancellation is a BaseException, so
         # the handler below never ran and a caller that disconnected after

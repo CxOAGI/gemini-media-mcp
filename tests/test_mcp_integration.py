@@ -137,6 +137,7 @@ class TestMCPIntegration:
                 "generate_clip",
                 "generate_video_omni",
                 "edit_video",
+                "extend_video_omni",
                 "loop_extend",
             }
             assert tool_names == expected_tools, (

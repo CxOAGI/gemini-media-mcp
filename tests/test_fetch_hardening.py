@@ -56,6 +56,17 @@ from src.__main__ import (
         "0.0.0.0",
         "ff02::1",  # multicast scopes that report is_global True
         "::ffff:127.0.0.1",
+        # IPv6 ranges that embed an IPv4 destination. Every one of these is
+        # is_global=True, so is_reserved is the only flag that refuses them --
+        # and a rewrite that dropped it made the first entry, NAT64-mapped
+        # 169.254.169.254, a working read of the cloud metadata service on any
+        # host with a NAT64/DNS64 route.
+        "64:ff9b::a9fe:a9fe",  # NAT64 well-known prefix -> cloud metadata
+        "64:ff9b::a00:1",  # NAT64 -> 10.0.0.1
+        "64:ff9b::7f00:1",  # NAT64 -> 127.0.0.1
+        "::7f00:1",  # IPv4-compatible -> 127.0.0.1
+        "::a00:1",  # IPv4-compatible -> 10.0.0.1
+        "5f00::1",  # 5f00::/16, reserved and is_global
     ],
 )
 def test_is_public_ip_rejects_non_routable(addr: str) -> None:
@@ -71,6 +82,8 @@ def test_is_public_ip_rejects_non_routable(addr: str) -> None:
         "100.63.255.255",  # immediately below RFC 6598
         "100.128.0.0",  # immediately above RFC 6598
         "2606:4700:4700::1111",
+        "2001:4860:4860::8888",
+        "2a00:1450:4001:80f::200e",
         "::ffff:8.8.8.8",
     ],
 )

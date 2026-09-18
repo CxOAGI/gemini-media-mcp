@@ -38,7 +38,7 @@ import re
 import threading
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -250,23 +250,64 @@ def _line_height(font: Font, leading: float = 1.35) -> int:
 def _split_overlong(word: str, font: Font, max_width: float) -> tuple[str, str]:
     """Split a single word that cannot fit on one line.
 
+    Binary-searches the cut. Walking down one character at a time measured
+    the string once per character, and `_wrap_text` calls this repeatedly on
+    what is left, so an unbroken token cost O(n^2) measurements there and the
+    pair came out cubic: at max_width=300 a single token measured 0.02s at 250
+    characters, 0.80s at 1000 and 60.5s at 4000 -- per field, with three
+    fields per panel and up to 24 panels a board, on a paid render with no
+    length cap upstream.
+
+    Nor is it only adversarial: ``str.split()`` finds no word boundary in CJK,
+    so any few-thousand-character Chinese or Japanese prompt arrives here as
+    one "word".
+
+    Prefix width is treated as non-decreasing in the cut, which is what makes
+    the search valid. Kerning means that is not guaranteed to the pixel, but
+    the result is a truncation for layout, so a one-pixel disagreement costs a
+    character at the break and nothing else.
+
     Returns:
         ``(head, rest)`` where ``head`` is the longest prefix that fits (at
         least one character, so the caller always makes progress).
     """
-    for cut in range(len(word) - 1, 0, -1):
-        if _text_width(font, word[:cut]) <= max_width:
-            return word[:cut], word[cut:]
-    return word[:1], word[1:]
+    # Never the whole word: `rest` must be non-empty or the caller cannot make
+    # progress.
+    high = len(word) - 1
+    if high < 1:
+        return word[:1], word[1:]
+    low, best = 1, 0
+    while low <= high:
+        mid = (low + high) // 2
+        if _text_width(font, word[:mid]) <= max_width:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    # Nothing fits: still emit one character, as the loop this replaced did.
+    cut = best if best >= 1 else 1
+    return word[:cut], word[cut:]
 
 
 def _ellipsize(line: str, font: Font, max_width: float) -> str:
-    """Trim ``line`` so it plus an ellipsis fits inside ``max_width``."""
+    """Trim ``line`` so it plus an ellipsis fits inside ``max_width``.
+
+    Binary-searched for the same reason as `_split_overlong`: trimming one
+    character per pass re-measured the whole string each time, and this is
+    called on the caller-supplied ``title`` of `generate_storyboard`, which
+    has no length check anywhere upstream. A 16,000-character title cost
+    18.3s here alone.
+    """
     ellipsis = _ellipsis_for(font)
-    trimmed = line
-    while trimmed and _text_width(font, trimmed + ellipsis) > max_width:
-        trimmed = trimmed[:-1]
-    return trimmed.rstrip() + ellipsis
+    low, high, best = 0, len(line), 0
+    while low <= high:
+        mid = (low + high) // 2
+        if _text_width(font, line[:mid] + ellipsis) <= max_width:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    return line[:best].rstrip() + ellipsis
 
 
 def _wrap_text(text: str, font: Font, max_width: float, max_lines: int) -> list[str]:
@@ -308,7 +349,13 @@ def _wrap_text(text: str, font: Font, max_width: float, max_lines: int) -> list[
         else:
             head, rest = _split_overlong(word, font, max_width)
             lines.append(head)
-            while _text_width(font, rest) > max_width:
+            # Stops at max_lines. This used to split the entire remainder
+            # before the truncation below threw all but max_lines of it away,
+            # so the work was unbounded in the length of one token while the
+            # output never exceeded three lines. The kept lines are identical
+            # either way -- the first max_lines heads do not depend on how far
+            # the split went.
+            while len(lines) < max_lines and _text_width(font, rest) > max_width:
                 head, rest = _split_overlong(rest, font, max_width)
                 lines.append(head)
             current = rest
@@ -465,8 +512,63 @@ class StoryboardFrame:
 
     @property
     def failed(self) -> bool:
-        """Whether this shot has no usable image."""
+        """Whether this shot has no usable image.
+
+        Bytes that exist but cannot be decoded are not usable either, and this
+        cannot see that -- so call :func:`normalize_frames` before counting.
+        """
         return self.image_bytes is None
+
+
+def normalize_frames(
+    frames: Sequence[StoryboardFrame],
+) -> tuple[list[StoryboardFrame], list[int]]:
+    """Mark frames whose bytes cannot be decoded as the failures they are.
+
+    `_render_panel` already drew "SHOT NOT GENERATED" for undecodable bytes,
+    but `failed` only asks whether image_bytes is None -- so the same shot was
+    a hole in the sheet and a success everywhere it was counted: the header
+    chip, render_html's summary, the panel badge colour, and
+    generate_storyboard's "3/3 shots" message.
+
+    Returns:
+        ``(frames, undecodable_indexes)`` -- the frames with undecodable ones
+        rewritten to ``image_bytes=None`` plus an ``error``, and the 1-based
+        indexes that were rewritten, so a caller can report them too.
+    """
+    normalized: list[StoryboardFrame] = []
+    undecodable: list[int] = []
+    for frame in frames:
+        if frame.image_bytes is None:
+            normalized.append(frame)
+            continue
+        try:
+            # load(), not verify(): verify() checks the container and does
+            # not detect truncation for JPEG, so a half-written JPEG passed
+            # here, _render_panel then drew "SHOT NOT GENERATED" for it, and
+            # the board still reported every shot rendered -- the exact
+            # defect this function was added to close. load() is the decode
+            # _prepare_frame_image performs anyway, so this is the same
+            # judgement made once, earlier; the cost is one extra decode per
+            # frame, bounded by the same pixel limits. _render_panel keeps
+            # its own try/except as a last line.
+            with Image.open(BytesIO(frame.image_bytes)) as probe:
+                probe.load()
+        except Exception as exc:  # noqa: BLE001 - Pillow raises broadly here
+            logger.warning(
+                "Shot %s: undecodable image bytes (%s)", frame.index, exc
+            )
+            normalized.append(
+                replace(
+                    frame,
+                    image_bytes=None,
+                    error=frame.error or f"Image could not be decoded: {exc}",
+                )
+            )
+            undecodable.append(frame.index)
+        else:
+            normalized.append(frame)
+    return normalized, undecodable
 
 
 # ============================================================================
@@ -1588,8 +1690,12 @@ def write_storyboard(
             overwrite each other.
 
     Returns:
-        ``{"sheet_path", "sheet_url", "html_path", "html_url"}`` — paths are
-        absolute, URLs are ``file://``. The contact sheet is composited once
+        ``{"sheet_path", "sheet_url", "html_path", "html_url",
+        "undecodable_shots"}`` — paths are absolute, URLs are ``file://``, and
+        ``undecodable_shots`` is a comma-joined list of the 1-based shot
+        indexes whose bytes would not decode (empty when all of them did), so
+        a caller counting rendered shots does not count a panel that says
+        "SHOT NOT GENERATED". The contact sheet is composited once
         here and written to ``sheet_path`` at full resolution; a caller that
         also needs it inline should read it back and pass it through
         :func:`render_sheet_preview` rather than re-render it at a smaller
@@ -1600,6 +1706,10 @@ def write_storyboard(
     """
     if not frames:
         raise ValueError("frames must not be empty — nothing to render")
+
+    # Once, here: both artifacts and every count downstream then describe the
+    # same board.
+    frames, undecodable = normalize_frames(frames)
 
     stem = basename or f"{_slugify(title)}-{uuid.uuid4().hex[:8]}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1621,4 +1731,7 @@ def write_storyboard(
         "sheet_url": f"file://{sheet_path}",
         "html_path": str(html_path),
         "html_url": f"file://{html_path}",
+        # Comma-joined so the return type stays dict[str, str]; empty when
+        # every frame decoded.
+        "undecodable_shots": ",".join(str(i) for i in undecodable),
     }
