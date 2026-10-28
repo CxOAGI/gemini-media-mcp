@@ -4214,7 +4214,11 @@ async def _directed_unguarded(
         "backend": backend,
         "checks": [_check_payload(c) for c in checks],
     }
-    block["checks_source"] = "cache" if cached is not None else "compiled"
+    # "compiled" only for a derive call that answered, even with no checks
+    # (every note skipped); a call that failed compiled nothing.
+    block["checks_source"] = (
+        "cache" if cached is not None else "failed" if abstained else "compiled"
+    )
     # Always a list, so a reader need not tell "none" from "not reported".
     block["skipped_notes"] = [{"text": s.text, "reason": s.reason} for s in skipped]
 

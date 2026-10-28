@@ -409,6 +409,7 @@ async def test_notes_with_nothing_to_check_still_render_once(
     payload = await harness.run(director_notes=NOTES)
     block = payload["director"]
     assert block["status"] == "no_checks"
+    assert block["checks_source"] == "compiled"
     assert block["skipped_notes"] == [
         {"text": "No people in the shot.", "reason": "unclear"}
     ]
@@ -427,6 +428,32 @@ async def test_a_blocked_derive_call_still_delivers_the_render(
     payload = await harness.run(director_notes=NOTES)
     block = payload["director"]
     assert (block["status"], block["reason"]) == ("abstained", "provider_blocked")
+    assert (block["checks_source"], block["checks"]) == ("failed", [])
+    assert "image_url" in payload
+
+
+@pytest.mark.parametrize(
+    ("derive", "reason"),
+    [
+        (
+            genai_errors.ServerError(504, {"error": {"message": "DEADLINE_EXCEEDED"}}),
+            "timeout",
+        ),
+        (_response("not json"), "parse_failed"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_derive_call_that_fails_compiles_nothing(
+    derive: Any, reason: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed derive call used to report checks_source "compiled" beside an
+    empty check list, as if the notes had been compiled into nothing."""
+    harness = _Harness(tmp_path, monkeypatch, derive)
+    payload = await harness.run(director_notes=NOTES)
+    block = payload["director"]
+    assert (block["status"], block["reason"]) == ("abstained", reason)
+    assert (block["checks_source"], block["checks"]) == ("failed", [])
     assert "image_url" in payload
 
 
