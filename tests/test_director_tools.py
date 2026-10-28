@@ -435,21 +435,29 @@ async def test_a_blocked_derive_call_still_delivers_the_render(
 @pytest.mark.parametrize(
     ("derive", "reason"),
     [
+        # A timeout is tried once more, so it takes two to fail.
         (
-            genai_errors.ServerError(504, {"error": {"message": "DEADLINE_EXCEEDED"}}),
+            [
+                genai_errors.ServerError(
+                    504, {"error": {"message": "DEADLINE_EXCEEDED"}}
+                ),
+                genai_errors.ServerError(
+                    504, {"error": {"message": "DEADLINE_EXCEEDED"}}
+                ),
+            ],
             "timeout",
         ),
-        (_response("not json"), "parse_failed"),
+        ([_response("not json")], "parse_failed"),
     ],
 )
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
 async def test_a_derive_call_that_fails_compiles_nothing(
-    derive: Any, reason: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    derive: list[Any], reason: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed derive call used to report checks_source "compiled" beside an
     empty check list, as if the notes had been compiled into nothing."""
-    harness = _Harness(tmp_path, monkeypatch, derive)
+    harness = _Harness(tmp_path, monkeypatch, *derive)
     payload = await harness.run(director_notes=NOTES)
     block = payload["director"]
     assert (block["status"], block["reason"]) == ("abstained", reason)
@@ -2595,3 +2603,124 @@ async def test_a_clip_whose_length_is_not_reported_is_measured(
     assert "answer each of the 4 seconds" in str(
         reviewer.models.generate_content.call_args_list[1].kwargs
     ) or any("answer each of the 4 seconds" in (p.text or "") for p in parts)
+
+
+# --------------------------------------------------------------------------
+# A notes-to-checks call that times out is tried once more
+# --------------------------------------------------------------------------
+
+_DERIVE_TIMEOUT = genai_errors.ServerError(
+    504, {"error": {"message": "DEADLINE_EXCEEDED"}}
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_derive_call_that_times_out_is_tried_once_more(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _Harness(
+        tmp_path, monkeypatch, _DERIVE_TIMEOUT, _response(DERIVED), PASSED
+    )
+    payload = await harness.run(director_notes=NOTES)
+    block = payload["director"]
+    assert (block["status"], block["checks_source"]) == ("passed", "compiled")
+    assert block["derive_attempts"] == 2
+    assert block["derive_retried_after"] == ["timeout"]
+    assert len(harness.director_calls) == 3
+    # The timed-out request may still have billed; said once.
+    from src.__main__ import _DIRECTOR_UNREPORTED_WARNING
+
+    assert payload["warnings"].count(_DIRECTOR_UNREPORTED_WARNING) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_a_derive_call_that_times_out_twice_abstains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _Harness(tmp_path, monkeypatch, _DERIVE_TIMEOUT, _DERIVE_TIMEOUT)
+    payload = await harness.run(director_notes=NOTES)
+    block = payload["director"]
+    assert (block["status"], block["reason"]) == ("abstained", "timeout")
+    assert (block["checks_source"], block["derive_attempts"]) == ("failed", 2)
+    assert "image_url" in payload
+    # Two requests that may have billed, one warning saying so.
+    from src.__main__ import _DIRECTOR_UNREPORTED_WARNING
+
+    assert payload["warnings"].count(_DIRECTOR_UNREPORTED_WARNING) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_checks_from_the_cache_took_no_derive_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _Harness(tmp_path, monkeypatch, _response(DERIVED), PASSED)
+    assert (await first.run(director_notes=NOTES))["director"]["derive_attempts"] == 1
+    (tmp_path / "again").mkdir()
+    second = _Harness(tmp_path / "again", monkeypatch, PASSED)
+    block = (await second.run(director_notes=NOTES))["director"]
+    assert (block["checks_source"], block["derive_attempts"]) == ("cache", 0)
+
+
+@pytest.mark.parametrize(
+    ("deadline", "attempts"),
+    # A first try that times out after 60 s. Of 210 s, 150 are left: a retry
+    # may take 45 s and still leave half for the render. Of 150 s, 90 are
+    # left: a retry would get 15 s, under the 20 s a request needs, so the
+    # render keeps the time.
+    [(210.0, 2), (150.0, 1)],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+async def test_a_derive_retry_never_takes_the_renders_half_of_the_deadline(
+    deadline: float, attempts: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.__main__ import _directed
+
+    clock = _Clock()
+    answers: list[Any] = [_DERIVE_TIMEOUT, _response(DERIVED), PASSED]
+
+    def reviewer_call(*args: Any, **kwargs: Any) -> Any:
+        answer = answers.pop(0)
+        if answer is _DERIVE_TIMEOUT:
+            clock.now += 60.0
+            raise answer
+        return answer
+
+    ctx, reviewer, _ = _video_harness(tmp_path, monkeypatch, [], clock=clock)
+    reviewer.models.generate_content.side_effect = reviewer_call
+    clip = tmp_path / "videos" / "take-1.mp4"
+    _mp4(clip, seconds=4.0)
+
+    async def render(prompt: str, quote: bool, time_left: float | None = None) -> str:
+        if quote:
+            return json.dumps({"estimated_cost": None, "duration_seconds": 4.0})
+        return json.dumps({"video_url": f"file://{clip}", "duration_seconds": 4.0})
+
+    payload = json.loads(
+        await _directed(
+            ctx,
+            render=render,
+            returns_content=False,
+            media_kind="video",
+            prompt="A mug turning",
+            notes=NOTES,
+            max_retakes=0,
+            dry_run=False,
+            duration_s=4.0,
+            deadline_s=deadline,
+        )
+    )
+    block = payload["director"]
+    assert block["derive_attempts"] == attempts
+    if attempts == 2:
+        assert block["status"] == "passed"
+        derive_retry = reviewer.models.generate_content.call_args_list[1]
+        timeout_ms = derive_retry.kwargs["config"].http_options.timeout
+        assert timeout_ms == pytest.approx(45_000, abs=1_000)
+    else:
+        assert (block["status"], block["reason"]) == ("abstained", "timeout")
+        assert "less than half of it for the render" in block["derive_retry_skipped"]
+        assert "video_url" in payload

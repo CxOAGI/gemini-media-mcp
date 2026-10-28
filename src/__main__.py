@@ -4177,12 +4177,12 @@ async def _directed_unguarded(
     # this process has already paid for is not sent again.
     cache_key = director.derive_cache_key(model, system, user)
     cached = director.cached_derivation(cache_key)
-    if cached is not None:
-        await ctx.info("Director: reusing the checks derived earlier for these notes")
-        checks, skipped = cached
-    else:
-        await ctx.info(f"Director: turning the notes into checks with {model}")
-        derived = await director.call_model(
+    derive_attempts = 0
+    derive_retried: list[str] = []
+    derive_retry_skipped: str | None = None
+
+    async def derive(timeout_s: float) -> Any:
+        outcome = await director.call_model(
             client,
             model,
             system=system,
@@ -4191,13 +4191,55 @@ async def _directed_unguarded(
             thinking_level=director.DERIVE_THINKING_LEVEL,
             max_output_tokens=director.DERIVE_MAX_OUTPUT_TOKENS,
             seed=director.request_seed(model, system, user),
-            timeout_s=_capped(director.DERIVE_TIMEOUT_SECONDS),
+            timeout_s=timeout_s,
         )
         director_costs.append(
-            actual_understanding_cost(model, derived.usage, label="derive call")
+            actual_understanding_cost(model, outcome.usage, label="derive call")
         )
-        if derived.unreported:
+        if outcome.unreported and _DIRECTOR_UNREPORTED_WARNING not in warnings:
             warnings.append(_DIRECTOR_UNREPORTED_WARNING)
+        return outcome
+
+    if cached is not None:
+        await ctx.info("Director: reusing the checks derived earlier for these notes")
+        checks, skipped = cached
+    else:
+        await ctx.info(f"Director: turning the notes into checks with {model}")
+        derived = await derive(_capped(director.DERIVE_TIMEOUT_SECONDS))
+        derive_attempts = derived.attempts
+        derive_retried = list(derived.retried)
+        derive_retry_skipped = derived.retry_skipped
+        if (
+            derived.status == "error"
+            and derived.reason == "timeout"
+            and derived.attempts == 1
+        ):
+            # A timed-out request has spent its own budget, so the retry is a
+            # second call with a fresh one. It is the cheapest director call
+            # and comes before any render, so it is worth one more try; on the
+            # video tools it may not take so long that less than half of
+            # timeout_seconds is left for the render.
+            delay = director.RETRY_DELAY_SECONDS["transient"]
+            retry_timeout = director.DERIVE_TIMEOUT_SECONDS
+            remaining = _remaining()
+            if remaining is not None and deadline_s is not None:
+                retry_timeout = min(retry_timeout, remaining - delay - deadline_s / 2)
+            if retry_timeout < director.MIN_RETRY_SECONDS:
+                derive_retry_skipped = (
+                    f"{max(remaining or 0.0, 0.0):.0f}s of timeout_seconds remained; "
+                    "a retry would have left less than half of it for the render."
+                )
+            else:
+                await ctx.info(
+                    "Director: turning the notes into checks timed out; trying "
+                    f"once more after {delay:g}s"
+                )
+                await asyncio.sleep(delay)
+                derive_retried.append("timeout")
+                derived = await derive(retry_timeout)
+                derive_attempts += derived.attempts
+                derive_retried += list(derived.retried)
+                derive_retry_skipped = derived.retry_skipped
         if derived.status != "ok":
             abstained = (derived.reason, derived.detail)
         else:
@@ -4219,6 +4261,13 @@ async def _directed_unguarded(
     block["checks_source"] = (
         "cache" if cached is not None else "failed" if abstained else "compiled"
     )
+    # Always present, as review_attempts is: 0 when the checks came from the
+    # cache, 2 when the derive call was retried.
+    block["derive_attempts"] = derive_attempts
+    if derive_retried:
+        block["derive_retried_after"] = derive_retried
+    if derive_retry_skipped:
+        block["derive_retry_skipped"] = derive_retry_skipped
     # Always a list, so a reader need not tell "none" from "not reported".
     block["skipped_notes"] = [{"text": s.text, "reason": s.reason} for s in skipped]
 
