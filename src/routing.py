@@ -12,7 +12,7 @@ filesystem, or consults the clock — routing is pure, deterministic, rule-based
 logic, so the same input always produces the same plan.
 
 Capability facts that already exist in the implementation modules (image size
-support, the Veo Lite restriction set, omni's duration bounds) are IMPORTED
+support, Veo's backend, omni's duration bounds) are IMPORTED
 rather than restated: a second copy would drift the first time Google changes
 a model. Facts with no existing home (relative cost/fidelity of each model,
 tool-level routing rules) are defined here.
@@ -20,7 +20,6 @@ tool-level routing rules) are defined here.
 
 import math
 import re
-import dataclasses
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, get_args
 
@@ -55,9 +54,7 @@ from .omni import (
 )
 from .video import (
     _CANONICAL_VIDEO_MODEL_IDS,  # pyright: ignore[reportPrivateUsage]
-    _GEMINI_API_MODE_ERRORS,  # pyright: ignore[reportPrivateUsage]
-    _GEMINI_API_UNSUPPORTED_MODES,  # pyright: ignore[reportPrivateUsage]
-    _VEO_LITE_MODELS,  # pyright: ignore[reportPrivateUsage]
+    VEO_GEMINI_API_SHUTDOWN,
     VideoModel,
 )
 
@@ -414,7 +411,6 @@ class VideoCapabilities:
     supports_negative_prompt: bool
     supports_audio: bool
     supports_conversational_edit: bool
-    gemini_api_only: bool
     min_duration_seconds: float
     max_duration_seconds: float
 
@@ -491,16 +487,6 @@ _VIDEO_PROFILES: dict[str, ModelProfile] = {
             "extension, keyframe interpolation and video references"
         ),
     ),
-    "veo-3.1-lite-generate-preview": ModelProfile(
-        model="veo-3.1-lite-generate-preview",
-        media_kind="video",
-        # $0.05/s — genuinely the cheapest video route.
-        cost_index=0.0,
-        fidelity_index=0.60,
-        speed_index=0.80,
-        text_rendering_index=0.0,
-        summary="cheapest Veo tier, text-to-video and image-to-video only",
-    ),
     "veo-3.1-fast-generate-001": ModelProfile(
         model="veo-3.1-fast-generate-001",
         media_kind="video",
@@ -538,7 +524,6 @@ _VIDEO_CAPABILITIES: dict[str, VideoCapabilities] = {
         # family with native audio.
         supports_audio=False,
         supports_conversational_edit=True,
-        gemini_api_only=False,
         min_duration_seconds=float(OMNI_MIN_DURATION),
         max_duration_seconds=float(OMNI_MAX_DURATION),
     ),
@@ -563,30 +548,8 @@ _VIDEO_CAPABILITIES: dict[str, VideoCapabilities] = {
         # OFF — a caveat, not a reason to exclude it when audio is wanted.
         supports_audio=True,
         supports_conversational_edit=True,
-        gemini_api_only=False,
         min_duration_seconds=float(OMNI_MIN_DURATION),
         max_duration_seconds=float(OMNI_MAX_DURATION),
-    ),
-    # Veo 3.1 Lite: Gemini-API-only, no 4K, no extension, no first/last frame,
-    # no reference images (src/video.py raises on the last three).
-    "veo-3.1-lite-generate-preview": VideoCapabilities(
-        supports_first_last_frame=False,
-        supports_extension=False,
-        supports_reference_images=False,
-        supports_4k=False,
-        supports_1080p=True,
-        supports_360p=False,
-        supports_seed=True,
-        supports_negative_prompt=True,
-        # Lite generates audio like the other Veo tiers; what it cannot do is
-        # let you switch it OFF (include_audio maps to the Vertex-only
-        # generate_audio flag and Lite never runs on Vertex) — a caveat, not a
-        # reason to exclude it when audio is wanted.
-        supports_audio=True,
-        supports_conversational_edit=False,
-        gemini_api_only=True,
-        min_duration_seconds=float(min(VEO_DURATIONS_SECONDS)),
-        max_duration_seconds=float(VEO_MAX_CLIP_SECONDS),
     ),
 }
 
@@ -600,12 +563,9 @@ _FULL_VEO_CAPABILITIES = VideoCapabilities(
     supports_360p=False,
     supports_seed=True,
     supports_negative_prompt=True,
-    # Veo 3.1 generates audio natively. On Vertex it is switchable via the
-    # generate_audio flag; on the Gemini API it is always on (src/video.py
-    # warns about exactly this).
+    # Veo 3.1 generates audio natively, switchable via the generate_audio flag.
     supports_audio=True,
     supports_conversational_edit=False,
-    gemini_api_only=False,
     min_duration_seconds=float(min(VEO_DURATIONS_SECONDS)),
     max_duration_seconds=float(VEO_MAX_CLIP_SECONDS),
 )
@@ -1647,14 +1607,12 @@ class RoutingConstraints:
         needs_extension: The output must continue an existing video.
         wants_gcs_output: Output must land in Cloud Storage.
         backend: Which backend the server is running against. Several rules
-            are backend-specific (GCS output, Veo Lite availability).
+            are backend-specific (GCS output, Veo, which runs on Vertex AI
+            only).
         gemini_api_key_available: Whether the server holds a GEMINI_API_KEY.
-            None means unknown, so a Gemini-API-only model stays on the table;
-            False is the server stating it has no key, which makes those
-            models unrunnable however the request is phrased. Live testing
-            found the planner recommending Veo 3.1 Lite on a Vertex
-            deployment with no key — the routing rule was already here, only
-            the credential fact was missing.
+            None means unknown. On a Vertex deployment it decides which
+            backend omni runs on, and so which upload ceiling an omni
+            extension is priced against.
         num_beats: How many distinct shots the output has.
         is_draft: This render is throwaway.
         is_iterating: The caller is refining an existing result.
@@ -2483,9 +2441,6 @@ class VideoNeeds:
     audio: bool
     conversational_edit: bool
     clip_duration_seconds: float
-    # Which backend the request runs on. A capability is not a property of the
-    # model alone: Veo has four the Gemini Developer API refuses.
-    backend: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -2607,73 +2562,23 @@ _VIDEO_CAPABILITY_RULES: tuple[_CapabilityRule, ...] = (
 )
 
 
-# MEASURED against the live service: Veo on the Gemini Developer API refuses
-# these four. first/last-frame answers "Your use case is currently not
-# supported", extension "encodedVideo isn't supported by this model",
-# reference images an empty result that still bills, and 4K "The string value
-# 4K for resolution is invalid". All four work on Vertex. The capability table
-# is per model, so without this the planner offered Veo for every one of them
-# on a backend that cannot serve it — and the 4K case is the worst, because
-# omni renders 4K there fine and would have been the right answer.
-_GEMINI_API_VEO_RESTRICTIONS: dict[str, str] = {
-    "supports_first_last_frame": (
-        "First/last-frame control is Vertex-only for Veo. Run against Vertex "
-        "AI, or describe the shot as one text-to-video prompt."
-    ),
-    "supports_extension": (
-        "Extension is Vertex-only for Veo. Run against Vertex AI (with "
-        "output_gcs_uri or VIDEO_GCS_BUCKET for delivery)."
-    ),
-    "supports_reference_images": (
-        "Veo reference images are Vertex-only; the Gemini Developer API "
-        "returns an empty result and bills for it. Use gemini-omni-1.1-flash's "
-        "reference_image_uris here, or run against Vertex AI."
-    ),
-    "supports_4k": (
-        "Veo cannot render 4K on the Gemini Developer API. gemini-omni-1.1-flash "
-        "renders 4K there via generate_video_omni, or run Veo against Vertex AI."
-    ),
-}
-
-
-def _video_capabilities_for(model: str, backend: str) -> VideoCapabilities | None:
-    """The capability set a model actually has ON THIS BACKEND."""
-    capabilities = _VIDEO_CAPABILITIES.get(model)
-    if capabilities is None or backend != "gemini_api" or is_omni_model(model):
-        return capabilities
-    return dataclasses.replace(
-        capabilities, **{attr: False for attr in _GEMINI_API_VEO_RESTRICTIONS}
-    )
-
-
 def _capability_rejection(
     model: str, needs: VideoNeeds
 ) -> tuple[_CapabilityRule, str] | None:
     """Return the first hard rule ``model`` violates, or None.
 
     Only the first is reported: once a model is out, listing every additional
-    reason is noise rather than expertise. A restriction that comes from the
-    BACKEND rather than the model says so, and names the fix that actually
-    applies — the generic rule's "use a Veo model" is wrong advice when the
-    Veo model is exactly what this backend refuses.
+    reason is noise rather than expertise. The backend is not a capability:
+    Veo on the Gemini Developer API is refused whatever it is asked for, which
+    _backend_rejection reports with the fix that applies.
     """
-    intrinsic = _VIDEO_CAPABILITIES.get(model)
-    capabilities = _video_capabilities_for(model, needs.backend)
-    if capabilities is None or intrinsic is None:
+    capabilities = _VIDEO_CAPABILITIES.get(model)
+    if capabilities is None:
         return None
     for rule in _VIDEO_CAPABILITY_RULES:
         if getattr(needs, rule.need_attr) and not getattr(
             capabilities, rule.capability_attr
         ):
-            if getattr(intrinsic, rule.capability_attr):
-                return (
-                    dataclasses.replace(
-                        rule,
-                        resolution=_GEMINI_API_VEO_RESTRICTIONS[rule.capability_attr],
-                    ),
-                    f"{model} excluded on the Gemini Developer API: the backend "
-                    f"refuses {rule.need_attr.replace('_', ' ')} for Veo.",
-                )
             return rule, rule.reason.format(model=model) + "."
     return None
 
@@ -2713,56 +2618,31 @@ def _duration_rejection(model: str, needs: VideoNeeds) -> str | None:
 def _backend_rejection(model: str, request: ResolvedRequest) -> tuple[str, str] | None:
     """Return (reason, resolution) when the backend cannot serve ``model``.
 
-    Three documented facts drive this: Veo 3.1 Lite is published on the Gemini
-    Developer API only, reaching it needs a GEMINI_API_KEY whatever the
-    backend, and GCS output is a Vertex-only config field.
+    Veo runs on Vertex AI only: Google switched off every Veo 3.1 model the
+    Gemini Developer API served on VEO_GEMINI_API_SHUTDOWN, and the server
+    refuses the call there (src/__main__._client_for_video_model). Omni is
+    served on both backends.
 
     Args:
         model: Candidate model ID.
-        request: The resolved request, including the backend and (when the
-            server told us) whether a Gemini API key exists.
+        request: The resolved request, including the backend.
 
     Returns:
         The rejection reason paired with the concrete fix, or None when the
         backend can serve the model.
     """
-    capabilities = _VIDEO_CAPABILITIES.get(model)
-    if capabilities is None:
-        return None
-    if capabilities.gemini_api_only and request.gemini_api_key_available is False:
-        # Checked before the backend rules because it is the stronger fact: on
-        # a Vertex deployment the server can still reach a Gemini-API-only
-        # model through a Gemini API client, but not without the key. Live
-        # testing had the planner recommending Lite into exactly this failure,
-        # so the reason is worded as the error the real call raises.
-        return (
-            f"{model} excluded: it is served by the Gemini Developer API only "
-            "and this server has no GEMINI_API_KEY, so the call would fail with "
-            "that error instead of rendering.",
-            "Set GEMINI_API_KEY to reach this model, or pick a Veo tier the "
-            "configured backend publishes.",
-        )
     if (
-        capabilities.gemini_api_only
-        and request.backend == "vertex"
-        and not request.gemini_api_key_available
+        model in _VIDEO_CAPABILITIES
+        and not is_omni_model(model)
+        and request.backend == "gemini_api"
     ):
-        # Only when the key is absent or unknown. The server genuinely routes
-        # these models through a dedicated Gemini API client on a Vertex
-        # deployment (see _client_for_video_model), so once it has told us a
-        # key exists, excluding the model would refuse a call that works —
-        # the mirror of the bug this rejection was added to prevent.
         return (
-            f"{model} excluded: served by the Gemini Developer API only — Vertex "
-            "AI has not published it. The server can route it through a Gemini "
-            "API client, but only when GEMINI_API_KEY is set.",
-            "Switch backend, or pick a model published on the backend in use.",
-        )
-    if capabilities.gemini_api_only and request.wants_gcs_output:
-        return (
-            f"{model} excluded: it runs on the Gemini API, which does not support "
-            "output_gcs_uri (GCS output is Vertex-only).",
-            "Switch backend, or pick a model published on the backend in use.",
+            f"{model} excluded: Veo is not available on the Gemini Developer "
+            f"API, where Google switched off its Veo 3.1 models on "
+            f"{VEO_GEMINI_API_SHUTDOWN}.",
+            f"Use {OMNI_1_1_MODEL}, Google's named replacement, or run the "
+            "server with Vertex AI credentials, where Veo 3.1 stays generally "
+            "available.",
         )
     return None
 
@@ -2863,9 +2743,10 @@ def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
     # whether or not the endpoint URIs have been handed over yet. Keying this
     # on the chosen tool alone meant "a smooth transition from sunrise to
     # snowfall" — with no URIs, which is how an agent asks before it has the
-    # stills — selected generate_video, needed nothing, and ranked Veo 3.1
-    # Lite: the exact example this module's docstring gives for a request it
-    # catches "before you pay for the failure".
+    # stills — selected generate_video, needed nothing, and ranked a model
+    # that cannot interpolate (Veo 3.1 Lite, since removed): the exact example
+    # this module's docstring gives for a request it catches "before you pay
+    # for the failure".
     first_last = (
         tool in ("generate_transition", "generate_bridge")
         or (request.has_first_frame and request.has_last_frame)
@@ -2875,7 +2756,6 @@ def _video_needs(request: ResolvedRequest, tool: ToolName) -> VideoNeeds:
         )
     )
     return VideoNeeds(
-        backend=request.backend,
         first_last_frame=first_last,
         extension=tool == "loop_extend" or request.needs_extension,
         reference_images=request.num_reference_images > 0,
@@ -2971,23 +2851,12 @@ def _video_params(
                     f"clips; {duration:g}s snaps to {snapped}s."
                 )
             duration = float(snapped)
-        if veo_mode in _GEMINI_API_UNSUPPORTED_MODES and request.backend in (
-            "gemini_api",
-            "unknown",
-        ):
-            # Measured against the live service, not inferred: this is the one
-            # mode that fails by billing for an empty result, so a route that
-            # recommends it must say so. "unknown" is included deliberately --
-            # a caveat that may not apply is cheaper than a silent charge.
-            detail = _GEMINI_API_MODE_ERRORS.get(veo_mode, "")
-            hedge = (
-                "the backend is unknown, and on the Gemini Developer API "
-                if request.backend == "unknown"
-                else "on the Gemini Developer API "
-            )
+        if request.backend == "unknown":
+            # A caveat that may not apply is cheaper than a refused call.
             caveats.append(
-                f"{model} cannot serve this mode ({veo_mode}) {hedge}"
-                f"— {detail}. Run it on Vertex AI instead."
+                f"{model} runs on Vertex AI only; on the Gemini Developer API "
+                f"Veo was switched off on {VEO_GEMINI_API_SHUTDOWN} and the "
+                "call is refused."
             )
 
     params: dict[str, Any] = {}
@@ -3316,19 +3185,6 @@ def _video_params(
                 "Storage."
             )
 
-    if (
-        not is_omni_model(model)
-        and request.backend == "gemini_api"
-        and not request.needs_audio
-    ):
-        caveats.append(
-            "include_audio=False cannot be honored on the Gemini API — Veo 3.1 "
-            "always generates audio there."
-        )
-
-    # Lite is published on the Gemini Developer API only, so the server routes
-    # it through a Gemini API client even in Vertex mode — which also means
-    # its audio is always on and its output can never go to GCS.
     sunset = DEPRECATED_VIDEO_MODELS.get(model)
     if sunset:
         caveats.append(
@@ -3337,13 +3193,6 @@ def _video_params(
             f"built on. The GA successor is {OMNI_1_1_MODEL}, which renders "
             "the same 720p at the same published rate and adds resolution "
             "control, video extension and first/last-frame interpolation."
-        )
-
-    if model in _VEO_LITE_MODELS:
-        caveats.append(
-            f"{model} is served by the Gemini Developer API only; GEMINI_API_KEY "
-            "must be set, audio is always generated, and output_gcs_uri is "
-            "unavailable."
         )
 
     return params, caveats
@@ -3687,43 +3536,6 @@ def _plan_video(
             )
         )
 
-    # Same shape as the GCS contradiction above, and measured the same way:
-    # on the Gemini Developer API, Veo refuses every mode that conditions on
-    # existing footage. generate_transition and generate_bridge come back
-    # "Your use case is currently not supported"; loop_extend comes back
-    # "encodedVideo isn't supported by this model". Identical calls succeed on
-    # Vertex. Without this the planner ranked generate_transition top on a
-    # backend that cannot render it, and handed over a clean quote beside it.
-    _GEMINI_API_BLOCKED_TOOLS = {
-        "loop_extend": ("extension", "encodedVideo isn't supported by this model"),
-        "generate_transition": (
-            "first/last-frame control",
-            "Your use case is currently not supported",
-        ),
-        "generate_bridge": (
-            "first/last-frame control",
-            "Your use case is currently not supported",
-        ),
-    }
-    if request.backend == "gemini_api" and tool in _GEMINI_API_BLOCKED_TOOLS:
-        capability, service_message = _GEMINI_API_BLOCKED_TOOLS[tool]
-        conflicts.append(
-            RoutingConflict(
-                code="veo_mode_unsupported_on_gemini_api",
-                detail=(
-                    f"{tool} needs Veo {capability}, which the Gemini Developer "
-                    f'API refuses: the service answers "{service_message}". '
-                    "Only text-to-video runs on this backend."
-                ),
-                resolution=(
-                    "Run against Vertex AI, where this mode works (set "
-                    "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, plus "
-                    "output_gcs_uri or VIDEO_GCS_BUCKET for delivery), or "
-                    "describe the shot as a single text-to-video prompt."
-                ),
-            )
-        )
-
     # Runtime beyond what a Veo extension chain can reach.
     if (
         request.total_duration_seconds is not None
@@ -4023,9 +3835,10 @@ def _animatic_rationale(
     preview of an expensive render, which is only true against the standard
     Veo tier. Omni bills $0.10136/s and Veo 3.1 Fast $0.10/s, so 3 x 8s beats
     cost $2.43 as an animatic against $2.40 for the real thing — and $1.20 on
-    Veo 3.1 Lite, which the animatic then costs double. The preview keeps its
-    place (catching a bad creative call before the delivery render is paid for
-    is worth something on its own), but the claim has to match the arithmetic.
+    Veo 3.1 Lite (since removed), which the animatic then cost double. The
+    preview keeps its place (catching a bad creative call before the delivery
+    render is paid for is worth something on its own), but the claim has to
+    match the arithmetic.
 
     Args:
         beats: How many beats the animatic renders.

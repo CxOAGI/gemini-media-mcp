@@ -29,20 +29,26 @@ from src.__main__ import AppContext
 
 VEO_FAST = "veo-3.1-fast-generate-001"
 VEO = "veo-3.1-generate-001"
-VEO_LITE = "veo-3.1-lite-generate-preview"
 
-# Veo serves these modes only on Vertex. MEASURED: the Gemini Developer API
-# answers "Your use case is currently not supported" for first/last-frame and
-# "encodedVideo isn't supported by this model" for extension.
-_VERTEX_ONLY_TOOLS = frozenset(
-    {"generate_transition", "generate_bridge", "loop_extend"}
+# Every tool that renders with Veo. Veo runs on Vertex AI only since Google
+# switched it off on the Gemini Developer API on 2026-10-22, so on that backend
+# these refuse rather than respond; test_main's
+# test_veo_tools_refuse_on_the_gemini_api covers the refusal.
+_VEO_TOOLS = frozenset(
+    {
+        "generate_video",
+        "generate_clip",
+        "generate_transition",
+        "generate_bridge",
+        "loop_extend",
+    }
 )
 
 
 def _ctx(
     tmp_path: Path,
     *,
-    vertexai: bool = False,
+    vertexai: bool = True,
     bucket: str | None = None,
     allowed: frozenset[str] = frozenset(),
 ) -> Any:
@@ -100,23 +106,6 @@ async def test_vertex_still_quotes_an_explicit_gcs_destination(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_an_env_bucket_default_is_dropped_on_the_gemini_api_not_rejected(
-    tmp_path: Path,
-) -> None:
-    """The documented asymmetry, and the easiest thing for a hoist to break.
-
-    An EXPLICIT output_gcs_uri on the Gemini API is rejected — the caller
-    asked for the impossible. A VIDEO_GCS_BUCKET env default is silently
-    dropped instead, so Lite and text-to-video still succeed inline on a
-    deployment that has the variable set for its Vertex work.
-    """
-    payload = await _quote(_ctx(tmp_path, bucket="gs://envbucket/out/"))
-    assert "error" not in payload, payload.get("error")
-    assert payload["estimated_cost"]["usd"] > 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(10.0)
 async def test_the_quote_now_applies_the_bucket_allowlist(tmp_path: Path) -> None:
     """Newly enforced at dry_run: it used to fire only on the real call."""
     payload = await _quote(
@@ -142,21 +131,8 @@ async def test_the_quote_now_rejects_a_malformed_gcs_uri(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-@pytest.mark.parametrize(
-    ("model", "vertexai"),
-    [
-        (VEO_FAST, True),
-        (VEO_FAST, False),
-        (VEO, True),
-        (VEO, False),
-        # Lite is Gemini-API-only; a Vertex context without a key refuses it
-        # rather than quoting — see the test below.
-        (VEO_LITE, False),
-    ],
-)
-async def test_a_veo_quote_names_one_model_on_both_backends(
-    tmp_path: Path, vertexai: bool, model: str
-) -> None:
+@pytest.mark.parametrize("model", [VEO_FAST, VEO])
+async def test_a_veo_quote_names_one_model(tmp_path: Path, model: str) -> None:
     """`model` and `cost.detail` must never name different models.
 
     The reported id used to be the backend-specific spelling while the detail
@@ -166,7 +142,7 @@ async def test_a_veo_quote_names_one_model_on_both_backends(
 
     payload = json.loads(
         await generate_video(
-            ctx=_ctx(tmp_path, vertexai=vertexai),
+            ctx=_ctx(tmp_path),
             prompt="x",
             model=model,
             dry_run=True,
@@ -175,32 +151,6 @@ async def test_a_veo_quote_names_one_model_on_both_backends(
     assert "error" not in payload, payload.get("error")
     assert payload["model"] == model
     assert payload["model"] in payload["estimated_cost"]["detail"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(10.0)
-async def test_lite_on_vertex_without_a_key_is_refused_by_the_quote_too(
-    tmp_path: Path,
-) -> None:
-    """A third rejection the hoist brought forward.
-
-    Choosing the client moved ahead of the dry_run return with the GCS
-    resolution, so a quote for a Gemini-API-only model on a Vertex deployment
-    with no key now fails the way the render fails, instead of pricing a call
-    that cannot be made.
-    """
-    from src.__main__ import generate_video
-
-    payload = json.loads(
-        await generate_video(
-            ctx=_ctx(tmp_path, vertexai=True),
-            prompt="x",
-            model=VEO_LITE,
-            dry_run=True,
-        )
-    )
-    assert "only available via the Gemini API" in payload["error"]
-    assert "estimated_cost" not in payload
 
 
 # ============================================================================
@@ -350,7 +300,7 @@ def test_veo_records_carry_no_resolution_notes() -> None:
             assert not record.resolution_notes, model
 
 
-@pytest.mark.parametrize("model", [VEO_FAST, VEO, VEO_LITE])
+@pytest.mark.parametrize("model", [VEO_FAST, VEO])
 def test_veo_has_no_360p_rate_and_is_not_given_one(model: str) -> None:
     """360p entered the resolution vocabulary for Omni's draft tier.
 
@@ -595,16 +545,10 @@ async def test_every_render_tool_reports_its_backend(
     expected = "vertex" if vertexai else "gemini_api"
     missing: list[str] = []
     for tool, kwargs in _render_tool_calls(video, image).items():
-        if not vertexai and tool in _VERTEX_ONLY_TOOLS:
-            # Veo refuses these on the Gemini Developer API, so there is no
-            # response to stamp — the refusal is the correct behaviour and is
-            # covered by test_a_gemini_api_quote_refuses_a_mode_veo_cannot_serve.
+        if not vertexai and tool in _VEO_TOOLS:
+            # Veo is refused on the Gemini Developer API, so there is no
+            # response to stamp — the refusal is the correct behaviour.
             continue
-        if not vertexai and kwargs.get("add_bridges"):
-            # A bridge is a first/last-frame render, so a clip that builds them
-            # inherits the restriction. The clip itself runs here; the bridges
-            # do not, so drop them rather than skipping the tool.
-            kwargs = {**kwargs, "add_bridges": False}
         # A bucket, because Vertex refuses to extend without a destination;
         # on the Gemini API the env default is dropped rather than rejected.
         raw = await getattr(main_mod, tool)(
@@ -652,9 +596,8 @@ async def test_planning_does_not_claim_a_backend_it_never_calls(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60.0)
-@pytest.mark.parametrize("vertexai", [False, True])
 async def test_every_rendered_response_reports_backend_and_sources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vertexai: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The REAL run is the one that reports a bill.
 
@@ -690,15 +633,13 @@ async def test_every_rendered_response_reports_backend_and_sources(
         "loop_extend": dict(prompt="c", video_uri=video, model=VEO_FAST, times=1),
         "generate_video": dict(prompt="x", model=VEO_FAST),
     }
-    expected = "vertex" if vertexai else "gemini_api"
+    # Every tool here is Veo, which runs on Vertex AI only.
+    expected = "vertex"
     bad: list[str] = []
     for tool, kwargs in calls.items():
-        if not vertexai and tool in _VERTEX_ONLY_TOOLS:
-            continue
         raw = await getattr(main_mod, tool)(
             ctx=_ctx(
                 tmp_path,
-                vertexai=vertexai,
                 bucket="gs://bkt/out/",
                 allowed=frozenset({"bkt"}),
             ),
@@ -920,16 +861,15 @@ async def test_an_unmeasurable_veo_render_says_its_resolution_is_assumed(
         ("loop_extend", {"video_uri": None}, "extend_video"),
     ],
 )
-async def test_a_gemini_api_quote_refuses_a_mode_veo_cannot_serve(
+async def test_a_gemini_api_quote_refuses_veo_whatever_the_mode(
     tmp_path: Path, tool: str, kwargs: dict[str, Any], mode: str
 ) -> None:
     """A quote must never price a call the backend cannot run.
 
-    MEASURED against the live service: on the Gemini Developer API, Veo
-    refuses every mode that conditions on existing footage. These three tools
-    were returning a clean price AND the very backend that made the call
-    impossible, in the same response — the signal was already in hand and
-    simply was not wired to a gate.
+    These three tools once returned a clean price AND the very backend that
+    made the call impossible, in the same response. Veo now has no endpoint
+    on the Gemini Developer API at all, so the refusal no longer depends on
+    the mode — but it must still come before the price.
     """
     import src.__main__ as main_mod
 
@@ -937,36 +877,36 @@ async def test_a_gemini_api_quote_refuses_a_mode_veo_cannot_serve(
     filled = {k: (video if "clip" in k or "video" in k else image) for k in kwargs}
     payload = json.loads(
         await getattr(main_mod, tool)(
-            ctx=_ctx(tmp_path), prompt="x", model=VEO_FAST, dry_run=True, **filled
+            ctx=_ctx(tmp_path, vertexai=False),
+            prompt="x",
+            model=VEO_FAST,
+            dry_run=True,
+            **filled,
         )
     )
     assert "estimated_cost" not in payload, f"{tool} priced an impossible call"
-    assert mode in payload["error"]
+    assert "Gemini Developer API" in payload["error"]
     assert "Vertex AI" in payload["error"]
 
 
 def test_the_planner_does_not_route_to_a_tool_this_backend_refuses() -> None:
-    """plan_generation ranked generate_transition top on a backend that 400s.
-
-    The planner already had a backend field and backend-specific rules, so
-    the mechanism existed; this mode simply was not among them.
-    """
+    """plan_generation once ranked generate_transition top on a backend that
+    400s. Veo is not served on the Gemini Developer API at all now, so the
+    same brief there routes to omni's interpolation, and each Veo model is
+    rejected with the reason and the fix."""
     from src.routing import RoutingConstraints, plan_generation
 
     intent = "a crossfade between these two frames"
     blocked = plan_generation(intent, RoutingConstraints(backend="gemini_api"))
-    codes = [c.code for c in blocked.conflicts]
-    assert "veo_mode_unsupported_on_gemini_api" in codes
-    conflict = next(
-        c for c in blocked.conflicts if c.code == "veo_mode_unsupported_on_gemini_api"
-    )
-    assert "Vertex AI" in conflict.resolution
+    assert blocked.routes, [r.reason for r in blocked.rejected]
+    assert not any(r.model.startswith("veo") for r in blocked.routes)
+    veo_rejections = [r for r in blocked.rejected if r.model.startswith("veo")]
+    assert veo_rejections
+    assert all("Gemini Developer API" in r.reason for r in veo_rejections)
 
-    # And the same brief on Vertex must stay clean, or the gate is just noise.
+    # And the same brief on Vertex must still offer Veo, or the gate is noise.
     allowed = plan_generation(intent, RoutingConstraints(backend="vertex"))
-    assert "veo_mode_unsupported_on_gemini_api" not in [
-        c.code for c in allowed.conflicts
-    ]
+    assert any(r.model.startswith("veo") for r in allowed.routes)
 
 
 @pytest.mark.asyncio
@@ -1103,41 +1043,37 @@ async def test_a_remote_delivery_still_projects_from_a_local_source(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30.0)
-@pytest.mark.parametrize("vertexai", [False, True])
 async def test_one_response_names_one_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vertexai: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`model` and `cost.detail` must never name different models.
 
-    The impl returns the SERVED id — the Gemini API is fed `-preview`
-    spellings — and reporting that beside a cost line priced on the canonical
-    name put two model names in one response. This was fixed once for the
-    quote and grew back on the rendered path, which is why it is settled in
-    one place now rather than per tool.
+    A caller may feed back the `-preview` spelling an older Gemini-API render
+    reported. Reporting that beside a cost line priced on the canonical name
+    would put two model names in one response; the canonical name wins.
     """
     from src.__main__ import generate_video
-    from src.video import _GEMINI_API_MODEL_IDS  # pyright: ignore[reportPrivateUsage]
+    from src.video import (
+        _CANONICAL_VIDEO_MODEL_IDS,  # pyright: ignore[reportPrivateUsage]
+    )
 
     out = tmp_path / "videos" / "m.mp4"
 
     async def veo_impl(**kwargs: Any) -> dict[str, Any]:
         _write_video(out, 1280, 720)
-        served = _GEMINI_API_MODEL_IDS.get(kwargs["model"], kwargs["model"])
+        served = _CANONICAL_VIDEO_MODEL_IDS.get(kwargs["model"], kwargs["model"])
         return {"video_url": f"file://{out}", "model": served, "duration_seconds": 4}
 
     monkeypatch.setattr("src.__main__.generate_video_impl", veo_impl)
     payload = json.loads(
         await generate_video(
-            ctx=_ctx(tmp_path, vertexai=vertexai), prompt="x", model=VEO_FAST
+            ctx=_ctx(tmp_path), prompt="x", model="veo-3.1-fast-generate-preview"
         )
     )
     assert "error" not in payload, payload.get("error")
     assert payload["model"] == VEO_FAST
     assert payload["model"] in payload["cost"]["detail"]
     assert "-preview" not in payload["cost"]["detail"]
-    if payload.get("served_model"):
-        # The wire spelling is kept, not dropped.
-        assert payload["served_model"].endswith("-preview")
 
 
 @pytest.mark.asyncio
@@ -1147,16 +1083,16 @@ async def test_reference_images_are_refused_on_the_gemini_api(
 ) -> None:
     """It returned an empty result with no usable error, and billed for it.
 
-    "No videos returned" told a caller nothing, cost roughly $0.80, and left
-    reference_to_video looking like a transient failure rather than a mode
-    this backend does not serve.
+    "No videos returned" told a caller nothing and cost roughly $0.80. Veo is
+    not served on the Gemini Developer API at all now, so the quote refuses
+    before pricing, naming the backends that do serve the request.
     """
     from src.__main__ import generate_video
 
     _, image = _seed_media(tmp_path)
     payload = json.loads(
         await generate_video(
-            ctx=_ctx(tmp_path),
+            ctx=_ctx(tmp_path, vertexai=False),
             prompt="x",
             model=VEO_FAST,
             reference_image_uris=[image],
@@ -1164,43 +1100,8 @@ async def test_reference_images_are_refused_on_the_gemini_api(
         )
     )
     assert "estimated_cost" not in payload
-    assert "reference_to_video" in payload["error"]
+    assert "Gemini Developer API" in payload["error"]
     assert "Vertex AI" in payload["error"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(30.0)
-async def test_image_to_video_is_not_warned_about_on_the_gemini_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """It renders fine there, and a warning on a working call is noise.
-
-    The caution was written when the backend was believed text-to-video only.
-    It was not, and warnings that fire on success teach callers to skip them.
-    """
-    from src.__main__ import generate_video
-
-    _, image = _seed_media(tmp_path)
-    out = tmp_path / "videos" / "i2v.mp4"
-
-    async def veo_impl(**kwargs: Any) -> dict[str, Any]:
-        _write_video(out, 1280, 720)
-        return {
-            "video_url": f"file://{out}",
-            "model": kwargs.get("model"),
-            "duration_seconds": 4,
-        }
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", veo_impl)
-    payload = json.loads(
-        await generate_video(
-            ctx=_ctx(tmp_path), prompt="x", model=VEO_FAST, image_uri=image
-        )
-    )
-    assert "error" not in payload, payload.get("error")
-    assert not [w for w in payload.get("warnings", []) if "text-to-video only" in w], (
-        payload.get("warnings")
-    )
 
 
 @pytest.mark.asyncio
@@ -1255,32 +1156,6 @@ async def test_generate_videos_extend_mode_bills_the_assembled_clip(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_veo_4k_is_refused_on_the_gemini_api_before_it_is_priced(
-    tmp_path: Path,
-) -> None:
-    """Gating covered modes but not resolutions.
-
-    This quoted $1.20 at the 4K rate and then 400'd — the highest-value false
-    quote in the server. Veo-specific: omni renders 4K on this backend.
-    """
-    from src.__main__ import generate_video
-
-    payload = json.loads(
-        await generate_video(
-            ctx=_ctx(tmp_path),
-            prompt="x",
-            model=VEO_FAST,
-            resolution="4K",
-            dry_run=True,
-        )
-    )
-    assert "estimated_cost" not in payload
-    assert "4K" in payload["error"]
-    assert "Vertex" in payload["error"] or "720p" in payload["error"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(20.0)
 async def test_a_clip_with_bridges_is_refused_before_any_beat_is_billed(
     tmp_path: Path,
 ) -> None:
@@ -1288,14 +1163,14 @@ async def test_a_clip_with_bridges_is_refused_before_any_beat_is_billed(
 
     On the Gemini API the quote came back clean with bridge_count: 1 and a
     positive ffmpeg check, the beats then rendered and billed ~$0.80, and only
-    the first bridge failed. Standalone bridges already refused on that
-    backend; the composite that builds them did not.
+    the first bridge failed. Veo is refused there outright now, so the quote
+    must refuse before any beat is priced.
     """
     from src.__main__ import generate_clip
 
     payload = json.loads(
         await generate_clip(
-            ctx=_ctx(tmp_path),
+            ctx=_ctx(tmp_path, vertexai=False),
             beats=[{"prompt": "a"}, {"prompt": "b"}],
             model=VEO_FAST,
             add_bridges=True,
@@ -1303,7 +1178,7 @@ async def test_a_clip_with_bridges_is_refused_before_any_beat_is_billed(
         )
     )
     assert "estimated_cost" not in payload
-    assert "first_last_frame" in payload["error"]
+    assert "Gemini Developer API" in payload["error"]
 
 
 def test_a_thought_signature_the_server_wrote_can_be_read_back() -> None:
@@ -1402,10 +1277,9 @@ async def test_first_last_frame_quotes_apply_the_gcs_allowlist(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_the_impl_refuses_veo_4k_on_the_gemini_api_before_the_wire() -> None:
-    """The dry run refused it; the real call let it through to a 400.
-
-    Same rule, both ends — the impl's resolution check now sees the backend.
+async def test_the_impl_refuses_veo_on_the_gemini_api_before_the_wire() -> None:
+    """The dry run refused 4K there once while the real call let it through
+    to a 400. Same rule, both ends — and now the rule is the whole backend.
     """
     from unittest.mock import MagicMock
 
@@ -1413,7 +1287,7 @@ async def test_the_impl_refuses_veo_4k_on_the_gemini_api_before_the_wire() -> No
 
     client = MagicMock()
     client._api_client.vertexai = False
-    with pytest.raises(ValueError, match="4K"):
+    with pytest.raises(ValueError, match="Gemini Developer API"):
         await impl(
             client=client, prompt="x", videos_dir=Path("."), model=VEO, resolution="4K"
         )

@@ -2206,7 +2206,7 @@ def test_interpolation_uses_the_task_the_release_note_names() -> None:
 def test_the_deprecated_model_says_when_it_stops() -> None:
     """A caller who reads a warning has time to move.
 
-    gemini-omni-flash-preview is switched off on 2026-09-30, so it can no
+    gemini-omni-flash-preview is switched off on 2026-10-22, so it can no
     longer be the silent default and cannot be pinned without being told.
     """
     from src.omni import (
@@ -2215,7 +2215,7 @@ def test_the_deprecated_model_says_when_it_stops() -> None:
     )
 
     assert DEFAULT_OMNI_MODEL == OMNI_1_1_MODEL, "the default must be the GA model"
-    assert OMNI_PREVIEW_SUNSET == "2026-09-30"
+    assert OMNI_PREVIEW_SUNSET == "2026-10-22"
 
 
 @pytest.mark.asyncio
@@ -2242,7 +2242,7 @@ async def test_pinning_the_deprecated_model_warns_with_its_end_date(
         model=OMNI_PREVIEW_MODEL,
     )
     warnings = result.get("warnings") or []
-    assert any("2026-09-30" in w for w in warnings), warnings
+    assert any("2026-10-22" in w for w in warnings), warnings
     assert any(OMNI_1_1_MODEL in w for w in warnings), warnings
     # And the GA model carries no such warning.
     fresh = await omni.generate_video_omni(
@@ -2672,16 +2672,25 @@ def test_the_animatic_resolution_knob_is_documented_where_it_is_used() -> None:
 # ============================================================================
 
 
+def _vertex_ctx(tmp_path: Path) -> Any:
+    """_ctx on Vertex AI, the only backend Veo runs on."""
+    ctx = _ctx(tmp_path)
+    ctx.request_context.lifespan_context.client._api_client.vertexai = True
+    return ctx
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
 async def test_a_gcs_output_on_the_gemini_api_is_refused_by_the_quote_too(
     tmp_path: Path,
 ) -> None:
-    """The docstring says it "is rejected" there. The quote priced it anyway.
+    """The docstring said it "is rejected" there. The quote priced it anyway.
 
     A clean $0.40 estimate, no warning, no warnings field — for a call the
     real path refuses. Same defect class as the over-length extension source:
-    a documented rejection that the pre-flight did not apply.
+    a documented rejection that the pre-flight did not apply. Veo is refused
+    on the Gemini Developer API outright now, GCS output or not, and the quote
+    must refuse it too.
     """
     from src.__main__ import generate_video
 
@@ -2694,7 +2703,8 @@ async def test_a_gcs_output_on_the_gemini_api_is_refused_by_the_quote_too(
             dry_run=True,
         )
     )
-    assert "requires Vertex AI mode" in payload["error"]
+    assert "Gemini Developer API" in payload["error"]
+    assert "Vertex AI" in payload["error"]
     assert "estimated_cost" not in payload, "quoted a call the render refuses"
 
 
@@ -2713,7 +2723,7 @@ async def test_the_reported_model_matches_the_cost_it_is_quoted_at(
     for requested in ("veo-3.1-fast-generate-001", "veo-3.1-generate-001"):
         payload = json.loads(
             await generate_video(
-                ctx=_ctx(tmp_path), prompt="x", model=requested, dry_run=True
+                ctx=_vertex_ctx(tmp_path), prompt="x", model=requested, dry_run=True
             )
         )
         reported = payload["model"]
@@ -2732,7 +2742,7 @@ async def test_a_preview_spelling_fed_back_resolves_to_its_canonical_name(
 
     payload = json.loads(
         await generate_video(
-            ctx=_ctx(tmp_path),
+            ctx=_vertex_ctx(tmp_path),
             prompt="x",
             model="veo-3.1-fast-generate-preview",
             dry_run=True,

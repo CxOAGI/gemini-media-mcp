@@ -26,28 +26,28 @@ than we would like):
 
 * **Vertex AI vs Gemini Developer API.** The image-model token rates are
   published identically on both the Gemini Developer API pricing page and the
-  Vertex AI generative-AI pricing page, so one table covers both. The Veo
-  per-second rates could only be confirmed on the Gemini Developer API
-  pricing page — the Vertex page defers to a Veo section that is rendered
-  client-side and is not retrievable as text. Veo prices are therefore
-  assumed to be identical on Vertex AI. If that assumption ever breaks, it
-  breaks in the direction of a wrong number, so treat Veo figures on Vertex
-  as "best published rate" rather than a billing guarantee.
+  Vertex AI generative-AI pricing page, so one table covers both. Veo runs on
+  Vertex AI only (Google switched it off on the Gemini Developer API on
+  2026-10-22 and removed it from that pricing page), so its rates are sourced
+  to the Vertex AI page. That page lists them in a unit it labels "count";
+  the figures equal the per-second rates the Gemini Developer API page
+  published until the removal, and they are applied per second here.
 * **Tier.** Everything here is the *Standard* paid tier. Google's Batch tier
   is exactly half price for these models (``BATCH_PRICE_MULTIPLIER``), but
   this server never issues batch requests, so batch rates are not applied
   automatically.
 * **Free tier.** There is none for any model in this module: the Gemini
   Developer API pricing page lists "Not available" in the free-tier column
-  for all three image models, all three Veo 3.1 variants and both omni
-  models (``gemini-omni-flash-preview`` and ``gemini-omni-1.1-flash``). So a
-  paid-tier price is always the right price here, and there is no free-tier
-  branch to model.
-* **Audio.** Veo 3.1 publishes a single per-second rate that already
-  includes natively generated audio; Google publishes no audio-free
-  discount. ``include_audio=False`` therefore does not reduce the estimate —
-  it only changes the wording of ``CostEstimate.detail``, so a caller can see
-  that turning audio off saves nothing.
+  for all three image models and both omni models
+  (``gemini-omni-flash-preview`` and ``gemini-omni-1.1-flash``), and Veo
+  runs only on Vertex AI, which has no free tier. So a paid-tier price is
+  always the right price here, and there is no free-tier branch to model.
+* **Audio.** The Veo rates here are the "Video + Audio generation" rows.
+  The Vertex AI page also lists lower "Video generation" rates without
+  audio, which this module does not apply: ``include_audio=False`` does not
+  reduce the estimate, so a silent render is quoted above what it bills —
+  the direction a quote may err in. It only changes the wording of
+  ``CostEstimate.detail``.
 * **Input tokens.** A pre-flight estimate cannot know how long the prompt
   will be, so ``estimate_image_cost`` prices output only unless the caller
   passes ``reference_images``/``input_text_tokens``. The post-hoc
@@ -71,6 +71,7 @@ API serves Veo under ``-preview`` IDs, and ``generate_video`` reports the
 translated ID back to the caller, so both spellings resolve to one price.
 """
 
+import datetime
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -89,18 +90,22 @@ from .omni import (
     canonical_omni_model,
     is_omni_model,
 )
-from .video import _GEMINI_API_MODEL_IDS, VideoModel
+from .video import _CANONICAL_VIDEO_MODEL_IDS, VideoModel
 
 # Date on which every price in this module was verified against the sources
 # below. Bump it (and re-check the tables) whenever these are refreshed —
 # callers surface it so a stale figure is visible rather than silent.
 #
-# Re-read in full on 2026-08-28, the day after gemini-omni-1.1-flash went GA
-# and republished the video table: all three image rows, all three Veo tiers
-# and both omni rows still carry the figures below. Anything automated reads
-# THIS field, so a per-record note claiming a later verification than this
-# date is a contradiction, not a refinement — bump here or not at all.
-PRICING_AS_OF = "2026-08-28"
+# Re-read in full on 2026-10-26, when the understanding-model rows were added
+# for the virtual director: the three image rows on both pricing pages, the two
+# Veo tiers on the Vertex AI page (Google removed Veo from the Gemini Developer
+# API page after switching it off there on 2026-10-22), gemini-omni-1.1-flash,
+# and the understanding rows on both pages. The omni preview's row is gone now
+# that its endpoint is off; its record keeps the figures last published, which
+# are 1.1's. Anything automated reads THIS field, so a per-record note claiming
+# a later verification than this date is a contradiction, not a refinement —
+# bump here or not at all.
+PRICING_AS_OF = "2026-10-26"
 
 PRICING_SOURCES: dict[str, str] = {
     "gemini_api": "https://ai.google.dev/gemini-api/docs/pricing",
@@ -131,9 +136,12 @@ _IMAGE_SOURCE_NOTE = (
     f"({_SRC_VERTEX_AI}), so this rate applies on either backend."
 )
 _VEO_SOURCE_NOTE = (
-    "Confirmed on the Gemini Developer API pricing page. The Vertex AI page "
-    "renders its Veo section client-side and publishes no retrievable table, "
-    "so the same rate is assumed — not verified — for Veo on Vertex AI."
+    "Confirmed on the Vertex AI pricing page, the only backend Veo runs on, as "
+    'its "Video + Audio generation" rate in a unit the page labels '
+    '"count"; the figure equals the per-second rate the Gemini Developer '
+    "API pricing page published before Google removed Veo from it. The "
+    "page's lower video-only rate is not applied, so a render with "
+    "include_audio=False is quoted above its bill."
 )
 
 # Google's Batch tier is half the Standard tier for every model priced here.
@@ -323,12 +331,12 @@ _IMAGE_PRICING: dict[str, ImageModelPricing] = {
 # Video pricing
 # ---------------------------------------------------------------------------
 #
-# Source: https://ai.google.dev/gemini-api/docs/pricing (Veo 3.1 table),
-# verified 2026-08-03: 720p/1080p/4K at $0.40/$0.40/$0.60 for Veo 3.1,
-# $0.10/$0.12/$0.30 for Veo 3.1 Fast, and $0.05/$0.08/(unsupported) for
-# Veo 3.1 Lite, all "include audio by default". The Vertex AI pricing page
-# does not expose a retrievable Veo table, so these rates are assumed to hold
-# on Vertex as well (see the module docstring).
+# Source: https://cloud.google.com/vertex-ai/generative-ai/pricing (Veo
+# table, "Video + Audio generation" rows), read 2026-10-26: 720p/1080p/4K at
+# $0.40/$0.40/$0.60 for Veo 3.1 and $0.10/$0.12/$0.30 for Veo 3.1 Fast. The
+# same figures were last confirmed per second on the Gemini Developer API
+# pricing page on 2026-10-20, before Google removed Veo from it (see the
+# module docstring).
 _OMNI_VIDEO_TOKENS_PER_SECOND = 5792
 _OMNI_VIDEO_USD_PER_MTOK = 17.50
 
@@ -389,21 +397,13 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
     "veo-3.1-generate-001": VideoModelPricing(
         usd_per_second_by_resolution={"720p": 0.40, "1080p": 0.40, "4K": 0.60},
         audio_included=True,
-        source=_SRC_GEMINI_API,
+        source=_SRC_VERTEX_AI,
         source_note=_VEO_SOURCE_NOTE,
     ),
     "veo-3.1-fast-generate-001": VideoModelPricing(
         usd_per_second_by_resolution={"720p": 0.10, "1080p": 0.12, "4K": 0.30},
         audio_included=True,
-        source=_SRC_GEMINI_API,
-        source_note=_VEO_SOURCE_NOTE,
-    ),
-    "veo-3.1-lite-generate-preview": VideoModelPricing(
-        # 4K is deliberately absent: Lite cannot render it (src/video.py
-        # rejects the combination) and Google publishes no 4K Lite rate.
-        usd_per_second_by_resolution={"720p": 0.05, "1080p": 0.08},
-        audio_included=True,
-        source=_SRC_GEMINI_API,
+        source=_SRC_VERTEX_AI,
         source_note=_VEO_SOURCE_NOTE,
     ),
     OMNI_MODEL: VideoModelPricing(
@@ -472,13 +472,10 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
     ),
 }
 
-# Veo IDs are spelled differently per backend: the Gemini Developer API serves
-# `-preview`, Vertex serves `-001`, and generate_video reports back whichever
-# it used. Invert src/video.py's table so both spellings price identically
-# instead of one of them looking like an unknown model.
-_VIDEO_MODEL_ALIASES: dict[str, str] = {
-    api_id: canonical for canonical, api_id in _GEMINI_API_MODEL_IDS.items()
-}
+# The `-preview` spellings older Gemini-API Veo renders reported, which the
+# tools still accept, price as the `-001` model they name instead of looking
+# like an unknown model.
+_VIDEO_MODEL_ALIASES: dict[str, str] = dict(_CANONICAL_VIDEO_MODEL_IDS)
 
 # Omni splits the same way: Vertex serves 1.1 as `gemini-omni-1.1-flash-preview`
 # and the Developer API as the bare name. Both spellings must price
@@ -771,7 +768,7 @@ def estimate_video_cost(
     Returns:
         A ``CostEstimate`` with ``is_estimate=True``, or None when the model
         is unknown, the duration is negative, or the model has no published
-        rate for that resolution (e.g. 4K on Veo 3.1 Lite).
+        rate for that resolution (e.g. 360p on Veo).
     """
     # A negative duration is not a short clip, it is a bad call. Snapping it
     # to the 4s floor would quote a real price for an impossible request, so
@@ -797,7 +794,7 @@ def estimate_video_cost(
     effective_resolution = pricing.fixed_resolution or requested
     usd_per_second = pricing.usd_per_second_by_resolution.get(effective_resolution)
     if usd_per_second is None:
-        # No published rate for this pairing (Veo Lite at 4K). Refusing to
+        # No published rate for this pairing (Veo at 360p). Refusing to
         # answer beats inventing a rate for a combination that would be
         # rejected anyway.
         return None
@@ -1027,9 +1024,14 @@ def actual_image_cost(
     reported_image = usage.candidate_modalities.get("IMAGE")
     reported_text = usage.candidate_modalities.get("TEXT")
     if reported_image is not None:
-        # Best case: the API told us exactly how the output split.
+        # Best case: the API told us exactly how the output split. The list
+        # can name IMAGE alone while candidates_token_count runs a few hundred
+        # higher: that surplus is text the model emitted beside the image,
+        # billed at the text rate, so it is counted rather than dropped.
         image_tokens = reported_image
         text_tokens = reported_text or 0.0
+        if usage.candidates_tokens is not None:
+            text_tokens = max(text_tokens, usage.candidates_tokens - image_tokens)
         output_reported = True
     elif usage.candidates_tokens is not None:
         # Only a total. Image models emit a fixed, documented number of image
@@ -1425,7 +1427,7 @@ def known_models() -> tuple[str, ...]:
         *get_args(ImageModel),
         *get_args(RetiredImageModel),
         *get_args(VideoModel),
-        *_GEMINI_API_MODEL_IDS.values(),
+        *_CANONICAL_VIDEO_MODEL_IDS,
         *OMNI_MODEL_ALIASES,
     }
     return tuple(sorted(models))
@@ -1539,8 +1541,176 @@ def pricing_coverage() -> dict[str, Any]:
         "batch_price_multiplier": BATCH_PRICE_MULTIPLIER,
         "notes": (
             "Standard paid-tier prices; no free tier exists for these media "
-            "models. Batch requests bill at half these rates. Veo per-second "
-            "rates were confirmed on the Gemini Developer API pricing page "
-            "and are assumed to match Vertex AI."
+            "models. Batch requests bill at half these rates. Veo runs on "
+            "Vertex AI only, and its rates are the Vertex AI page's video-with-"
+            "audio rates."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Understanding models (the virtual director)
+# ---------------------------------------------------------------------------
+#
+# The text-output models src.director calls to turn director notes into checks
+# and to review renders against them. Billed per token: input (text, image,
+# video and audio at one rate), output with thinking tokens included, and input
+# served from the implicit cache at a cached rate. Both models launched on
+# introductory rates that step up on a published date, so each record is a
+# list of dated steps. Read from the Gemini Developer API pricing page on
+# PRICING_AS_OF:
+#
+#   gemini-4-argon    input  "$2.00 through November 30, 2026." /
+#                            "$4.00 starting December 1, 2026."
+#                     output (including thinking tokens) $10.00 / $20.00
+#                     context caching $0.10 / $0.20, "Implicit caching only"
+#   gemini-3.8-flash  input $0.75 / $1.50, output $3.75 / $7.50,
+#                     caching $0.075 / $0.15; the step is January 1, 2027.
+#
+# Kept apart from the image and video tables on purpose: these models produce
+# no media, so none of the per-image or per-second machinery applies, and an
+# estimate here is tokens times rate, no more.
+
+
+@dataclass(frozen=True)
+class UnderstandingRateStep:
+    """The rates in force from ``effective_from`` (an ISO date) onward."""
+
+    effective_from: str
+    input_usd_per_mtok: float
+    output_usd_per_mtok: float
+    cached_input_usd_per_mtok: float
+
+
+@dataclass(frozen=True)
+class UnderstandingModelPricing:
+    """Dated per-token rates for one understanding model, oldest step first."""
+
+    steps: tuple[UnderstandingRateStep, ...]
+    source: str
+    source_note: str | None = None
+
+    def rates_on(self, day: datetime.date) -> UnderstandingRateStep:
+        """The step in force on ``day``."""
+        current = self.steps[0]
+        for step in self.steps:
+            if day >= datetime.date.fromisoformat(step.effective_from):
+                current = step
+        return current
+
+
+_UNDERSTANDING_SOURCE_NOTE = (
+    "Read from the Gemini Developer API pricing page. The Vertex AI page lists "
+    "the same rates for the global endpoint, which is the one the director "
+    "calls (other Vertex locations cost 10% more). On Vertex the introductory "
+    "rate is paid as 50% credits back on net spend, so an invoice may show the "
+    "standard rate and a credit."
+)
+
+_UNDERSTANDING_PRICING: dict[str, UnderstandingModelPricing] = {
+    "gemini-4-argon": UnderstandingModelPricing(
+        steps=(
+            UnderstandingRateStep("2026-10-13", 2.00, 10.00, 0.10),
+            UnderstandingRateStep("2026-12-01", 4.00, 20.00, 0.20),
+        ),
+        source=_SRC_GEMINI_API,
+        source_note=_UNDERSTANDING_SOURCE_NOTE,
+    ),
+    "gemini-3.8-flash": UnderstandingModelPricing(
+        steps=(
+            UnderstandingRateStep("2026-09-02", 0.75, 3.75, 0.075),
+            UnderstandingRateStep("2027-01-01", 1.50, 7.50, 0.15),
+        ),
+        source=_SRC_GEMINI_API,
+        source_note=_UNDERSTANDING_SOURCE_NOTE,
+    ),
+}
+
+
+def _today() -> datetime.date:
+    """Today — a function so a test can pin the calendar."""
+    return datetime.date.today()
+
+
+def estimate_understanding_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    calls: int = 1,
+    label: str = "director call",
+) -> CostEstimate | None:
+    """Pre-flight price of ``calls`` understanding calls of this size.
+
+    Priced at today's rates with no cache hits, so with ``output_tokens`` set
+    to the call's output cap the figure is an upper bound: the implicit cache
+    only ever lowers a bill, and a call cannot bill past its cap.
+
+    Returns:
+        A ``CostEstimate``, or None for a model with no published rate.
+    """
+    pricing = _UNDERSTANDING_PRICING.get(model)
+    if pricing is None or calls < 0:
+        return None
+    rates = pricing.rates_on(_today())
+    input_usd = calls * input_tokens * rates.input_usd_per_mtok / _TOKENS_PER_MILLION
+    output_usd = calls * output_tokens * rates.output_usd_per_mtok / _TOKENS_PER_MILLION
+    return CostEstimate(
+        usd=input_usd + output_usd,
+        is_estimate=True,
+        unit="token",
+        detail=f"{calls} {label}{'s' if calls != 1 else ''} on {model}, at most",
+        breakdown={
+            "calls": float(calls),
+            "input_tokens": float(calls * input_tokens),
+            "output_tokens": float(calls * output_tokens),
+            "input_usd": input_usd,
+            "output_usd": output_usd,
+        },
+        source=pricing.source,
+        source_note=pricing.source_note,
+    )
+
+
+def actual_understanding_cost(
+    model: str, usage: Mapping[str, int] | None, *, label: str = "director call"
+) -> CostEstimate | None:
+    """The cost of one completed understanding call, from metered usage.
+
+    ``usage`` carries ``prompt_tokens`` (cached ones included),
+    ``cached_tokens``, ``output_tokens`` and ``thought_tokens``. Thinking is
+    billed as output, and cached prompt tokens at the cached rate.
+
+    Returns:
+        A ``CostEstimate``, or None for an unpriced model or missing usage.
+    """
+    pricing = _UNDERSTANDING_PRICING.get(model)
+    if pricing is None or usage is None:
+        return None
+    rates = pricing.rates_on(_today())
+    prompt = int(usage.get("prompt_tokens", 0))
+    cached = min(int(usage.get("cached_tokens", 0)), prompt)
+    output = int(usage.get("output_tokens", 0))
+    thoughts = int(usage.get("thought_tokens", 0))
+    input_usd = (
+        (prompt - cached) * rates.input_usd_per_mtok
+        + cached * rates.cached_input_usd_per_mtok
+    ) / _TOKENS_PER_MILLION
+    output_usd = (output + thoughts) * rates.output_usd_per_mtok / _TOKENS_PER_MILLION
+    return CostEstimate(
+        usd=input_usd + output_usd,
+        is_estimate=False,
+        unit="token",
+        detail=f"{label} on {model}",
+        breakdown={
+            "calls": 1.0,
+            "input_tokens": float(prompt),
+            "cached_tokens": float(cached),
+            "output_tokens": float(output),
+            "thought_tokens": float(thoughts),
+            "input_usd": input_usd,
+            "output_usd": output_usd,
+        },
+        source=pricing.source,
+        source_note=pricing.source_note,
+    )

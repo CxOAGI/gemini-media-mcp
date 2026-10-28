@@ -1,6 +1,6 @@
 # Gemini Media MCP
 
-Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with a cost estimate before every call.
+Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with a cost estimate before every call and an optional Gemini 4 Argon director that checks each take against your notes.
 
 ## What it does
 
@@ -8,6 +8,7 @@ Plan, generate, compose, and edit images and video with Gemini image models, Veo
 - **Generate:** images with Gemini, video with Veo 3.1, fast video with Omni.
 - **Compose:** storyboards, multi-beat reels, transitions between stills, bridges between clips.
 - **Edit and extend:** conversational video edits, seamless scene extension, loop and extend.
+- **Direct:** optional `director_notes` have Gemini 4 Argon turn your notes into checks, review each take, and retake on a clear fail.
 - **Cost-aware:** any call runs `dry_run` for a quote; real runs report metered cost and its pricing source.
 
 ## Quick start
@@ -18,7 +19,7 @@ uvx gemini-media-mcp setup
 
 The `setup` wizard walks you through the whole onboarding flow end-to-end:
 
-1. Pick a credential mode: **Gemini API** (images + video, easier to set up) or **Vertex AI** (images + video, adds GCS output and Vertex-only features).
+1. Pick a credential mode: **Gemini API** (images + Omni video, easier to set up) or **Vertex AI** (images + Veo and Omni video, adds GCS output and Vertex-only features).
 2. Enter your API key, or your Google Cloud project plus a service account JSON (file path or inline paste).
 3. Choose where generated media should be written (defaults to `~/gemini-media`).
 4. Optionally set a `VIDEO_GCS_BUCKET` for large video output, and auto-populate `GCS_ALLOWED_BUCKETS`.
@@ -37,8 +38,8 @@ If you prefer to configure everything by hand, the manual steps are below.
 
 ### Prerequisites
 
-- For images **and** video with the simplest setup: a Gemini API key ([setup instructions](#gemini-api-setup)). Veo 3.1 video works on the **paid** Gemini API tier, and Veo 3.1 Lite is served exclusively through the Gemini API.
-- For images and video with GCS output and Vertex-only features (e.g. controllable audio: `include_audio` is only honoured on Vertex, where it maps to Veo's `generate_audio` config; on the Gemini API Veo 3.1 always produces audio): a Google Cloud project with the Vertex AI API enabled and a service account with Vertex AI permissions ([setup instructions](#vertex-ai-setup))
+- For images **and** video with the simplest setup: a Gemini API key ([setup instructions](#gemini-api-setup)). Video on the Gemini API runs on Gemini Omni (`generate_video_omni`); Google switched off Veo 3.1 there on **October 22, 2026**, and the Veo tools refuse on that backend and name the alternatives.
+- For images and video with Veo, GCS output and Vertex-only features (e.g. controllable audio: `include_audio` maps to Veo's `generate_audio` config): a Google Cloud project with the Vertex AI API enabled and a service account with Vertex AI permissions ([setup instructions](#vertex-ai-setup))
 
 ### Environment Variables
 
@@ -53,7 +54,7 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 
 **→ See [Vertex AI Setup](#vertex-ai-setup) for detailed instructions**
 
-Alternatively, for the Gemini API (images + video, including Veo 3.1 on the paid tier):
+Alternatively, for the Gemini API (images, plus video through Gemini Omni; Veo needs Vertex AI):
 
 ```bash
 export GEMINI_API_KEY=your-api-key
@@ -76,6 +77,7 @@ Other variables the server reads:
 | `DATA_FOLDER` | Where generated media is written (default `data`). **Required** when running in a container |
 | `VIDEO_GCS_BUCKET` | Default bucket for large video output; also seeds the `GCS_ALLOWED_BUCKETS` allowlist |
 | `OMNI_BACKEND` | Which backend serves the omni tools: `auto` (default), `vertex`, or `gemini_api`. `auto` uses the Gemini Developer API whenever `GEMINI_API_KEY` is set — even on a Vertex server, which is a different project, billing path and quota pool. Set `vertex` to keep omni traffic in the Vertex project. A per-call `omni_backend` argument overrides it; every omni response reports `backend` and `backend_reason`. |
+| `DIRECTOR_MODEL` | Model the [virtual director](#virtual-director) uses: `gemini-4-argon` (default) or `gemini-3.8-flash`, about a third of the price |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Service account key as inline JSON instead of a file path (Vertex mode only). Written by `setup`; the server materialises it into a temp file. `GOOGLE_APPLICATION_CREDENTIALS` also accepts inline JSON |
 | `RUNNING_IN_CONTAINER` | Set to `true` by the Docker image. Makes `DATA_FOLDER` mandatory and switches the sse/streamable-http bind address to `0.0.0.0` (`127.0.0.1` otherwise). Presence of `/.dockerenv` has the same effect |
 | `FASTMCP_HOST` | Bind address for the sse/streamable-http transports; `--host` wins over it |
@@ -147,6 +149,41 @@ This writes files to your host path and returns paths like `/Users/yourusername/
 **Every generation tool supports `dry_run: true`** — it returns the cost estimate for the exact call that would run (rerouted model, snapped duration, bridges counted) and generates nothing. Real runs report the metered cost in the response and the sidecar manifest. `generate_clip` is the one to always price first: 3 beats at 8s is $2.40 on the fast tier and $9.60 on standard.
 
 
+### Virtual director
+
+`generate_image`, `generate_video` and `generate_video_omni` take optional `director_notes`: what the shot must get right, in plain words. Without them nothing changes: no extra call and no extra cost.
+
+With notes, the tool:
+
+1. Turns the notes into checks with Gemini 4 Argon. Each check quotes the words of the notes it came from, and a check that quotes nothing in the notes is dropped as invented. Notes that cannot be checked by looking, such as file format or delivery, are listed under `skipped_notes`.
+2. Renders the take exactly as it would without notes, then has Argon review it against every check. The reviewer is also shown the images the render was given: always the image being edited and the first and last frames, and the first three of `image_uris` and of `reference_image_uris`. Each is named for what it is, and lists are numbered in your order, so in the notes "reference 1" is `reference_image_uris[0]` (on omni, `<IMAGE_REF_0>` works too) and "input image 1" is `image_uris[0]`. Each take lists what the reviewer was shown under `references_shown`; anything it was not shown is named in a warning, and a check that needs it comes back `unsure`. Each check comes back `pass`, `fail`, `unsure` or `not_applicable`, with where in the image or when in the clip the problem is. Clips are sampled at 4 frames a second. A fail that does not say where counts as `unsure`.
+3. When a check fails and `max_retakes` allows (0 to 2, default 1), renders again with your prompt, unchanged, plus a "Director's notes for this take" list made from the failed checks' fix instructions, and reviews that take. The notes say they win wherever they conflict with your prompt. A check that particular text appears (a headline, a label) is a `text` check carrying the `literal` the notes asked for and, where the notes say it, a `target` such as "the smaller line under the headline". Its fix note is always `<Target> must read exactly: "<literal>"`, written by the server, because a model-written fix puts how to compare the text ("with no trailing period") after it and the next render prints that too; a target that is long, quotes anything, names the text itself or uses a comparison word falls back to "The text". How the text is compared stays in the check, which only the reviewer reads. A text check is not judged by the reviewer but transcribed by it: the reviewer copies out the text it sees, and the server compares that with the literal character for character, with runs of whitespace collapsed and curly quotes straightened; no transcription is `unsure`. Image models tend to add a trailing period to a short line, so write the literal the way the copy is actually set rather than against the model's habit.
+
+It returns the first take that passes, or else the take with the fewest fails (on a clip, then the least time showing them), and says which. A retake can fix one check and break another, so it is never assumed to be better: every take is reviewed, and the take returned can be an earlier one. The top-level `prompt` is always the one you sent; when the returned take is a retake, `effective_prompt` is the text that rendered it. The response's `director` block lists the checks, every take with its prompt, media, verdict, per-check results and costs, `chosen_take`, and `retakes_used`. A retake that never rendered is listed too, with verdict `not_rendered`, its error and its prompt, so the fix notes can be read either way. Each omni take carries its own `interaction_id`, so a retake that was not returned can still be continued or reconciled. `review_attempts` counts the review requests; when it is 2, `retried_after` says why: `quota` (a 429, which is not billed) or `transient` (a server error, which may be, and a warning says so). `cost` covers everything the call billed: every take and every director call. Each take's sidecar manifest records its review under `director_review`, together with your notes, the checks and the director model, so the manifest can be read without the response.
+
+What holds throughout:
+
+- **No confidence number.** The reviewer is never asked how sure it is, and none is reported. A model's own certainty is not calibrated; the states have to be compared with human labels before a number means anything.
+- **A clip is judged second by second.** A check that must hold for the whole clip (steam throughout, no hands in frame) is a `throughout` check: the reviewer answers `y`, `n` or `?` for each second, and the server decides. Any `n` is a fail with the exact seconds as evidence; any `?`, or a list shorter than the clip, is `unsure`. A clip is judged in whole seconds, its length rounded to the nearest one (a 6.04 s clip is six seconds; an 8.6 s clip is nine, the last covering 8.0–8.6 s), so a gap shorter than a second fails that whole second.
+- **The media cannot steer its own retake.** Text inside a render is assessed, never followed, and retake notes are built only from the fix instructions derived from your notes plus time ranges, never from what the reviewer wrote about the media.
+- **The render always lands.** A review that hits a 429 or a server error is retried once after a short wait, if its time budget allows. A render the service turns away with a 429 or a server error is tried again after 10 s and then 30 s, or after the wait the 429 asked for, each time only when the time left fits the wait, a render and a review (`render_attempts`, `render_retried_after`, `render_retry_waits`; a retry that cannot fit says `reason: "budget"`). A render that was already submitted is never sent again. Image quotas can allow only a few renders a minute and recover over tens of seconds, so a retake is often refused seconds after the take before it. One that still cannot run (quota, timeout, a safety block, a clip over 14 MB inline) is recorded as `abstained` with a reason, and the take is still returned. An `unsure` review stops instead of paying for a retake.
+- **No judgments about people.** Checks never assess a person's identity, likeness, age, sex or gender, race or ethnicity, health, emotion, attractiveness or body.
+
+The kinds of thing a review catches: a line set in capitals when the notes asked for title case, a footer the prompt never mentioned, a size annotation printed on a label, hands entering the frame at 00:01–00:04, a clip with no steam for its first second.
+
+On the video tools, `timeout_seconds` bounds the whole directed call, because MCP hosts cancel long calls and a cancelled call has already billed its renders. Each take renders in the time left; a review that could not finish is skipped (`abstained`, reason `deadline`), and a retake is not started when the previous take shows it would not fit. Raise `timeout_seconds`, and your host's limit, to leave room for retakes.
+
+A `dry_run` with notes quotes the worst case: every take rendered and reviewed, each review at its output cap, no cache hits. Three charges cannot be priced in advance and are left out: an image render's input tokens (`generate_image` quotes output only), a director request that fails without reporting its usage, and a render that fails with a server error or a timeout and is tried again, which may bill for the failed attempt; a warning names either of the last two if it happens. A retake that fails is listed with `submission` saying how far it got: `submitted` (it may still bill, and its quote is counted where the tool gives one), `unknown` (it may have reached Google, so `cost` is a lower bound) or `none` (nothing billed). Inputs are validated by the tool's own dry run before the first director call is paid for, and checks derived for the same notes, prompt and model earlier in the server's life are reused rather than derived again; `checks_source` says `compiled` or `cache`, and a cached set adds no derive cost. Director calls use `gemini-4-argon` ($2 / $10 per 1M input / output tokens through 2026-11-30, then $4 / $20); set `DIRECTOR_MODEL=gemini-3.8-flash` for about a third of that. On Vertex AI they go to the global endpoint, one of the three locations that serve Argon.
+
+```json
+{
+  "prompt": "A ceramic mug on a walnut table, morning light",
+  "model": "gemini-3.1-flash-image",
+  "director_notes": "The label reads GOLDEN HOUR in serif capitals. No people or hands in the shot. The handle faces right.",
+  "max_retakes": 1
+}
+```
+
 ### plan_generation
 
 **Start here when you are not sure which tool or model to use.** Describe what you want in plain language and get back ranked, ready-to-call plans — which tool, which model, which parameters, why that model won, what each option costs, and which models were ruled out and for what reason.
@@ -159,7 +196,7 @@ It generates nothing, costs nothing, and is instant: pure rule-based routing ove
 
 **Returns:** ranked `routes` (tool, model, ready-to-use `params`, score, rationale, caveats, cost), `rejected` models **with reasons**, `conflicts`, a suggested multi-step `workflow`, and `notes`.
 
-It catches requests that cannot work *before* you pay for the failure — 4K on a 1K-only model, extension or first/last-frame on Veo Lite, GCS output on the Gemini API — and reports each as a conflict with a fix.
+It catches requests that cannot work *before* you pay for the failure — 4K on a 1K-only model, Veo on the Gemini API, GCS output on the Gemini API — and reports each as a conflict with a fix.
 
 > Capability beats budget by design. Ask for legible text on a `cheap` budget and it still recommends `gemini-3-pro-image`: a cheap image that fails the brief isn't cheap.
 
@@ -213,6 +250,7 @@ Generate images using Gemini image models.
 - `aspect_ratio`: Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`)
 - `person_generation`: Policy for generating people — `dont_allow`, `allow_adult`, or `allow_all` (some regions restrict these values)
 - `dry_run`: Return only the cost estimate and the resolved model/parameters — generates nothing, free and instant
+- `director_notes`, `max_retakes`: Have the [virtual director](#virtual-director) check the image against your notes and retake on a fail
 
 Every real run reports `usage` (the token counts the API metered) and `cost` derived from them, and writes both into the sidecar manifest. A dry run prices **the call that would actually be issued**: ask for `imagen-4.0-generate-001` at 4K and it quotes `gemini-3.1-flash-image`; ask `gemini-3.1-flash-lite-image` for 4K and it quotes its 1K default and tells you why.
 
@@ -228,26 +266,26 @@ Every real run reports `usage` (the token counts the API metered) and `cost` der
 
 ### generate_video
 
-Generate videos using VEO models. Video works on **both** credential modes: Veo 3.1 runs on the paid Gemini API tier as well as on Vertex AI. Vertex AI additionally provides GCS output and some Vertex-only features (e.g. `include_audio`, which is only honoured on Vertex). Veo 3.1 Lite is served **exclusively** through the Gemini API.
+Generate videos using VEO models, which run on **Vertex AI** only. Vertex AI also provides GCS output and Vertex-only features such as `include_audio`. Google switched off Veo 3.1 on the Gemini Developer API on **October 22, 2026**; on a server using a Gemini API key this tool refuses before quoting anything and points to `generate_video_omni` (`gemini-omni-1.1-flash`, Google's named replacement) or Vertex AI.
 
 **Parameters:**
 - `prompt` (required): Text description of the video
 - `model` (required — there is no default; name one explicitly):
   - `veo-3.1-generate-001`: Highest quality, 4/6/8s duration, audio support
   - `veo-3.1-fast-generate-001`: Faster generation with audio support
-  - `veo-3.1-lite-generate-preview`: Most cost-effective, 4/6/8s, audio; text-to-video and image-to-video only (no extension, reference images, first/last-frame, or 4K). Served via the Gemini API only; Vertex AI projects may return 404 for this model.
 - `aspect_ratio`: `16:9` (default) or `9:16`
-- `resolution`: Output resolution, `720p`, `1080p`, or `4K` (4K not supported on Veo 3.1 Lite)
+- `resolution`: Output resolution, `720p`, `1080p`, or `4K`
 - `duration_seconds`: Video duration (4/6/8s), **default `8.0`** — the longest and most expensive option. Omitting it on `veo-3.1-generate-001` bills a full 8s render (from $3.20 at 720p/1080p); pass `4` explicitly when a short beat will do.
-- `include_audio` (default `false`): Enable audio generation (Vertex only; on the Gemini API Veo 3.1 always produces audio)
+- `include_audio` (default `false`): Enable audio generation
 - `person_generation`: Policy for generating people — `allow_adult` or `allow_all` (some regions restrict these values)
 - `audio_prompt`: Audio description
 - `negative_prompt`: Things to avoid in the video
 - `seed`: Random seed for reproducibility
 - `image_uri`: First frame image URI for image-to-video generation
-- `timeout_seconds` (default `210`): Overall deadline for the render. Common MCP hosts cap one tool call at roughly four minutes; a render that outlives the *host's* limit is cancelled by the host — the caller sees a bare "Tool execution failed" with no message, cost or operation name, and the Veo operation completes and bills anyway (a 4K render did exactly this). Under the host ceiling the server answers first: a timeout returns a structured error naming the `generation_mode`, the `attempted_cost` and the `operation_name` to reconcile in the console. Raise it if your host allows a longer call; 4K is the slowest tier.
+- `timeout_seconds` (default `210`): Overall deadline for the render. Common MCP hosts cap one tool call at roughly four minutes; a render that outlives the *host's* limit is cancelled by the host — the caller sees a bare "Tool execution failed" with no message, cost or operation name, and the Veo operation completes and bills anyway (a 4K render did exactly this). Under the host ceiling the server answers first: a timeout returns a structured error naming the `generation_mode`, the `attempted_cost`, the `operation_name` to reconcile in the console, and `submission`: `submitted` (the render may still complete and bill), `unknown` (the submit call itself ran out of time, so it may have reached Google) or `none` (nothing was sent). Raise it if your host allows a longer call; 4K is the slowest tier.
 - `draft` (default `false`): When `true`, routes the request to `gemini-omni-1.1-flash` for a fast 720p draft instead of Veo. Iterate fast, then re-run with `draft=false` to finalize on Veo. At 720p this buys speed, not savings (omni is $0.10136/s against Veo Fast's $0.10/s) — add `draft_resolution="360p"` and it buys both. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
 - `draft_resolution`: Resolution for a `draft=true` pass. Naming one renders the draft on `gemini-omni-1.1-flash`, the model that has a resolution parameter; `360p` is about a third of the 720p price and the cheapest render this server can issue. Unset keeps the preview model's fixed 720p.
+- `director_notes`, `max_retakes`: Have the [virtual director](#virtual-director) check the clip against your notes and retake on a fail
 
 **Additional Parameters:**
 - `last_frame_uri`: Last frame image URI for first+last frame control
@@ -274,7 +312,7 @@ Fast conversational video generation through Google's Omni models (Interactions 
 
 Two models, selected with `omni_model`:
 
-| | `gemini-omni-flash-preview` (switched off 2026-09-30) | `gemini-omni-1.1-flash` (default) |
+| | `gemini-omni-flash-preview` (switched off 2026-10-22) | `gemini-omni-1.1-flash` (default) |
 |---|---|---|
 | Output | 720p / 24fps, fixed | 360p, 720p, 1080p, 4K |
 | Conversational editing | yes | yes |
@@ -288,13 +326,13 @@ Two models, selected with `omni_model`:
 
 Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast's $0.10/s. What 1.1 adds is a genuinely cheap **draft** tier — `resolution="360p"` is about a third of that, and Google says it renders up to 60% faster.
 
-**`gemini-omni-1.1-flash` is now the default.** It was the preview model, on the reasoning that flipping it would move existing callers without asking — but the preview endpoint is **switched off on 2026-09-30**, so defaulting to it meant defaulting new callers onto a model with weeks to live. Pinning `omni_model="gemini-omni-flash-preview"` still works and now warns with that date.
+**`gemini-omni-1.1-flash` is now the default.** It was the preview model, on the reasoning that flipping it would move existing callers without asking — but the preview endpoint is **switched off on 2026-10-22**, so defaulting to it meant defaulting new callers onto a model with weeks to live. Since that date, pinning `omni_model="gemini-omni-flash-preview"` is refused before any quote or call, naming `gemini-omni-1.1-flash` instead.
 
 **The two backends are on different tracks.** 1.1 is generally available on the Gemini Developer API. On Vertex AI / Gemini Enterprise Agent Platform it is still *Preview*, published as `gemini-omni-1.1-flash-preview` (translated automatically), and preview video models there are allowlist-gated with near-zero default quota — a 429 naming the base model means an allowlist and quota request to your Google Cloud account team, not a wait. Set `GEMINI_API_KEY` to use the GA path, which is also the only backend with the Files API the uploaded-source path needs.
 
 **Parameters:**
 - `prompt` (required): Text description of the video. Timecodes work in plain language (`"[0-3s] a person walks"`), as does audio direction (`"include calm background music"`). If you write your own role tags (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) they are passed through untouched; otherwise the declarations are generated from the media arguments and echoed back as `effective_prompt`
-- `omni_model`: `gemini-omni-1.1-flash` (default) or `gemini-omni-flash-preview` (switched off 2026-09-30). Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K. Pass the Gemini-API spelling on either backend: Vertex AI publishes 1.1 as `gemini-omni-1.1-flash-preview` and the translation is automatic, with the canonical ID reported back and the served one alongside it as `served_model`
+- `omni_model`: `gemini-omni-1.1-flash` (default) or `gemini-omni-flash-preview` (switched off 2026-10-22). Arguments the chosen model cannot honor are **refused, never dropped** — a 4K request on the preview model is an error, not a 720p render billed as 4K. Pass the Gemini-API spelling on either backend: Vertex AI publishes 1.1 as `gemini-omni-1.1-flash-preview` and the translation is automatic, with the canonical ID reported back and the served one alongside it as `served_model`
 - `omni_backend`: `auto` (default; the server's `OMNI_BACKEND` applies), `vertex`, or `gemini_api`. On a Vertex server that also has a `GEMINI_API_KEY`, `auto` sends omni to the Gemini Developer API; pass `vertex` to keep the call in the Vertex project. An unsatisfiable choice is refused, as is one that contradicts the backend a `previous_interaction_id` was minted on. The response's `backend` and `backend_reason` say which backend served the call and why.
 
 > **Omni on Vertex AI is Preview and may require access to be requested for the project.** A call that is refused there says so, and names the Gemini Developer API as the alternative — where the Interactions API is GA.
@@ -308,6 +346,7 @@ Neither is the *cheap* path at 720p: both bill $0.10136/s, a hair above Veo Fast
 - `duration_seconds`: Video duration, 3–10 (default 6) — likewise **not sent on an edit**, and the rendered length is then chosen by the service: a measured 3s source edited with `duration_seconds=4` came back at 10.01s. On an edit the response reports `duration_seconds: null` and the quote uses omni's 10s maximum as an upper bound
 - `previous_interaction_id`: Continue editing a prior omni result (optional)
 - `timeout_seconds`: Overall deadline for create + polling (default 600). A render typically takes over a minute; raise it for long queues
+- `director_notes`, `max_retakes`: Have the [virtual director](#virtual-director) check the clip against your notes and retake on a fail. Each take is a fresh render, not a conversational edit
 
 **Notes:**
 - No `seed` or `negative_prompt` on either model — put negatives in the prompt (`"no dialogue"`, `"no extra sound effects"`)
@@ -374,13 +413,13 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 - `video_uri` (required): The Veo-generated video to extend
 - `prompt`: What the video continues with (default: "continue the action")
 - `times`: Number of ~7s extensions to apply, 1-20 (default: 1)
-- `model`: Veo model to use (default `veo-3.1-generate-001`; Lite is not supported)
+- `model`: Veo model to use (default `veo-3.1-generate-001`)
 - `aspect_ratio`: `16:9` (default) or `9:16` — must match the source video
-- `include_audio`: Generate audio on the extended sections (default `true`; Vertex only)
-- `output_gcs_uri`: GCS URI for output (optional; required on Vertex)
+- `include_audio`: Generate audio on the extended sections (default `true`)
+- `output_gcs_uri`: GCS URI for output (required, or set `VIDEO_GCS_BUCKET`)
 
 **Notes:**
-- Veo 3.1 / Veo 3.1 Fast only (not Lite)
+- Veo 3.1 / Veo 3.1 Fast, on Vertex AI
 - 720p
 
 ### generate_clip
@@ -414,7 +453,7 @@ Generate a transition video **between two still frames** using Veo 3.1's first+l
 - `first_frame_uri` (required): Starting still (`gs://`, `https://`, `file://`)
 - `last_frame_uri` (required): Ending still
 - `prompt`: Transition motion and style (default: `smooth cinematic transition between the two frames`)
-- `model`: Veo model — default `veo-3.1-fast-generate-001`. **Lite does not support first/last-frame mode** and cannot be used
+- `model`: Veo model — default `veo-3.1-fast-generate-001`
 - `duration_seconds`: 4/6/8s, snapped to nearest
 - `aspect_ratio`, `include_audio`, `audio_prompt`, `negative_prompt`, `seed`, `output_gcs_uri`
 
@@ -434,9 +473,9 @@ Same primitive as `generate_transition`, but takes **two clips instead of two st
 
 There are two video paths, and you choose based on where you are in the workflow:
 
-- **`gemini-omni-flash-preview` (retiring)** — 720p, 24fps, conversational multi-turn editing. No seeds, no negative prompts, no first/last-frame control. **Switched off on 2026-09-30**; reachable only by pinning `omni_model="gemini-omni-flash-preview"`, which warns with that date. The draft and animatic paths no longer route here.
+- **`gemini-omni-flash-preview` (switched off)** — 720p, 24fps, conversational multi-turn editing. No seeds, no negative prompts, no first/last-frame control. **Switched off on 2026-10-22**; pinning `omni_model="gemini-omni-flash-preview"` is now refused before any quote or call. The draft and animatic paths no longer route here.
 - **`gemini-omni-1.1-flash` (fast, and far more controllable)** — everything above plus 360p/1080p/4K output, first/last-frame interpolation, video references, native audio and scene extension. Still no seeds and no negative prompts. Reached by passing `omni_model="gemini-omni-1.1-flash"` to `generate_video_omni` or `edit_video`, and by `extend_video_omni`.
-- **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds for reproducibility, first/last-frame control, reference images, and extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
+- **Veo 3.1 / Fast (high-fidelity, Vertex AI only)** — up to 1080p/4K, seeds for reproducibility, first/last-frame control, reference images, and extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
 
 Typical workflows (`plan_generation` recommends these as ordered `workflow` steps, with both figures quoted):
 - **cheap draft → finalize**: run `generate_video_omni(omni_model="gemini-omni-1.1-flash", resolution="360p")` for a preview at roughly a third of the 720p price, then re-run at `720p`/`1080p`/`4K` — or on Veo — once the shot is right. The equivalent shortcuts are `generate_video(draft=true, draft_resolution="360p")` and `generate_clip(animatic=true, animatic_resolution="360p")`.
@@ -506,7 +545,7 @@ The simplest way to generate both images and video:
 4. Copy your key (starts with `AIzaSy...`)
 5. Set the environment variable: `export GEMINI_API_KEY=your-api-key`
 
-**Note**: The Gemini API supports Veo 3.1 video generation on the **paid** tier, and Veo 3.1 Lite is available only through the Gemini API. Vertex AI adds GCS output and some Vertex-only features (e.g. controllable audio — `include_audio` only takes effect on Vertex), but is not required for video.
+**Note**: On the Gemini API, video runs on Gemini Omni. Google switched off Veo 3.1 there (all tiers, including Lite) on **October 22, 2026**, so Veo needs Vertex AI, which also adds GCS output and Vertex-only features such as controllable audio.
 
 
 ## Contributing

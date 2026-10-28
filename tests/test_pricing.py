@@ -148,7 +148,6 @@ def test_priced_models_are_the_canonical_ids_only() -> None:
         OMNI_PREVIEW_MODEL,
         "veo-3.1-fast-generate-001",
         "veo-3.1-generate-001",
-        "veo-3.1-lite-generate-preview",
     )
 
 
@@ -347,8 +346,6 @@ def test_video_estimate_matches_published_per_second_rates() -> None:
         ("veo-3.1-fast-generate-001", "720p", 0.10),
         ("veo-3.1-fast-generate-001", "1080p", 0.12),
         ("veo-3.1-fast-generate-001", "4K", 0.30),
-        ("veo-3.1-lite-generate-preview", "720p", 0.05),
-        ("veo-3.1-lite-generate-preview", "1080p", 0.08),
     ]
     for model, resolution, per_second in cases:
         estimate = estimate_video_cost(model, 8, resolution)
@@ -408,9 +405,9 @@ def test_resolution_spelling_is_normalized() -> None:
     assert upper.usd == lower.usd
 
 
-def test_lite_has_no_published_4k_rate_so_returns_none() -> None:
-    # src/video.py rejects 4K on Lite outright; there is no price to quote.
-    assert estimate_video_cost("veo-3.1-lite-generate-preview", 8, "4K") is None
+def test_veo_has_no_published_360p_rate_so_returns_none() -> None:
+    # 360p is omni 1.1's draft tier; Veo publishes no rate for it.
+    assert estimate_video_cost("veo-3.1-generate-001", 8, "360p") is None
 
 
 def test_unknown_resolution_returns_none() -> None:
@@ -683,7 +680,7 @@ def test_actual_video_cost_without_duration_or_usage_returns_none() -> None:
 
 
 def test_actual_video_cost_returns_none_for_an_unpriced_resolution() -> None:
-    assert actual_video_cost("veo-3.1-lite-generate-preview", 8, "4K") is None
+    assert actual_video_cost("veo-3.1-generate-001", 8, "360p") is None
 
 
 # ============================================================================
@@ -1004,17 +1001,21 @@ def test_an_image_quote_says_the_rate_holds_on_both_backends() -> None:
     assert PRICING_SOURCES["vertex_ai"] in note
 
 
-def test_a_veo_quote_flags_that_the_vertex_rate_is_assumed() -> None:
-    """Veo per-second rates could only be confirmed on the Gemini Developer
-    API page. A Vertex caller quoted one is relying on an assumption, and the
-    payload has to say so rather than leaving it in a source-file docstring."""
+def test_a_veo_quote_is_sourced_to_the_vertex_page() -> None:
+    """Veo runs on Vertex AI only, and Google removed it from the Gemini
+    Developer API pricing page, so its rates are sourced to the Vertex page.
+    That page labels the unit "count" and also lists a cheaper video-only
+    rate this module does not apply; a caller checking the figure needs both
+    facts, in the payload rather than a source-file docstring."""
     payload = cost_to_dict(estimate_video_cost("veo-3.1-generate-001", 8, "720p"))
     assert payload is not None
-    assert payload["pricing_source"] == PRICING_SOURCES["gemini_api"]
+    assert payload["pricing_source"] == PRICING_SOURCES["vertex_ai"]
     note = payload["pricing_source_note"]
     assert note is not None
-    assert "assumed" in note
-    assert "Vertex AI" in note
+    assert "Vertex AI pricing page" in note
+    assert '"count"' in note
+    assert "Gemini Developer API" in note
+    assert "include_audio=False" in note
     # The Veo caveat must not be confused with the image cross-check note.
     assert note != _image_note()
 
@@ -1073,10 +1074,13 @@ def test_actual_costs_carry_provenance_too() -> None:
             ],
         ),
     )
-    for cost in (metered, fallback, per_second, omni_tokens):
+    for cost in (metered, fallback, omni_tokens):
         assert cost is not None
         assert cost.source == PRICING_SOURCES["gemini_api"]
-    assert per_second is not None and per_second.source_note is not None
+    # Veo is sourced to the Vertex page, the only backend it runs on.
+    assert per_second is not None
+    assert per_second.source == PRICING_SOURCES["vertex_ai"]
+    assert per_second.source_note is not None
 
 
 def test_superseded_ids_inherit_the_replacement_models_provenance() -> None:
@@ -1095,10 +1099,10 @@ def test_sum_costs_keeps_a_source_every_component_shares() -> None:
             estimate_video_cost("veo-3.1-fast-generate-001", 4),
         ]
     )
-    assert total.source == PRICING_SOURCES["gemini_api"]
-    # Both are Veo, so the Vertex caveat survives the aggregation.
+    assert total.source == PRICING_SOURCES["vertex_ai"]
+    # Both are Veo, so the Veo caveat survives the aggregation.
     assert total.source_note is not None
-    assert "assumed" in total.source_note
+    assert "Vertex AI pricing page" in total.source_note
 
 
 def test_sum_costs_drops_a_source_its_components_do_not_share() -> None:
@@ -1110,7 +1114,7 @@ def test_sum_costs_drops_a_source_its_components_do_not_share() -> None:
         unit="image",
         detail="priced from the other page",
         breakdown={"images": 1.0},
-        source=PRICING_SOURCES["vertex_ai"],
+        source=PRICING_SOURCES["gemini_api"],
     )
     total = sum_costs([estimate_video_cost("veo-3.1-generate-001", 8), elsewhere])
     assert total.usd == pytest.approx(8 * 0.40 + 1.0)
@@ -1121,13 +1125,13 @@ def test_sum_costs_drops_a_source_its_components_do_not_share() -> None:
 
 
 def test_sum_costs_drops_a_note_the_components_do_not_share() -> None:
-    """Image and Veo rates come off the same page but carry different
+    """Image and omni rates come off the same page but carry different
     caveats, so the aggregate keeps the URL and drops the note rather than
     applying one kind of rate's caveat to the other's."""
     total = sum_costs(
         [
             estimate_image_cost("gemini-3.1-flash-image", "1K"),
-            estimate_video_cost("veo-3.1-generate-001", 8),
+            estimate_video_cost(OMNI_MODEL, 8),
         ]
     )
     assert total.unit == "mixed"
@@ -1165,7 +1169,7 @@ def test_an_unpriced_component_does_not_erase_the_shared_source() -> None:
         ]
     )
     assert total.breakdown["unpriced_components"] == 1.0
-    assert total.source == PRICING_SOURCES["gemini_api"]
+    assert total.source == PRICING_SOURCES["vertex_ai"]
 
 
 def test_a_cost_with_no_source_still_reports_the_key() -> None:
@@ -1189,7 +1193,7 @@ def test_describe_model_pricing_exposes_the_source_caveat() -> None:
     video = describe_model_pricing("veo-3.1-generate-001")
     image = describe_model_pricing("gemini-3.1-flash-image")
     assert video is not None and image is not None
-    assert "assumed" in video["source_note"]
+    assert '"count"' in video["source_note"]
     assert PRICING_SOURCES["vertex_ai"] in image["source_note"]
 
 
@@ -1206,3 +1210,120 @@ def test_source_notes_only_point_at_pages_the_module_actually_used() -> None:
         for word in note.split():
             if word.startswith("http"):
                 assert word.strip("()., ") in PRICING_SOURCES.values()
+
+
+# ---------------------------------------------------------------------------
+# Understanding models (the virtual director)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("day", "input_rate", "output_rate"),
+    [
+        ("2026-11-30", 2.00, 10.00),
+        ("2026-12-01", 4.00, 20.00),
+    ],
+)
+def test_argon_rates_step_up_on_their_published_day(
+    day: str, input_rate: float, output_rate: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "$2.00 through November 30, 2026." / "$4.00 starting December 1, 2026."
+    and $10 / $20 output, thinking included."""
+    import datetime
+
+    import src.pricing as pricing
+
+    monkeypatch.setattr(pricing, "_today", lambda: datetime.date.fromisoformat(day))
+    estimate = pricing.estimate_understanding_cost(
+        "gemini-4-argon", 1_000_000, 1_000_000
+    )
+    assert estimate is not None
+    assert estimate.usd == pytest.approx(input_rate + output_rate)
+    assert estimate.source == pricing.PRICING_SOURCES["gemini_api"]
+
+
+def test_flash_rates_step_up_on_new_years_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    import datetime
+
+    import src.pricing as pricing
+
+    monkeypatch.setattr(pricing, "_today", lambda: datetime.date(2026, 12, 31))
+    before = pricing.estimate_understanding_cost("gemini-3.8-flash", 1_000_000, 0)
+    monkeypatch.setattr(pricing, "_today", lambda: datetime.date(2027, 1, 1))
+    after = pricing.estimate_understanding_cost("gemini-3.8-flash", 1_000_000, 0)
+    assert before is not None and after is not None
+    assert (before.usd, after.usd) == pytest.approx((0.75, 1.50))
+
+
+def test_a_metered_call_bills_thinking_as_output_and_cache_hits_at_the_cached_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import datetime
+
+    import src.pricing as pricing
+
+    monkeypatch.setattr(pricing, "_today", lambda: datetime.date(2026, 12, 2))
+    cost = pricing.actual_understanding_cost(
+        "gemini-4-argon",
+        {
+            "prompt_tokens": 10_000,
+            "cached_tokens": 4_000,
+            "output_tokens": 500,
+            "thought_tokens": 1_500,
+        },
+    )
+    assert cost is not None and cost.is_estimate is False
+    # 6,000 uncached at $4 + 4,000 cached at $0.20 + 2,000 output at $20.
+    assert cost.usd == pytest.approx((6_000 * 4 + 4_000 * 0.20 + 2_000 * 20) / 1e6)
+
+
+def test_the_quote_bounds_any_bill_at_the_output_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same day, same size: a call cannot bill past its cap, and the cache
+    only lowers the bill, so the quote at the cap is a ceiling."""
+    import src.pricing as pricing
+
+    quote = pricing.estimate_understanding_cost("gemini-4-argon", 5_000, 8_192)
+    worst = pricing.actual_understanding_cost(
+        "gemini-4-argon",
+        {
+            "prompt_tokens": 5_000,
+            "cached_tokens": 0,
+            "output_tokens": 2_000,
+            "thought_tokens": 6_192,
+        },
+    )
+    cached = pricing.actual_understanding_cost(
+        "gemini-4-argon",
+        {
+            "prompt_tokens": 5_000,
+            "cached_tokens": 5_000,
+            "output_tokens": 100,
+            "thought_tokens": 0,
+        },
+    )
+    assert quote is not None and worst is not None and cached is not None
+    assert quote.usd >= worst.usd >= cached.usd
+
+
+def test_unknown_understanding_models_and_missing_usage_are_unpriced() -> None:
+    import src.pricing as pricing
+
+    assert pricing.estimate_understanding_cost("gemini-2.5-flash", 1, 1) is None
+    assert pricing.actual_understanding_cost("gemini-4-argon", None) is None
+
+
+def test_actual_image_cost_bills_text_the_modality_list_left_out() -> None:
+    """The Gemini API can list IMAGE alone while candidates_token_count runs
+    a few hundred higher; that surplus is text and bills at the text rate."""
+    usage = FakeUsageMetadata(
+        prompt_token_count=0,
+        candidates_token_count=1500,
+        candidates_tokens_details=[FakeModalityTokenCount("IMAGE", 1120)],
+    )
+    cost = actual_image_cost("gemini-3.1-flash-image", usage, "1K", 1)
+    assert cost is not None
+    assert cost.breakdown["output_image_tokens"] == 1120.0
+    assert cost.breakdown["output_text_tokens"] == 380.0
+    assert cost.usd == pytest.approx((1120 * 60 + 380 * 3) / 1e6)

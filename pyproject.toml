@@ -1,15 +1,29 @@
 [project]
 name = "gemini-media-mcp"
 dynamic = ["version"]
-description = "Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with per-call cost estimates"
+description = "Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with a cost estimate before every call and an optional Gemini 4 Argon director that checks each take against your notes"
 readme = "README.md"
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "gemini",
+    "veo",
+    "gemini-omni",
+    "argon",
+    "image-generation",
+    "video-generation",
+    "vertex-ai",
+]
 license = { file = "LICENSE" }
 requires-python = ">=3.13"
 dependencies = [
     # FastMCP moved out of this import path in MCP 2.x. Keep the published
     # package on the compatible SDK until the server is migrated.
     "mcp>=1.23.1,<2",
-    "google-genai>=2.20.0",
+    # 2.31.0 is the first release with GenerateContentConfig.automatic_continuation,
+    # which image.py sets to keep one billed request per render, and it is past
+    # the 2.30.1 minimum Gemini 4 Argon requires.
+    "google-genai>=2.31.0",
     "pillow>=12.0.0",
     "aiohttp>=3.13.2",
     "google-cloud-storage>=3.6.0",

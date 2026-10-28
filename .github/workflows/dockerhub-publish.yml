@@ -61,5 +61,5 @@ jobs:
           username: ${{ secrets.DOCKERHUBUSERNAME }}
           password: ${{ secrets.DOCKERHUBTOKEN }}
           repository: cxoagi/gemini-media-mcp
-          short-description: Cost-aware MCP for Gemini images, Veo and Gemini Omni video, storyboards, clips, and editing.
+          short-description: Cost-aware MCP for Gemini images, Veo 3.1 and Omni video, with an optional Argon director.
           readme-filepath: ./DOCKER_HUB_README.md

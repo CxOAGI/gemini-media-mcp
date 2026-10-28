@@ -12,6 +12,7 @@ import os
 import re
 import socket
 import sys
+import time
 import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from google import genai
+from google.genai import types
 
 from . import credentials
 from .video import VEO_DEFAULT_TIMEOUT_SECONDS, VEO_MEASURED_4K_SECONDS
@@ -38,6 +40,7 @@ from PIL import Image as PILImage
 from .image import ImageModel, ImageSize, MediaResolution, RetiredImageModel
 from .image import generate_image as generate_image_impl
 from .omni import (
+    OmniSubmission,
     omni_extension_refusal,
     omni_model_reroute_warning,
     omni_model_refusal,
@@ -58,13 +61,16 @@ from .omni import (
 )
 from .routing import BudgetPreference, MediaKind
 from .storyboard import Theme
+from .director import DEFAULT_MAX_RETAKES
 from .omni import generate_video_omni as generate_video_omni_impl
 from .video import (
     _MAX_REFERENCE_IMAGES,
-    _VEO_LITE_MODELS,
     VEO_EXTENSION_STEP_SECONDS,
+    VEO_GEMINI_API_REFUSAL,
     TranslatedVideoModel,
     VideoModel,
+    http_status,
+    retry_after_seconds,
     validate_video_request_inputs,
     veo_extension_output_lengths,
 )
@@ -168,10 +174,9 @@ class AppContext:
     images_dir: Path
     videos_dir: Path
     client: genai.Client
-    # Dedicated Gemini API (AI Studio) client. Used to route models that
-    # are not yet published on Vertex (e.g. veo-3.1-lite-generate-preview)
-    # when the primary client runs in Vertex mode. None when no
-    # GEMINI_API_KEY is configured.
+    # Dedicated Gemini API (AI Studio) client, used to reach omni on the
+    # Gemini Developer API when the primary client runs in Vertex mode (see
+    # _omni_backend_decision). None when no GEMINI_API_KEY is configured.
     gemini_api_client: genai.Client | None = None
     temp_creds_path: Path | None = None
     video_gcs_bucket: str | None = None  # Default GCS bucket for video output
@@ -378,23 +383,20 @@ def create_gemini_api_client() -> genai.Client | None:
 
 
 def _client_for_video_model(app_ctx: AppContext, model: str) -> genai.Client:
-    """Pick the right genai.Client for a video model.
+    """Pick the genai.Client a Veo model runs on: the primary, on Vertex AI.
 
-    Veo 3.1 Lite is served via the Gemini API / AI Studio only; calling
-    it on Vertex hits aiplatform.googleapis.com and fails. When the
-    primary client is in Vertex mode, route Lite through the Gemini API
-    client instead.
+    Veo has no endpoint on the Gemini Developer API (VEO_GEMINI_API_SHUTDOWN),
+    so a deployment whose primary client is not Vertex is refused here. Every
+    Veo tool asks this before it quotes or fetches anything, so the refusal is
+    free and a dry run cannot price a call that would 404.
+
+    Raises:
+        RuntimeError: When the primary client is not a Vertex AI client.
+            ``_backend_of`` relies on this type to fall back to the primary
+            client's mode.
     """
-    if model in _VEO_LITE_MODELS and getattr(
-        app_ctx.client._api_client, "vertexai", False
-    ):
-        if app_ctx.gemini_api_client is None:
-            raise RuntimeError(
-                f"Model {model} is only available via the Gemini API. "
-                "Set GEMINI_API_KEY so the lite model can be served by "
-                "AI Studio (Vertex AI has not published it yet)."
-            )
-        return app_ctx.gemini_api_client
+    if not getattr(app_ctx.client._api_client, "vertexai", False):
+        raise RuntimeError(VEO_GEMINI_API_REFUSAL)
     return app_ctx.client
 
 
@@ -530,7 +532,7 @@ def _backend_of(app_ctx: AppContext, model: str | None) -> str:
         return _omni_backend_choice(app_ctx, requested=None if pin == "auto" else pin)
     try:
         # Defer to the real routing rule rather than restating it here; a
-        # second copy of "which client serves Lite" is a copy that drifts.
+        # second copy of "which client serves Veo" is a copy that drifts.
         client = _client_for_video_model(app_ctx, name)
     except RuntimeError:
         # No client serves this model on this deployment. The call itself
@@ -547,8 +549,8 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
     ended up on one of eight. Routed through here it cannot be forgotten.
     """
     quote = bool(payload.get("dry_run"))
-    # One response, one model name. The impl returns the SERVED id — the
-    # Gemini API is fed `-preview` spellings, Vertex `-001` — and reporting
+    # One response, one model name. The impl returns the SERVED id — omni
+    # 1.1 is `gemini-omni-1.1-flash-preview` on Vertex — and reporting
     # that beside a cost line priced on the canonical name had two fields
     # naming different models. The quote was fixed for this once and the
     # rendered path grew it back, so it is settled here instead of per tool.
@@ -659,10 +661,10 @@ def _omni_backend_decision(
     A blocked event loop hangs every request in the process, not just this one.
 
     The reason is part of the answer because the default is not obvious from
-    the outside. On a Vertex-primary server that also holds a GEMINI_API_KEY
-    (any deployment that wants Veo Lite does), omni went to the Gemini
-    Developer API on every call, with nothing an operator or caller could
-    set to keep it in the Vertex project, and the response's ``backend``
+    the outside. On a Vertex-primary server that also holds a GEMINI_API_KEY,
+    omni went to the Gemini Developer API on every call, with nothing an
+    operator or caller could set to keep it in the Vertex project, and the
+    response's ``backend``
     field said where the call went but not that it could have gone elsewhere.
     For an enterprise deployment that is a different billing path, quota pool
     and credential model, chosen silently. ``requested`` is the explicit
@@ -836,6 +838,7 @@ async def _omni_generate_and_manifest(
     backend_reason: str | None = None,
     timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     manifest_extra: dict[str, Any] | None = None,
+    submission: OmniSubmission | None = None,
 ) -> dict[str, Any]:
     """Run the omni impl and attach a sidecar manifest, returning the result.
 
@@ -902,6 +905,7 @@ async def _omni_generate_and_manifest(
         allow_uri_delivery=not client_is_vertex,
         timeout_seconds=timeout_seconds,
         log_callback=ctx.info,
+        submission=submission,
     )
     if not effective_gcs and wants_uri_delivery(
         omni_spec(model), resolution, result.get("task")
@@ -1240,6 +1244,33 @@ def _veo_access_advice(exc: BaseException) -> str | None:
         "GOOGLE_CLOUD_LOCATION names a region serving the model. Nothing was "
         "rendered or billed."
     )
+
+
+def _thought_signature_path(url: str) -> Path:
+    """The file a thought_signature_url names, or raise for anything else."""
+    if not url.startswith("file://"):
+        raise ValueError(
+            "thought_signature_url must be a file:// URL returned by a "
+            f"previous generate_image call, got: {url}"
+        )
+    return Path(url[7:])
+
+
+def _submission_note(state: str, *, handle: str | None) -> str:
+    """What a failed render's caller needs to know about its bill."""
+    if state == "submitted":
+        return (
+            f"{handle} was submitted and may still complete and bill; reconcile "
+            "it before rendering again."
+            if handle
+            else "The render was submitted and may still complete and bill."
+        )
+    if state == "unknown":
+        return (
+            "The request may have reached Google before the deadline; if it "
+            "did, it may still complete and bill."
+        )
+    return "The request had not been submitted, so nothing was billed."
 
 
 def _veo_attempt_facts(
@@ -1949,8 +1980,8 @@ def _resolve_video_gcs(
     gcs_uri = output_gcs_uri or default_bucket
     # GCS output only works on Vertex AI. On the Gemini API path, reject an
     # explicit output_gcs_uri (the caller asked for the impossible) but
-    # silently drop a VIDEO_GCS_BUCKET env default so Lite / text-to-video
-    # still succeed inline. This drop happens BEFORE format validation so a
+    # silently drop a VIDEO_GCS_BUCKET env default so the call can still
+    # succeed inline. This drop happens BEFORE format validation so a
     # malformed env default (e.g. a bare bucket name) can't fail calls on a
     # path where it would never be used anyway.
     if gcs_uri and not is_vertex_client:
@@ -2400,25 +2431,21 @@ async def fetch(
                 f"Local file access is not allowed without a configured DATA_FOLDER: {uri}"
             )
 
-        if uri.startswith("file://"):
-            path = _validate_local_path(Path(uri[7:]), allowed_dir)
-            if path.stat().st_size > max_bytes:
-                raise ValueError(f"File exceeds size cap {max_bytes}: {path}")
-            return path.read_bytes()
-
         # Reject unsupported schemes (ftp://, s3://, data:, ...) with a clear
         # message instead of letting them fall into local-path validation,
         # which would misreport them as "outside the allowed directory".
-        if "://" in uri or uri.startswith("data:"):
+        if not uri.startswith("file://") and ("://" in uri or uri.startswith("data:")):
             raise ValueError(f"Unsupported URI scheme: {uri}")
 
-        # Bare path: validate the location BEFORE any filesystem probe so a
-        # path outside allowed_dir never gets an exists()/stat() call that
-        # could leak file existence via timing or differing error paths.
-        validated = _validate_local_path(Path(uri), allowed_dir)
-        if validated.stat().st_size > max_bytes:
-            raise ValueError(f"File exceeds size cap {max_bytes}: {validated}")
-        return validated.read_bytes()
+        # Resolving, stat and reading all touch the filesystem, and a slow
+        # disk or a wedged mount blocks whatever thread does it. On the event
+        # loop that froze every request, and no deadline a caller set around
+        # this await could fire. Off the loop, on a pool of its own, a stall
+        # parks one of its threads and the caller's deadline still holds.
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _get_local_read_executor(), _read_local_file, uri, allowed_dir, max_bytes
+        )
     except Exception as e:
         logger.error("Failed to fetch %s: %s", uri, e)
         return None
@@ -2475,6 +2502,41 @@ def _image_cost(
 ) -> dict[str, Any] | None:
     """Cost for an image call, shaped for the MCP response."""
     return _cost_payload(_image_cost_estimate(model, image_size, usage=usage, n=n))
+
+
+def _read_local_file(uri: str, allowed_dir: Path, max_bytes: int) -> bytes:
+    """Read a file:// URI or bare path inside ``allowed_dir``. Blocking.
+
+    The location is validated before any probe, so a path outside
+    ``allowed_dir`` never gets a stat() call that could leak whether a file
+    exists through timing or differing errors.
+    """
+    raw = uri[len("file://") :] if uri.startswith("file://") else uri
+    path = _validate_local_path(Path(raw), allowed_dir)
+    if path.stat().st_size > max_bytes:
+        raise ValueError(f"File exceeds size cap {max_bytes}: {path}")
+    return path.read_bytes()
+
+
+# Local file reads get their own pool, for the reason the probe pools below
+# do: a thread blocked on a slow or wedged mount cannot be cancelled, so it
+# must not be one the rest of the server draws on. Reads are per input and
+# can run to MAX_FETCH_BYTES, so they are kept apart from the small probes.
+_LOCAL_READ_MAX_WORKERS = 4
+_local_read_executor: ThreadPoolExecutor | None = None
+_local_read_lock = threading.Lock()
+
+
+def _get_local_read_executor() -> ThreadPoolExecutor:
+    """Return the process-wide local-file read pool, created on first use."""
+    global _local_read_executor
+    with _local_read_lock:
+        if _local_read_executor is None:
+            _local_read_executor = ThreadPoolExecutor(
+                max_workers=_LOCAL_READ_MAX_WORKERS,
+                thread_name_prefix="local-read",
+            )
+        return _local_read_executor
 
 
 _SIDECAR_MAX_BYTES = 256 * 1024
@@ -3096,7 +3158,7 @@ def _assemble_clip_manifest(
     if errors:
         manifest["errors"] = errors
     if warnings:
-        # The same warning (e.g. "audio not honored on the Gemini API") is
+        # The same warning (e.g. "seed was not sent") is
         # emitted per beat and per bridge; dedupe at the clip level, preserving
         # first-seen order, so the manifest carries each distinct warning once
         # instead of one copy per segment.
@@ -3265,8 +3327,8 @@ def _assemble_loop_extend_manifest(
         "kind": "loop_extend",
         "source_video_uri": source_video_uri,
         "prompt": prompt,
-        # The model that actually ran: the impl translates Veo IDs
-        # per backend (the Gemini API serves -preview spellings).
+        # The model that actually ran: the impl normalizes an older
+        # Gemini-API `-preview` spelling to its `-001` name.
         "model": served_model,
         "aspect_ratio": aspect_ratio,
         "times": len(steps),
@@ -3405,10 +3467,1114 @@ mcp = FastMCP(
         "reviewable boards and multi-beat reels; generate_transition and "
         "generate_bridge join shots; edit_video and loop_extend revise and "
         "extend footage. Every generation tool takes dry_run to return a cost "
-        "estimate before spending."
+        "estimate before spending. generate_image, generate_video and "
+        "generate_video_omni take director_notes: Gemini 4 Argon turns them "
+        "into checks, reviews each take against them, and retakes on a fail."
     ),
     lifespan=app_lifespan,
 )
+
+
+# ============================================================================
+# Virtual director
+# ============================================================================
+#
+# Opt-in through director_notes on generate_image, generate_video and
+# generate_video_omni. The tool calls itself once per take with the notes
+# stripped, so a take is exactly the render the tool would have made without
+# a director: same validation, same quote, same manifest. The rules of the
+# review itself live in src/director.py.
+
+# A request that timed out or hit a server error reported no usage, but Google
+# may still have processed and billed it; the director cannot see that, so it
+# says so.
+_DIRECTOR_UNREPORTED_WARNING = (
+    "A director request timed out or hit a server error. Google may still have "
+    "processed and billed it; its cost is not included because it was never "
+    "reported."
+)
+
+# Below this many seconds left on the caller's deadline a review is skipped
+# rather than sent: a review that cannot finish still bills, and a call the
+# host cancels has already billed. A MEDIUM-thinking review of a clip takes
+# longer than one of an image.
+_DIRECTOR_MIN_REVIEW_SECONDS: dict[str, float] = {"image": 30.0, "video": 60.0}
+
+# The most time spent reading reference images for review, or less when the
+# caller's deadline is nearer.
+_DIRECTOR_REFERENCE_READ_SECONDS = 30.0
+
+# Images the reviewer is shown from each list a render was given (image_uris,
+# reference_image_uris). Each one costs up to 1,120 input tokens on every
+# review, and fidelity to the first few is what a director checks. The image
+# being edited and the first and last frames are always shown.
+_DIRECTOR_MAX_REFERENCES = 3
+
+
+def _uri_or_base64(
+    kind: str, param: str, uri: str | None, b64: str | None
+) -> tuple[str, str, str | None]:
+    """An image a tool reads from ``{param}_uri``, or else ``{param}_base64``."""
+    return (kind, f"{param}_uri", uri) if uri else (kind, f"{param}_base64", b64)
+
+
+def _review_references(
+    *inputs: tuple[str, str, str | None], omni: bool = False
+) -> list[tuple[Any, str, str]]:
+    """The images a render was given, as the reviewer will be shown them.
+
+    Each input is (kind, parameter, URI or base64), in the order the tool
+    reads them: what the render was edited from or anchored on, then the
+    lists. Returns (ReviewReference, "uri" or "base64", value) for each one
+    given. A list item keeps its place in the caller's list, so the second
+    of reference_image_uris is reference 2 even when the first is empty.
+    ``omni`` names omni's prompt tag for each.
+    """
+    from .director import LISTED_KINDS, ReviewReference
+
+    counts: dict[str, int] = {}
+    references: list[tuple[Any, str, str]] = []
+    for kind, given_as, value in inputs:
+        counts[kind] = counts.get(kind, 0) + 1 if kind in LISTED_KINDS else 1
+        if value:
+            references.append(
+                (
+                    ReviewReference(kind, counts[kind], given_as, omni),
+                    "base64" if given_as.endswith("_base64") else "uri",
+                    value,
+                )
+            )
+    return references
+
+
+def _named(references: list[Any]) -> str:
+    """References as a response lists them: "reference 4 (...), ..."."""
+    return ", ".join(ref.label for ref in references)
+
+
+def _director_client(app_ctx: AppContext) -> genai.Client:
+    """The client the director's understanding calls go through.
+
+    Argon is served only from the global, us and eu locations on Vertex, so a
+    Vertex deployment uses the global-location client omni already keeps; on
+    the Gemini API the primary client serves it as-is.
+    """
+    if getattr(app_ctx.client._api_client, "vertexai", False):
+        return _get_omni_vertex_global_client()
+    return app_ctx.client
+
+
+def _tool_payload(raw: Any) -> tuple[dict[str, Any], list[Any]]:
+    """Split a tool's return into its JSON payload and any other content.
+
+    generate_image returns a content list (a preview image beside the JSON);
+    the video tools return the JSON string itself.
+    """
+    if isinstance(raw, str):
+        return json.loads(raw), []
+    text = next(item for item in raw if isinstance(item, TextContent))
+    return json.loads(text.text), [item for item in raw if item is not text]
+
+
+def _cost_estimate_from_dict(cost: dict[str, Any] | None) -> Any:
+    """Rebuild a pricing CostEstimate from a response's cost dict, or None."""
+    if not cost:
+        return None
+    from .pricing import CostEstimate
+
+    return CostEstimate(
+        usd=float(cost["usd"]),
+        is_estimate=bool(cost.get("is_estimate", True)),
+        unit=str(cost.get("unit", "mixed")),
+        detail=str(cost.get("detail", "")),
+        breakdown={k: float(v) for k, v in (cost.get("breakdown") or {}).items()},
+        source=cost.get("pricing_source"),
+        source_note=cost.get("pricing_source_note"),
+    )
+
+
+def _check_payload(check: Any) -> dict[str, Any]:
+    """One derived check as it appears in a response and a manifest."""
+    payload: dict[str, Any] = {
+        "id": check.id,
+        "check": check.check,
+        "fix": check.fix,
+        "from_notes": check.from_notes,
+        "kind": check.kind,
+    }
+    if check.literal is not None:
+        payload["literal"] = check.literal
+    if check.target is not None:
+        payload["target"] = check.target
+    return payload
+
+
+async def _wait(seconds: float) -> None:
+    """Sleep before a render is tried again. Its own name, so a test can
+    record the wait instead of taking it."""
+    await asyncio.sleep(seconds)
+
+
+def _seconds_value(seconds: float) -> float | int:
+    return int(seconds) if seconds == int(seconds) else round(seconds, 1)
+
+
+def _render_retry_reason(payload: dict[str, Any]) -> str | None:
+    """Why a failed render is worth one more request, or None.
+
+    A 429 is refused before any work, so a second request risks only the
+    wait. A server error, or a timeout that may or may not have reached
+    Google ("unknown"), is tried again too, with the first attempt kept as a
+    possible charge. A render that was submitted is never rendered again: it
+    exists or will, and the take keeps the handle to it.
+    """
+    if "error" not in payload or payload.get("submission") == "submitted":
+        return None
+    status = payload.get("status_code")
+    if status == 429:
+        return "quota"
+    if (isinstance(status, int) and status >= 500) or payload.get(
+        "submission"
+    ) == "unknown":
+        return "transient"
+    return None
+
+
+def _check_result_payload(result: Any) -> dict[str, Any]:
+    """One check's result as it appears in a response."""
+    payload: dict[str, Any] = {"id": result.id, "state": result.state}
+    if result.observation:
+        payload["observation"] = result.observation
+    evidence = []
+    for item in result.evidence:
+        entry: dict[str, Any] = {}
+        if item.where:
+            entry["where"] = item.where
+        if item.start_s is not None:
+            entry["start_seconds"] = round(item.start_s, 3)
+            entry["end_seconds"] = round(item.end_s or item.start_s, 3)
+        if entry:
+            evidence.append(entry)
+    if evidence:
+        payload["evidence"] = evidence
+    if not result.reported:
+        payload["reported"] = False
+    if result.note:
+        payload["note"] = result.note
+    return payload
+
+
+async def _review_take(
+    app_ctx: AppContext,
+    *,
+    client: genai.Client,
+    model: str,
+    checks: list[Any],
+    payload: dict[str, Any],
+    take_prompt: str,
+    media_kind: MediaKind,
+    references: list[tuple[bytes, str, Any]],
+    audio_requested: bool | None,
+    deadline: float | None = None,
+) -> tuple[Any, Any, list[Any]]:
+    """Review one take. Returns the TakeReview, its cost, and the references
+    left out to fit the inline request.
+
+    ``references`` are (bytes, MIME type, ReviewReference) already prepared
+    for review. The TakeReview lists the ones a sent request carried.
+    ``deadline`` is the directed call's end on the monotonic clock. The review's
+    timeout is taken from it after the media is read and prepared, so that
+    time is spent from the same budget, and a review with too little left is
+    not sent.
+
+    Never raises for a review that cannot run: an unreadable render, a
+    provider refusal or a malformed answer is an abstention with a reason, and
+    the take is still delivered.
+    """
+    from . import director
+    from .pricing import actual_understanding_cost
+
+    media_url = str(payload.get("image_url") or payload.get("video_url") or "")
+    duration = payload.get("duration_seconds")
+    duration_s = float(duration) if isinstance(duration, (int, float)) else None
+    is_vertex = getattr(client._api_client, "vertexai", False)
+
+    async def read_subject() -> tuple[Any, bytes] | str:
+        """The render as a request part and its bytes, or why it can't be."""
+        nonlocal duration_s
+        if media_kind == "video" and media_url.startswith("gs://") and is_vertex:
+            part = director.video_part(
+                "video/mp4", uri=media_url, duration_s=duration_s
+            )
+            return part, media_url.encode()
+        # A clip goes inline as it is, so it is capped here; an image is
+        # scaled down below, so it is fetched under the ordinary cap.
+        data = await fetch(
+            media_url,
+            allowed_dir=app_ctx.data_folder,
+            allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+            max_bytes=(
+                director.MAX_INLINE_MEDIA_BYTES
+                if media_kind == "video"
+                else MAX_FETCH_BYTES
+            ),
+        )
+        if data is None:
+            return (
+                "The render could not be read inline: it is larger than "
+                f"{director.MAX_INLINE_MEDIA_BYTES // (1024 * 1024)} MB or "
+                "not readable from here."
+            )
+        if media_kind == "video":
+            if duration_s is None:
+                # An omni edit leaves the length to the service and reports
+                # none. Without it a per-second answer shorter than the clip
+                # could pass, and evidence past its end would go unchecked.
+                duration_s = await _probe_media(measure_video_duration_bytes, data)
+            return director.video_part(
+                "video/mp4", data=data, duration_s=duration_s
+            ), data
+        try:
+            data, mime = await asyncio.to_thread(director.prepare_review_image, data)
+        except Exception as exc:  # noqa: BLE001 - an unreadable render abstains
+            return str(exc)
+        return director.image_part(data, mime), data
+
+    def skipped(
+        reason: str, detail: str, attempts: int = 1
+    ) -> tuple[Any, Any, list[Any]]:
+        return (
+            director.TakeReview(
+                status="abstained", reason=reason, detail=detail, attempts=attempts
+            ),
+            None,
+            [],
+        )
+
+    # Reading the render is bounded by the same deadline as the review: it
+    # must leave a review's worth of time, or the review could not run and
+    # the host could cancel the call before the paid render is delivered.
+    read_budget = (
+        None
+        if deadline is None
+        else deadline - time.monotonic() - _DIRECTOR_MIN_REVIEW_SECONDS[media_kind]
+    )
+    if read_budget is not None and read_budget <= 0:
+        return skipped(
+            "deadline",
+            "Too little of timeout_seconds remained to read the render and review it.",
+            attempts=0,
+        )
+    try:
+        read = (
+            await read_subject()
+            if read_budget is None
+            else await asyncio.wait_for(read_subject(), read_budget)
+        )
+    except TimeoutError:
+        return skipped(
+            "deadline",
+            "Reading the render did not finish in the time timeout_seconds left "
+            "for a review.",
+            attempts=0,
+        )
+    if isinstance(read, str):
+        return skipped("media_unavailable", read)
+    subject, subject_bytes = read
+
+    # One inline request carries the render and the references together, so
+    # the references are trimmed to what fits beside the render.
+    budget = director.MAX_INLINE_MEDIA_BYTES - len(subject_bytes)
+    kept: list[tuple[bytes, str, Any]] = []
+    for ref in references:
+        if len(ref[0]) > budget:
+            break
+        kept.append(ref)
+        budget -= len(ref[0])
+    shown = tuple(ref for _, _, ref in kept)
+    trimmed = [ref for _, _, ref in references[len(kept) :]]
+    parts: list[Any] = []
+    for ref_bytes, ref_mime, ref in kept:
+        parts += [
+            director.media_label(ref.key),
+            director.image_part(ref_bytes, ref_mime),
+        ]
+    parts += [director.media_label(director.SUBJECT_KEY), subject]
+    system, user = director.build_review_request(
+        checks, take_prompt, media_kind, shown, audio_requested, duration_s
+    )
+    review_timeout = (
+        director.IMAGE_REVIEW_TIMEOUT_SECONDS
+        if media_kind == "image"
+        else director.VIDEO_REVIEW_TIMEOUT_SECONDS
+    )
+    if deadline is not None:
+        left = deadline - time.monotonic()
+        if left < _DIRECTOR_MIN_REVIEW_SECONDS[media_kind]:
+            return (
+                director.TakeReview(
+                    status="abstained",
+                    reason="deadline",
+                    detail=(
+                        f"{max(left, 0):.0f}s of timeout_seconds remained once the "
+                        "render was read, too little for a review."
+                    ),
+                    attempts=0,
+                ),
+                None,
+                [],
+            )
+        review_timeout = min(review_timeout, left - 5.0)
+    parts.append(types.Part(text=user))
+    outcome = await director.call_model(
+        client,
+        model,
+        system=system,
+        parts=parts,
+        schema=director.REVIEW_SCHEMA,
+        thinking_level=director.REVIEW_THINKING_LEVEL,
+        max_output_tokens=director.review_max_output_tokens(media_kind),
+        # Seeded from the render's address and size, not its bytes: hashing
+        # 20 MB on the event loop buys nothing a seed needs.
+        seed=director.request_seed(
+            model, system, user, media_url, str(len(subject_bytes))
+        ),
+        timeout_s=review_timeout,
+        media_resolution=(
+            types.MediaResolution.MEDIA_RESOLUTION_HIGH
+            if media_kind == "image"
+            else types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
+        ),
+    )
+    cost = actual_understanding_cost(model, outcome.usage, label="review call")
+    if outcome.status != "ok":
+        return (
+            director.TakeReview(
+                status="abstained",
+                reason=outcome.reason,
+                detail=outcome.detail,
+                attempts=outcome.attempts,
+                unreported=outcome.unreported,
+                retry_skipped=outcome.retry_skipped,
+                retried=outcome.retried,
+                shown=shown,
+            ),
+            cost,
+            trimmed,
+        )
+    try:
+        results = director.parse_review(
+            outcome.text or "", checks, media_kind, duration_s
+        )
+    except Exception as exc:  # noqa: BLE001 - any unusable answer abstains
+        return (
+            director.TakeReview(
+                status="abstained",
+                reason="parse_failed",
+                detail=str(exc),
+                attempts=outcome.attempts,
+                unreported=outcome.unreported,
+                retry_skipped=outcome.retry_skipped,
+                retried=outcome.retried,
+                shown=shown,
+            ),
+            cost,
+            trimmed,
+        )
+    return (
+        director.TakeReview(
+            status="reviewed",
+            results=results,
+            attempts=outcome.attempts,
+            unreported=outcome.unreported,
+            retry_skipped=outcome.retry_skipped,
+            retried=outcome.retried,
+            shown=shown,
+        ),
+        cost,
+        trimmed,
+    )
+
+
+def _record_take_review(
+    payload: dict[str, Any], take_summary: dict[str, Any], context: dict[str, Any]
+) -> bool:
+    """Add a take's review to its manifest, so the sidecar carries it too.
+
+    ``context`` is what the review is judged against: the director model, the
+    caller's notes, the checks derived from them and any notes skipped. The
+    response states it once for every take; a manifest is opened on its own,
+    long after the call, so each one carries it, or "n1: pass" means nothing.
+    """
+    # The manifest already holds the prompt this take rendered; a second copy
+    # doubles the file for a long prompt.
+    take_summary = {
+        **context,
+        **{k: v for k, v in take_summary.items() if k != "prompt"},
+    }
+    sidecar_url = str(payload.get("sidecar_url") or "")
+    if sidecar_url.startswith("file://"):
+        sidecar = Path(sidecar_url[len("file://") :])
+        try:
+            manifest = json.loads(sidecar.read_text())
+            manifest["director_review"] = take_summary
+            text = json.dumps(manifest, indent=2, sort_keys=True)
+            # The interaction lookup reads sidecars up to _SIDECAR_MAX_BYTES and
+            # skips larger ones, which would lose the backend a continuation
+            # must run on. Routing outranks the review.
+            if len(text.encode()) > _SIDECAR_MAX_BYTES:
+                return False
+            sidecar.write_text(text)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not add the review to %s: %s", sidecar, exc)
+            return False
+    elif isinstance(payload.get("manifest"), dict):
+        payload["manifest"]["director_review"] = take_summary
+    return True
+
+
+async def _directed(ctx: Context[ServerSession, AppContext], **kwargs: Any) -> Any:
+    """Run a generation tool under the virtual director; see _directed_unguarded.
+
+    The director hook sits before each tool's own try/except, so this is the
+    boundary that turns any failure inside the director into the
+    ``{"error": ...}`` body every tool otherwise returns, instead of an
+    unhandled exception the host reports as a bare tool failure.
+    """
+    try:
+        return await _directed_unguarded(ctx, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the tool boundary
+        await ctx.error(f"Directed render failed: {exc}")
+        logger.exception("Director error")
+        body = json.dumps({"error": str(exc)})
+        return (
+            [TextContent(type="text", text=body)]
+            if kwargs.get("returns_content")
+            else body
+        )
+
+
+async def _directed_unguarded(
+    ctx: Context[ServerSession, AppContext],
+    *,
+    render: Any,
+    returns_content: bool,
+    media_kind: MediaKind,
+    prompt: str,
+    notes: str,
+    max_retakes: int,
+    dry_run: bool,
+    references: list[tuple[Any, str, str]] | None = None,
+    unshown_inputs: list[str] | None = None,
+    duration_s: float | None = None,
+    audio_requested: bool | None = None,
+    deadline_s: float | None = None,
+) -> Any:
+    """Run a generation tool under the virtual director.
+
+    ``render(prompt, dry_run, timeout)`` calls the tool itself without notes
+    and returns what the tool returns; ``timeout`` is the time left on
+    ``deadline_s``, or None. A dry run quotes the worst case: every take
+    rendered and reviewed, at the output cap, with no cache hits. A real run
+    derives the checks, then renders and reviews take by take until a take
+    passes, a review cannot decide, or the retakes run out, and returns the
+    best take with every take's result and cost.
+
+    ``references`` are the images the render was given, from
+    _review_references. The reviewer sees every one the render is anchored
+    on and the first _DIRECTOR_MAX_REFERENCES of each list.
+    ``unshown_inputs`` names inputs the reviewer cannot see at all, such as
+    reference clips. Every image left out is named in a warning.
+
+    ``deadline_s`` bounds the whole call, renders included. MCP hosts cancel a
+    tool call after a few minutes, and a cancelled call has still billed its
+    renders, so the director skips a review or a retake that could not finish
+    in the time left, and says so, rather than letting the host cut it off.
+    """
+    from . import director
+    from .pricing import (
+        actual_understanding_cost,
+        cost_to_dict,
+        estimate_understanding_cost,
+        sum_costs,
+    )
+
+    app_ctx = ctx.request_context.lifespan_context
+    warnings: list[str] = []
+    started = time.monotonic()
+
+    def _remaining() -> float | None:
+        if deadline_s is None:
+            return None
+        return deadline_s - (time.monotonic() - started)
+
+    def _capped(limit: float) -> float:
+        """``limit``, or less when the caller's deadline is nearer."""
+        remaining = _remaining()
+        return limit if remaining is None else max(1.0, min(limit, remaining))
+
+    def _error(message: str) -> Any:
+        body = json.dumps({"error": message})
+        return [TextContent(type="text", text=body)] if returns_content else body
+
+    async def _finish(payload: dict[str, Any], others: list[Any]) -> Any:
+        if warnings:
+            payload["warnings"] = [*(payload.get("warnings") or []), *warnings]
+            await _emit_warnings(ctx, warnings)
+        text = _respond(app_ctx, payload)
+        return (
+            [*others, TextContent(type="text", text=text)] if returns_content else text
+        )
+
+    try:
+        notes = director.validate_director_request(notes, max_retakes)
+        model = director.director_model()
+    except ValueError as exc:
+        return _error(str(exc))
+
+    supplied = references or []
+    over_limit = [
+        ref
+        for ref, _, _ in supplied
+        if ref.kind in director.LISTED_KINDS and ref.index > _DIRECTOR_MAX_REFERENCES
+    ]
+    references_s = [item for item in supplied if item[0] not in over_limit]
+    if over_limit:
+        warnings.append(
+            f"The reviewer is shown at most {_DIRECTOR_MAX_REFERENCES} images from "
+            f"each list, so it was not shown {_named(over_limit)}; a check that "
+            "needs one is answered unsure."
+        )
+    for unshown in unshown_inputs or []:
+        warnings.append(f"The reviewer is not shown {unshown}.")
+    takes_max = 1 + max_retakes
+
+    if dry_run:
+        raw = await render(prompt, True)
+        payload, others = _tool_payload(raw)
+        if "error" in payload:
+            return raw
+        per_take = _cost_estimate_from_dict(payload.get("estimated_cost"))
+        # The tool's own quote resolves the length that will render (snapped,
+        # forced to 8 s for references, extended, or an edit's upper bound),
+        # and the review watches that clip, not the one requested.
+        quoted_length = payload.get("duration_seconds")
+        review_seconds = (
+            float(quoted_length)
+            if isinstance(quoted_length, (int, float))
+            and not isinstance(quoted_length, bool)
+            else duration_s
+        )
+        # A retake prompt carries up to MAX_CHECKS fix notes on top of the
+        # caller's, so the review is quoted with the longest prompt it can see.
+        longest_prompt = prompt + "x" * (
+            director.MAX_CHECKS * (director.MAX_CHECK_CHARS + 20)
+        )
+        derive_cost = estimate_understanding_cost(
+            model,
+            director.derive_input_tokens(notes, prompt),
+            director.DERIVE_MAX_OUTPUT_TOKENS,
+            label="derive call",
+        )
+        review_cost = estimate_understanding_cost(
+            model,
+            director.review_input_tokens(
+                longest_prompt,
+                media_kind,
+                duration_s=review_seconds,
+                reference_count=len(references_s),
+            ),
+            director.review_max_output_tokens(media_kind),
+            calls=takes_max,
+            label="review call",
+        )
+        director_cost = sum_costs([derive_cost, review_cost], label="director")
+        payload["estimated_cost"] = cost_to_dict(
+            sum_costs([per_take] * takes_max + [director_cost], label="directed render")
+        )
+        payload["director"] = {
+            "model": model,
+            "max_takes": takes_max,
+            "render_estimated_cost_per_take": cost_to_dict(per_take),
+            "director_estimated_cost": cost_to_dict(director_cost),
+            "how_to_read": (
+                "estimated_cost prices the worst case: every take rendered and "
+                "reviewed, each director call at its output cap, no cache hits. "
+                "The call stops early as soon as a take passes. Three charges "
+                "cannot be priced in advance and are not included: an image "
+                "render's input tokens (generate_image quotes output only), a "
+                "director request that fails without reporting its usage, and "
+                "a render that fails with a server error or a timeout and is "
+                "tried again, which may bill for the failed attempt. A warning "
+                "names either of the last two if it happens."
+            ),
+        }
+        return await _finish(payload, others)
+
+    # Validate the render before paying for any director call: the tool's
+    # own dry run applies every check the render would, and costs nothing.
+    preflight = await render(prompt, True)
+    if "error" in _tool_payload(preflight)[0]:
+        return preflight
+
+    client = _director_client(app_ctx)
+    backend = (
+        "vertex" if getattr(client._api_client, "vertexai", False) else "gemini_api"
+    )
+    director_costs: list[Any] = []
+
+    prepared_references: list[tuple[bytes, str, Any]] = []
+    unreadable: list[Any] = []
+
+    async def read_references() -> None:
+        for ref, kind, value in references_s:
+            data = None
+            try:
+                data = (
+                    _decode_base64_capped(value)
+                    if kind == "base64"
+                    else await fetch(
+                        value,
+                        allowed_dir=app_ctx.data_folder,
+                        allowed_gcs_buckets=app_ctx.allowed_gcs_buckets,
+                    )
+                )
+                if data is not None:
+                    ref_bytes, ref_mime = await asyncio.to_thread(
+                        director.prepare_review_image, data
+                    )
+                    prepared_references.append((ref_bytes, ref_mime, ref))
+                    continue
+            except Exception:  # noqa: BLE001 - an unreadable reference is left out
+                pass
+            unreadable.append(ref)
+
+    # Read before the first render, so with a deadline it is bounded too: a
+    # slow reference must not spend the time the renders need.
+    try:
+        await asyncio.wait_for(
+            read_references(), _capped(_DIRECTOR_REFERENCE_READ_SECONDS)
+        )
+    except TimeoutError:
+        done = {*unreadable, *(ref for _, _, ref in prepared_references)}
+        warnings.append(
+            "Reading the reference images did not finish in time, so the "
+            "reviewer was not shown "
+            + _named([ref for ref, _, _ in references_s if ref not in done])
+            + "."
+        )
+    if unreadable:
+        warnings.append(
+            f"The reviewer was not shown {_named(unreadable)}: it could not be "
+            "read as an image."
+        )
+
+    system, user = director.build_derive_request(notes, prompt, media_kind)
+    checks: list[Any] = []
+    skipped: list[Any] = []
+    abstained: tuple[str | None, str | None] | None = None
+    # The same notes, prompt and model give the same checks, so a request
+    # this process has already paid for is not sent again.
+    cache_key = director.derive_cache_key(model, system, user)
+    cached = director.cached_derivation(cache_key)
+    if cached is not None:
+        await ctx.info("Director: reusing the checks derived earlier for these notes")
+        checks, skipped = cached
+    else:
+        await ctx.info(f"Director: turning the notes into checks with {model}")
+        derived = await director.call_model(
+            client,
+            model,
+            system=system,
+            parts=[types.Part(text=user)],
+            schema=director.DERIVE_SCHEMA,
+            thinking_level=director.DERIVE_THINKING_LEVEL,
+            max_output_tokens=director.DERIVE_MAX_OUTPUT_TOKENS,
+            seed=director.request_seed(model, system, user),
+            timeout_s=_capped(director.DERIVE_TIMEOUT_SECONDS),
+        )
+        director_costs.append(
+            actual_understanding_cost(model, derived.usage, label="derive call")
+        )
+        if derived.unreported:
+            warnings.append(_DIRECTOR_UNREPORTED_WARNING)
+        if derived.status != "ok":
+            abstained = (derived.reason, derived.detail)
+        else:
+            try:
+                checks, skipped = director.parse_derived(
+                    derived.text or "", notes, media_kind
+                )
+                director.remember_derivation(cache_key, checks, skipped)
+            except ValueError as exc:
+                abstained = ("parse_failed", str(exc))
+
+    block: dict[str, Any] = {
+        "model": model,
+        "backend": backend,
+        "checks": [_check_payload(c) for c in checks],
+    }
+    block["checks_source"] = "cache" if cached is not None else "compiled"
+    # Always a list, so a reader need not tell "none" from "not reported".
+    block["skipped_notes"] = [{"text": s.text, "reason": s.reason} for s in skipped]
+
+    if not checks:
+        # Nothing to check against: render once, as the tool would have, and
+        # say why the director stood down. The render is never withheld.
+        raw = await render(prompt, False, _remaining())
+        payload, others = _tool_payload(raw)
+        if abstained:
+            block.update(status="abstained", reason=abstained[0])
+            if abstained[1]:
+                block["detail"] = abstained[1]
+        else:
+            block["status"] = "no_checks"
+        block["cost"] = cost_to_dict(_director_subtotal(director_costs))
+        payload["director"] = block
+        _add_total_cost(payload, [payload.get("cost")], director_costs)
+        return await _finish(payload, others)
+
+    call_deadline = None if deadline_s is None else started + deadline_s
+    review_context: dict[str, Any] = {
+        "model": model,
+        "director_notes": notes,
+        "checks": block["checks"],
+        "checks_source": block["checks_source"],
+        "skipped_notes": block["skipped_notes"],
+    }
+    takes: list[dict[str, Any]] = []
+    reviews: list[Any] = []
+    render_costs: list[Any] = []
+    # One entry per attempted take, rendered or not, in order.
+    attempted: list[dict[str, Any]] = []
+    take_prompt = prompt
+    # How long the last render took: what a retried render is assumed to need.
+    last_render_seconds = 0.0
+    for attempt in range(takes_max):
+        await ctx.info(f"Director: rendering take {attempt + 1} of at most {takes_max}")
+        take_started = time.monotonic()
+        render_started = take_started
+        raw = await render(take_prompt, False, _remaining())
+        payload, others = _tool_payload(raw)
+        render_attempts = 1
+        render_retried: list[str] = []
+        render_waits: list[float] = []
+        render_retry_skipped: str | None = None
+        while (retry_reason := _render_retry_reason(payload)) and len(
+            render_retried
+        ) < len(director.RENDER_RETRY_WAITS):
+            # Further requests, each only when the time left fits the wait,
+            # a render like the last one and a review. Image quotas recover
+            # over tens of seconds, so the waits grow, and a 429 that says
+            # how long to wait is believed, within that budget.
+            after_wait = last_render_seconds + _DIRECTOR_MIN_REVIEW_SECONDS[media_kind]
+            remaining = _remaining()
+            wait = director.RENDER_RETRY_WAITS[len(render_retried)]
+            asked = payload.get("retry_after_seconds")
+            if isinstance(asked, (int, float)) and not isinstance(asked, bool):
+                wait = (
+                    float(asked)
+                    if remaining is None
+                    else min(float(asked), max(0.0, remaining - after_wait))
+                )
+            if remaining is not None and remaining < wait + after_wait:
+                render_retry_skipped = (
+                    f"{max(remaining, 0):.0f}s of timeout_seconds remained; a "
+                    f"retry needs {wait + after_wait:.0f}s for the wait, a render "
+                    "and a review."
+                )
+                break
+            if retry_reason == "transient":
+                # Google may have taken the failed request; nothing says
+                # whether it billed, so the total is a lower bound.
+                render_costs.append(None)
+                if not render_retried or "transient" not in render_retried:
+                    warnings.append(
+                        f"Take {attempt + 1}'s render failed with a server error "
+                        "or a timeout and was tried again. If a failed request "
+                        "reached Google it may still bill, and that charge is "
+                        "not in cost."
+                    )
+            await ctx.info(
+                f"Director: take {attempt + 1} was not rendered ({retry_reason}); "
+                f"trying again after {wait:g}s"
+            )
+            await _wait(wait)
+            render_waits.append(wait)
+            render_retried.append(retry_reason)
+            render_attempts += 1
+            render_started = time.monotonic()
+            raw = await render(take_prompt, False, _remaining())
+            payload, others = _tool_payload(raw)
+        media_url = payload.get("image_url") or payload.get("video_url")
+        if "error" in payload or not media_url:
+            # Listed like any take, so its prompt (a retake's fix notes
+            # included) can be read even though nothing rendered.
+            not_rendered: dict[str, Any] = {
+                "take": attempt + 1,
+                "prompt": take_prompt,
+                "verdict": "not_rendered",
+                "error": payload.get("error") or "The model returned no media.",
+                "render_attempts": render_attempts,
+            }
+            if render_retried:
+                not_rendered["render_retried_after"] = render_retried
+                not_rendered["render_retry_waits"] = [
+                    _seconds_value(w) for w in render_waits
+                ]
+            if render_retry_skipped:
+                not_rendered["reason"] = "budget"
+                not_rendered["render_retry_skipped"] = render_retry_skipped
+            # What the failed take may still bill, by how far it got. The tool
+            # says so explicitly in "submission"; an absent operation name is
+            # not enough to tell a local failure from a submitted render.
+            submission = payload.get("submission")
+            billed: Any = None
+            if submission:
+                not_rendered["submission"] = submission
+            # The handle a caller needs to find, resume or reconcile the
+            # render this take may still be billed for.
+            for handle in ("operation_name", "interaction_id"):
+                if payload.get(handle):
+                    not_rendered[handle] = payload[handle]
+            if submission == "submitted":
+                # Veo quotes what it may bill as attempted_cost; omni does not,
+                # and a missing figure makes the total a lower bound.
+                billed = payload.get("attempted_cost")
+                render_costs.append(billed)
+            elif submission == "unknown":
+                render_costs.append(None)
+            elif "error" not in payload and payload.get("cost"):
+                # A billed answer with no media, such as an image model's
+                # text-only refusal.
+                billed = payload["cost"]
+                render_costs.append(billed)
+            if billed:
+                not_rendered["render_cost"] = billed
+            attempted.append(not_rendered)
+            if not takes:
+                # The first take produced nothing to review: hand back exactly
+                # what the tool returned, with what the director spent.
+                block.update(status="abstained", reason="no_media")
+                block["retakes_used"] = 0
+                block["takes"] = attempted
+                block["cost"] = cost_to_dict(_director_subtotal(director_costs))
+                payload["director"] = block
+                if "error" not in payload:
+                    _add_total_cost(payload, [payload.get("cost")], director_costs)
+                return await _finish(payload, others)
+            warnings.append(
+                f"Take {attempt + 1} did not render, so the director kept the best "
+                f"earlier take: {not_rendered['error']}"
+            )
+            if submission == "submitted":
+                warnings.append(
+                    f"Take {attempt + 1} was submitted before it failed and may "
+                    "still complete and bill; "
+                    + (
+                        "its quoted cost is included in cost."
+                        if billed
+                        else "its cost is unknown, so cost is a lower bound."
+                    )
+                )
+            elif submission == "unknown":
+                warnings.append(
+                    f"Take {attempt + 1} may have reached Google before it failed; "
+                    "if it did, it may still bill, so cost is a lower bound."
+                )
+            break
+        last_render_seconds = time.monotonic() - render_started
+        render_costs.append(payload.get("cost"))
+        remaining = _remaining()
+        if (
+            remaining is not None
+            and remaining < _DIRECTOR_MIN_REVIEW_SECONDS[media_kind]
+        ):
+            review, review_cost, trimmed = (
+                director.TakeReview(
+                    status="abstained",
+                    reason="deadline",
+                    detail=(
+                        f"{max(remaining, 0):.0f}s of timeout_seconds remained "
+                        "after the render, too little for a review."
+                    ),
+                    attempts=0,
+                ),
+                None,
+                [],
+            )
+        else:
+            await ctx.info(f"Director: reviewing take {attempt + 1}")
+            try:
+                review, review_cost, trimmed = await _review_take(
+                    app_ctx,
+                    client=client,
+                    model=model,
+                    checks=checks,
+                    payload=payload,
+                    take_prompt=take_prompt,
+                    media_kind=media_kind,
+                    references=prepared_references,
+                    audio_requested=audio_requested,
+                    deadline=call_deadline,
+                )
+            except Exception as exc:  # noqa: BLE001 - the take is paid for; keep it
+                logger.exception("Director review failed")
+                review, review_cost, trimmed = (
+                    director.TakeReview(
+                        status="abstained", reason="review_error", detail=str(exc)
+                    ),
+                    None,
+                    [],
+                )
+        director_costs.append(review_cost)
+        if review.unreported and _DIRECTOR_UNREPORTED_WARNING not in warnings:
+            warnings.append(_DIRECTOR_UNREPORTED_WARNING)
+        if trimmed:
+            warnings.append(
+                f"Take {attempt + 1}: the reviewer was not shown {_named(trimmed)}, "
+                "so the render fit the inline request."
+            )
+        summary: dict[str, Any] = {
+            "take": attempt + 1,
+            "prompt": take_prompt,
+            "media_url": media_url,
+            "render_cost": payload.get("cost"),
+            "review_cost": cost_to_dict(review_cost),
+        }
+        # The handle a caller needs to continue or reconcile this take, which
+        # the top level carries only for the take returned.
+        for handle in ("operation_name", "interaction_id"):
+            if payload.get(handle):
+                summary[handle] = payload[handle]
+        summary["render_attempts"] = render_attempts
+        if render_retried:
+            summary["render_retried_after"] = render_retried
+            summary["render_retry_waits"] = [_seconds_value(w) for w in render_waits]
+        if review.status == "reviewed":
+            summary["verdict"] = review.verdict
+            summary["results"] = [_check_result_payload(r) for r in review.results]
+        else:
+            summary["verdict"] = "abstained"
+            summary["reason"] = review.reason
+            if review.detail:
+                summary["detail"] = review.detail
+        # Always present, so a single attempt reads as one rather than as
+        # missing: 0 when no review was sent, 2 when one was retried.
+        summary["review_attempts"] = review.attempts
+        if review.retried:
+            # Why each earlier request failed: quota (a 429, not billed) or
+            # transient (a 5xx, which may have billed; see warnings).
+            summary["retried_after"] = list(review.retried)
+        if review.retry_skipped:
+            summary["retry_skipped"] = review.retry_skipped
+        if review.shown:
+            summary["references_shown"] = [ref.label for ref in review.shown]
+        if not _record_take_review(payload, summary, review_context):
+            warnings.append(
+                f"Take {attempt + 1}'s review was not added to its manifest: the "
+                "file would have outgrown the size the interaction lookup reads. "
+                "It is in this response."
+            )
+        takes.append({"payload": payload, "others": others, "summary": summary})
+        attempted.append(summary)
+        reviews.append(review)
+        if not director.should_retake(review, takes_max - attempt - 1):
+            break
+        # A retake takes about as long as the take before it.
+        take_seconds = time.monotonic() - take_started
+        remaining = _remaining()
+        if remaining is not None and remaining < take_seconds:
+            warnings.append(
+                f"Stopped before take {attempt + 2}: take {attempt + 1} took "
+                f"{take_seconds:.0f}s and {max(remaining, 0):.0f}s of "
+                "timeout_seconds remained. Raise timeout_seconds (and your MCP "
+                "host's limit) to leave room for retakes."
+            )
+            break
+        # Every correction so far, not only the latest: a retake restarts from
+        # the caller's prompt, so a note dropped is a correction undone.
+        take_prompt = director.retake_prompt(
+            prompt,
+            director.retake_notes(
+                checks, [r.results for r in reviews if r.status == "reviewed"]
+            ),
+        )
+
+    chosen = director.choose_take(reviews)
+    final = takes[chosen]
+    payload, others = final["payload"], final["others"]
+    chosen_review = reviews[chosen]
+    block["status"] = (
+        chosen_review.verdict if chosen_review.status == "reviewed" else "abstained"
+    )
+    if chosen_review.status != "reviewed":
+        block["reason"] = chosen_review.reason
+    block["chosen_take"] = final["summary"]["take"]
+    # Every retake the director started, rendered or not: a retake whose
+    # render failed was still spent.
+    block["retakes_used"] = len(attempted) - 1
+    block["takes"] = attempted
+    block["cost"] = cost_to_dict(_director_subtotal(director_costs))
+    block["how_to_read"] = (
+        "Each check is pass, fail, unsure or not_applicable from one review of "
+        "that take. No confidence number is reported: a model's own certainty "
+        "is not calibrated, and these states have not yet been compared with "
+        "human labels."
+    )
+    payload["director"] = block
+    _report_prompts(payload, requested=prompt, rendered=final["summary"]["prompt"])
+    if len(takes) > 1 and chosen != len(takes) - 1:
+        warnings.append(
+            f"Returned take {chosen + 1}, which the review rated best; the later "
+            "takes were also rendered and billed, and are listed under "
+            "director.takes."
+        )
+    _add_total_cost(payload, render_costs, director_costs)
+    return await _finish(payload, others)
+
+
+def _report_prompts(payload: dict[str, Any], *, requested: str, rendered: str) -> None:
+    """Keep ``prompt`` the caller's, and say what rendered when it differs.
+
+    The returned take may be a retake, rendered from the caller's prompt plus
+    fix notes. ``prompt`` stays what the caller sent and ``effective_prompt``
+    carries the text that rendered, the convention generate_video_omni already
+    follows. Omni may report an effective_prompt of its own, built from this
+    take's prompt plus its generated role declarations; that is the fuller
+    record of what was sent, so it is kept.
+    """
+    payload["prompt"] = requested
+    if rendered != requested and "effective_prompt" not in payload:
+        payload["effective_prompt"] = rendered
+
+
+def _director_subtotal(director_costs: list[Any]) -> Any:
+    """What the director's own calls billed, leaving out calls with no usage."""
+    from .pricing import sum_costs
+
+    return sum_costs([c for c in director_costs if c is not None], label="director")
+
+
+def _add_total_cost(
+    payload: dict[str, Any], render_costs: list[Any], director_costs: list[Any]
+) -> None:
+    """Make ``cost`` what the whole directed call billed.
+
+    Every take's render plus every director call. Each take's own render cost
+    stays on its entry in director.takes and in its manifest.
+    """
+    from .pricing import cost_to_dict, sum_costs
+
+    # A director call with no reported usage (it failed before Google
+    # answered) is left out rather than counted as unpriced, which would mark
+    # the whole total as a lower bound.
+    estimates = [_cost_estimate_from_dict(c) for c in render_costs] + [
+        c for c in director_costs if c is not None
+    ]
+    if all(e is None for e in estimates):
+        return
+    payload["cost"] = cost_to_dict(sum_costs(estimates, label="directed render"))
 
 
 @mcp.tool()
@@ -3425,6 +4591,8 @@ async def generate_image(
     person_generation: str | None = None,
     thought_signature_url: str | None = None,
     dry_run: bool = False,
+    director_notes: str | None = None,
+    max_retakes: int = DEFAULT_MAX_RETAKES,
 ):
     """Generate an image using Google Gemini image models.
 
@@ -3471,6 +4639,26 @@ async def generate_image(
             from a previous response to continue editing. Example workflow:
             1. First call: generate_image(prompt="Draw a cat") → returns thought_signature_url
             2. Second call: generate_image(prompt="Make it orange", thought_signature_url=<from step 1>)
+        director_notes: Optional. What the image must get right, in plain
+            words ("the label reads GOLDEN HOUR in serif capitals; no people in the shot"). Gemini 4 Argon turns the notes into checks,
+            reviews the image against them, and when a check fails
+            renders again with fix notes, up to max_retakes times. The response
+            then carries a `director` block with each check's state on every
+            take, and `cost` covers every take and every director call. Omit it
+            and the tool behaves exactly as it does without a director: no
+            extra call and no extra cost.
+            In the notes, call the image being edited "the source image" and
+            reference_image_uris[0] "reference 1", [1] "reference 2" and so on;
+            the reviewer is shown the source and the first three references.
+            Put text that must appear in quotes, exactly as it should be set
+            ('the headline reads "Slow mornings, good coffee."'): it is
+            compared character for character, case and punctuation included.
+        max_retakes: Re-renders the director may spend when a check fails, 0
+            to 2 (default 1). A dry run with director_notes quotes the worst
+            case: every take rendered and reviewed. A retake the service turns
+            away with a 429 (image quotas can allow only a few renders a
+            minute) or a server error is tried again after 10 s, then 30 s,
+            or the wait the 429 asked for, while the call's time allows.
         dry_run: When True, generate nothing and return only the cost estimate
             and the resolved model/parameters. Free and instant — use it to
             price a call before committing to it. A real run reports the
@@ -3504,6 +4692,37 @@ async def generate_image(
         A dry run reports dry_run, requested_model, model, prompt, image_size,
         estimated_cost and any warnings.
     """
+    if director_notes is not None:
+        return await _directed(
+            ctx,
+            render=lambda take_prompt, quote, _time_left=None: generate_image(
+                ctx=ctx,
+                prompt=take_prompt,
+                model=model,
+                image_uri=image_uri,
+                image_base64=image_base64,
+                reference_image_uris=reference_image_uris,
+                image_size=image_size,
+                media_resolution=media_resolution,
+                aspect_ratio=aspect_ratio,
+                person_generation=person_generation,
+                thought_signature_url=thought_signature_url,
+                dry_run=quote,
+            ),
+            returns_content=True,
+            media_kind="image",
+            prompt=prompt,
+            notes=director_notes,
+            max_retakes=max_retakes,
+            dry_run=dry_run,
+            references=_review_references(
+                _uri_or_base64("source", "image", image_uri, image_base64),
+                *(
+                    ("reference", f"reference_image_uris[{i}]", uri)
+                    for i, uri in enumerate(reference_image_uris or [])
+                ),
+            ),
+        )
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
@@ -3556,6 +4775,14 @@ async def generate_image(
             _assert_local_source(image_uri, data_dir, "image_uri")
             for ref_uri in (reference_image_uris or [])[:_MAX_IMAGE_REFERENCE_IMAGES]:
                 _assert_local_source(ref_uri, data_dir, "reference image")
+            # The inputs the render decodes and reads locally, checked the same
+            # way, so a quote is refused wherever the render would be.
+            if image_base64 and not image_uri:
+                _decode_base64_capped(image_base64)
+            if thought_signature_url:
+                await _read_thought_signature_async(
+                    _thought_signature_path(thought_signature_url), data_dir
+                )
 
             payload: dict[str, Any] = {
                 "dry_run": True,
@@ -3609,12 +4836,7 @@ async def generate_image(
         # edit into an unrelated fresh generation.
         thought_signature = None
         if thought_signature_url:
-            if not thought_signature_url.startswith("file://"):
-                raise ValueError(
-                    "thought_signature_url must be a file:// URL returned by a "
-                    f"previous generate_image call, got: {thought_signature_url}"
-                )
-            sig_path = Path(thought_signature_url[7:])
+            sig_path = _thought_signature_path(thought_signature_url)
             thought_signature = await _read_thought_signature_async(sig_path, data_dir)
 
         await ctx.info(f"Generating image with model={model}")
@@ -3724,7 +4946,12 @@ async def generate_image(
     except Exception as e:
         await ctx.error(f"Image generation failed: {e}")
         logger.exception("Tool error")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        body: dict[str, Any] = {"error": str(e)}
+        if (status := http_status(e)) is not None:
+            body["status_code"] = status
+        if (wait := retry_after_seconds(e)) is not None:
+            body["retry_after_seconds"] = wait
+        return [TextContent(type="text", text=json.dumps(body))]
 
 
 @mcp.tool()
@@ -3759,8 +4986,8 @@ async def plan_generation(
     drive them.
 
     It also catches requests that cannot work before you pay for the failure —
-    4K on a 1K-only model, extending or first/last-frame on Veo Lite, GCS
-    output on the Gemini API — and reports them as conflicts with a fix.
+    4K on a 1K-only model, Veo on the Gemini Developer API, GCS output on the
+    Gemini API — and reports them as conflicts with a fix.
 
     Args:
         ctx: MCP context with application state
@@ -3793,10 +5020,10 @@ async def plan_generation(
 
         from .routing import RoutingConstraints, plan_generation as plan_impl
 
-        # Tell the planner what this deployment can actually reach. Without
-        # it, it recommended Veo Lite — Gemini-API-only — on a Vertex server
-        # with no key, a route the real call refuses with exactly that
-        # message. The server knows; the router is pure and cannot find out.
+        # Tell the planner what this deployment can actually reach: Veo on a
+        # Gemini-API server, or omni on the Gemini API from a Vertex server
+        # with no key, are routes the real call refuses. The server knows; the
+        # router is pure and cannot find out.
         app_ctx = ctx.request_context.lifespan_context
         primary_is_vertex = bool(
             getattr(getattr(app_ctx.client, "_api_client", None), "vertexai", False)
@@ -4192,6 +5419,8 @@ async def generate_video(
     draft_resolution: str | None = None,
     timeout_seconds: float = VEO_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
+    director_notes: str | None = None,
+    max_retakes: int = DEFAULT_MAX_RETAKES,
 ) -> str:
     """Generate a video using Google VEO models.
 
@@ -4201,28 +5430,21 @@ async def generate_video(
         model: Model to use - options include:
                - "veo-3.1-generate-001": VEO 3.1 (highest quality, 4/6/8s, audio)
                - "veo-3.1-fast-generate-001": VEO 3.1 Fast (faster, 4/6/8s, audio)
-               - "veo-3.1-lite-generate-preview": VEO 3.1 Lite (most cost-effective,
-                 4/6/8s, audio; supports ONLY text-to-video and
-                 image-to-video — no extension, reference images,
-                 first/last-frame, or 4K).
-                 Availability note: Lite is served via the Gemini API / AI
-                 Studio only; Vertex AI has not published it. When the server
-                 runs in Vertex mode, Lite calls are automatically routed
-                 through the Gemini API client, so GEMINI_API_KEY must also
-                 be set to use Lite.
-                 Prefer these three names. The schema also accepts
-                 "veo-3.1-generate-preview" and "veo-3.1-fast-generate-preview"
-                 — the spellings the Gemini API backend reports back — so a
-                 model returned by a prior render round-trips; they resolve to
-                 the -001 models above.
+                 Veo runs on Vertex AI only: Google switched off its Veo 3.1
+                 models on the Gemini Developer API on 2026-10-22, so a server
+                 without Vertex credentials refuses this tool and points to
+                 generate_video_omni. Prefer these two names. The schema also
+                 accepts "veo-3.1-generate-preview" and
+                 "veo-3.1-fast-generate-preview" — the spellings older
+                 Gemini-API renders reported — so a model from such a manifest
+                 round-trips; they resolve to the -001 models above.
         aspect_ratio: 16:9 (default) or 9:16
         duration_seconds: Video duration (4/6/8s)
         include_audio: Enable audio generation
         audio_prompt: Audio description
         negative_prompt: Things to avoid in the video
         seed: Random seed for reproducibility
-        resolution: Output resolution, "720p" or "1080p". "4K" is only
-            available on the non-Lite VEO models (not veo-3.1-lite).
+        resolution: Output resolution, "720p", "1080p" or "4K".
         person_generation: Person generation policy, "allow_adult" or
             "allow_all". (Some regions restrict these values.)
         image_uri: First frame image URI for image-to-video
@@ -4236,12 +5458,9 @@ async def generate_video(
         extend_video_uri: URI of existing VEO-generated video to extend.
             Extends the final second of the video and continues the action.
             Note: Cannot be used together with other image inputs.
-            Vertex AI only: extension requires output_gcs_uri there (the larger
-            combined video exceeds inline limits), and the Gemini Developer API
-            refuses the mode outright ("encodedVideo isn't supported by this
-            model"), so the tool rejects it before spending. Billed on the
-            ASSEMBLED clip, not the ~7s appended: a 4s source extended once
-            renders and bills 11s.
+            Requires output_gcs_uri (the larger combined video exceeds inline
+            limits). Billed on the ASSEMBLED clip, not the ~7s appended: a 4s
+            source extended once renders and bills 11s.
 
             A REMOTE source (gs://, http://) makes the dry-run estimate a
             FLOOR rather than a ceiling. This is the one place a pre-flight in
@@ -4258,8 +5477,6 @@ async def generate_video(
             such exception — omni documents a maximum source length, so an
             unmeasurable source is quoted at that maximum and over-states.)
         output_gcs_uri: GCS bucket URI for large video output (e.g. gs://bucket/path/).
-            Vertex AI only — on the Gemini API, output is always returned inline
-            and an explicit output_gcs_uri is rejected.
         timeout_seconds: Overall deadline for the render (submit + polling +
             download), default 210s -- the same figure the omni tools use, for
             the same reason: common MCP hosts cap one tool call at roughly four
@@ -4271,6 +5488,32 @@ async def generate_video(
             first, with the operation name, the mode and the attempted cost.
             Raise it when your host allows a longer call; 4K is the slowest
             tier.
+        director_notes: Optional. What the clip must get right, in plain
+            words ("the mug turns left to right; the logo stays readable; no hands enter the frame"). Gemini 4 Argon turns the notes into checks,
+            reviews the clip against them, sampling it at 4 frames a second, and when a check fails
+            renders again with fix notes, up to max_retakes times. The response
+            then carries a `director` block with each check's state on every
+            take, and `cost` covers every take and every director call. Omit it
+            and the tool behaves exactly as it does without a director: no
+            extra call and no extra cost.
+            In the notes, call image_uri "the first frame", last_frame_uri
+            "the last frame" and reference_image_uris[0] "reference 1" and so
+            on; the reviewer is shown the frames and the first three
+            references. A draft is reviewed against image_uri alone, as
+            "input image 1", since that is all it renders from.
+            Put text that must appear in quotes, exactly as it should be set:
+            it is compared character for character. Say "throughout" or "the
+            whole clip" for what must hold at every moment ("steam rises
+            throughout"): it is judged one second at a time.
+        max_retakes: Re-renders the director may spend when a check fails, 0
+            to 2 (default 1). A dry run with director_notes quotes the worst
+            case: every take rendered and reviewed. A retake the service turns
+            away with a 429 (image quotas can allow only a few renders a
+            minute) or a server error is tried again after 10 s, then 30 s,
+            or the wait the 429 asked for, while the call's time allows.
+            With director_notes, timeout_seconds bounds the whole call: each
+            take renders in the time left, and a review or retake that could
+            not finish in time is skipped and reported.
         dry_run: When True, generate nothing and return only the cost
             estimate for the call that would run (the omni draft price when
             draft=True). Free and instant. A real run reports the actual
@@ -4310,6 +5553,68 @@ async def generate_video(
         requested_duration_seconds, the snapped duration_seconds that will
         actually render, and estimated_cost.
     """
+    if director_notes is not None:
+        return await _directed(
+            ctx,
+            render=lambda take_prompt, quote, time_left=None: generate_video(
+                ctx=ctx,
+                prompt=take_prompt,
+                model=model,
+                aspect_ratio=aspect_ratio,
+                duration_seconds=duration_seconds,
+                include_audio=include_audio,
+                audio_prompt=audio_prompt,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                resolution=resolution,
+                person_generation=person_generation,
+                image_uri=image_uri,
+                image_base64=image_base64,
+                last_frame_uri=last_frame_uri,
+                last_frame_base64=last_frame_base64,
+                reference_image_uris=reference_image_uris,
+                extend_video_uri=extend_video_uri,
+                output_gcs_uri=output_gcs_uri,
+                draft=draft,
+                draft_resolution=draft_resolution,
+                timeout_seconds=(
+                    timeout_seconds if time_left is None else max(1.0, time_left)
+                ),
+                dry_run=quote,
+            ),
+            returns_content=False,
+            media_kind="video",
+            prompt=prompt,
+            notes=director_notes,
+            max_retakes=max_retakes,
+            dry_run=dry_run,
+            duration_s=duration_seconds,
+            # A draft renders on omni from image_uri alone, as an input image
+            # whose use omni infers; it ignores the last frame and references,
+            # so the reviewer is not shown them either.
+            references=(
+                _review_references(
+                    _uri_or_base64("input", "image", image_uri, image_base64)
+                )
+                if draft
+                else _review_references(
+                    _uri_or_base64("first_frame", "image", image_uri, image_base64),
+                    _uri_or_base64(
+                        "last_frame", "last_frame", last_frame_uri, last_frame_base64
+                    ),
+                    *(
+                        ("reference", f"reference_image_uris[{i}]", uri)
+                        for i, uri in enumerate(reference_image_uris or [])
+                    ),
+                )
+            ),
+            unshown_inputs=(["the video being extended"] if extend_video_uri else None),
+            # A draft renders on omni, which ignores include_audio.
+            audio_requested=None if draft else include_audio,
+            deadline_s=timeout_seconds,
+        )
+    # How far a draft's omni render got, for the error body if it fails.
+    draft_submission = OmniSubmission()
     try:
         app_ctx = ctx.request_context.lifespan_context
         data_dir = app_ctx.data_folder
@@ -4347,9 +5652,9 @@ async def generate_video(
         # inputs it documents as IGNORED — `_draft_ignored_veo_params` lists
         # output_gcs_uri, yet _resolve_video_gcs raised on a Gemini-API
         # deployment before the warning naming it could ever be built, and
-        # _client_for_video_model raised for a Lite model on Vertex without
-        # GEMINI_API_KEY over a Veo client the draft never uses. The backend a
-        # draft reports is omni's, which is the one that will serve it.
+        # _client_for_video_model refuses Veo on a Gemini-API deployment, a
+        # client the draft never uses. The backend a draft reports is omni's,
+        # which is the one that will serve it.
         video_client: genai.Client | None = None
         if draft:
             is_vertex_client = _omni_backend_is_vertex(app_ctx)
@@ -4367,6 +5672,13 @@ async def generate_video(
             )
 
         if dry_run:
+            # Inline images are decoded by the render; decode them here too,
+            # so a quote is refused wherever the render would be.
+            if image_base64 and not image_uri:
+                _decode_base64_capped(image_base64)
+            # A draft ignores the last frame, so it is not checked for one.
+            if last_frame_base64 and not last_frame_uri and not draft:
+                _decode_base64_capped(last_frame_base64)
             # Draft mode routes to omni, which serves a plain text/image
             # request and snaps on its own [3, 10]s clamp — the Veo modes
             # below do not apply to it.
@@ -4374,9 +5686,7 @@ async def generate_video(
             if not draft:
                 # Same checks the impl applies, so a quote can never succeed
                 # for a render the real call would refuse. The mode is derived
-                # the way the impl derives it — a Lite quote used to price
-                # extension, reference and first/last-frame calls it cannot
-                # serve, because only the resolution rule was shared.
+                # the way the impl derives it and reported on the quote.
                 from .video import validate_render_options
 
                 if extend_video_uri:
@@ -4391,20 +5701,17 @@ async def generate_video(
                     quoted_mode = "image_to_video"
                 else:
                     quoted_mode = "text_to_video"
-                # The backend is as much a constraint as the model: Veo on
-                # the Gemini Developer API refuses every mode that conditions
-                # on existing footage, and this quote used to price those
-                # calls cleanly while reporting that very backend beside them.
+                # The backend is as much a constraint as the model: Veo has
+                # no endpoint on the Gemini Developer API at all.
                 validate_render_options(
                     model,
                     resolution,
-                    quoted_mode,
                     backend=_backend_of(app_ctx, str(model)),
                 )
 
                 # Refuse a local source the real run would reject, so a quote
                 # does not price a render that cannot fetch its inputs. AFTER
-                # validate_render_options so a Lite mode-restriction still takes
+                # validate_render_options so a model or backend refusal takes
                 # precedence (mirrors generate_bridge). base64 frames are inline
                 # bytes, not paths, so they are never passed here. References
                 # are sliced to what the render fetches (reference_image_uris[:
@@ -4606,6 +5913,10 @@ async def generate_video(
                 duration_seconds=duration_seconds,
                 resolution=draft_res,
                 manifest_extra=extra,
+                # The caller's deadline holds for a draft too; the default
+                # matches omni's own, so an unset one changes nothing.
+                timeout_seconds=max(1, int(timeout_seconds)),
+                submission=draft_submission,
             )
             if ignored:
                 result.setdefault("warnings", []).append(
@@ -4679,9 +5990,6 @@ async def generate_video(
                     )
                 reference_images.append(ref_bytes)
 
-        # Resolve the client up front: Veo Lite (and pure Gemini-API
-        # deployments) route to the Gemini API, which does not support GCS
-        # output. GCS behavior below depends on which backend is used.
         # video_client / is_vertex_client / gcs_uri are resolved in the
         # pre-flight above, so the quote and the render cannot disagree about
         # the destination.
@@ -4697,9 +6005,8 @@ async def generate_video(
                 if extend_bucket is None:
                     raise ValueError(f"Invalid extend_video_uri: {extend_video_uri}")
                 _assert_gcs_bucket_allowed(extend_bucket, app_ctx.allowed_gcs_buckets)
-            # On Vertex, extensions produce a larger combined video that must be
-            # written to GCS. On the Gemini API there is no GCS output; the
-            # extended clip is downloaded inline, so no GCS target is required.
+            # Extensions produce a larger combined video that must be written
+            # to GCS.
             if is_vertex_client and not gcs_uri:
                 raise ValueError(
                     "Video extension on Vertex AI requires output_gcs_uri (or a "
@@ -4857,8 +6164,8 @@ async def generate_video(
             "prompt": prompt,
             "audio_prompt": audio_prompt,
             "negative_prompt": negative_prompt,
-            # The model that actually ran: the impl translates Veo IDs
-            # per backend (the Gemini API serves -preview spellings).
+            # The model that actually ran: the impl normalizes an older
+            # Gemini-API `-preview` spelling to its `-001` name.
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
@@ -4877,7 +6184,7 @@ async def generate_video(
             "extend_video_uri": extend_video_uri,
         }
         # Surface any warnings the impl emitted for silently-dropped caller
-        # intent (e.g. include_audio ignored on the Gemini API path).
+        # intent (e.g. a negative seed that was not sent).
         warnings = result.get("warnings")
         if warnings:
             manifest["warnings"] = warnings
@@ -4922,6 +6229,10 @@ async def generate_video(
         # Structured, naming the mode, the attempted cost and -- for a timeout
         # -- the operation that may still complete and bill.
         body: dict[str, Any] = {"error": str(e)}
+        if (status := http_status(e)) is not None:
+            body["status_code"] = status
+        if (wait := retry_after_seconds(e)) is not None:
+            body["retry_after_seconds"] = wait
         body.update(
             _veo_attempt_facts(
                 model=model, draft=draft, draft_resolution=draft_resolution,
@@ -4938,19 +6249,33 @@ async def generate_video(
         advice = _veo_access_advice(e)
         if advice:
             body["advice"] = advice
+        # How far the render got, said explicitly: an absent operation name
+        # cannot tell a local failure from a request that may have reached
+        # Google. A draft runs on omni, which tracks its own.
+        submission = (
+            draft_submission.state(e) if draft else getattr(e, "submission", "none")
+        )
+        operation_name = getattr(e, "operation_name", None)
+        interaction_id = draft_submission.interaction_id if draft else None
+        if isinstance(e, TimeoutError) or submission != "none":
+            body["submission"] = submission
+            if operation_name:
+                body["operation_name"] = operation_name
+            if interaction_id:
+                body["interaction_id"] = interaction_id
+            handle = (
+                f"Operation {operation_name}"
+                if operation_name
+                else (f"Interaction {interaction_id}" if interaction_id else None)
+            )
+            body["note"] = _submission_note(submission, handle=handle)
         if isinstance(e, TimeoutError):
             body["timed_out"] = True
             body["timeout_seconds"] = timeout_seconds
-            operation_name = getattr(e, "operation_name", None)
             body["operation_name"] = operation_name
             body["note"] = (
                 "The deadline passed before the render finished. "
-                + (
-                    f"Operation {operation_name} was submitted and may still "
-                    "complete and bill; reconcile it in the console."
-                    if operation_name
-                    else "The request had not been submitted, so nothing was billed."
-                )
+                + body["note"]
                 + " Raise timeout_seconds if your host allows a longer call."
             )
         return _respond(ctx.request_context.lifespan_context, body)
@@ -4983,8 +6308,7 @@ async def generate_transition(
         first_frame_uri: URI of the starting still (gs://, https://, file://)
         last_frame_uri: URI of the ending still (gs://, https://, file://)
         prompt: Description of the transition motion and style
-        model: VEO model (defaults to fast; Lite does NOT support
-            first/last-frame mode and cannot be used here)
+        model: VEO model (defaults to fast)
         duration_seconds: Transition length. Veo renders 4, 6 or 8s only;
             others snap to the nearest, ties down (5 -> 4, 7 -> 6).
         aspect_ratio: 16:9 or 9:16 (must match clip aspect for clean cuts)
@@ -5024,20 +6348,18 @@ async def generate_transition(
         )
 
         if dry_run:
-            # Both tools are first/last-frame renders by definition, which
-            # Veo Lite cannot serve — the docstrings said so but nothing
-            # enforced it on the quote path.
+            # Same rule the render applies, so the quote cannot price a call
+            # the backend refuses.
             from .video import validate_render_options
 
             validate_render_options(
                 model,
-                generation_mode="first_last_frame",
                 backend=_backend_of(app_ctx, model),
             )
 
             # Refuse a local frame the real run would reject, so a quote does
             # not price a transition that cannot fetch its frames. After
-            # validate_render_options so a Lite mode-restriction still takes
+            # validate_render_options so a backend refusal still takes
             # precedence (mirrors generate_bridge); remote frames (gs://) are
             # uncheckable offline and still price.
             _assert_local_source(first_frame_uri, data_dir, "first_frame_uri")
@@ -5144,8 +6466,8 @@ async def generate_transition(
             "prompt": prompt,
             "audio_prompt": audio_prompt,
             "negative_prompt": negative_prompt,
-            # The model that actually ran: the impl translates Veo IDs
-            # per backend (the Gemini API serves -preview spellings).
+            # The model that actually ran: the impl normalizes an older
+            # Gemini-API `-preview` spelling to its `-001` name.
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
@@ -5256,20 +6578,18 @@ async def generate_bridge(
         )
 
         if dry_run:
-            # Both tools are first/last-frame renders by definition, which
-            # Veo Lite cannot serve — the docstrings said so but nothing
-            # enforced it on the quote path.
+            # Same rule the render applies, so the quote cannot price a call
+            # the backend refuses.
             from .video import validate_render_options
 
             validate_render_options(
                 model,
-                generation_mode="first_last_frame",
                 backend=_backend_of(app_ctx, model),
             )
 
             # Refuse a local clip the real run would reject, so a quote does not
             # price a bridge that cannot render. After validate_render_options so
-            # a Lite mode-restriction error still takes precedence; remote clips
+            # a backend refusal still takes precedence; remote clips
             # (gs://) are uncheckable offline and still price.
             _assert_local_source(from_clip_uri, data_dir, "from_clip_uri")
             _assert_local_source(to_clip_uri, data_dir, "to_clip_uri")
@@ -5386,8 +6706,8 @@ async def generate_bridge(
             "prompt": prompt,
             "audio_prompt": audio_prompt,
             "negative_prompt": negative_prompt,
-            # The model that actually ran: the impl translates Veo IDs
-            # per backend (the Gemini API serves -preview spellings).
+            # The model that actually ran: the impl normalizes an older
+            # Gemini-API `-preview` spelling to its `-001` name.
             "model": result.get("model", model),
             "aspect_ratio": aspect_ratio,
             "duration_seconds": result.get("duration_seconds", duration_seconds),
@@ -5630,10 +6950,15 @@ async def generate_clip(
 
             validate_render_options(
                 model,
-                generation_mode="first_last_frame",
                 backend=_backend_of(app_ctx, str(model)),
             )
             preflight.append("ffmpeg available for frame decoding (bridges)")
+
+        if not animatic:
+            # The routing rule the render applies below, asked before the
+            # quote too, so a dry run cannot price beats no client can serve
+            # (Veo on a Gemini-API deployment).
+            _client_for_video_model(app_ctx, model)
 
         if dry_run:
             est_model = animatic_model if animatic else model
@@ -5688,8 +7013,8 @@ async def generate_clip(
             return _respond(app_ctx, dry_payload)
 
         # Resolve the client ONCE, before the beat loop. If the model can't be
-        # routed (e.g. a Lite model on Vertex with no GEMINI_API_KEY, or omni
-        # with no Gemini API access), let the RuntimeError propagate to the
+        # routed (e.g. Veo on a Gemini-API deployment, or omni with no Gemini
+        # API access), let the RuntimeError propagate to the
         # outer handler so the tool returns a top-level {"error": ...} rather
         # than failing every beat individually and returning a success-shaped
         # clip with empty segments.
@@ -5882,7 +7207,7 @@ async def generate_clip(
             if beat_duration_source:
                 beat_manifest["duration_source"] = beat_duration_source
             # Surface any warnings the impl emitted for this beat (e.g.
-            # include_audio ignored on the Gemini API path) in the beat
+            # a negative seed that was not sent) in the beat
             # manifest and aggregate them into the clip-level warnings.
             beat_warnings = beat_result.get("warnings")
             if beat_warnings:
@@ -6062,6 +7387,8 @@ async def generate_video_omni(
     output_gcs_uri: str | None = None,
     timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
+    director_notes: str | None = None,
+    max_retakes: int = DEFAULT_MAX_RETAKES,
 ) -> str:
     """Generate a video fast with an Omni model (Interactions API).
 
@@ -6075,7 +7402,7 @@ async def generate_video_omni(
       first/last-frame interpolation, image and video references, native
       audio, and video extension (see extend_video_omni).
     * `gemini-omni-flash-preview` — 720p/24fps and nothing else. Deprecated;
-      its endpoint is switched off on 2026-09-30.
+      its endpoint is switched off on 2026-10-22.
 
     A 360p pass costs about a third of 720p, which makes it the cheapest
     preview this server can render.
@@ -6091,7 +7418,7 @@ async def generate_video_omni(
             background music").
         omni_model: "gemini-omni-1.1-flash" (default) or the deprecated
             "gemini-omni-flash-preview", whose endpoint is switched off on
-            2026-09-30. Arguments the chosen model cannot honor are refused,
+            2026-10-22. Arguments the chosen model cannot honor are refused,
             never dropped.
         image_uris: Optional input images whose role the model infers — one is
             treated as a starting frame, several as subject references
@@ -6144,6 +7471,31 @@ async def generate_video_omni(
             vertex. The response reports `backend` and `backend_reason`. An
             unsatisfiable choice is refused, as is one that contradicts the
             backend a previous_interaction_id was minted on.
+        director_notes: Optional. What the clip must get right, in plain
+            words ("the mug turns left to right; the logo stays readable; no hands enter the frame"). Gemini 4 Argon turns the notes into checks,
+            reviews the clip against them, sampling it at 4 frames a second, and when a check fails
+            renders again with fix notes, up to max_retakes times. The response
+            then carries a `director` block with each check's state on every
+            take, and `cost` covers every take and every director call. Omit it
+            and the tool behaves exactly as it does without a director: no
+            extra call and no extra cost.
+            In the notes, call first_frame_uri "the first frame",
+            last_frame_uri "the last frame", image_uris[0] "input image 1" and
+            reference_image_uris[0] "reference 1" (or <IMAGE_REF_0>) and so
+            on; the reviewer is shown the frames and the first three of each
+            list. Put text that must appear in quotes, exactly as it should be
+            set: it is compared character for character. Say "throughout" or
+            "the whole clip" for what must hold at every moment ("steam rises
+            throughout"): it is judged one second at a time.
+        max_retakes: Re-renders the director may spend when a check fails, 0
+            to 2 (default 1). A dry run with director_notes quotes the worst
+            case: every take rendered and reviewed. A retake the service turns
+            away with a 429 (image quotas can allow only a few renders a
+            minute) or a server error is tried again after 10 s, then 30 s,
+            or the wait the 429 asked for, while the call's time allows.
+            With director_notes, timeout_seconds bounds the whole call: each
+            take renders in the time left, and a review or retake that could
+            not finish in time is skipped and reported.
         dry_run: When True, return only the cost estimate for the clamped
             duration and generate nothing.
 
@@ -6151,6 +7503,62 @@ async def generate_video_omni(
         JSON with video_url, interaction_id (pass to edit_video /
         extend_video_omni / this tool to keep going), and generation details.
     """
+    if director_notes is not None:
+        return await _directed(
+            ctx,
+            render=lambda take_prompt, quote, time_left=None: generate_video_omni(
+                ctx=ctx,
+                prompt=take_prompt,
+                omni_model=omni_model,
+                omni_backend=omni_backend,
+                image_uris=image_uris,
+                first_frame_uri=first_frame_uri,
+                last_frame_uri=last_frame_uri,
+                reference_image_uris=reference_image_uris,
+                reference_video_uris=reference_video_uris,
+                input_video_uri=input_video_uri,
+                aspect_ratio=aspect_ratio,
+                duration_seconds=duration_seconds,
+                resolution=resolution,
+                previous_interaction_id=previous_interaction_id,
+                output_gcs_uri=output_gcs_uri,
+                timeout_seconds=(
+                    timeout_seconds if time_left is None else max(1, int(time_left))
+                ),
+                dry_run=quote,
+            ),
+            returns_content=False,
+            media_kind="video",
+            prompt=prompt,
+            notes=director_notes,
+            max_retakes=max_retakes,
+            dry_run=dry_run,
+            duration_s=duration_seconds,
+            references=_review_references(
+                ("first_frame", "first_frame_uri", first_frame_uri),
+                ("last_frame", "last_frame_uri", last_frame_uri),
+                *(
+                    ("input", f"image_uris[{i}]", uri)
+                    for i, uri in enumerate(image_uris or [])
+                ),
+                *(
+                    ("reference", f"reference_image_uris[{i}]", uri)
+                    for i, uri in enumerate(reference_image_uris or [])
+                ),
+                omni=True,
+            ),
+            unshown_inputs=[
+                what
+                for what, given in (
+                    ("the reference clips", reference_video_uris),
+                    ("the input video", input_video_uri),
+                )
+                if given
+            ],
+            deadline_s=timeout_seconds,
+        )
+    # How far the render got, for the error body if it fails.
+    omni_submission = OmniSubmission()
     try:
         app_ctx = ctx.request_context.lifespan_context
         # Which backend serves this call, decided once and reported; see
@@ -6406,6 +7814,7 @@ async def generate_video_omni(
             resolution=normalized_resolution,
             output_gcs_uri=output_gcs_uri,
             timeout_seconds=timeout_seconds,
+            submission=omni_submission,
             manifest_extra={
                 "image_uris": image_uris,
                 "first_frame_uri": first_frame_uri,
@@ -6428,7 +7837,24 @@ async def generate_video_omni(
     except Exception as e:
         await ctx.error(f"Omni video generation failed: {e}")
         logger.exception("Tool error")
-        return json.dumps({"error": str(e)})
+        omni_body: dict[str, Any] = {"error": str(e)}
+        if (status := http_status(e)) is not None:
+            omni_body["status_code"] = status
+        if (wait := retry_after_seconds(e)) is not None:
+            omni_body["retry_after_seconds"] = wait
+        state = omni_submission.state(e)
+        if isinstance(e, TimeoutError) or state != "none":
+            omni_body["submission"] = state
+            omni_body["timed_out"] = isinstance(e, TimeoutError)
+            if omni_submission.interaction_id:
+                omni_body["interaction_id"] = omni_submission.interaction_id
+            handle = (
+                f"Interaction {omni_submission.interaction_id}"
+                if omni_submission.interaction_id
+                else None
+            )
+            omni_body["note"] = _submission_note(state, handle=handle)
+        return json.dumps(omni_body)
 
 
 @mcp.tool()
@@ -7193,8 +8619,8 @@ async def loop_extend(
 
     Each Veo extension continues the video by ~7 seconds; this chains them,
     feeding each extended result back in as the source for the next. Veo
-    supports up to 20 extensions. Output is 720p. Not supported on Veo 3.1
-    Lite. On Vertex AI, extension requires a GCS output target.
+    supports up to 20 extensions. Output is 720p. Extension requires a GCS
+    output target.
 
     Args:
         ctx: MCP context with application state
@@ -7203,7 +8629,7 @@ async def loop_extend(
         times: Number of ~7s extensions to chain (1-20). Each turn APPENDS
             ~7s but BILLS the whole assembled clip, so cost grows with the
             square of this — see max_cost_usd.
-        model: Veo model (not the Lite model)
+        model: Veo model
         aspect_ratio: 16:9 or 9:16. An extension continues the source, so the
             rendered aspect ratio is the source's; this value must match it.
             The server does not verify the match — the source is typically a
@@ -7211,8 +8637,8 @@ async def loop_extend(
             the source may be ignored or distort the render rather than being
             refused here.
         include_audio: Generate audio on the extended sections (default True,
-            so extending an audio video doesn't go silent; Vertex only)
-        output_gcs_uri: GCS output URI (required on Vertex for extensions)
+            so extending an audio video doesn't go silent)
+        output_gcs_uri: GCS output URI (required for extensions)
         dry_run: When True, return only the cost of the extension chain and
             generate nothing. The basis is NOT times x ~7s: MEASURED, a Veo
             turn renders and bills the ASSEMBLED clip (a 4.0s source came
@@ -7251,16 +8677,12 @@ async def loop_extend(
         if times < 1 or times > 20:
             raise ValueError("times must be between 1 and 20.")
 
-        if model in _VEO_LITE_MODELS:
-            raise ValueError("Veo 3.1 Lite does not support video extension.")
-        # Extension is one of the modes Veo refuses on the Gemini Developer
-        # API. Checked here, before the quote, so a dry run cannot price a
-        # chain that cannot run — the same rule the model restriction follows.
+        # Veo has no endpoint on the Gemini Developer API. Checked here,
+        # before the quote, so a dry run cannot price a chain that cannot run.
         from .video import validate_render_options
 
         validate_render_options(
             model,
-            generation_mode="extend_video",
             backend=_backend_of(app_ctx, str(model)),
         )
         _validate_aspect_ratio(aspect_ratio)
@@ -7521,8 +8943,8 @@ async def loop_extend(
             result["cost"] = manifest["cost"]
         if manifest.get("warnings"):
             result["warnings"] = manifest["warnings"]
-            # Mirror the extension-chain warnings (e.g. include_audio ignored
-            # on the Gemini API path) onto the notification channel.
+            # Mirror the extension-chain warnings (e.g. a negative seed that
+            # was not sent) onto the notification channel.
             await _emit_warnings(ctx, manifest["warnings"])
         sidecar_url = _write_sidecar(current, manifest)
         if sidecar_url:

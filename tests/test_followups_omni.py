@@ -279,33 +279,32 @@ async def test_empty_inline_data_falls_through_to_uri(tmp_path: Path) -> None:
 
 
 # ============================================================================
-# A returned model ID must round-trip: an agent that feeds result["model"]
-# from a Gemini-API render back into the next call must not hit a rejection.
+# A recorded model ID must round-trip: an agent that feeds result["model"],
+# or a manifest from an older Gemini-API render, back into the next call must
+# not hit a rejection.
 # ============================================================================
 
 
 def test_every_returnable_video_model_is_also_accepted() -> None:
-    """On the Gemini API a render reports a `-preview` model; the type it is
-    validated against rejected those, so chaining that ID into loop_extend or
-    generate_video failed. Every ID a run can return must be an accepted
-    input."""
+    """Gemini-API renders made before Veo was switched off there (2026-10-22)
+    reported a `-preview` model, and their manifests still say so; the type
+    a tool validates against once rejected those, so chaining that ID into
+    loop_extend or generate_video failed. Every ID a run reports, or once
+    reported, must be an accepted input."""
     import typing
 
-    from src.video import TranslatedVideoModel, VideoModel, _GEMINI_API_MODEL_IDS
+    from src.video import (
+        _CANONICAL_VIDEO_MODEL_IDS,  # pyright: ignore[reportPrivateUsage]
+        TranslatedVideoModel,
+        VideoModel,
+    )
 
     # The tools accept the union: the canonical catalogue the planner ranks
-    # over, plus the translated spellings a Gemini-API render reports back.
+    # over, plus the spellings older Gemini-API renders reported.
     accepted = set(typing.get_args(VideoModel)) | set(
         typing.get_args(TranslatedVideoModel)
     )
-    returnable: set[str] = set()
-    for canonical in (
-        "veo-3.1-generate-001",
-        "veo-3.1-fast-generate-001",
-        "veo-3.1-lite-generate-preview",
-    ):
-        returnable.add(canonical)  # Vertex reports the canonical id
-        returnable.add(_GEMINI_API_MODEL_IDS.get(canonical, canonical))  # Gemini API
+    returnable = set(typing.get_args(VideoModel)) | set(_CANONICAL_VIDEO_MODEL_IDS)
     assert returnable <= accepted, f"not accepted: {returnable - accepted}"
 
     # But the planner's candidate catalogue must stay canonical-only — folding
@@ -322,7 +321,8 @@ async def test_a_returned_preview_id_normalizes_before_the_backend_translation(
 ) -> None:
     """A `-preview` id passed back must resolve to canonical first: raw on
     Vertex it would 404, and the reported model must be identical to what a
-    caller who named the canonical id would have gotten."""
+    caller who named the canonical id would have gotten. A Gemini API client
+    is refused whichever spelling it is handed."""
     from tests.test_video import (
         FakeGeneratedVideo,
         FakeGenaiClient,
@@ -353,10 +353,11 @@ async def test_a_returned_preview_id_normalizes_before_the_backend_translation(
     # On Vertex a fed-back preview id must not be sent raw (it would 404) — it
     # is normalized, so the reported model is the canonical one.
     assert await report(True, "veo-3.1-generate-preview") == "veo-3.1-generate-001"
-    # On the Gemini API, naming the canonical id or feeding back the preview id
-    # both report the same served spelling.
-    assert await report(False, "veo-3.1-generate-001") == "veo-3.1-generate-preview"
-    assert await report(False, "veo-3.1-generate-preview") == "veo-3.1-generate-preview"
+    assert await report(True, "veo-3.1-generate-001") == "veo-3.1-generate-001"
+    # Veo has no endpoint on the Gemini API any more, under either spelling.
+    for model_in in ("veo-3.1-generate-001", "veo-3.1-generate-preview"):
+        with pytest.raises(ValueError, match="Gemini Developer API"):
+            await report(False, model_in)
 
 
 def test_the_video_tool_schemas_accept_the_translated_ids() -> None:

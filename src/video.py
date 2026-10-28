@@ -6,6 +6,8 @@ import threading
 import uuid
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
 from stat import S_ISREG
@@ -73,43 +75,49 @@ async def run_off_loop(
 VideoModel = Literal[
     "veo-3.1-generate-001",
     "veo-3.1-fast-generate-001",
-    "veo-3.1-lite-generate-preview",
 ]
 
-# The IDs the Gemini API backend serves under, and the ones a real run REPORTS
-# back in its `model` field on that backend. Accepted as tool input purely so a
-# returned model round-trips: an agent that reads result["model"] from a
-# Gemini-API render and feeds it into loop_extend / generate_video must not hit
-# a schema rejection. Kept SEPARATE from VideoModel on purpose — the planner
-# enumerates VideoModel as its candidate catalogue (routing.LIVE_VIDEO_MODELS),
-# and folding these spellings in would make it rank each model twice. They
-# resolve to the canonical `-001` id before anything downstream sees them (see
+# The IDs the Gemini Developer API served Veo under, which renders made there
+# before the shutdown below REPORTED back in their `model` field and wrote into
+# their manifests. Still accepted as tool input so such a model round-trips: an
+# agent that feeds one into loop_extend / generate_video must not hit a schema
+# rejection. Kept SEPARATE from VideoModel on purpose — the planner enumerates
+# VideoModel as its candidate catalogue (routing.LIVE_VIDEO_MODELS), and
+# folding these spellings in would make it rank each model twice. They resolve
+# to the canonical `-001` id before anything downstream sees them (see
 # _CANONICAL_VIDEO_MODEL_IDS). Same split as ImageModel vs RetiredImageModel.
 TranslatedVideoModel = Literal[
     "veo-3.1-generate-preview",
     "veo-3.1-fast-generate-preview",
 ]
 
-# Veo 3.1 Lite does not support 4K output or video extension.
-_VEO_LITE_MODELS = {"veo-3.1-lite-generate-preview"}
-
-# The Gemini Developer API serves Veo 3.1 under `-preview` IDs, while Vertex
-# AI uses the `-001` IDs (live-verified: a `-001` call on the Gemini API 404s
-# with "not found for API version v1beta"). The public VideoModel values stay
-# the `-001` names; they are translated per backend at call time.
-_GEMINI_API_MODEL_IDS = {
-    "veo-3.1-generate-001": "veo-3.1-generate-preview",
-    "veo-3.1-fast-generate-001": "veo-3.1-fast-generate-preview",
-}
-
-# Reverse of the per-backend map: a caller may pass back a `-preview` ID that a
-# prior Gemini-API render reported. Normalize it to the canonical `-001` name
-# BEFORE the per-backend translation runs, so the request behaves identically
-# to one that named the canonical model — on Vertex it stays `-001` (a raw
-# `-preview` would 404 there), on the Gemini API it re-translates to `-preview`.
+# A `-preview` spelling from an older Gemini-API render, normalized to the
+# canonical `-001` name before anything else reads the model. Vertex serves
+# only `-001`; a raw `-preview` 404s there.
 _CANONICAL_VIDEO_MODEL_IDS = {
-    preview: canonical for canonical, preview in _GEMINI_API_MODEL_IDS.items()
+    "veo-3.1-generate-preview": "veo-3.1-generate-001",
+    "veo-3.1-fast-generate-preview": "veo-3.1-fast-generate-001",
 }
+
+# The Gemini Developer API served Veo 3.1 only under `-preview` IDs, and its
+# deprecations table switched every one of them off on this date:
+#   "veo-3.1-generate-preview"      | "October 22, 2026" | "gemini-omni-1.1-flash"
+#   "veo-3.1-fast-generate-preview" | "October 22, 2026" | "gemini-omni-1.1-flash"
+#   "veo-3.1-lite-generate-preview" | "October 22, 2026" | "gemini-omni-1.1-flash"
+# Veo now runs on Vertex AI only, where the GA `-001` tiers remain ("November
+# 17, 2026 or later"). Vertex's own Lite, veo-3.1-lite-generate-001, is Preview
+# and sold through Provisioned Throughput or fixed quota only ("Batch inference
+# and pay-as-you-go are not supported"), so Lite left this server rather than
+# moving to Vertex.
+VEO_GEMINI_API_SHUTDOWN = "2026-10-22"
+
+VEO_GEMINI_API_REFUSAL = (
+    "Veo is not available on the Gemini Developer API: Google switched off its "
+    f"Veo 3.1 models there on {VEO_GEMINI_API_SHUTDOWN}. Use generate_video_omni "
+    "with gemini-omni-1.1-flash, Google's named replacement, or run this server "
+    "with Vertex AI credentials, where veo-3.1-generate-001 and "
+    "veo-3.1-fast-generate-001 remain generally available."
+)
 
 # Generation mode for VEO 3.1
 GenerationMode = Literal[
@@ -235,42 +243,6 @@ def _prepare_frame_inputs(
     return first_frame_input, last_frame_input, reference_image_inputs, warnings
 
 
-# Generation modes Veo 3.1 Lite cannot serve. It handles text-to-video and
-# image-to-video only.
-_LITE_UNSUPPORTED_MODES = ("extend_video", "reference_to_video", "first_last_frame")
-
-# MEASURED against the live service: on the Gemini Developer API, Veo refuses
-# every mode that conditions on existing footage. first_last_frame comes back
-# "Your use case is currently not supported" (generate_transition,
-# generate_bridge) and extend_video comes back "encodedVideo isn't supported by
-# this model" (loop_extend). The identical calls succeed on Vertex.
-#
-# reference_to_video joined these after a live test: it does not answer with a
-# usable error at all, just an empty result the tool surfaced as "No videos
-# returned", and it appears to have billed for the attempt — the worst possible
-# failure shape, and the one most worth gating. image_to_video was tested in the
-# same round and RENDERS FINE, so the caution once emitted for it is gone: this
-# backend is not "text-to-video only", and a warning that fires on a working
-# call is noise that teaches callers to ignore warnings.
-_GEMINI_API_UNSUPPORTED_MODES = (
-    "first_last_frame",
-    "extend_video",
-    "reference_to_video",
-)
-
-_GEMINI_API_MODE_ERRORS = {
-    "first_last_frame": (
-        'the service answers "Your use case is currently not supported"'
-    ),
-    "extend_video": (
-        'the service answers "encodedVideo isn\'t supported by this model"'
-    ),
-    "reference_to_video": (
-        "the service returns an empty result with no usable error, and bills "
-        "for the attempt"
-    ),
-}
-
 # Veo 3.1 accepts at most this many reference images; extras are not sent.
 _MAX_REFERENCE_IMAGES = 3
 
@@ -311,17 +283,143 @@ VEO_DEFAULT_TIMEOUT_SECONDS = 210.0
 VEO_MEASURED_4K_SECONDS = 335.0
 
 
+Submission = Literal["submitted", "unknown", "none"]
+
+
+def http_status(exc: BaseException) -> int | None:
+    """The HTTP status an SDK error carries, from either client, or None."""
+    for attribute in ("code", "status_code"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int) and 100 <= value <= 599:
+            return value
+    return None
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """How long a refusal asked us to wait before trying again, or None.
+
+    Read from the response's Retry-After header (seconds, or an HTTP date),
+    else from a google.rpc.RetryInfo entry in the error's details.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    try:
+        items = list(headers.items()) if headers is not None else []
+    except (AttributeError, TypeError):
+        items = []
+    for key, value in items:
+        if str(key).lower() != "retry-after":
+            continue
+        text = str(value).strip()
+        try:
+            return max(0.0, float(text))
+        except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    details = getattr(exc, "details", None)
+    error = details.get("error", details) if isinstance(details, dict) else None
+    entries = error.get("details") if isinstance(error, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or not str(entry.get("@type", "")).endswith(
+            "RetryInfo"
+        ):
+            continue
+        delay = entry.get("retryDelay")
+        if isinstance(delay, str) and delay.endswith("s"):
+            try:
+                return max(0.0, float(delay[:-1]))
+            except ValueError:
+                return None
+        if isinstance(delay, dict):
+            try:
+                return max(
+                    0.0,
+                    float(delay.get("seconds") or 0)
+                    + float(delay.get("nanos") or 0) / 1e9,
+                )
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def refused_before_work(exc: BaseException) -> bool:
+    """Whether a failed submit certainly started no render.
+
+    True for a 4xx (the service turned the request down: a bad argument, a
+    permission, a quota) and for an argument error raised here before
+    anything was sent. Everything else leaves it open whether the request
+    reached Google: a timeout of either SDK's kind, a dropped connection, a
+    5xx such as a gateway timeout, a response that could not be read.
+    """
+    status = http_status(exc)
+    if status is not None:
+        return 400 <= status < 500
+    if type(exc).__name__ == "UnknownApiResponseError":
+        return False  # Google answered; the answer could not be read.
+    return isinstance(exc, (ValueError, TypeError))
+
+
+class VeoOperationFailed(ValueError):
+    """Google finished the operation and reported a failure or no video.
+
+    Not a submission to reconcile: Google bills Veo only for a video that was
+    generated, so a render that failed this way adds nothing to a bill.
+    """
+
+
+class VeoSubmissionError(RuntimeError):
+    """A Veo render failed, other than by timing out, after its request may
+    have reached Google.
+
+    The message is the original failure's; ``submission`` and
+    ``operation_name`` say what may still bill: ``submitted`` once Google
+    returned an operation (a render that completed and then failed to
+    download or save has billed), ``unknown`` when the submit itself failed
+    in a way that leaves open whether Google received it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        submission: Submission,
+        operation_name: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.submission: Submission = submission
+        self.operation_name = operation_name
+
+
 class VeoTimeoutError(TimeoutError):
     """A Veo render ran past its deadline.
 
     Carries the operation name when the request had been submitted, because
     that is the handle a caller needs to find -- and reconcile -- a render
     that may well finish and bill after this error is returned.
+
+    ``submission`` says how far the render got, which an absent operation name
+    alone cannot: ``submitted`` once Google returned an operation, ``unknown``
+    when the submit call itself ran out of time (the request may have reached
+    Google), ``none`` when the deadline passed before it was sent.
     """
 
-    def __init__(self, message: str, *, operation_name: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation_name: str | None = None,
+        submission: Submission | None = None,
+    ) -> None:
         super().__init__(message)
         self.operation_name = operation_name
+        self.submission: Submission = submission or (
+            "submitted" if operation_name else "none"
+        )
 _VEO_POLL_INTERVAL_SECONDS = 10.0
 
 # Per-call ceilings. google-genai hands timeout=None straight to httpx when
@@ -381,22 +479,20 @@ def _load_extend_video(location: Path, allowed_dir: Path | None) -> types.Video:
 def validate_render_options(
     model: str,
     resolution: str | None = None,
-    generation_mode: str | None = None,
     backend: str | None = None,
 ) -> None:
-    """Raise for a model/resolution/mode combination Veo cannot render.
+    """Raise for a model/resolution/backend combination Veo cannot render.
 
     Shared by the generation path and the tools' dry_run quotes, so a quote
     can never succeed for a call that would be refused — the same
-    single-source rule as resolve_image_model on the image side. Every Lite
-    restriction lives here; enforcing them per tool is what let a dry run
-    price an extension on a model that cannot extend.
+    single-source rule as resolve_image_model on the image side.
 
-    ``backend`` extends that rule from the model to the deployment. Veo on the
-    Gemini Developer API refuses every mode that conditions on existing
-    footage, and the tools were quoting those calls cleanly — printing the very
-    backend that made them impossible in the same response as the price.
+    ``backend`` extends that rule from the model to the deployment: Veo has no
+    endpoint on the Gemini Developer API at all (VEO_GEMINI_API_SHUTDOWN), so
+    a request routed there is refused before its resolution is read.
     """
+    if backend == "gemini_api":
+        raise ValueError(VEO_GEMINI_API_REFUSAL)
     if resolution is not None:
         valid_resolutions = ("720p", "1080p", "4K")
         if resolution not in valid_resolutions:
@@ -404,45 +500,6 @@ def validate_render_options(
                 f"Unsupported resolution '{resolution}'. "
                 f"Supported values are {', '.join(valid_resolutions)}."
             )
-        if resolution == "4K" and model in _VEO_LITE_MODELS:
-            raise ValueError(
-                f"Model {model} does not support 4K resolution. "
-                "Use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
-            )
-        if resolution == "4K" and backend == "gemini_api":
-            # Gating covered modes but not resolutions, so this quoted $1.20 at
-            # the 4K rate and then 400'd: the highest-value false quote in the
-            # server. Veo-specific — omni renders 4K on this backend fine.
-            raise ValueError(
-                "Veo cannot render 4K on the Gemini Developer API: the service "
-                'answers "The string value 4K for resolution is invalid". '
-                "Render at 720p or 1080p here, or run against Vertex AI. "
-                "(Omni does render 4K on this backend.)"
-            )
-    if (
-        generation_mode is not None
-        and model in _VEO_LITE_MODELS
-        and generation_mode in _LITE_UNSUPPORTED_MODES
-    ):
-        raise ValueError(
-            f"Model {model} does not support {generation_mode}. "
-            "Veo 3.1 Lite supports only text-to-video and image-to-video; "
-            "use veo-3.1-generate-001 or veo-3.1-fast-generate-001 instead."
-        )
-    if (
-        backend == "gemini_api"
-        and generation_mode is not None
-        and generation_mode in _GEMINI_API_UNSUPPORTED_MODES
-    ):
-        detail = _GEMINI_API_MODE_ERRORS.get(generation_mode, "")
-        raise ValueError(
-            f"Veo cannot render {generation_mode} on the Gemini Developer API"
-            + (f": {detail}" if detail else "")
-            + ". This mode works on Vertex AI — configure Vertex credentials "
-            "(GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, with "
-            "output_gcs_uri or VIDEO_GCS_BUCKET for delivery) and retry. "
-            "Text-to-video works on this backend."
-        )
 
 
 def validate_video_request_inputs(
@@ -495,20 +552,6 @@ def validate_video_request_inputs(
         )
 
 
-def resolve_served_video_model(model: str, is_vertexai: bool) -> str:
-    """The model id a real run reports for ``model`` on this backend.
-
-    A caller may pin a canonical `-001` id or feed back the `-preview` id a
-    prior Gemini-API render returned; either way the served id is derived the
-    same way the impl derives it, so a dry_run's `model` field matches what the
-    real run will report instead of echoing the raw input.
-    """
-    canonical = _CANONICAL_VIDEO_MODEL_IDS.get(model, model)
-    if not is_vertexai:
-        return _GEMINI_API_MODEL_IDS.get(canonical, canonical)
-    return canonical
-
-
 async def generate_video(
     client: genai.Client,
     prompt: str,
@@ -552,32 +595,32 @@ async def generate_video(
             resolve inside. Security boundary, not a convenience: without it
             any local path readable by the server could be uploaded to the
             API as "video to extend".
-        extend_video_uri: URI of existing VEO video to extend. On Vertex AI
-            this requires output_gcs_uri; on the Gemini API the extended
-            clip is returned inline and GCS output is not supported.
-        resolution: Output resolution ("720p" or "1080p"; "4K" only for non-Lite
-            models). When None, the API default is used.
+        extend_video_uri: URI of existing VEO video to extend. Requires
+            output_gcs_uri.
+        resolution: Output resolution ("720p", "1080p" or "4K"). When None,
+            the API default is used.
         person_generation: Person generation policy ("allow_adult" or "allow_all").
             Passed through to the API for validation. When None, the API default
             is used.
         output_gcs_uri: GCS URI for output (required for extensions and large
-            videos). Only supported in Vertex AI mode.
+            videos).
 
     Returns:
         Dictionary with video_url and generation metadata
+
+    Raises:
+        ValueError: If ``client`` is not a Vertex AI client. Veo has no
+            endpoint on the Gemini Developer API (VEO_GEMINI_API_SHUTDOWN), so
+            nothing is sent.
     """
-    model_id = str(model)
+    # Before any work: the tools refuse this at their pre-flight too, but the
+    # impl must never send a call to an endpoint that no longer exists.
+    if not getattr(client._api_client, "vertexai", False):
+        raise ValueError(VEO_GEMINI_API_REFUSAL)
 
-    # Normalize a served `-preview` ID a caller fed back from a prior render to
-    # its canonical `-001` name first, so the per-backend translation below is
-    # the single source of the served spelling.
-    model_id = _CANONICAL_VIDEO_MODEL_IDS.get(model_id, model_id)
-
-    # Translate model IDs per backend: the Gemini Developer API serves Veo
-    # under `-preview` IDs and 404s on the Vertex `-001` names.
-    is_vertexai = getattr(client._api_client, "vertexai", False)
-    if not is_vertexai:
-        model_id = _GEMINI_API_MODEL_IDS.get(model_id, model_id)
+    # A `-preview` ID from an older Gemini-API render names the same model as
+    # its `-001` spelling, the only one Vertex serves.
+    model_id = _CANONICAL_VIDEO_MODEL_IDS.get(str(model), str(model))
 
     # Non-fatal warnings surfaced back to the caller (e.g. a request that could
     # not be honored but should not abort the whole generation).
@@ -605,16 +648,6 @@ async def generate_video(
         generation_mode = "first_last_frame"
     elif image_bytes:
         generation_mode = "image_to_video"
-
-    # Veo 3.1 Lite (served via the Gemini API) does not support video
-    # extension, reference images, or first/last-frame control — fail fast
-    # with a clear message instead of an opaque API error. Shared with the
-    # tools' dry_run quotes so both refuse the same combinations.
-    validate_render_options(
-        model,
-        generation_mode=generation_mode,
-        backend="vertex" if is_vertexai else "gemini_api",
-    )
 
     # Prepare image inputs -- off the event loop. Decoding five near-limit
     # inputs (first, last, three references) inline measured ~8s of frozen
@@ -665,25 +698,12 @@ async def generate_video(
         allowed = [4, 6, 8]
         effective_duration = min(allowed, key=lambda x: abs(x - duration_seconds))
     config_kwargs["duration_seconds"] = effective_duration
-    # generate_audio is only supported on Vertex AI. Veo 3.1 already applies prompt
-    # rewriting automatically, so `enhance_prompt` is Veo-2-only and must not be sent.
-    # (is_vertexai computed at the top alongside model-ID translation.)
-    if is_vertexai:
-        # Send the flag explicitly BOTH ways: omitting it lets the API apply
-        # its own default (audio on for Veo 3.1), which would silently
-        # contradict include_audio=False and the reported audio_enabled.
-        config_kwargs["generate_audio"] = include_audio
-
-    # On the Gemini API path, generate_audio is never sent and Veo 3.1 always
-    # generates audio natively. A caller who explicitly asked for NO audio
-    # (include_audio=False, the default) cannot have that honored here, so warn
-    # rather than silently returning a clip with baked-in audio. (include_audio=True
-    # is satisfied since audio is produced, so no warning is needed there.)
-    if not is_vertexai and not include_audio:
-        warnings.append(
-            "include_audio=False was not honored: Veo 3.1 on the Gemini API "
-            "always generates audio. Use Vertex AI mode to control audio."
-        )
+    # Veo 3.1 already applies prompt rewriting automatically, so
+    # `enhance_prompt` is Veo-2-only and must not be sent. generate_audio is
+    # sent explicitly BOTH ways: omitting it lets the API apply its own default
+    # (audio on for Veo 3.1), which would silently contradict
+    # include_audio=False and the reported audio_enabled.
+    config_kwargs["generate_audio"] = include_audio
 
     # Add last frame to config for first+last frame mode
     if last_frame_input:
@@ -707,21 +727,11 @@ async def generate_video(
             "this render is not reproducible."
         )
 
-    # output_gcs_uri is a Vertex-only config field. The Gemini API (e.g. for
-    # Veo Lite) does not support GCS output, so only forward it on Vertex.
-    # Callers may pass a default bucket (VIDEO_GCS_BUCKET) that applies to
-    # Vertex runs; silently ignoring it on the Gemini API path keeps Lite and
-    # plain text-to-video working. The generate_video tool separately rejects
-    # an *explicit* output_gcs_uri on a Gemini-API-routed call.
-    if output_gcs_uri and is_vertexai:
+    if output_gcs_uri:
         config_kwargs["output_gcs_uri"] = output_gcs_uri
 
     if resolution is not None:
-        # With the backend: the dry run refused Veo 4K on the Gemini API and
-        # this, the real call, let it through to a 400 on the wire.
-        validate_render_options(
-            model, resolution, backend="vertex" if is_vertexai else "gemini_api"
-        )
+        validate_render_options(model, resolution, backend="vertex")
         config_kwargs["resolution"] = resolution
 
     if person_generation is not None:
@@ -804,12 +814,73 @@ async def generate_video(
             )
         return left
 
-    operation = await run_off_loop(
-        functools.partial(client.models.generate_videos, **api_kwargs),
-        timeout=min(_VEO_SUBMIT_TIMEOUT_SECONDS, _remaining()),
-        message="Video generation timed out submitting the request.",
-    )
+    try:
+        operation = await run_off_loop(
+            functools.partial(client.models.generate_videos, **api_kwargs),
+            timeout=min(_VEO_SUBMIT_TIMEOUT_SECONDS, _remaining()),
+            message="Video generation timed out submitting the request.",
+        )
+    except VeoTimeoutError:
+        raise  # The deadline passed before the request was sent.
+    except TimeoutError as exc:
+        raise VeoTimeoutError(
+            f"{exc} It may have reached Google before the deadline; if it did, "
+            "it may still complete and bill.",
+            submission="unknown",
+        ) from exc
+    except Exception as exc:
+        if refused_before_work(exc):
+            raise
+        raise VeoSubmissionError(str(exc), submission="unknown") from exc
 
+    operation_name = getattr(operation, "name", None)
+    try:
+        return await _finish_operation(
+            client,
+            operation,
+            remaining=_remaining,
+            videos_dir=videos_dir,
+            log_callback=log_callback,
+            result_fields={
+                "prompt": prompt_for_api,
+                "model": model_id,
+                "audio_enabled": include_audio,
+                "duration_seconds": effective_duration,
+                "generation_mode": generation_mode,
+            },
+            extend_video_uri=extend_video_uri,
+            warnings=warnings,
+        )
+    except (VeoTimeoutError, VeoOperationFailed):
+        raise
+    except TimeoutError as exc:
+        # Polling, downloading or saving ran out of time after Google accepted
+        # the request: the render may still complete, or already has, and
+        # bills either way.
+        raise VeoTimeoutError(
+            str(exc), operation_name=operation_name, submission="submitted"
+        ) from exc
+    except Exception as exc:
+        # Anything else after Google accepted the request, such as a full
+        # disk while saving a completed render: the render bills regardless.
+        raise VeoSubmissionError(
+            str(exc), operation_name=operation_name, submission="submitted"
+        ) from exc
+
+
+async def _finish_operation(
+    client: Any,
+    operation: Any,
+    *,
+    remaining: Callable[[], float],
+    videos_dir: Path,
+    log_callback: Callable[[str], Awaitable[None]] | None,
+    result_fields: dict[str, Any],
+    extend_video_uri: str | None,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Poll a submitted Veo operation to completion and save its video."""
+    _remaining = remaining
     operation_name = getattr(operation, "name", None)
     if log_callback:
         await log_callback(f"Polling operation: {operation.name}")
@@ -825,11 +896,11 @@ async def generate_video(
         )
 
     if operation.error:
-        raise ValueError(f"VEO error: {operation.error}")
+        raise VeoOperationFailed(f"VEO error: {operation.error}")
 
     result = getattr(operation, "response", None) or getattr(operation, "result", None)
     if not result or not getattr(result, "generated_videos", None):
-        raise ValueError("No videos returned")
+        raise VeoOperationFailed("No videos returned")
 
     video = result.generated_videos[0].video
 
@@ -855,23 +926,16 @@ async def generate_video(
         )
         video_url = f"file://{filepath}"
 
-    # Report audio truthfully: on Vertex AI it depends on the generate_audio flag
-    # (== include_audio), but on the Gemini API path Veo 3.1 always generates
-    # audio natively regardless of the include_audio input.
-    audio_enabled = include_audio if is_vertexai else True
-
+    # result_fields carries generate_audio as audio_enabled: the flag sent is
+    # include_audio, so it is what the clip carries.
     result = {
         "message": "Video generated successfully",
         "video_url": video_url,
-        "prompt": prompt_for_api,
-        "model": model_id,
-        "audio_enabled": audio_enabled,
-        "duration_seconds": effective_duration,
-        "generation_mode": generation_mode,
+        **result_fields,
     }
 
     # For extend_video mode, also return the extended video URI
-    if generation_mode == "extend_video" and extend_video_uri:
+    if result_fields["generation_mode"] == "extend_video" and extend_video_uri:
         result["extended_from"] = extend_video_uri
 
     # Include warnings only when non-empty, so clean runs keep tidy manifests.

@@ -16,6 +16,8 @@ from google.auth import exceptions as google_auth_exceptions
 from google.genai import types
 from PIL import Image
 
+from .storyboard import _sniff_mime
+
 logger = logging.getLogger(__name__)
 
 ImageModel = Literal[
@@ -226,6 +228,32 @@ _MAX_DECODED_PIXELS = 4_000_000
 # stay under this — the documented workflow cannot trip it. It is here so that
 # raising the per-image budget cannot silently reintroduce the batch blow-up.
 _MAX_TOTAL_DECODED_PIXELS = 64_000_000
+
+
+# File extension per image MIME type, for the formats the Gemini image models
+# are known to return plus the one more the shared sniffer recognises.
+_IMAGE_EXTENSIONS: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _image_extension(data: bytes, declared_mime: str | None) -> str:
+    """Return the file extension that matches the rendered image's bytes.
+
+    Every render used to be written as ``.png``. The models do not always
+    return PNG: renders from gemini-3.1-flash-lite-image were found on disk as
+    JPEG bytes behind a ``.png`` name, which breaks any consumer that checks a
+    file's extension against its content (Google Merchant Center requires the
+    two to match). The bytes decide. The declared MIME type is the fallback
+    for a format the sniff does not know, and PNG remains the last resort.
+    """
+    sniffed = _sniff_mime(data)
+    if sniffed != "image/png" or data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return _IMAGE_EXTENSIONS[sniffed]
+    return _IMAGE_EXTENSIONS.get((declared_mime or "").lower(), ".png")
 
 
 def _megapixels(pixels: float) -> str:
@@ -515,6 +543,11 @@ async def generate_image(
         # Build config with new Gemini 3 parameters
         config_kwargs: dict[str, Any] = {
             "response_modalities": ["TEXT", "IMAGE"],
+            # The SDK defaults this on from 2.31.0: a response ending in
+            # finish_reason CONTINUATION is re-sent until the model finishes,
+            # and every hop bills. The quote prices one request, so one
+            # request is all a render may make.
+            "automatic_continuation": False,
         }
 
         # Build ImageConfig for Gemini image models. aspect_ratio and
@@ -559,7 +592,9 @@ async def generate_image(
         pil_images.clear()
 
         output_bytes = None
+        output_mime: str | None = None
         fallback_image_bytes = None
+        fallback_mime: str | None = None
         text_parts: list[str] = []
         response_thought_signature = None
         usage = _usage_dict(response)
@@ -588,8 +623,10 @@ async def generate_image(
                         # still returns the image the API produced rather
                         # than "no image".
                         fallback_image_bytes = part.inline_data.data
+                        fallback_mime = part.inline_data.mime_type
                         if not getattr(part, "thought", False):
                             output_bytes = part.inline_data.data
+                            output_mime = part.inline_data.mime_type
                     # Capture thought signature for multi-turn editing
                     if hasattr(part, "thought_signature") and part.thought_signature:
                         sig = part.thought_signature
@@ -602,6 +639,7 @@ async def generate_image(
         # the model returned — better than discarding real image bytes.
         if not output_bytes and fallback_image_bytes:
             output_bytes = fallback_image_bytes
+            output_mime = fallback_mime
 
         if not output_bytes:
             if text_parts:
@@ -622,7 +660,7 @@ async def generate_image(
                 return result
             raise ValueError("Gemini returned no image")
 
-        filename = f"{uuid.uuid4()}.png"
+        filename = f"{uuid.uuid4()}{_image_extension(output_bytes, output_mime)}"
         filepath = images_dir / filename
         filepath.write_bytes(output_bytes)
 

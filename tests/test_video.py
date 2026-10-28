@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from google.genai import errors as genai_errors
 from PIL import Image
 
-from src.video import _GEMINI_API_MODEL_IDS, generate_video
+from src.video import VEO_GEMINI_API_REFUSAL, generate_video
 
 # ============================================================================
 # Test Doubles
@@ -110,9 +111,13 @@ class FakeModels:
 
 
 class FakeApiClient:
-    """Test double for internal API client."""
+    """Test double for internal API client.
 
-    def __init__(self, vertexai: bool = False) -> None:
+    Vertex by default: Veo runs on Vertex AI only, and the impl refuses any
+    other client before it sends anything.
+    """
+
+    def __init__(self, vertexai: bool = True) -> None:
         self.vertexai = vertexai
 
 
@@ -123,7 +128,7 @@ class FakeGenaiClient:
         self,
         operation: FakeOperation | None = None,
         raise_error: Exception | None = None,
-        vertexai: bool = False,
+        vertexai: bool = True,
     ) -> None:
         self.models = FakeModels(operation, raise_error)
         self.operations = FakeOperations(operation or FakeOperation())
@@ -246,10 +251,7 @@ async def test_generate_video_veo2(
     )
 
     assert gen_result["message"] == "Video generated successfully"
-    # Non-Vertex fake client: the impl reports the translated Gemini-API ID.
-    assert gen_result["model"] == _GEMINI_API_MODEL_IDS.get(
-        input["model"], input["model"]
-    )
+    assert gen_result["model"] == input["model"]
     assert "video_url" in gen_result
 
 
@@ -365,9 +367,7 @@ async def test_generate_video_veo3(
     result = FakeVideoResult([gen_video])
     operation = FakeOperation(done=True, result=result)
 
-    # Set vertexai=True when testing audio features (only supported in Vertex AI)
-    use_vertexai = input.get("include_audio", False)
-    client = FakeGenaiClient(operation=operation, vertexai=use_vertexai)
+    client = FakeGenaiClient(operation=operation)
 
     gen_result = await generate_video(
         client=client,  # type: ignore[arg-type]
@@ -381,20 +381,9 @@ async def test_generate_video_veo3(
     )
 
     assert gen_result["message"] == "Video generated successfully"
-    # The impl reports the backend-appropriate model ID: the Vertex `-001`
-    # name as-is, or the translated `-preview` ID on the Gemini API path.
-    if use_vertexai:
-        assert gen_result["model"] == input["model"]
-    else:
-        assert gen_result["model"] == _GEMINI_API_MODEL_IDS.get(
-            input["model"], input["model"]
-        )
-
-    # On Vertex AI audio_enabled == include_audio; on the Gemini API path
-    # (non-Vertex) Veo 3.1 always generates audio natively.
-    include_audio = input.get("include_audio", False)
-    expected_audio = include_audio if use_vertexai else True
-    assert gen_result["audio_enabled"] == expected_audio
+    assert gen_result["model"] == input["model"]
+    # generate_audio is sent as include_audio, so that is what the clip carries.
+    assert gen_result["audio_enabled"] == input.get("include_audio", False)
 
 
 # ============================================================================
@@ -1101,58 +1090,6 @@ async def test_generate_video_veo3_fast_with_features(
     assert gen_result["audio_enabled"] is True
 
 
-# ============================================================================
-# generate_video tests - VEO 3.1 Lite
-# ============================================================================
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_veo_lite_text_to_video(tmp_path: Path) -> None:
-    """VEO 3.1 Lite supports basic text-to-video."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    video_obj = FakeVideoObject(video_bytes=b"fake video")
-    gen_video = FakeGeneratedVideo(video_obj)
-    result = FakeVideoResult([gen_video])
-    operation = FakeOperation(done=True, result=result)
-    client = FakeGenaiClient(operation=operation)
-
-    gen_result = await generate_video(
-        client=client,  # type: ignore[arg-type]
-        prompt="A dog running",
-        videos_dir=videos_dir,
-        model="veo-3.1-lite-generate-preview",
-    )
-
-    assert gen_result["model"] == "veo-3.1-lite-generate-preview"
-    assert gen_result["generation_mode"] == "text_to_video"
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_veo_lite_rejects_extension(tmp_path: Path) -> None:
-    """VEO 3.1 Lite does not support video extension."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    video_obj = FakeVideoObject(video_bytes=b"fake video")
-    gen_video = FakeGeneratedVideo(video_obj)
-    result = FakeVideoResult([gen_video])
-    operation = FakeOperation(done=True, result=result)
-    client = FakeGenaiClient(operation=operation)
-
-    with pytest.raises(ValueError, match="does not support extend_video"):
-        await generate_video(
-            client=client,  # type: ignore[arg-type]
-            prompt="Continue",
-            videos_dir=videos_dir,
-            model="veo-3.1-lite-generate-preview",
-            extend_video_uri="gs://bucket/video.mp4",
-        )
-
-
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
 async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> None:
@@ -1184,7 +1121,7 @@ async def test_generate_video_extend_rejects_path_traversal(tmp_path: Path) -> N
 # ============================================================================
 
 
-def _basic_client(vertexai: bool = False) -> "FakeGenaiClient":
+def _basic_client(vertexai: bool = True) -> "FakeGenaiClient":
     """Build a client whose fake operation returns a single video with bytes."""
     video_obj = FakeVideoObject(video_bytes=b"fake video content")
     gen_video = FakeGeneratedVideo(video_obj)
@@ -1291,43 +1228,93 @@ async def test_generate_video_invalid_aspect_ratio_raises(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_gcs_output_dropped_on_non_vertex(
-    tmp_path: Path,
-) -> None:
-    """On the Gemini API (non-Vertex) client, output_gcs_uri is silently dropped.
+async def test_generate_video_refuses_a_gemini_api_client(tmp_path: Path) -> None:
+    """Veo has no endpoint on the Gemini Developer API since 2026-10-22.
 
-    The impl must not raise (that would break Veo Lite / text-to-video when a
-    VIDEO_GCS_BUCKET default is funneled through). It just omits the Vertex-only
-    field from the config. The generate_video *tool* separately rejects an
-    explicit request — see test_main.py.
+    The impl refuses a non-Vertex client before anything is sent, so nothing
+    that calls it directly can reach a switched-off model ID.
     """
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    captured: dict[str, Any] = {}
+    sent: list[dict[str, Any]] = []
+    client = FakeGenaiClient(vertexai=False)
 
+    def recording_generate_videos(**kwargs: Any) -> FakeOperation:
+        sent.append(kwargs)
+        return FakeOperation()
+
+    client.models.generate_videos = recording_generate_videos  # type: ignore[assignment]
+
+    with pytest.raises(ValueError) as refused:
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="A cat walking",
+            videos_dir=videos_dir,
+            model="veo-3.1-fast-generate-001",
+        )
+
+    assert str(refused.value) == VEO_GEMINI_API_REFUSAL
+    assert "2026-10-22" in str(refused.value)
+    assert "generate_video_omni" in str(refused.value)
+    assert "gemini-omni-1.1-flash" in str(refused.value)
+    assert "Vertex AI credentials" in str(refused.value)
+    assert sent == []
+
+
+def test_the_shared_validator_refuses_the_gemini_api_backend() -> None:
+    """The validator the quotes and the render share refuses the backend before
+    it reads the request, so a caller that checks options before resolving a
+    client (loop_extend does) gets the same refusal as everything else."""
+    from src.video import validate_render_options
+
+    with pytest.raises(ValueError) as refused:
+        validate_render_options("veo-3.1-generate-001", "720p", backend="gemini_api")
+    assert str(refused.value) == VEO_GEMINI_API_REFUSAL
+    # Vertex is unaffected.
+    validate_render_options("veo-3.1-generate-001", "4K", backend="vertex")
+
+
+@pytest.mark.parametrize(
+    ("older_spelling", "canonical"),
+    [
+        ("veo-3.1-generate-preview", "veo-3.1-generate-001"),
+        ("veo-3.1-fast-generate-preview", "veo-3.1-fast-generate-001"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_an_older_preview_spelling_renders_as_its_001_model_on_vertex(
+    older_spelling: str, canonical: str, tmp_path: Path
+) -> None:
+    """A manifest from an older Gemini-API render names the `-preview` ID.
+    Fed back on Vertex, it must reach the `-001` model Vertex serves, since a
+    raw `-preview` 404s there."""
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    sent: list[dict[str, Any]] = []
     video_obj = FakeVideoObject(video_bytes=b"fake video content")
-    gen_video = FakeGeneratedVideo(video_obj)
-    result = FakeVideoResult([gen_video])
-    operation = FakeOperation(done=True, result=result)
-    client = FakeGenaiClient(operation=operation)  # vertexai=False by default
+    operation = FakeOperation(
+        done=True, result=FakeVideoResult([FakeGeneratedVideo(video_obj)])
+    )
+    client = FakeGenaiClient(operation=operation)
 
-    def capturing_generate_videos(**kwargs: Any) -> FakeOperation:
-        captured["config"] = kwargs.get("config")
+    def recording_generate_videos(**kwargs: Any) -> FakeOperation:
+        sent.append(kwargs)
         return operation
 
-    client.models.generate_videos = capturing_generate_videos  # type: ignore[assignment]
+    client.models.generate_videos = recording_generate_videos  # type: ignore[assignment]
 
-    gen_result = await generate_video(
+    result = await generate_video(
         client=client,  # type: ignore[arg-type]
-        prompt="GCS output",
+        prompt="rain",
         videos_dir=videos_dir,
-        model="veo-3.1-generate-001",
-        output_gcs_uri="gs://bucket/out.mp4",
+        model=older_spelling,  # type: ignore[arg-type]
     )
 
-    assert gen_result["message"] == "Video generated successfully"
-    assert captured["config"].output_gcs_uri is None
+    assert sent[0]["model"] == canonical
+    assert result["model"] == canonical
 
 
 @pytest.mark.asyncio
@@ -1415,23 +1402,6 @@ async def test_generate_video_resolution_invalid_raises(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
-async def test_generate_video_4k_rejected_for_lite(tmp_path: Path) -> None:
-    """4K resolution is rejected for Veo Lite models."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    with pytest.raises(ValueError, match="does not support 4K"):
-        await generate_video(
-            client=_basic_client(),  # type: ignore[arg-type]
-            prompt="4K lite",
-            videos_dir=videos_dir,
-            model="veo-3.1-lite-generate-preview",
-            resolution="4K",
-        )
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
 async def test_generate_video_person_generation_passed_through(tmp_path: Path) -> None:
     """person_generation is passed through to the config as-is."""
     videos_dir = tmp_path / "videos"
@@ -1464,57 +1434,8 @@ async def test_generate_video_person_generation_passed_through(tmp_path: Path) -
 
 
 # ============================================================================
-# generate_video tests - Audio intent warnings (Gemini API path)
+# generate_video tests - Audio intent
 # ============================================================================
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_warns_no_audio_on_gemini_api(tmp_path: Path) -> None:
-    """On the Gemini API path, include_audio=False cannot be honored, so warn.
-
-    Veo 3.1 on the Gemini API always generates audio natively. The result must
-    carry a warning AND report audio_enabled=True truthfully.
-    """
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    gen_result = await generate_video(
-        client=_basic_client(),  # type: ignore[arg-type]  # vertexai=False
-        prompt="Silent video please",
-        videos_dir=videos_dir,
-        model="veo-3.1-generate-001",
-        include_audio=False,
-    )
-
-    assert "warnings" in gen_result
-    assert isinstance(gen_result["warnings"], list)
-    assert any(
-        "include_audio=False was not honored" in w for w in gen_result["warnings"]
-    )
-    assert gen_result["audio_enabled"] is True
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_no_audio_warning_when_audio_requested_gemini_api(
-    tmp_path: Path,
-) -> None:
-    """include_audio=True on the Gemini API is satisfied, so no audio warning."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    gen_result = await generate_video(
-        client=_basic_client(),  # type: ignore[arg-type]  # vertexai=False
-        prompt="Video with audio",
-        videos_dir=videos_dir,
-        model="veo-3.1-generate-001",
-        include_audio=True,
-    )
-
-    # Nothing else warns here, so the key should be absent entirely.
-    assert "warnings" not in gen_result
-    assert gen_result["audio_enabled"] is True
 
 
 @pytest.mark.asyncio
@@ -1564,42 +1485,6 @@ async def test_generate_video_last_frame_without_first_raises(
             videos_dir=videos_dir,
             model="veo-3.1-generate-001",
             last_frame_bytes=_create_test_image(),
-        )
-
-
-@pytest.mark.parametrize(
-    "kwargs_extra",
-    [
-        pytest.param({"image_bytes": True, "last_frame_bytes": True}, id="first_last"),
-        pytest.param({"reference_images": True}, id="reference"),
-    ],
-)
-@pytest.mark.asyncio
-@pytest.mark.timeout(2.0)
-async def test_generate_video_lite_rejects_unsupported_modes(
-    kwargs_extra: dict[str, bool],
-    tmp_path: Path,
-) -> None:
-    """Veo 3.1 Lite rejects first/last-frame and reference modes up front."""
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    img = _create_test_image()
-    kwargs: dict[str, Any] = {}
-    if kwargs_extra.get("image_bytes"):
-        kwargs["image_bytes"] = img
-    if kwargs_extra.get("last_frame_bytes"):
-        kwargs["last_frame_bytes"] = img
-    if kwargs_extra.get("reference_images"):
-        kwargs["reference_images"] = [img]
-
-    with pytest.raises(ValueError, match="Veo 3.1 Lite supports only"):
-        await generate_video(
-            client=FakeGenaiClient(),  # type: ignore[arg-type]
-            prompt="x",
-            videos_dir=videos_dir,
-            model="veo-3.1-lite-generate-preview",
-            **kwargs,
         )
 
 
@@ -1752,3 +1637,310 @@ def test_a_truncated_input_is_refused_locally_not_on_the_wire(fmt: str) -> None:
         _prepare_image_input(whole[: len(whole) // 2])
     # A whole file is still passed through untouched.
     assert _prepare_image_input(whole).image_bytes is whole
+
+
+# --------------------------------------------------------------------------
+# How far a timed-out render got
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_submit_that_times_out_may_have_reached_google(tmp_path: Path) -> None:
+    """The submit call itself ran out of time: the request may have arrived,
+    so the render may still bill. Neither "submitted" nor "nothing billed"."""
+    from src.video import VeoTimeoutError
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    client = FakeGenaiClient(raise_error=TimeoutError("submit stalled"), vertexai=True)
+    with pytest.raises(VeoTimeoutError) as caught:
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="rain",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+        )
+    assert caught.value.submission == "unknown"
+    assert caught.value.operation_name is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_poll_that_times_out_was_submitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Polling only happens once Google accepted the request. A plain timeout
+    from a stalled poll used to carry no operation name, so the tool told the
+    caller nothing had been billed."""
+    import src.video as video_mod
+    from src.video import VeoTimeoutError
+
+    monkeypatch.setattr(video_mod, "_VEO_POLL_INTERVAL_SECONDS", 0.0)
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    operation = FakeOperation(name="operations/abc")
+    operation.set_done_after_polls(2)
+    client = FakeGenaiClient(operation=operation, vertexai=True)
+
+    def stalled(op: Any) -> Any:
+        raise TimeoutError("poll stalled")
+
+    monkeypatch.setattr(client.operations, "get", stalled)
+    with pytest.raises(VeoTimeoutError) as caught:
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="rain",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+        )
+    assert caught.value.submission == "submitted"
+    assert caught.value.operation_name == "operations/abc"
+
+
+@pytest.mark.parametrize(
+    ("submission", "operation_name", "phrase"),
+    [
+        ("submitted", "operations/abc", "Operation operations/abc was submitted"),
+        ("unknown", None, "may have reached Google"),
+        ("none", None, "nothing was billed"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(10.0)
+async def test_the_tool_says_how_far_a_timed_out_render_got(
+    submission: str,
+    operation_name: str | None,
+    phrase: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    import src.__main__ as server
+    from src.__main__ import AppContext
+    from src.__main__ import generate_video as generate_video_tool
+    from src.video import VeoTimeoutError
+
+    async def timed_out(**kwargs: Any) -> Any:
+        raise VeoTimeoutError(
+            "deadline",
+            operation_name=operation_name,
+            submission=submission,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(server, "generate_video_impl", timed_out)
+    (tmp_path / "videos").mkdir()
+    client = MagicMock()
+    client._api_client.vertexai = True
+    ctx = MagicMock()
+    ctx.info = AsyncMock()
+    ctx.error = AsyncMock()
+    ctx.warning = AsyncMock()
+    ctx.request_context.lifespan_context = AppContext(
+        data_folder=tmp_path,
+        images_dir=tmp_path / "images",
+        videos_dir=tmp_path / "videos",
+        client=client,
+    )
+    body = json.loads(
+        await generate_video_tool(
+            ctx=ctx, prompt="rain", model="veo-3.1-generate-001", duration_seconds=4.0
+        )
+    )
+    assert body["submission"] == submission
+    assert phrase in body["note"]
+
+
+def _httpx_request() -> Any:
+    import httpx
+
+    return httpx.Request("POST", "https://example.invalid/v1/interactions")
+
+
+def _httpx_response(status: int) -> Any:
+    import httpx
+
+    return httpx.Response(status, request=_httpx_request())
+
+
+@pytest.mark.parametrize(
+    ("exc", "refused"),
+    [
+        # Either SDK's timeout, a dropped connection, a 5xx: it may have
+        # reached Google.
+        (TimeoutError("stalled"), False),
+        ("interactions_timeout", False),
+        ("interactions_504", False),
+        (genai_errors.ServerError(503, {"error": {"message": "UNAVAILABLE"}}), False),
+        # Turned down by the service, or never sent.
+        (genai_errors.ClientError(400, {"error": {"message": "bad"}}), True),
+        (genai_errors.ClientError(429, {"error": {"message": "quota"}}), True),
+        ("interactions_400", True),
+        (ValueError("bad argument"), True),
+    ],
+)
+def test_only_a_clear_refusal_means_nothing_was_started(
+    exc: Any, refused: bool
+) -> None:
+    """The Interactions client raises its own types, none of them a Python
+    TimeoutError; tracking that only knew TimeoutError called a timed-out
+    create "none"."""
+    from google.genai._gaos.lib import compat_errors as interactions_errors
+
+    from src.video import refused_before_work
+
+    if exc == "interactions_timeout":
+        exc = interactions_errors.APITimeoutError(request=_httpx_request())
+    elif exc == "interactions_504":
+        exc = interactions_errors.InternalServerError(
+            "gateway timeout", response=_httpx_response(504), body=None
+        )
+    elif exc == "interactions_400":
+        exc = interactions_errors.BadRequestError(
+            "bad", response=_httpx_response(400), body=None
+        )
+    assert refused_before_work(exc) is refused
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_submit_that_fails_ambiguously_may_have_reached_google(
+    tmp_path: Path,
+) -> None:
+    from src.video import VeoSubmissionError
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    client = FakeGenaiClient(
+        raise_error=genai_errors.ServerError(
+            503, {"error": {"message": "UNAVAILABLE"}}
+        ),
+        vertexai=True,
+    )
+    with pytest.raises(VeoSubmissionError) as caught:
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="rain",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+        )
+    assert caught.value.submission == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_refused_submit_is_raised_as_it_was(tmp_path: Path) -> None:
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    refusal = genai_errors.ClientError(403, {"error": {"message": "PERMISSION_DENIED"}})
+    client = FakeGenaiClient(raise_error=refusal, vertexai=True)
+    with pytest.raises(genai_errors.ClientError):
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="rain",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_a_completed_render_that_fails_to_save_was_submitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The render finished and bills; a full disk afterwards must not make it
+    look like nothing was sent."""
+    from src.video import VeoSubmissionError
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    video = FakeVideoObject()  # no bytes and no gs:// URI: it is downloaded
+    operation = FakeOperation(
+        result=FakeVideoResult([FakeGeneratedVideo(video)]), name="operations/done"
+    )
+    client = FakeGenaiClient(operation=operation, vertexai=True)
+
+    def disk_full(path: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(video, "save", disk_full)
+    with pytest.raises(VeoSubmissionError) as caught:
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="rain",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+        )
+    assert (caught.value.submission, caught.value.operation_name) == (
+        "submitted",
+        "operations/done",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+async def test_an_operation_google_reports_as_failed_is_not_a_submission(
+    tmp_path: Path,
+) -> None:
+    """Google bills Veo only for a generated video, so an operation it reports
+    as failed is not one to reconcile."""
+    from src.video import VeoOperationFailed
+
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    client = FakeGenaiClient(operation=FakeOperation(error="boom"), vertexai=True)
+    with pytest.raises(VeoOperationFailed):
+        await generate_video(
+            client=client,  # type: ignore[arg-type]
+            prompt="rain",
+            videos_dir=videos_dir,
+            model="veo-3.1-generate-001",
+        )
+
+
+# --------------------------------------------------------------------------
+# The wait a refusal asks for
+# --------------------------------------------------------------------------
+
+
+def test_a_retry_after_header_is_read_as_seconds() -> None:
+    from types import SimpleNamespace
+
+    from src.video import retry_after_seconds
+
+    exc = SimpleNamespace(response=SimpleNamespace(headers={"retry-after": "25"}))
+    assert retry_after_seconds(exc) == 25.0  # type: ignore[arg-type]
+    dated = SimpleNamespace(
+        response=SimpleNamespace(
+            headers={"Retry-After": "Thu, 01 Jan 2026 00:00:00 GMT"}
+        )
+    )
+    assert retry_after_seconds(dated) == 0.0  # type: ignore[arg-type]
+    assert retry_after_seconds(SimpleNamespace(response=None)) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("delay", ["25s", "25.5s", {"seconds": 25, "nanos": 500000000}])
+def test_retry_info_in_the_error_details_is_read(delay: object) -> None:
+    from types import SimpleNamespace
+
+    from src.video import retry_after_seconds
+
+    exc = SimpleNamespace(
+        response=None,
+        details={
+            "error": {
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": delay,
+                    }
+                ],
+            }
+        },
+    )
+    assert retry_after_seconds(exc) == pytest.approx(  # type: ignore[arg-type]
+        25.0 if delay == "25s" else 25.5
+    )

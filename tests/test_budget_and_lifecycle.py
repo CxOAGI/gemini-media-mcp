@@ -207,7 +207,7 @@ async def test_the_preview_model_is_refused_from_its_sunset_day(
     import src.omni as omni_mod
     from src.__main__ import generate_video_omni
 
-    monkeypatch.setattr(omni_mod, "_today", lambda: datetime.date(2026, 9, 29))
+    monkeypatch.setattr(omni_mod, "_today", lambda: datetime.date(2026, 10, 21))
     before = json.loads(
         await generate_video_omni(
             ctx=_ctx(tmp_path, vertexai=False),
@@ -218,7 +218,7 @@ async def test_the_preview_model_is_refused_from_its_sunset_day(
     )
     assert "error" not in before, before.get("error")
 
-    monkeypatch.setattr(omni_mod, "_today", lambda: datetime.date(2026, 9, 30))
+    monkeypatch.setattr(omni_mod, "_today", lambda: datetime.date(2026, 10, 22))
     after = json.loads(
         await generate_video_omni(
             ctx=_ctx(tmp_path, vertexai=False),
@@ -227,7 +227,7 @@ async def test_the_preview_model_is_refused_from_its_sunset_day(
             dry_run=True,
         )
     )
-    assert "switched off on 2026-09-30" in after["error"]
+    assert "switched off on 2026-10-22" in after["error"]
     assert "gemini-omni-1.1-flash" in after["error"]
 
 
@@ -238,7 +238,7 @@ def test_the_planner_stops_offering_the_preview_model_from_its_sunset(
     import src.omni as omni_mod
     from src.routing import RoutingConstraints, plan_generation
 
-    monkeypatch.setattr(omni_mod, "_today", lambda: datetime.date(2026, 10, 1))
+    monkeypatch.setattr(omni_mod, "_today", lambda: datetime.date(2026, 10, 23))
     plan = plan_generation(
         "a 6 second video of rain", RoutingConstraints(backend="gemini_api")
     )

@@ -3,7 +3,7 @@
 The one thing here is the calendar -- both of them. `src.omni` asks the real clock whether the
 preview endpoint's switch-off date has passed, and 17 tests across
 `test_omni.py`, `test_wire_contract_omni.py` and `test_routing.py` pass
-`model=OMNI_PREVIEW_MODEL` and expect it to work. On 2026-09-30 the real clock
+`model=OMNI_PREVIEW_MODEL` and expect it to work. On 2026-10-22 the real clock
 starts answering "yes" and every one of them fails with the refusal — 38 tests
 in all, on a date nobody would connect to a code change. Only
 `test_budget_and_lifecycle.py` pinned the calendar, and only for its own cases.
@@ -26,8 +26,9 @@ from collections.abc import Iterator
 import src.__main__ as _server
 import src.image as image
 import src.omni as omni
+import src.pricing as pricing
 
-# Before OMNI_PREVIEW_SUNSET (2026-09-30), so the preview model still serves and
+# Before OMNI_PREVIEW_SUNSET (2026-10-22), so the preview model still serves and
 # the suite tests the pre-sunset behaviour it was written for. Any date before
 # the sunset would do; this one is fixed so a failure is never about "when".
 PINNED_TODAY = datetime.date(2026, 9, 15)
@@ -42,6 +43,10 @@ def _pin_the_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
     tests to remember to ask for it would not have prevented it.
     """
     monkeypatch.setattr(omni, "_today", lambda: PINNED_TODAY)
+    # Understanding-model rates step up on published dates (Argon on
+    # 2026-12-01, 3.8 Flash on 2027-01-01); unpinned, a quote assertion would
+    # change on those days.
+    monkeypatch.setattr(pricing, "_today", lambda: PINNED_TODAY)
 
     # The second clock. src.image reads `date.today()` directly for the image
     # model shutdown phrasing, and the first version of this fixture pinned

@@ -2,13 +2,16 @@
 
 Video is half this server's tools and had no wire-level coverage. The risk is
 the same one the Imagen work was about: ``src/video.py`` rewrites the model ID
-on the way out, because the Gemini Developer API serves Veo under ``-preview``
-IDs and 404s on the Vertex ``-001`` names. A translation that updated an
+on the way out — an older Gemini-API ``-preview`` spelling becomes the
+``-001`` name, the only one Vertex serves — and a rewrite that updated an
 internal variable but built the old URL would pass every fake-client test and
-fail every real call.
+fail every real call. Veo runs on Vertex AI only since Google switched it off
+on the Gemini Developer API on 2026-10-22, so a Gemini API client must put
+nothing on the wire at all.
 
-These drive the real SDK against a stateful local stub covering the full
-long-running-operation flow: submit, poll while pending, then read the result.
+These drive the real SDK, in Vertex mode, against a stateful local stub
+covering the full long-running-operation flow: submit, poll while pending,
+then read the result.
 """
 
 import asyncio
@@ -22,8 +25,9 @@ from typing import Any
 import pytest
 from google import genai
 from google.genai.types import HttpOptions
+from google.oauth2.credentials import Credentials
 
-from src.video import generate_video
+from src.video import VEO_GEMINI_API_REFUSAL, generate_video
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"FAKE" * 64
 
@@ -41,34 +45,35 @@ class _VeoStub:
         self.requests: list[dict[str, Any]] = []
         self.polls = 0
 
+    _OPERATION = (
+        "projects/stub-project/locations/us-central1/publishers/google/models/"
+        "veo/operations/op-1"
+    )
+
     def submit_response(self) -> dict[str, Any]:
-        return {"name": "models/veo/operations/op-1", "done": False}
+        return {"name": self._OPERATION, "done": False}
 
     def poll_response(self) -> dict[str, Any]:
         self.polls += 1
         if self.polls <= self.pending_polls:
-            return {"name": "models/veo/operations/op-1", "done": False}
+            return {"name": self._OPERATION, "done": False}
         if self.fail_with:
             return {
-                "name": "models/veo/operations/op-1",
+                "name": self._OPERATION,
                 "done": True,
                 "error": {"code": 3, "message": self.fail_with},
             }
         return {
-            "name": "models/veo/operations/op-1",
+            "name": self._OPERATION,
             "done": True,
             "response": {
-                "generateVideoResponse": {
-                    "generatedSamples": [
-                        {
-                            "video": {
-                                # mldev spells these encodedVideo/encoding.
-                                "encodedVideo": base64.b64encode(_FAKE_MP4).decode(),
-                                "encoding": "video/mp4",
-                            }
-                        }
-                    ]
-                }
+                # Vertex spells these bytesBase64Encoded/mimeType.
+                "videos": [
+                    {
+                        "bytesBase64Encoded": base64.b64encode(_FAKE_MP4).decode(),
+                        "mimeType": "video/mp4",
+                    }
+                ]
             },
         }
 
@@ -99,7 +104,7 @@ def _make_handler(stub: _VeoStub) -> type[BaseHTTPRequestHandler]:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
             stub.requests.append({"path": self.path, "body": body})
-            # Vertex polls operations with POST; mldev submits with POST.
+            # Vertex submits with POST and polls with POST :fetchPredictOperation.
             if "operations" in self.path or ":fetchPredictOperation" in self.path:
                 self._reply(stub.poll_response())
             else:
@@ -138,6 +143,21 @@ def _run(client: Any, videos_dir: Path, **kwargs: Any) -> dict[str, Any]:
 
 
 def _client(base_url: str) -> Any:
+    """A real Vertex-mode client aimed at the stub.
+
+    A static token stands in for credentials: it is never refreshed, so no
+    request leaves the machine.
+    """
+    return genai.Client(
+        vertexai=True,
+        project="stub-project",
+        location="us-central1",
+        credentials=Credentials(token="stub-token-not-real"),
+        http_options=HttpOptions(base_url=base_url),
+    )
+
+
+def _gemini_api_client(base_url: str) -> Any:
     return genai.Client(
         api_key="stub-key-not-real", http_options=HttpOptions(base_url=base_url)
     )
@@ -146,26 +166,27 @@ def _client(base_url: str) -> Any:
 @pytest.mark.parametrize(
     ("requested", "expected_on_wire"),
     [
-        pytest.param("veo-3.1-generate-001", "veo-3.1-generate-preview", id="standard"),
+        pytest.param("veo-3.1-generate-001", "veo-3.1-generate-001", id="standard"),
         pytest.param(
-            "veo-3.1-fast-generate-001", "veo-3.1-fast-generate-preview", id="fast"
+            "veo-3.1-fast-generate-001", "veo-3.1-fast-generate-001", id="fast"
         ),
         pytest.param(
-            "veo-3.1-lite-generate-preview",
-            "veo-3.1-lite-generate-preview",
-            id="lite_already_preview",
+            "veo-3.1-generate-preview",
+            "veo-3.1-generate-001",
+            id="older_preview_spelling_normalized",
         ),
     ],
 )
 @pytest.mark.timeout(20.0)
-def test_gemini_api_receives_the_preview_spelling(
+def test_vertex_receives_the_001_spelling(
     requested: str,
     expected_on_wire: str,
     tmp_path: Path,
     no_poll_delay: None,
 ) -> None:
-    """The Gemini Developer API 404s on the Vertex -001 names, so the submit
-    URL must carry the -preview spelling."""
+    """Vertex serves only the -001 names, so the submit URL must carry one —
+    including when the caller fed back the -preview spelling an older
+    Gemini-API render reported."""
     stub = _VeoStub()
     server, base_url = _serve(stub)
     videos_dir = tmp_path / "videos"
@@ -284,12 +305,14 @@ def test_aspect_ratio_and_sample_count_reach_the_api(
     assert parameters.get("sampleCount") == 1
 
 
+@pytest.mark.parametrize("include_audio", [False, True])
 @pytest.mark.timeout(20.0)
-def test_gemini_api_reports_audio_as_always_on(
-    tmp_path: Path, no_poll_delay: None
+def test_generate_audio_is_sent_both_ways(
+    include_audio: bool, tmp_path: Path, no_poll_delay: None
 ) -> None:
-    """Veo 3.1 on the Gemini API always generates audio, whatever the caller
-    asked for. Reporting the request back would be a lie."""
+    """Omitting the flag lets the API apply its own default (audio on), which
+    would silently contradict include_audio=False and the audio_enabled the
+    response reports. So it is sent either way, and reported as sent."""
     stub = _VeoStub()
     server, base_url = _serve(stub)
     videos_dir = tmp_path / "videos"
@@ -299,10 +322,31 @@ def test_gemini_api_reports_audio_as_always_on(
             _client(base_url),
             videos_dir,
             model="veo-3.1-generate-001",
-            include_audio=False,
+            include_audio=include_audio,
         )
     finally:
         server.shutdown()
         server.server_close()
 
-    assert result["audio_enabled"] is True
+    assert stub.parameters().get("generateAudio") is include_audio
+    assert result["audio_enabled"] is include_audio
+
+
+@pytest.mark.timeout(20.0)
+def test_a_gemini_api_client_puts_nothing_on_the_wire(tmp_path: Path) -> None:
+    """Google switched off every Veo 3.1 model the Gemini Developer API served
+    on 2026-10-22. The impl refuses a Gemini API client before the SDK is
+    asked for anything, so not one request reaches the endpoint."""
+    stub = _VeoStub()
+    server, base_url = _serve(stub)
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    try:
+        with pytest.raises(ValueError) as refused:
+            _run(_gemini_api_client(base_url), videos_dir, model="veo-3.1-generate-001")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert str(refused.value) == VEO_GEMINI_API_REFUSAL
+    assert stub.requests == []

@@ -101,7 +101,7 @@ async def test_generate_video_emits_warnings_to_channel(
 ) -> None:
     from src.__main__ import generate_video
 
-    ctx = _ctx(_app_ctx(tmp_path))
+    ctx = _ctx(_app_ctx(tmp_path, vertexai=True))
     out = tmp_path / "videos" / "v.mp4"
     out.write_bytes(b"mp4")
 
@@ -124,7 +124,7 @@ async def test_generate_transition_emits_warnings_to_channel(
 ) -> None:
     from src.__main__ import generate_transition
 
-    ctx = _ctx(_app_ctx(tmp_path))
+    ctx = _ctx(_app_ctx(tmp_path, vertexai=True))
     (tmp_path / "first.png").write_bytes(_png_bytes())
     (tmp_path / "last.png").write_bytes(_png_bytes(color="tomato"))
     out = tmp_path / "videos" / "t.mp4"
@@ -151,7 +151,7 @@ async def test_generate_bridge_emits_warnings_to_channel(
 ) -> None:
     from src.__main__ import generate_bridge
 
-    ctx = _ctx(_app_ctx(tmp_path))
+    ctx = _ctx(_app_ctx(tmp_path, vertexai=True))
     (tmp_path / "a.mp4").write_bytes(b"clipA")
     (tmp_path / "b.mp4").write_bytes(b"clipB")
     out = tmp_path / "videos" / "br.mp4"
@@ -211,7 +211,7 @@ async def test_generate_clip_emits_beat_warnings_to_channel(
 ) -> None:
     from src.__main__ import generate_clip
 
-    ctx = _ctx(_app_ctx(tmp_path))
+    ctx = _ctx(_app_ctx(tmp_path, vertexai=True))
     out = tmp_path / "videos" / "beat.mp4"
     out.write_bytes(b"mp4")
 
@@ -656,10 +656,10 @@ async def test_a_draft_dry_run_prices_a_gcs_request_it_will_ignore(
 async def test_a_draft_never_resolves_a_client_for_the_veo_model_it_skips(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`_client_for_video_model` raises for a Lite model on Vertex with no key.
+    """`_client_for_video_model` raises for Veo on a Gemini-API deployment.
 
     The draft renders on omni and never uses that client, so resolving it
-    turned a working draft into a RuntimeError about a model it does not
+    would turn a working draft into a RuntimeError about a model it does not
     touch. Asserted by making the resolver fail outright: if the draft path
     calls it at all, this test fails.
     """
@@ -674,7 +674,7 @@ async def test_a_draft_never_resolves_a_client_for_the_veo_model_it_skips(
         await generate_video(
             ctx=_ctx(_app_ctx(tmp_path)),
             prompt="a cat",
-            model="veo-3.1-lite-generate-preview",
+            model="veo-3.1-fast-generate-001",
             draft=True,
             dry_run=True,
         )
@@ -704,7 +704,7 @@ async def test_animatic_resolution_is_ignored_when_animatic_is_false(
 
     result = json.loads(
         await generate_clip(
-            ctx=_ctx(_app_ctx(tmp_path)),
+            ctx=_ctx(_app_ctx(tmp_path, vertexai=True)),
             beats=[{"prompt": "a cat"}],
             animatic=False,
             animatic_resolution="9000p",
@@ -1070,7 +1070,7 @@ async def test_generate_video_hands_its_deadline_to_the_render(
         }
 
     monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
-    ctx = _ctx(_app_ctx(tmp_path))
+    ctx = _ctx(_app_ctx(tmp_path, vertexai=True))
     await generate_video(ctx=ctx, prompt="a leaf", model="veo-3.1-fast-generate-001")
     assert seen[-1]["timeout_seconds"] == VEO_DEFAULT_TIMEOUT_SECONDS == 210.0
     await generate_video(
@@ -1135,7 +1135,7 @@ async def test_any_veo_failure_names_what_was_attempted(
     monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
     body = json.loads(
         await generate_video(
-            ctx=_ctx(_app_ctx(tmp_path)),
+            ctx=_ctx(_app_ctx(tmp_path, vertexai=True)),
             prompt="x",
             model="veo-3.1-fast-generate-001",
             duration_seconds=8,
@@ -1321,7 +1321,7 @@ async def test_a_non_iam_failure_is_left_exactly_as_reported(
     monkeypatch.setattr("src.__main__.generate_video_impl", failing)
     body = json.loads(
         await generate_video(
-            ctx=_ctx(_app_ctx(tmp_path)), prompt="a leaf",
+            ctx=_ctx(_app_ctx(tmp_path, vertexai=True)), prompt="a leaf",
             model="veo-3.1-fast-generate-001", duration_seconds=4,
         )
     )
