@@ -583,6 +583,87 @@ async def test_generate_image_gemini31_flash(
     assert result["image_url"].startswith("file://")
 
 
+@pytest.mark.parametrize(
+    ("encoded_as", "declared_mime", "expected_suffix"),
+    [
+        ("PNG", "image/png", ".png"),
+        ("JPEG", "image/jpeg", ".jpg"),
+        ("WEBP", "image/webp", ".webp"),
+        # The bytes decide even when the declared type disagrees with them.
+        ("JPEG", "image/png", ".jpg"),
+    ],
+)
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_rendered_file_extension_matches_its_bytes(
+    encoded_as: str,
+    declared_mime: str,
+    expected_suffix: str,
+    tmp_path: Path,
+) -> None:
+    """A JPEG render must not be written behind a .png name.
+
+    Found on disk: gemini-3.1-flash-lite-image renders saved as JPEG bytes in
+    .png files, because every render was named .png whatever came back.
+    """
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    buffer = BytesIO()
+    Image.new("RGB", (64, 64), color="red").save(buffer, format=encoded_as)
+    rendered = buffer.getvalue()
+    part = FakePart(inline_data=FakeInlineData(declared_mime, rendered))
+    client = FakeGenaiClient(
+        gemini_response=FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    )
+
+    result = await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="A red square",
+        images_dir=images_dir,
+        model="gemini-3.1-flash-lite-image",
+    )
+
+    written = Path(result["image_url"].removeprefix("file://"))
+    assert written.suffix == expected_suffix
+    assert written.read_bytes() == rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_render_never_follows_continuation_tokens(tmp_path: Path) -> None:
+    """One render is one billed request.
+
+    google-genai 2.31.0 turned automatic continuation on by default: a
+    response ending in CONTINUATION is re-sent until the model finishes, and
+    each hop bills. The quote prices a single request, so the render must ask
+    for exactly that.
+    """
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    part = FakePart(inline_data=FakeInlineData("image/png", _create_test_image()))
+    client = FakeGenaiClient(
+        gemini_response=FakeGeminiResponse([FakeCandidate(FakeContent([part]))])
+    )
+
+    await generate_image(
+        client=client,  # type: ignore[arg-type]
+        prompt="A red square",
+        images_dir=images_dir,
+        model="gemini-3.1-flash-image",
+    )
+
+    assert client.models.last_generate_content_kwargs is not None
+    config = client.models.last_generate_content_kwargs["config"]
+    assert config.automatic_continuation is False
+
+
+def test_image_extension_falls_back_to_the_declared_type() -> None:
+    """Bytes the sniff does not know take the declared type, then PNG."""
+    assert src.image._image_extension(b"not an image", "image/webp") == ".webp"
+    assert src.image._image_extension(b"not an image", "IMAGE/JPEG") == ".jpg"
+    assert src.image._image_extension(b"not an image", None) == ".png"
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(2.0)
 async def test_generate_image_gemini31_flash_vertex_global_location(

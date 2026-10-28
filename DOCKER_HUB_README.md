@@ -1,6 +1,6 @@
 # Gemini Media MCP Server
 
-Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with a cost estimate before every call.
+Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with a cost estimate before every call and an optional Gemini 4 Argon director that checks each take against your notes.
 
 [What is an MCP Server?](https://www.anthropic.com/news/model-context-protocol)
 
@@ -12,7 +12,7 @@ Plan, generate, compose, and edit images and video with Gemini image models, Veo
 | **Author** | [CxOAGI](https://github.com/CxOAGI) |
 | **Repository** | [https://github.com/CxOAGI/gemini-media-mcp](https://github.com/CxOAGI/gemini-media-mcp) |
 
-## Available Tools (10)
+## Available Tools (11)
 
 | Tools provided by this Server | Short Description |
 |-------------------------------|-------------------|
@@ -23,7 +23,7 @@ Plan, generate, compose, and edit images and video with Gemini image models, Veo
 | `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a fast animatic preview |
 | `generate_transition` | Veo first+last-frame transition between two stills |
 | `generate_bridge` | Transition between two existing clips (frames extracted for you) |
-| `generate_video_omni` | Fast conversational video via `gemini-omni-flash-preview` or `gemini-omni-1.1-flash` (Interactions API) |
+| `generate_video_omni` | Fast conversational video via `gemini-omni-1.1-flash` (Interactions API) |
 | `edit_video` | Conversationally edit a previously omni-generated video |
 | `extend_video_omni` | Append a seamless continuation to an existing video (`gemini-omni-1.1-flash`) |
 | `loop_extend` | Extend a Veo video multiple times in one call |
@@ -49,7 +49,7 @@ Decide how to generate something before spending anything. Returns ranked, ready
 | `pinned_model` | string *optional* | A model you must use; reported as a conflict if it can't satisfy the request |
 
 **Notes:**
-- Catches impossible combinations before you pay for the failure (4K on a 1K-only model, extension on Veo Lite, GCS on the Gemini API)
+- Catches impossible combinations before you pay for the failure (4K on a 1K-only model, Veo on the Gemini API, GCS on the Gemini API)
 - Every rejected model comes with a reason — nothing is dropped silently
 
 *This tool is read-only.*
@@ -92,6 +92,8 @@ Generate images using Gemini image models
 | `aspect_ratio` | string *optional* | Output aspect ratio (e.g. `1:1`, `16:9`, `9:16`) |
 | `person_generation` | string *optional* | Policy for generating people: `dont_allow`, `allow_adult`, or `allow_all` |
 | `dry_run` | boolean *optional* | Return only the cost estimate; generates nothing |
+| `director_notes` | string *optional* | What the image must get right, in plain words. Gemini 4 Argon checks each take against them and retakes on a clear fail; see [Virtual director](#virtual-director) |
+| `max_retakes` | integer *optional* | Retakes the director may spend when a check fails, 0 to 2 (default 1) |
 
 **Available Models (GA):**
 - `gemini-3.1-flash-image` - Nano Banana 2; the general-purpose choice; fast, up to 4K output, up to 14 reference images
@@ -128,29 +130,30 @@ The server binds `0.0.0.0` inside a container so the published port is reachable
 
 ### Tool: **`generate_video`**
 
-Generate videos using VEO models. Works on both the Gemini API (Veo 3.1 on the paid tier; Veo 3.1 Lite is Gemini-API-only) and Vertex AI (adds GCS output and Vertex-only features).
+Generate videos using VEO models, which run on Vertex AI only (with GCS output and Vertex-only features). Google switched off Veo 3.1 on the Gemini Developer API on October 22, 2026; on a server using a Gemini API key this tool refuses and points to `generate_video_omni` (`gemini-omni-1.1-flash`) or Vertex AI.
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description of the video to generate |
-| `model` | string **required** | VEO model to use — no default; name one explicitly: `veo-3.1-generate-001`, `veo-3.1-fast-generate-001`, `veo-3.1-lite-generate-preview` |
+| `model` | string **required** | VEO model to use — no default; name one explicitly: `veo-3.1-generate-001` or `veo-3.1-fast-generate-001` |
 | `aspect_ratio` | string *optional* | Video aspect ratio: `16:9` (default) or `9:16` |
-| `resolution` | string *optional* | Output resolution: `720p`, `1080p`, or `4K` (4K not on Lite) |
+| `resolution` | string *optional* | Output resolution: `720p`, `1080p`, or `4K` |
 | `duration_seconds` | number *optional* | Video duration in seconds (4/6/8s). **Default `8.0`**, the longest and priciest option — an omitted duration on `veo-3.1-generate-001` bills a full 8s render (from $3.20 at 720p/1080p) |
-| `include_audio` | boolean *optional* | Enable audio generation (default `false`; honoured on Vertex only — on the Gemini API Veo 3.1 always produces audio) |
+| `include_audio` | boolean *optional* | Enable audio generation (default `false`) |
 | `person_generation` | string *optional* | Policy for generating people: `allow_adult` or `allow_all` |
 | `dry_run` | boolean *optional* | Return only the cost estimate; generates nothing |
+| `director_notes` | string *optional* | What the clip must get right, in plain words. Gemini 4 Argon checks each take against them and retakes on a clear fail; see [Virtual director](#virtual-director) |
+| `max_retakes` | integer *optional* | Retakes the director may spend when a check fails, 0 to 2 (default 1) |
 | `audio_prompt` | string *optional* | Audio description |
 | `negative_prompt` | string *optional* | Things to avoid in the video |
 | `seed` | integer *optional* | Random seed for reproducibility |
 | `image_uri` | string *optional* | Input image URI for image-to-video generation |
-| `draft` | boolean *optional* | When `true`, routes to `gemini-omni-flash-preview` for a fast 720p draft instead of Veo (default `false`) |
+| `draft` | boolean *optional* | When `true`, renders a fast 720p draft on `gemini-omni-1.1-flash` instead of Veo (default `false`) |
 | `draft_resolution` | string *optional* | Resolution for a `draft=true` pass. Naming one renders the draft on `gemini-omni-1.1-flash`; `360p` is a third of the 720p price |
 
 **Available Models** (no default — `model` must be supplied):
 - `veo-3.1-generate-001` - VEO 3.1 (4/6/8 seconds with audio support)
 - `veo-3.1-fast-generate-001` - VEO 3.1 Fast (faster generation)
-- `veo-3.1-lite-generate-preview` - VEO 3.1 Lite (cheapest; Gemini-API-only; text-to-video and image-to-video only)
 
 **Supported Aspect Ratios:**
 - `16:9` - Widescreen (default)
@@ -176,7 +179,7 @@ Generate a multi-beat short clip — the building block for a reel. One call ren
 | `model` | string *optional* | Veo model for every beat (default `veo-3.1-fast-generate-001`) |
 | `include_audio` | boolean *optional* | Audio per beat (default `true`; Vertex only) |
 | `add_bridges` | boolean *optional* | Generate a transition between consecutive beats (requires local beat outputs) |
-| `animatic` | boolean *optional* | Render every beat with `gemini-omni-flash-preview` for a fast 720p storyboard preview of the whole reel |
+| `animatic` | boolean *optional* | Render every beat with `gemini-omni-1.1-flash` for a fast 720p storyboard preview of the whole reel |
 | `animatic_resolution` | string *optional* | Resolution for the animatic pass. Naming one renders it on `gemini-omni-1.1-flash`; `360p` is a third of the 720p price |
 | `output_gcs_uri` | string *optional* | GCS URI for all outputs |
 
@@ -200,7 +203,7 @@ Veo 3.1 first+last-frame transition between two **still frames**.
 | `first_frame_uri` | string | Starting still (`gs://`, `https://`, `file://`) |
 | `last_frame_uri` | string | Ending still |
 | `prompt` | string *optional* | Transition motion and style |
-| `model` | string *optional* | Veo model (default fast; **Lite is not supported** — no first/last-frame mode) |
+| `model` | string *optional* | Veo model (default fast) |
 | `duration_seconds` | number *optional* | 4/6/8s, snapped to nearest |
 | `aspect_ratio` | string *optional* | Must match the surrounding clips |
 | `include_audio` / `audio_prompt` / `negative_prompt` / `seed` / `output_gcs_uri` | *optional* | As for `generate_video` |
@@ -232,12 +235,12 @@ Same as `generate_transition`, but takes two **clips** — it decodes the last f
 
 Fast conversational video generation through Google's Omni models (Interactions API). This is the fast path for drafts and iteration and the only family with multi-turn conversational editing. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
 
-Two models, selected with `omni_model`. `gemini-omni-flash-preview` (the default) renders 720p/24fps and nothing else. `gemini-omni-1.1-flash` adds 360p/1080p/4K output, first/last-frame interpolation, image and video references, native audio, and scene extension (see `extend_video_omni`). Both bill $0.10136/s at 720p — a hair above Veo Fast — but 1.1's `resolution="360p"` draft tier is about a third of that.
+`gemini-omni-1.1-flash` (the default) renders 360p/720p/1080p/4K with first/last-frame interpolation, image and video references, native audio, and scene extension (see `extend_video_omni`). It bills $0.10136/s at 720p — a hair above Veo Fast — and its `resolution="360p"` draft tier is about a third of that. `gemini-omni-flash-preview` was switched off on 2026-10-22 and is refused.
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
 | `prompt` | string | Text description of the video to generate. Role tags you write yourself (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) pass through untouched; otherwise the declarations are generated from the media arguments and echoed back as `effective_prompt` |
-| `omni_model` | string *optional* | `gemini-omni-flash-preview` (default) or `gemini-omni-1.1-flash`. Arguments the chosen model cannot honor are refused, never dropped |
+| `omni_model` | string *optional* | `gemini-omni-1.1-flash` (default). `gemini-omni-flash-preview` was switched off on 2026-10-22 and is refused. Arguments the model cannot honor are refused, never dropped |
 | `image_uris` | array *optional* | Image URIs whose role the model infers — at most 8 images in total; a longer list is rejected |
 | `first_frame_uri` / `last_frame_uri` | string *optional* | 1.1 only. Keyframe interpolation; `last_frame_uri` requires `first_frame_uri`, and the same URI for both loops the clip |
 | `reference_image_uris` | array *optional* | 1.1 only. Bound to `<IMAGE_REF_0>`, `<IMAGE_REF_1>`, … in order |
@@ -248,6 +251,8 @@ Two models, selected with `omni_model`. `gemini-omni-flash-preview` (the default
 | `duration_seconds` | number *optional* | Video duration, 3–10 (default 6). Also not sent on an edit; the service then picks the rendered length |
 | `previous_interaction_id` | string *optional* | Continue editing a prior omni result |
 | `timeout_seconds` | integer *optional* | Deadline for create + polling (default 600); raise it for long queues |
+| `director_notes` | string *optional* | What the clip must get right, in plain words. Gemini 4 Argon checks each take against them and retakes on a clear fail; see [Virtual director](#virtual-director) |
+| `max_retakes` | integer *optional* | Retakes the director may spend when a check fails, 0 to 2 (default 1) |
 
 **Notes:**
 - No `seed` or `negative_prompt` on either model — put negatives in the prompt (`no dialogue`)
@@ -318,13 +323,13 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 | `video_uri` | string | The Veo-generated video to extend |
 | `prompt` | string *optional* | What the video continues with (default: "continue the action") |
 | `times` | integer *optional* | Number of ~7s extensions to apply, 1-20 (default: 1) |
-| `model` | string *optional* | Veo model (default `veo-3.1-generate-001`; Lite not supported) |
+| `model` | string *optional* | Veo model (default `veo-3.1-generate-001`) |
 | `aspect_ratio` | string *optional* | `16:9` (default) or `9:16` — must match the source video |
 | `include_audio` | boolean *optional* | Audio on extended sections (default `true`; Vertex only) |
 | `output_gcs_uri` | string *optional* | GCS URI for output (required on Vertex) |
 
 **Notes:**
-- Veo 3.1 / Veo 3.1 Fast only (not Lite)
+- Veo 3.1 / Veo 3.1 Fast, on Vertex AI
 - 720p
 
 *This tool may perform destructive updates.*
@@ -337,13 +342,26 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 
 Two video paths, chosen by where you are in the workflow:
 
-- **`gemini-omni-flash-preview` (fastest turnaround)** — 720p, 24fps, conversational multi-turn editing. Great for drafts, storyboards, and iteration. No seeds, negative prompts, or first/last-frame control. Reached via `generate_video_omni`, `edit_video`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
-- **`gemini-omni-1.1-flash` (fast, and far more controllable)** — everything above plus 360p/1080p/4K output, first/last-frame interpolation, video references, native audio and scene extension. Still no seeds or negative prompts. Reached by passing `omni_model="gemini-omni-1.1-flash"` to `generate_video_omni` or `edit_video`, and by `extend_video_omni`.
-- **Veo 3.1 / Fast / Lite (high-fidelity)** — up to 1080p/4K, seeds, first/last-frame control, reference images, extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
+- **`gemini-omni-1.1-flash` (fast turnaround)** — 360p/720p/1080p/4K, conversational multi-turn editing, first/last-frame interpolation, video references, native audio and scene extension. No seeds or negative prompts. Great for drafts, storyboards and iteration. Reached via `generate_video_omni`, `edit_video`, `extend_video_omni`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
+- **Veo 3.1 / Fast (high-fidelity, Vertex AI only)** — up to 1080p/4K, seeds, first/last-frame control, reference images, extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
 
 Typical workflows:
 - **draft → finalize**: run `generate_video` with `draft=true` to preview quickly on omni, then re-run the same prompt with `draft=false` to render the final on Veo.
-- **animatic → final**: run `generate_clip` with `animatic=true` (default `false`) to render each beat through `gemini-omni-flash-preview` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` to commit to full Veo renders.
+- **animatic → final**: run `generate_clip` with `animatic=true` (default `false`) to render each beat through `gemini-omni-1.1-flash` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` to commit to full Veo renders.
+
+---
+
+## Virtual director
+
+`generate_image`, `generate_video` and `generate_video_omni` take optional `director_notes`: what the shot must get right, in plain words. Without them nothing changes: no extra call and no extra cost. With them, Gemini 4 Argon turns the notes into checks, each quoting the words it came from; the take renders exactly as it would without notes and is reviewed against every check (`pass`, `fail`, `unsure` or `not_applicable`, with where in the image or when in the clip the problem is); a clear fail buys a retake, up to `max_retakes` (0 to 2, default 1), with your prompt unchanged plus fix notes built from the checks. The response's `director` block lists the checks, every take with its results and costs, `chosen_take` and `retakes_used`; `cost` covers every take and every director call, and each take's sidecar manifest carries its review.
+
+- No confidence number is reported; the states have not been compared with human labels.
+- A fail needs evidence, or it counts as `unsure`, and an `unsure` review stops instead of paying for a retake.
+- Text inside a render is assessed, never followed: retake notes come only from the checks derived from your notes.
+- No check assesses a person's identity, likeness, age, sex or gender, race or ethnicity, health, emotion, attractiveness or body.
+- A `dry_run` with notes quotes the worst case. On the video tools, `timeout_seconds` bounds the whole directed call.
+
+`DIRECTOR_MODEL` selects `gemini-4-argon` (default) or `gemini-3.8-flash` (about a third of the price). On Vertex AI, director calls use the global endpoint.
 
 ---
 
@@ -374,7 +392,7 @@ Typical workflows:
 }
 ```
 
-### Using Gemini API (Images + Videos)
+### Using Gemini API (Images + Omni Videos)
 
 ```json
 {
@@ -418,7 +436,7 @@ Typical workflows:
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | — | The service account key as inline JSON, instead of mounting a file. Written by `gemini-media-mcp setup`; the server materialises it into a temp file |
 | `DATA_FOLDER` | ✅ | Output directory path (must match host path in volume) |
 
-### Gemini API Configuration (Images + Videos)
+### Gemini API Configuration (Images + Omni Videos)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -433,12 +451,13 @@ Typical workflows:
 | `VIDEO_GCS_BUCKET` | Default bucket for large video output; also seeds the allowlist above |
 | `FASTMCP_HOST` | Bind address for the sse/streamable-http transports; `--host` wins over it |
 | `RUNNING_IN_CONTAINER` | Set to `true` by this image. Makes `DATA_FOLDER` mandatory and binds `0.0.0.0` instead of `127.0.0.1`. Leave it alone unless you are building your own image |
+| `DIRECTOR_MODEL` | Model for `director_notes` reviews: `gemini-4-argon` (default) or `gemini-3.8-flash` |
 
 ---
 
 ## Google Cloud Setup
 
-Video generation with VEO models works on the paid Gemini API tier (Veo 3.1 Lite is Gemini-API-only). Vertex AI is optional and adds GCS output plus Vertex-only features. To use Vertex AI:
+Video generation with VEO models needs Vertex AI: Google switched off Veo 3.1 on the Gemini Developer API on October 22, 2026, so a Gemini API key alone reaches video through Gemini Omni only. Vertex AI also adds GCS output plus Vertex-only features. To use Vertex AI:
 
 ### Quick Setup Steps:
 

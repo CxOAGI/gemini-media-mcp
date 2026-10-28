@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src.director import director_model
 
 
 def get_api_key():
@@ -31,6 +32,19 @@ def is_vertex_ai():
 requires_api = pytest.mark.skipif(
     not get_api_key() and not is_vertex_ai(),
     reason="GEMINI_API_KEY or Vertex AI credentials not set",
+)
+
+# Veo runs on Vertex AI only: Google switched off its Veo 3.1 models on the
+# Gemini Developer API on 2026-10-22, so a live render needs Vertex.
+requires_vertex = pytest.mark.skipif(
+    not is_vertex_ai(),
+    reason="Veo runs on Vertex AI only; set GOOGLE_GENAI_USE_VERTEXAI=true",
+)
+
+# The refusal only happens on a server whose primary client is the Gemini API.
+requires_gemini_api_only = pytest.mark.skipif(
+    not get_api_key() or is_vertex_ai(),
+    reason="needs GEMINI_API_KEY without Vertex AI mode",
 )
 
 pytestmark = [pytest.mark.asyncio]
@@ -181,6 +195,33 @@ class TestMCPIntegration:
             assert sidecar["image_size"] == "2K"
 
     @requires_api
+    async def test_director_reviews_an_image_against_its_notes(self, temp_data_folder):
+        """The live check the director's requests need: Argon accepts the
+        derive and review calls (response schema, thinking level, media
+        resolution) on whichever backend is configured, and the review reaches
+        a verdict instead of abstaining on a configuration error."""
+        async with _mcp_session(temp_data_folder) as session:
+            result = await session.call_tool(
+                "generate_image",
+                {
+                    "prompt": "A white ceramic mug on a wooden table, plain background",
+                    "model": "gemini-3.1-flash-lite-image",
+                    "director_notes": (
+                        "The mug is white. There are no people or hands in the image."
+                    ),
+                    "max_retakes": 0,
+                },
+            )
+            payload = _assert_generated(result, "image_url")
+            block = payload["director"]
+            assert block["model"] == director_model(), block
+            assert block["checks_source"] in ("compiled", "cache"), block
+            assert block["checks"], block
+            take = block["takes"][0]
+            assert take["verdict"] in ("passed", "failed", "unsure"), take
+            assert block["cost"]["usd"] > 0, block
+
+    @requires_api
     async def test_gemini3_pro_returns_a_thought_signature(self, temp_data_folder):
         """Multi-turn editing depends on the signature being returned.
 
@@ -238,7 +279,7 @@ class TestMCPIntegration:
 
     # ==================== VEO 3.1 Tests ====================
 
-    @requires_api
+    @requires_vertex
     async def test_veo31_basic(self, temp_data_folder):
         """Test VEO 3.1 basic generation."""
         async with _mcp_session(temp_data_folder) as session:
@@ -252,7 +293,7 @@ class TestMCPIntegration:
             payload = _assert_generated(result, "video_url")
             assert payload.get("cost") is not None, "a real run must report cost"
 
-    @requires_api
+    @requires_vertex
     async def test_veo31_duration(self, temp_data_folder):
         """Test VEO 3.1 with duration_seconds parameter (4/6/8s)."""
         async with _mcp_session(temp_data_folder) as session:
@@ -267,7 +308,7 @@ class TestMCPIntegration:
             payload = _assert_generated(result, "video_url")
             assert payload.get("cost") is not None, "a real run must report cost"
 
-    @requires_api
+    @requires_vertex
     async def test_veo31_fast(self, temp_data_folder):
         """Test VEO 3.1 fast model variant."""
         async with _mcp_session(temp_data_folder) as session:
@@ -281,39 +322,20 @@ class TestMCPIntegration:
             payload = _assert_generated(result, "video_url")
             assert payload.get("cost") is not None, "a real run must report cost"
 
-    @requires_api
-    async def test_veo31_lite(self, temp_data_folder):
-        """Test VEO 3.1 Lite preview model."""
+    @requires_gemini_api_only
+    async def test_veo_is_refused_on_the_gemini_api(self, temp_data_folder):
+        """Veo has no endpoint on the Gemini Developer API since 2026-10-22.
+        The server refuses before sending anything, so this costs nothing."""
         async with _mcp_session(temp_data_folder) as session:
             result = await session.call_tool(
                 "generate_video",
                 {
                     "prompt": "A paper airplane gliding through the sky",
-                    "model": "veo-3.1-lite-generate-preview",
+                    "model": "veo-3.1-fast-generate-001",
                     "duration_seconds": 4,
                 },
             )
-            payload = _assert_generated(result, "video_url")
-            assert payload.get("cost") is not None, "a real run must report cost"
-
-    @requires_api
-    async def test_veo31_lite_rejects_extend(self, temp_data_folder):
-        """VEO 3.1 Lite must reject video-extension requests (doesn't
-        support extension per model card)."""
-        async with _mcp_session(temp_data_folder) as session:
-            result = await session.call_tool(
-                "generate_video",
-                {
-                    "prompt": "continue this clip",
-                    "model": "veo-3.1-lite-generate-preview",
-                    "extend_video_uri": "gs://example/clip.mp4",
-                },
-            )
-            # Fragment verified against the impl's actual message ("does not
-            # support extend_video") by driving generate_video through a wire
-            # stub — an earlier fix asserted "video extension" and would have
-            # failed live for the wrong reason.
-            _assert_refused(result, "does not support extend")
+            _assert_refused(result, "not available on the Gemini Developer API")
 
 
 if __name__ == "__main__":

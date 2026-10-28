@@ -364,7 +364,7 @@ def test_create_client(
 
 
 # ============================================================================
-# Veo Lite routing tests
+# Veo client routing tests
 # ============================================================================
 
 
@@ -391,22 +391,6 @@ def test_create_gemini_api_client_builds_client_with_key(
     assert create_gemini_api_client() is fake
 
 
-def test_client_for_video_model_routes_lite_through_api_client(
-    tmp_path: Path,
-) -> None:
-    vertex_client = _make_fake_client(vertexai=True)
-    api_client = _make_fake_client(vertexai=False)
-    ctx = AppContext(
-        data_folder=tmp_path,
-        images_dir=tmp_path,
-        videos_dir=tmp_path,
-        client=vertex_client,
-        gemini_api_client=api_client,
-    )
-    picked = _client_for_video_model(ctx, "veo-3.1-lite-generate-preview")
-    assert picked is api_client
-
-
 def test_client_for_video_model_uses_main_client_for_non_lite(
     tmp_path: Path,
 ) -> None:
@@ -423,35 +407,26 @@ def test_client_for_video_model_uses_main_client_for_non_lite(
     assert picked is vertex_client
 
 
-def test_client_for_video_model_lite_without_api_key_raises(
-    tmp_path: Path,
+@pytest.mark.parametrize("model", ["veo-3.1-generate-001", "veo-3.1-fast-generate-001"])
+def test_client_for_video_model_refuses_a_gemini_api_primary(
+    model: str, tmp_path: Path
 ) -> None:
-    vertex_client = _make_fake_client(vertexai=True)
-    ctx = AppContext(
-        data_folder=tmp_path,
-        images_dir=tmp_path,
-        videos_dir=tmp_path,
-        client=vertex_client,
-        gemini_api_client=None,
-    )
-    with pytest.raises(RuntimeError, match="only available via the Gemini API"):
-        _client_for_video_model(ctx, "veo-3.1-lite-generate-preview")
+    """Veo has no endpoint on the Gemini Developer API since 2026-10-22, so a
+    server whose primary client is the Gemini API has no client for it. A
+    RuntimeError, which _backend_of relies on to fall back cleanly."""
+    from src.video import VEO_GEMINI_API_REFUSAL
 
-
-def test_client_for_video_model_lite_on_api_only_passes_through(
-    tmp_path: Path,
-) -> None:
-    """When primary client is already the Gemini API, don't require a second one."""
     api_client = _make_fake_client(vertexai=False)
     ctx = AppContext(
         data_folder=tmp_path,
         images_dir=tmp_path,
         videos_dir=tmp_path,
         client=api_client,
-        gemini_api_client=None,
+        gemini_api_client=api_client,
     )
-    picked = _client_for_video_model(ctx, "veo-3.1-lite-generate-preview")
-    assert picked is api_client
+    with pytest.raises(RuntimeError) as refused:
+        _client_for_video_model(ctx, model)
+    assert str(refused.value) == VEO_GEMINI_API_REFUSAL
 
 
 # ============================================================================
@@ -2195,8 +2170,9 @@ def _video_ctx(
     ctx.warning = AsyncMock()
     # Shape the client explicitly. A bare MagicMock reads as Vertex (every
     # attribute is truthy), which silently routes tests down the Vertex
-    # branch — where loop_extend requires a GCS target and Lite is refused
-    # for want of a key. That accident has cost real debugging time twice.
+    # branch — where loop_extend requires a GCS target. That accident has
+    # cost real debugging time twice. Veo runs on Vertex only, so a Veo test
+    # passes vertexai=True; the Gemini API default suits the omni tests.
     client = MagicMock()
     client._api_client.vertexai = vertexai
     ctx.request_context.lifespan_context = AppContext(
@@ -2469,7 +2445,7 @@ async def test_generate_video_raises_on_unfetchable_image_uri(
     monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
 
     result = await generate_video(
-        ctx=_video_ctx(tmp_path),
+        ctx=_video_ctx(tmp_path, vertexai=True),
         prompt="p",
         model="veo-3.1-generate-001",
         image_uri=f"file://{tmp_path / 'nope.png'}",
@@ -2501,7 +2477,7 @@ async def test_generate_video_raises_on_unfetchable_last_frame(
     monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
 
     result = await generate_video(
-        ctx=_video_ctx(tmp_path),
+        ctx=_video_ctx(tmp_path, vertexai=True),
         prompt="p",
         model="veo-3.1-generate-001",
         image_uri=f"file://{first_frame}",
@@ -2540,7 +2516,7 @@ async def test_generate_video_passes_new_params(
     monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
 
     result = await generate_video(
-        ctx=_video_ctx(tmp_path),
+        ctx=_video_ctx(tmp_path, vertexai=True),
         prompt="p",
         model="veo-3.1-generate-001",
         resolution="1080p",
@@ -2667,7 +2643,8 @@ def _ctx_wrapping(app_ctx: Any) -> Any:
 async def test_generate_video_explicit_gcs_on_gemini_api_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An explicit output_gcs_uri on a Gemini-API-routed call is a clear error."""
+    """An explicit output_gcs_uri on a Gemini-API deployment is refused like
+    any other Veo call there, before the impl runs."""
     from src.__main__ import generate_video
 
     (tmp_path / "images").mkdir()
@@ -2675,7 +2652,7 @@ async def test_generate_video_explicit_gcs_on_gemini_api_raises(
     ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
 
     async def should_not_run(**kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("impl must not run when explicit GCS is rejected")
+        raise AssertionError("impl must not run on a Gemini-API deployment")
 
     monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
 
@@ -2691,86 +2668,81 @@ async def test_generate_video_explicit_gcs_on_gemini_api_raises(
     assert "Vertex AI" in result["error"]
 
 
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        pytest.param(
+            "generate_video",
+            {"prompt": "x", "model": "veo-3.1-fast-generate-001"},
+            id="generate_video",
+        ),
+        pytest.param(
+            "generate_video",
+            {"prompt": "x", "model": "veo-3.1-generate-preview"},
+            id="generate_video_older_spelling",
+        ),
+        pytest.param(
+            "generate_transition",
+            {"first_frame_uri": "gs://b/a.png", "last_frame_uri": "gs://b/b.png"},
+            id="generate_transition",
+        ),
+        pytest.param(
+            "generate_bridge",
+            {"from_clip_uri": "gs://b/a.mp4", "to_clip_uri": "gs://b/b.mp4"},
+            id="generate_bridge",
+        ),
+        pytest.param(
+            "generate_clip",
+            {"beats": [{"prompt": "a"}, {"prompt": "b"}]},
+            id="generate_clip",
+        ),
+        pytest.param(
+            "loop_extend",
+            {"video_uri": "gs://b/v.mp4", "times": 2},
+            id="loop_extend",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_generate_video_env_gcs_default_dropped_on_gemini_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.timeout(10.0)
+async def test_veo_tools_refuse_on_the_gemini_api(
+    tool: str,
+    kwargs: dict[str, Any],
+    dry_run: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A VIDEO_GCS_BUCKET default must not break Gemini-API generation.
+    """Google switched off every Veo 3.1 model the Gemini Developer API served
+    on 2026-10-22. On a Gemini-API deployment every Veo tool refuses, quote
+    included, before anything is fetched or rendered, and names both ways
+    out: omni on this backend, or Veo on Vertex AI."""
+    import src.__main__ as main_mod
 
-    Regression: the env default was funneled to the impl and the Vertex-only
-    gate then hard-raised, breaking all Veo Lite / text-to-video runs.
-    """
-    from src.__main__ import generate_video
+    (tmp_path / "images").mkdir(exist_ok=True)
+    (tmp_path / "videos").mkdir(exist_ok=True)
 
-    (tmp_path / "images").mkdir()
-    (tmp_path / "videos").mkdir()
-    ctx = _ctx_wrapping(
-        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
-    )
+    async def must_not_spend(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("nothing may be fetched or rendered for Veo here")
 
-    captured: dict[str, Any] = {}
-
-    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
-        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
-        return {
-            "message": "Video generated successfully",
-            "video_url": f"file://{tmp_path}/videos/out.mp4",
-            "model": kwargs.get("model", ""),
-        }
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
+    monkeypatch.setattr(main_mod, "generate_video_impl", must_not_spend)
+    monkeypatch.setattr(main_mod, "fetch", must_not_spend)
 
     result = json.loads(
-        await generate_video(ctx=ctx, prompt="x", model="veo-3.1-generate-001")
-    )
-    assert result["message"] == "Video generated successfully"
-    # The env-default bucket is dropped on the Gemini API path.
-    assert captured["output_gcs_uri"] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_generate_video_extend_on_gemini_api_without_gcs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Video extension works on the Gemini API without a GCS target.
-
-    Regression: two independently-added checks (extend-requires-GCS and
-    GCS-requires-Vertex) deadlocked extension on Gemini-API deployments.
-    """
-    from src.__main__ import generate_video
-
-    (tmp_path / "images").mkdir()
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-    src_clip = videos_dir / "src.mp4"
-    src_clip.write_bytes(b"fake-mp4")
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
-
-    captured: dict[str, Any] = {}
-
-    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
-        captured["extend_video_uri"] = kwargs.get("extend_video_uri")
-        return {
-            "message": "Video generated successfully",
-            "video_url": f"file://{videos_dir}/out.mp4",
-            "model": kwargs.get("model", ""),
-            "generation_mode": "extend_video",
-        }
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
-
-    result = json.loads(
-        await generate_video(
-            ctx=ctx,
-            prompt="continue",
-            model="veo-3.1-generate-001",
-            extend_video_uri=f"file://{src_clip}",
+        await getattr(main_mod, tool)(
+            ctx=_ctx_wrapping(_gemini_api_app_ctx(tmp_path)),
+            dry_run=dry_run,
+            **kwargs,
         )
     )
-    assert result["message"] == "Video generated successfully"
-    assert captured["extend_video_uri"] == f"file://{src_clip}"
+
+    assert "segments" not in result
+    error = result["error"]
+    assert "Gemini Developer API" in error
+    assert "2026-10-22" in error
+    assert "generate_video_omni" in error
+    assert "gemini-omni-1.1-flash" in error
+    assert "Vertex AI credentials" in error
 
 
 @pytest.mark.asyncio
@@ -2883,250 +2855,11 @@ async def test_fetch_unsupported_scheme_message(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_generate_transition_explicit_gcs_on_gemini_api_raises(
+async def test_generate_clip_unroutable_model_is_a_top_level_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An explicit output_gcs_uri on a Gemini-API-routed transition is a clear
-    top-level error, not a silent drop by the impl."""
-    from src.__main__ import generate_transition
-
-    images_dir = tmp_path / "images"
-    images_dir.mkdir()
-    (tmp_path / "videos").mkdir()
-    frame_a = images_dir / "a.png"
-    frame_b = images_dir / "b.png"
-    frame_a.write_bytes(_create_test_image())
-    frame_b.write_bytes(_create_test_image())
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
-
-    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("impl must not run when explicit GCS is rejected")
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
-
-    result = json.loads(
-        await generate_transition(
-            ctx=ctx,
-            first_frame_uri=f"file://{frame_a}",
-            last_frame_uri=f"file://{frame_b}",
-            output_gcs_uri="gs://bucket/out.mp4",
-        )
-    )
-    assert "error" in result
-    assert "Vertex AI" in result["error"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_generate_transition_env_gcs_default_dropped_on_gemini_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A VIDEO_GCS_BUCKET default is silently dropped (not raised) for a
-    Gemini-API transition, and the call succeeds inline."""
-    from src.__main__ import generate_transition
-
-    images_dir = tmp_path / "images"
-    images_dir.mkdir()
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-    frame_a = images_dir / "a.png"
-    frame_b = images_dir / "b.png"
-    frame_a.write_bytes(_create_test_image())
-    frame_b.write_bytes(_create_test_image())
-    ctx = _ctx_wrapping(
-        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
-    )
-
-    captured: dict[str, Any] = {}
-
-    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
-        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
-        out = videos_dir / "out.mp4"
-        out.write_bytes(b"mp4")
-        return {
-            "message": "Video generated successfully",
-            "video_url": f"file://{out}",
-            "model": kwargs.get("model", ""),
-            "audio_enabled": False,
-            "generation_mode": "first_last_frame",
-        }
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
-
-    result = json.loads(
-        await generate_transition(
-            ctx=ctx,
-            first_frame_uri=f"file://{frame_a}",
-            last_frame_uri=f"file://{frame_b}",
-        )
-    )
-    assert result["message"] == "Video generated successfully"
-    assert captured["output_gcs_uri"] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(30.0)
-async def test_generate_bridge_explicit_gcs_on_gemini_api_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An explicit output_gcs_uri on a Gemini-API-routed bridge errors."""
-    from src.__main__ import generate_bridge
-
-    (tmp_path / "images").mkdir()
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-    clip_a = videos_dir / "a.mp4"
-    clip_b = videos_dir / "b.mp4"
-    clip_a.write_bytes(_make_fake_mp4())
-    clip_b.write_bytes(_make_fake_mp4())
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
-
-    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("impl must not run when explicit GCS is rejected")
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
-
-    result = json.loads(
-        await generate_bridge(
-            ctx=ctx,
-            from_clip_uri=f"file://{clip_a}",
-            to_clip_uri=f"file://{clip_b}",
-            output_gcs_uri="gs://bucket/out.mp4",
-        )
-    )
-    assert "error" in result
-    assert "Vertex AI" in result["error"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(30.0)
-async def test_generate_bridge_env_gcs_default_dropped_on_gemini_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A VIDEO_GCS_BUCKET default is dropped (not raised) for a Gemini-API
-    bridge, and the call succeeds inline."""
-    from src.__main__ import generate_bridge
-
-    (tmp_path / "images").mkdir()
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-    clip_a = videos_dir / "a.mp4"
-    clip_b = videos_dir / "b.mp4"
-    clip_a.write_bytes(_make_fake_mp4())
-    clip_b.write_bytes(_make_fake_mp4())
-    ctx = _ctx_wrapping(
-        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
-    )
-
-    captured: dict[str, Any] = {}
-
-    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
-        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
-        out = videos_dir / "bridge.mp4"
-        out.write_bytes(b"mp4")
-        return {
-            "message": "Video generated successfully",
-            "video_url": f"file://{out}",
-            "model": kwargs.get("model", ""),
-            "audio_enabled": False,
-            "generation_mode": "first_last_frame",
-        }
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
-
-    result = json.loads(
-        await generate_bridge(
-            ctx=ctx,
-            from_clip_uri=f"file://{clip_a}",
-            to_clip_uri=f"file://{clip_b}",
-        )
-    )
-    assert result["message"] == "Video generated successfully"
-    assert captured["output_gcs_uri"] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_generate_clip_explicit_gcs_on_gemini_api_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An explicit output_gcs_uri on a Gemini-API-routed clip errors top-level
-    before any beat runs."""
-    from src.__main__ import generate_clip
-
-    (tmp_path / "images").mkdir()
-    (tmp_path / "videos").mkdir()
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
-
-    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("impl must not run when explicit GCS is rejected")
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", should_not_run)
-
-    result = json.loads(
-        await generate_clip(
-            ctx=ctx,
-            beats=[{"prompt": "a"}, {"prompt": "b"}],
-            output_gcs_uri="gs://bucket/out.mp4",
-        )
-    )
-    assert "error" in result
-    assert "Vertex AI" in result["error"]
-    assert result.get("kind") != "clip"
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(10.0)
-async def test_generate_clip_env_gcs_default_dropped_on_gemini_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A VIDEO_GCS_BUCKET default is dropped (not raised) for a Gemini-API
-    clip, and beats succeed inline."""
-    from src.__main__ import generate_clip
-
-    (tmp_path / "images").mkdir()
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-    ctx = _ctx_wrapping(
-        _gemini_api_app_ctx(tmp_path, video_gcs_bucket="gs://default-bucket/out/")
-    )
-
-    captured: dict[str, Any] = {}
-
-    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
-        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
-        out = videos_dir / "beat.mp4"
-        out.write_bytes(_make_fake_mp4())
-        return {
-            "message": "Video generated successfully",
-            "video_url": f"file://{out}",
-            "model": kwargs.get("model", ""),
-            "audio_enabled": kwargs.get("include_audio", False),
-            "generation_mode": "text_to_video",
-            "duration_seconds": kwargs.get("duration_seconds"),
-        }
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
-
-    result = json.loads(
-        await generate_clip(
-            ctx=ctx,
-            beats=[{"prompt": "a", "duration_seconds": 4}],
-            add_bridges=False,
-        )
-    )
-    assert result["kind"] == "clip"
-    assert len(result["segments"]) == 1
-    assert captured["output_gcs_uri"] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_generate_clip_lite_without_api_client_top_level_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A Lite model that can't route (Vertex primary, no gemini_api_client)
-    fails top-level, not as an empty-segments success manifest.
+    """A model no client can serve (Veo on a Gemini-API deployment) fails
+    top-level, not as an empty-segments success manifest.
 
     Regression: the client was resolved inside the per-beat try/except, so the
     RuntimeError was recorded once per beat and the clip returned zero
@@ -3136,16 +2869,7 @@ async def test_generate_clip_lite_without_api_client_top_level_error(
 
     (tmp_path / "images").mkdir()
     (tmp_path / "videos").mkdir()
-    vertex_client = MagicMock()
-    vertex_client._api_client.vertexai = True
-    app_ctx = AppContext(
-        data_folder=tmp_path,
-        images_dir=tmp_path / "images",
-        videos_dir=tmp_path / "videos",
-        client=vertex_client,
-        gemini_api_client=None,
-    )
-    ctx = _ctx_wrapping(app_ctx)
+    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
 
     async def should_not_run(**kwargs: Any) -> dict[str, Any]:
         raise AssertionError("impl must not run when the model can't be routed")
@@ -3156,11 +2880,11 @@ async def test_generate_clip_lite_without_api_client_top_level_error(
         await generate_clip(
             ctx=ctx,
             beats=[{"prompt": "a"}, {"prompt": "b"}],
-            model="veo-3.1-lite-generate-preview",
+            model="veo-3.1-fast-generate-001",
         )
     )
     assert "error" in result
-    assert "Gemini API" in result["error"]
+    assert "Gemini Developer API" in result["error"]
     assert result.get("kind") != "clip"
     assert "segments" not in result
 
@@ -3278,7 +3002,7 @@ async def test_generate_video_propagates_warnings(
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
     (tmp_path / "images").mkdir()
-    warning = "include_audio=False ignored on the Gemini API path"
+    warning = "seed=-1 was not sent: Veo seeds must be non-negative"
 
     async def mock_impl(**kwargs: Any) -> dict[str, Any]:
         out = videos_dir / "v.mp4"
@@ -3295,7 +3019,9 @@ async def test_generate_video_propagates_warnings(
 
     result = json.loads(
         await generate_video(
-            ctx=_video_ctx(tmp_path), prompt="p", model="veo-3.1-generate-001"
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            prompt="p",
+            model="veo-3.1-generate-001",
         )
     )
     assert result["warnings"] == [warning]
@@ -3445,38 +3171,6 @@ async def test_generate_image_malformed_thought_signature_url_raises(
     payload = json.loads(result[0].text)
     assert "error" in payload
     assert "file://" in payload["error"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_generate_video_bare_env_bucket_dropped_on_gemini_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A malformed (bare, non-gs://) VIDEO_GCS_BUCKET env default must not
-    fail calls on the Gemini API path, where it would be dropped anyway."""
-    from src.__main__ import generate_video
-
-    (tmp_path / "images").mkdir()
-    (tmp_path / "videos").mkdir()
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path, video_gcs_bucket="my-bucket"))
-
-    captured: dict[str, Any] = {}
-
-    async def mock_impl(**kwargs: Any) -> dict[str, Any]:
-        captured["output_gcs_uri"] = kwargs.get("output_gcs_uri")
-        return {
-            "message": "Video generated successfully",
-            "video_url": f"file://{tmp_path}/videos/out.mp4",
-            "model": kwargs.get("model", ""),
-        }
-
-    monkeypatch.setattr("src.__main__.generate_video_impl", mock_impl)
-
-    result = json.loads(
-        await generate_video(ctx=ctx, prompt="x", model="veo-3.1-generate-001")
-    )
-    assert result["message"] == "Video generated successfully"
-    assert captured["output_gcs_uri"] is None
 
 
 @pytest.mark.asyncio
@@ -3741,23 +3435,14 @@ async def test_loop_extend_chains_extensions(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_loop_extend_rejects_lite_and_bad_times(
+async def test_loop_extend_rejects_bad_times(
     tmp_path: Path,
 ) -> None:
     from src.__main__ import loop_extend
 
     (tmp_path / "images").mkdir()
     (tmp_path / "videos").mkdir()
-    ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
-
-    lite = json.loads(
-        await loop_extend(
-            ctx=ctx,
-            video_uri="file:///x.mp4",
-            model="veo-3.1-lite-generate-preview",
-        )
-    )
-    assert "error" in lite and "Lite" in lite["error"]
+    ctx = _ctx_wrapping(_vertex_app_ctx(tmp_path))
 
     bad = json.loads(await loop_extend(ctx=ctx, video_uri="file:///x.mp4", times=99))
     assert "error" in bad and "between 1 and 20" in bad["error"]
@@ -4164,7 +3849,7 @@ async def test_plan_generation_flags_impossible_requests(tmp_path: Path) -> None
     result = await plan_generation(
         ctx=_image_ctx(tmp_path),
         intent="extend this video",
-        pinned_model="veo-3.1-lite-generate-preview",
+        pinned_model="gemini-omni-flash-preview",
         needs_extension=True,
     )
     payload = json.loads(result[0].text)
@@ -4557,9 +4242,9 @@ async def test_generate_clip_validates_every_beat_before_rendering_any(
 async def test_video_manifest_records_the_model_that_actually_ran(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Veo IDs are translated per backend — the Gemini API serves -preview
-    spellings — so a manifest naming the requested ID misreports what was
-    billed."""
+    """The manifest names the model the impl reported, not the one requested:
+    an older Gemini-API `-preview` spelling is normalized to the `-001` model
+    Vertex actually served."""
     import src.__main__ as main_mod
 
     videos_dir = tmp_path / "videos"
@@ -4573,7 +4258,7 @@ async def test_video_manifest_records_the_model_that_actually_ran(
             "video_url": f"file://{out}",
             "prompt": kwargs["prompt"],
             # What the backend actually served.
-            "model": "veo-3.1-generate-preview",
+            "model": "veo-3.1-generate-001",
             "duration_seconds": 8,
             "audio_enabled": True,
             "generation_mode": "text_to_video",
@@ -4583,11 +4268,13 @@ async def test_video_manifest_records_the_model_that_actually_ran(
 
     payload = json.loads(
         await main_mod.generate_video(
-            ctx=_video_ctx(tmp_path), prompt="a cat", model="veo-3.1-generate-001"
+            ctx=_video_ctx(tmp_path, vertexai=True),
+            prompt="a cat",
+            model="veo-3.1-generate-preview",
         )
     )
     manifest = json.loads(Path(payload["sidecar_url"][7:]).read_text())
-    assert manifest["model"] == "veo-3.1-generate-preview"
+    assert manifest["model"] == "veo-3.1-generate-001"
 
 
 @pytest.mark.parametrize("bad", [-5, float("nan"), float("inf")])
@@ -4832,7 +4519,11 @@ async def test_unfetchable_inputs_fail_loud_not_silent(
     for impl in ("generate_video_impl", "generate_video_omni_impl"):
         monkeypatch.setattr(main_mod, impl, must_not_generate, raising=False)
 
-    result = await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), **kwargs)
+    # Veo runs on Vertex only; the omni cases keep the Gemini API default.
+    on_vertex = tool in ("generate_transition", "generate_bridge")
+    result = await getattr(main_mod, tool)(
+        ctx=_video_ctx(tmp_path, vertexai=on_vertex), **kwargs
+    )
     payload = json.loads(result if isinstance(result, str) else result[0].text)
     assert "Could not fetch" in payload["error"]
 
@@ -4857,7 +4548,7 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
 
     payload = json.loads(
         await main_mod.generate_clip(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True),
             beats=[{"prompt": "x", "first_frame_uri": "https://example.com/f.png"}],
         )
     )
@@ -5053,7 +4744,7 @@ async def test_video_real_run_reports_metered_cost(
             "message": "Video generated successfully",
             "video_url": f"file://{out}",
             "prompt": kwargs["prompt"],
-            "model": "veo-3.1-generate-preview",
+            "model": "veo-3.1-generate-001",
             "duration_seconds": 4,  # snapped from the 5s request
             "audio_enabled": True,
             "generation_mode": "text_to_video",
@@ -5063,7 +4754,7 @@ async def test_video_real_run_reports_metered_cost(
 
     payload = json.loads(
         await main_mod.generate_video(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True),
             prompt="a cat",
             model="veo-3.1-generate-001",
             duration_seconds=5.0,
@@ -5084,29 +4775,9 @@ async def test_video_real_run_reports_metered_cost(
     [
         pytest.param(
             "generate_video",
-            {
-                "prompt": "x",
-                "model": "veo-3.1-lite-generate-preview",
-                "resolution": "4K",
-            },
-            "does not support 4K",
-            id="quote_4k_on_lite",
-        ),
-        pytest.param(
-            "generate_video",
             {"prompt": "x", "model": "veo-3.1-generate-001", "resolution": "8K"},
             "Unsupported resolution",
             id="quote_bogus_resolution",
-        ),
-        pytest.param(
-            "loop_extend",
-            {
-                "video_uri": "file:///x.mp4",
-                "model": "veo-3.1-lite-generate-preview",
-                "times": 2,
-            },
-            "does not support video extension",
-            id="quote_extension_on_lite",
         ),
         pytest.param(
             "loop_extend",
@@ -5123,20 +4794,16 @@ async def test_dry_run_refuses_what_the_real_run_would_refuse(
 ) -> None:
     """A dry run that quotes an impossible call sends the caller to a
     guaranteed failure with a price in hand. loop_extend's quote used to sit
-    above the Lite, aspect and bucket checks; generate_video's used to return
-    estimated_cost: null for 4K-on-Lite instead of the impl's error.
+    above the aspect and bucket checks.
     """
     import src.__main__ as main_mod
 
-    # Lite is served only by the Gemini API; first/last-frame and extension
-    # only by Vertex. One shared backend cannot serve both, so the case decides.
-    on_vertex = "lite" not in json.dumps(kwargs).lower()
     payload = json.loads(
         await getattr(main_mod, tool)(
             ctx=_video_ctx(
                 tmp_path,
-                vertexai=on_vertex,
-                video_gcs_bucket="gs://bkt/out/" if on_vertex else None,
+                vertexai=True,
+                video_gcs_bucket="gs://bkt/out/",
             ),
             dry_run=True,
             **kwargs,
@@ -5171,114 +4838,6 @@ async def test_dry_run_enforces_the_gcs_allowlist(tmp_path: Path) -> None:
         )
     )
     assert allowed["estimated_cost"]["usd"] == pytest.approx(2 * 7 * 0.40)
-
-
-@pytest.mark.parametrize(
-    ("tool", "kwargs", "fragment"),
-    [
-        pytest.param(
-            "generate_video",
-            {
-                "prompt": "x",
-                "model": "veo-3.1-lite-generate-preview",
-                "extend_video_uri": "gs://b/v.mp4",
-            },
-            "does not support extend_video",
-            id="lite_extend",
-        ),
-        pytest.param(
-            "generate_video",
-            {
-                "prompt": "x",
-                "model": "veo-3.1-lite-generate-preview",
-                "reference_image_uris": ["a"],
-            },
-            "does not support reference_to_video",
-            id="lite_references",
-        ),
-        pytest.param(
-            "generate_video",
-            {
-                "prompt": "x",
-                "model": "veo-3.1-lite-generate-preview",
-                "image_uri": "a",
-                "last_frame_uri": "b",
-            },
-            "does not support first_last_frame",
-            id="lite_first_last",
-        ),
-        pytest.param(
-            "generate_transition",
-            {
-                "first_frame_uri": "a",
-                "last_frame_uri": "b",
-                "model": "veo-3.1-lite-generate-preview",
-            },
-            "does not support first_last_frame",
-            id="lite_transition",
-        ),
-        pytest.param(
-            "generate_bridge",
-            {
-                "from_clip_uri": "a",
-                "to_clip_uri": "b",
-                "model": "veo-3.1-lite-generate-preview",
-            },
-            "does not support first_last_frame",
-            id="lite_bridge",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_dry_run_refuses_every_lite_restriction(
-    tool: str, kwargs: dict[str, Any], fragment: str, tmp_path: Path
-) -> None:
-    """Live testing found the quote pricing five impossible Lite calls at
-    $0.20-$0.40 apiece. Only the resolution rule was shared with the impl;
-    the generation-mode restrictions were enforced per tool, so a dry run
-    happily priced an extension on a model that cannot extend."""
-    import src.__main__ as main_mod
-
-    payload = json.loads(
-        await getattr(main_mod, tool)(ctx=_video_ctx(tmp_path), dry_run=True, **kwargs)
-    )
-    assert fragment in payload["error"]
-
-
-@pytest.mark.parametrize(
-    ("model", "kwargs"),
-    [
-        pytest.param("veo-3.1-lite-generate-preview", {}, id="lite_text_to_video"),
-        pytest.param(
-            "veo-3.1-lite-generate-preview",
-            # gs:// so the image_to_video quote exercises the Lite guard, not
-            # the new local-source refusal; a bare path would now be refused as
-            # outside DATA_FOLDER before the price is returned.
-            {"image_uri": "gs://b/a.png"},
-            id="lite_image_to_video",
-        ),
-    ],
-)
-@pytest.mark.asyncio
-@pytest.mark.timeout(5.0)
-async def test_the_lite_guard_does_not_over_reach(
-    model: str, kwargs: dict[str, Any], tmp_path: Path
-) -> None:
-    """Lite genuinely supports text-to-video and image-to-video."""
-    import src.__main__ as main_mod
-
-    payload = json.loads(
-        await main_mod.generate_video(
-            ctx=_video_ctx(tmp_path),
-            prompt="x",
-            model=model,
-            duration_seconds=8,
-            dry_run=True,
-            **kwargs,
-        )
-    )
-    assert payload["estimated_cost"]["usd"] > 0
 
 
 @pytest.mark.asyncio
@@ -5328,7 +4887,7 @@ async def test_generate_video_quote_reports_the_duration_it_prices(
 
     payload = json.loads(
         await main_mod.generate_video(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True),
             prompt="x",
             model="veo-3.1-generate-001",
             duration_seconds=5,

@@ -460,15 +460,18 @@ def test_on_the_gemini_api_the_planner_routes_4k_and_references_to_omni() -> Non
     assert vertex.routes[0].model.startswith("veo")
 
 
-def test_a_gemini_api_clip_plan_does_not_hand_over_bridges() -> None:
-    """add_bridges on that backend is a partial-spend trap: beats bill, bridge fails."""
+def test_a_gemini_api_clip_plan_hands_over_no_veo_clip() -> None:
+    """generate_clip renders every beat with Veo, which the Gemini Developer API
+    no longer serves (switched off 2026-10-22). Handing one over there would
+    be a plan that cannot run, so the plan says what to do instead."""
     plan = plan_generation(
         "a 3 shot commercial with crossfade transitions",
         RoutingConstraints(backend="gemini_api"),
     )
-    clip = next(r for r in plan.routes if r.tool == "generate_clip")
-    assert clip.params.get("add_bridges") is False
-    assert any("add_bridges disabled" in c for c in clip.caveats)
+    assert not any(r.tool == "generate_clip" for r in plan.routes)
+    conflict = next(c for c in plan.conflicts if c.code == "no_model_can_serve_request")
+    assert "gemini-omni-1.1-flash" in conflict.resolution
+    assert "Vertex" in conflict.resolution
 
 
 def test_an_all_excluded_plan_explains_itself_instead_of_returning_nothing() -> None:

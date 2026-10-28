@@ -88,11 +88,11 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from google import genai
 
-from .video import run_off_loop
+from .video import refused_before_work, run_off_loop
 
 # Type for async log callback from MCP context
 LogCallback = Callable[[str], Awaitable[None]]
@@ -100,11 +100,12 @@ LogCallback = Callable[[str], Awaitable[None]]
 OMNI_PREVIEW_MODEL = "gemini-omni-flash-preview"
 OMNI_1_1_MODEL = "gemini-omni-1.1-flash"
 
-# "The existing gemini-omni-flash-preview endpoint will be deprecated on
-# September 30, 2026" — Gemini API release notes, 2026-08-27. Surfaced on
-# every call that still pins it, because a caller who reads a warning has time
-# to move and a caller who reads nothing does not.
-OMNI_PREVIEW_SUNSET = "2026-09-30"
+# The Gemini API deprecations page lists gemini-omni-flash-preview with an
+# earliest shutdown of October 22, 2026, the same day as the Veo preview IDs
+# (the 2026-08-27 release notes had said September 30). Surfaced on every call
+# that still pins it, because a caller who reads a warning has time to move
+# and a caller who reads nothing does not.
+OMNI_PREVIEW_SUNSET = "2026-10-22"
 
 
 def _today() -> datetime.date:
@@ -1258,6 +1259,31 @@ async def _prepare_video_part(
     return _document_part(uri)
 
 
+@dataclass
+class OmniSubmission:
+    """How far an omni render got, for an error that interrupts it.
+
+    The service renders an interaction once it exists and bills it whether or
+    not this process is still waiting, so a failure must say whether one was
+    created. The caller passes an instance in; the impl marks it just before
+    the create call and again when create returns an id.
+    """
+
+    create_sent: bool = False
+    interaction_id: str | None = None
+
+    def state(self, exc: BaseException) -> Literal["submitted", "unknown", "none"]:
+        """``submitted`` once an interaction exists; ``unknown`` when the
+        create call failed in a way that leaves open whether the service
+        received it (a timeout of either SDK's kind, a dropped connection, a
+        5xx); ``none`` when it was not sent or was refused outright."""
+        if self.interaction_id:
+            return "submitted"
+        if self.create_sent and not refused_before_work(exc):
+            return "unknown"
+        return "none"
+
+
 async def generate_video_omni(
     client: genai.Client,
     prompt: str,
@@ -1279,6 +1305,7 @@ async def generate_video_omni(
     allow_uri_delivery: bool = False,
     timeout_seconds: int = OMNI_DEFAULT_TIMEOUT_SECONDS,
     log_callback: LogCallback | None = None,
+    submission: OmniSubmission | None = None,
 ) -> dict[str, Any]:
     """Generate, edit or extend a video with one of the Omni models.
 
@@ -1611,6 +1638,12 @@ async def generate_video_omni(
         media_before_text=spec.media_before_text,
     )
 
+    # A deadline that has already passed sends nothing, so it is checked
+    # before the request is marked as sent.
+    if loop.time() >= deadline:
+        raise _timed_out(None)
+    if submission is not None:
+        submission.create_sent = True
     try:
         interaction = await _run_within_deadline(
             client.interactions.create, **create_kwargs
@@ -1630,6 +1663,8 @@ async def generate_video_omni(
     interaction_id = _field(interaction, "id") or _field(interaction, "name")
     if not interaction_id:
         raise ValueError("Interaction create response carried no interaction id.")
+    if submission is not None:
+        submission.interaction_id = str(interaction_id)
 
     # Poll the background interaction until it leaves the in-flight statuses.
     # `completed` proceeds to extraction; any other terminal status fails fast

@@ -23,7 +23,6 @@ import pytest
 from tests.test_main import _video_ctx
 
 VEO = "veo-3.1-generate-001"
-LITE = "veo-3.1-lite-generate-preview"
 IMAGE_MODEL = "gemini-3.1-flash-image"
 
 
@@ -105,7 +104,7 @@ async def test_generate_video_dry_run_refuses_a_missing_in_sandbox_source(
 
     payload = _payload(
         await generate_video(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True),
             prompt="x",
             model=VEO,
             image_uri=_missing_in_sandbox(tmp_path),
@@ -125,7 +124,7 @@ async def test_generate_video_dry_run_still_prices_a_gs_source(tmp_path: Path) -
 
     payload = _payload(
         await generate_video(
-            ctx=_video_ctx(tmp_path),
+            ctx=_video_ctx(tmp_path, vertexai=True),
             prompt="x",
             model=VEO,
             image_uri="gs://b/a.png",
@@ -138,26 +137,27 @@ async def test_generate_video_dry_run_still_prices_a_gs_source(tmp_path: Path) -
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_generate_video_dry_run_lite_restriction_precedes_source_error(
+async def test_generate_video_dry_run_backend_refusal_precedes_source_error(
     tmp_path: Path,
 ) -> None:
-    """The source check must run AFTER validate_render_options: a Lite model
-    asked for first/last-frame with two bad local frames must report the mode
-    restriction, not the source error — the ordering pitfall this round fixed."""
+    """The source check must run AFTER the model and backend checks: Veo on a
+    Gemini-API deployment asked for first/last-frame with two bad local frames
+    must report that Veo is not served there, not the source error — the
+    ordering pitfall this round fixed."""
     from src.__main__ import generate_video
 
     payload = _payload(
         await generate_video(
             ctx=_video_ctx(tmp_path),
             prompt="x",
-            model=LITE,
+            model=VEO,
             image_uri=_out_of_sandbox(),
             last_frame_uri=_out_of_sandbox(),
             dry_run=True,
         )
     )
     assert "estimated_cost" not in payload
-    assert "does not support first_last_frame" in payload["error"]
+    assert "Gemini Developer API" in payload["error"]
     assert "outside the permitted data folder" not in payload["error"]
 
 

@@ -37,7 +37,6 @@ LITE_IMAGE = "gemini-3.1-flash-lite-image"
 PRO_IMAGE = "gemini-3-pro-image"
 VEO = "veo-3.1-generate-001"
 VEO_FAST = "veo-3.1-fast-generate-001"
-VEO_LITE = "veo-3.1-lite-generate-preview"
 
 # The smallest score gap that counts as "capability genuinely outranked
 # budget" rather than "the tie-break happened to pick the right model".
@@ -620,15 +619,11 @@ def test_omni_is_reached_through_its_own_tool() -> None:
     [
         ("a video of a cat", None, DEFAULT_VIDEO_MODEL),
         ("a video of a cat", RoutingConstraints(budget="best"), VEO),
-        # Lite, not omni: omni is $0.10136/s against Lite's $0.05/s. This case
+        # Fast, not omni: omni is $0.10136/s against Fast's $0.10/s. This case
         # asserted omni until its cost_index was corrected from 0.0 — the
         # cheapest slot in the family — which had a budget=cheap request
         # ranking a $0.4054 route above a $0.40 one.
-        (
-            "a video of a cat",
-            RoutingConstraints(budget="cheap"),
-            "veo-3.1-lite-generate-preview",
-        ),
+        ("a video of a cat", RoutingConstraints(budget="cheap"), VEO_FAST),
     ],
 )
 def test_video_ranking(
@@ -649,30 +644,23 @@ def test_video_ranking(
 _RULE_CASES: tuple[tuple[str, str, RoutingConstraints, str, str], ...] = (
     (
         "first_last_frame_unsupported",
-        "veo lite cannot interpolate between frames",
+        "the omni preview cannot interpolate between frames",
         RoutingConstraints(first_frame_uri="a", last_frame_uri="b"),
-        VEO_LITE,
+        OMNI_MODEL,
         "first+last-frame",
     ),
     (
         "extension_unsupported",
-        "veo lite cannot extend",
+        "the omni preview cannot extend",
         RoutingConstraints(media_kind="video", needs_extension=True),
-        VEO_LITE,
+        OMNI_MODEL,
         "cannot extend",
     ),
     (
-        "reference_images_unsupported",
-        "veo lite takes no reference images",
-        RoutingConstraints(media_kind="video", num_reference_images=2),
-        VEO_LITE,
-        "reference images",
-    ),
-    (
         "4k_unsupported",
-        "veo lite has no 4K",
+        "the omni preview has no 4K",
         RoutingConstraints(media_kind="video", resolution="4K"),
-        VEO_LITE,
+        OMNI_MODEL,
         "cannot produce 4K",
     ),
     (
@@ -738,24 +726,69 @@ def test_capability_rules_reject_with_an_explanation(
 
 
 def test_every_capability_rule_is_covered_by_a_test_case() -> None:
-    """The rule table and the test table must not drift apart."""
-    assert {case[0] for case in _RULE_CASES} == {
+    """The rule table and the test table must not drift apart.
+
+    reference_images_unsupported has no model in today's catalog to violate
+    it, so it is proven on a patched capability set instead (below).
+    """
+    assert {case[0] for case in _RULE_CASES} | {"reference_images_unsupported"} == {
         rule.code for rule in _VIDEO_CAPABILITY_RULES
     }
 
 
-def test_veo_lite_is_not_offered_on_vertex() -> None:
-    """Lite is published on the Gemini Developer API only."""
-    plan = plan_generation("a video of a cat", RoutingConstraints(backend="vertex"))
-    assert VEO_LITE not in _models(plan)
-    reason = _reason_for(plan, VEO_LITE)
-    assert "Gemini Developer API only" in reason
-    assert "GEMINI_API_KEY" in reason
+def test_the_reference_images_rule_still_fires(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No model in the catalog lacks reference images since Veo 3.1 Lite left
+    the server, but the rule must keep firing for the next model that does."""
+    import dataclasses
+
+    import src.routing as routing
+
+    patched = dict(routing._VIDEO_CAPABILITIES)  # pyright: ignore[reportPrivateUsage]
+    patched[VEO_FAST] = dataclasses.replace(
+        patched[VEO_FAST], supports_reference_images=False
+    )
+    monkeypatch.setattr(routing, "_VIDEO_CAPABILITIES", patched)
+
+    plan = plan_generation(
+        "a video of a product",
+        RoutingConstraints(media_kind="video", num_reference_images=2),
+    )
+    assert VEO_FAST not in _models(plan)
+    assert "reference images" in _reason_for(plan, VEO_FAST)
 
 
-def test_veo_lite_is_offered_on_the_gemini_api() -> None:
+def test_veo_is_not_offered_on_the_gemini_api() -> None:
+    """Google switched off every Veo 3.1 model the Gemini Developer API served
+    on 2026-10-22, so a plan there routes video to omni and says why Veo is
+    out, with the fix."""
     plan = plan_generation("a video of a cat", RoutingConstraints(backend="gemini_api"))
-    assert VEO_LITE in _models(plan)
+    offered = _models(plan)
+    assert VEO not in offered and VEO_FAST not in offered
+    assert OMNI_1_1_MODEL in offered
+    for model in (VEO, VEO_FAST):
+        reason = _reason_for(plan, model)
+        assert "Gemini Developer API" in reason
+        assert "2026-10-22" in reason
+
+
+def test_veo_is_offered_on_vertex() -> None:
+    plan = plan_generation("a video of a cat", RoutingConstraints(backend="vertex"))
+    assert {VEO, VEO_FAST} <= set(_models(plan))
+
+
+def test_a_pinned_veo_model_on_the_gemini_api_is_a_conflict() -> None:
+    """A pin on a model the backend no longer serves must say why the plan has
+    nothing for it, and how to get it."""
+    plan = plan_generation(
+        "a video of a cat",
+        RoutingConstraints(backend="gemini_api", pinned_model=VEO_FAST),
+    )
+    conflicts = {conflict.code: conflict for conflict in plan.conflicts}
+    assert "pinned_model_backend_unsupported" in conflicts
+    conflict = conflicts["pinned_model_backend_unsupported"]
+    assert "Gemini Developer API" in conflict.detail
+    assert OMNI_1_1_MODEL in conflict.resolution
+    assert "Vertex AI" in conflict.resolution
 
 
 def test_gcs_output_on_the_gemini_api_is_a_conflict() -> None:
@@ -768,15 +801,6 @@ def test_gcs_output_on_the_gemini_api_is_a_conflict() -> None:
     assert recommended is not None
     assert "output_gcs_uri" not in recommended.params
     assert any("Vertex-only" in caveat for caveat in recommended.caveats)
-
-
-def test_gcs_output_excludes_veo_lite_even_on_an_unknown_backend() -> None:
-    """Lite runs on the Gemini API, which has no GCS output at all."""
-    plan = plan_generation(
-        "a video of a cat", RoutingConstraints(wants_gcs_output=True)
-    )
-    assert VEO_LITE not in _models(plan)
-    assert "output_gcs_uri" in _reason_for(plan, VEO_LITE)
 
 
 @pytest.mark.parametrize("duration", [1.0, 2.0])
@@ -821,7 +845,9 @@ def test_conversational_edit_with_a_seed_requirement_is_a_conflict() -> None:
 def test_pinned_model_violating_a_rule_becomes_a_conflict() -> None:
     plan = plan_generation(
         "a video of a cat",
-        RoutingConstraints(media_kind="video", resolution="4K", pinned_model=VEO_LITE),
+        RoutingConstraints(
+            media_kind="video", resolution="4K", pinned_model=OMNI_MODEL
+        ),
     )
     assert "pinned_model_4k_unsupported" in _conflict_codes(plan)
 
@@ -909,13 +935,6 @@ def test_multi_render_cost_sums_every_segment() -> None:
     assert single.cost is not None and clip.cost is not None
     assert clip.cost.usd == pytest.approx(single.cost.usd * 3)
     assert clip.cost.breakdown["renders"] == 3.0
-
-
-def test_lite_route_discloses_its_gemini_api_constraints() -> None:
-    plan = plan_generation("a video of a cat", RoutingConstraints(backend="gemini_api"))
-    lite = [route for route in plan.routes if route.model == VEO_LITE]
-    assert lite
-    assert any("GEMINI_API_KEY" in caveat for caveat in lite[0].caveats)
 
 
 # ============================================================================
@@ -1331,11 +1350,10 @@ def _omni_animatic_usd(
     ("budget", "expected_model", "animatic_is_cheaper"),
     [
         # At 360p on omni 1.1 the preview is a third of omni's own 720p rate,
-        # which puts it under every Veo tier — including Lite, which it used to
-        # cost double. That is the point of previewing at 360p.
+        # which puts it under every Veo tier. That is the point of previewing
+        # at 360p.
         pytest.param("best", VEO, True, id="standard_tier_saves"),
         pytest.param(None, VEO_FAST, True, id="fast_tier_saves"),
-        pytest.param("cheap", VEO_LITE, True, id="lite_tier_saves"),
     ],
 )
 def test_the_animatic_claims_a_saving_only_when_it_saves(
@@ -1398,48 +1416,6 @@ def test_the_animatic_makes_no_economic_claim_when_pricing_is_unavailable(
     assert "$" not in rationale
     assert "sav" not in rationale
     assert OMNI_1_1_MODEL in rationale
-
-
-@pytest.mark.parametrize("backend", ["vertex", "unknown", "gemini_api"])
-def test_veo_lite_is_rejected_when_the_server_has_no_gemini_api_key(
-    backend: str,
-) -> None:
-    """Lite is Gemini-API-only, so with no key the call fails with exactly that
-    message. The planner knew the rule and recommended Lite anyway because
-    nothing ever told it the credential state."""
-    plan = plan_generation(
-        "a video of a cat",
-        RoutingConstraints(backend=cast(Any, backend), gemini_api_key_available=False),
-    )
-    assert VEO_LITE not in _models(plan)
-    reason = _reason_for(plan, VEO_LITE)
-    assert "GEMINI_API_KEY" in reason
-    # The models the deployment can actually run are still planned.
-    assert plan.is_satisfiable
-
-
-@pytest.mark.parametrize("key_state", [None, True])
-def test_veo_lite_survives_when_a_key_is_available_or_unknown(
-    key_state: bool | None,
-) -> None:
-    """None means "not stated", which must keep today's behaviour."""
-    plan = plan_generation(
-        "a video of a cat",
-        RoutingConstraints(backend="gemini_api", gemini_api_key_available=key_state),
-    )
-    assert VEO_LITE in _models(plan)
-
-
-def test_pinned_veo_lite_without_a_key_is_a_conflict_that_names_the_key() -> None:
-    plan = plan_generation(
-        "a video of a cat",
-        RoutingConstraints(gemini_api_key_available=False, pinned_model=VEO_LITE),
-    )
-    conflicts = {conflict.code: conflict for conflict in plan.conflicts}
-    assert "pinned_model_backend_unsupported" in conflicts
-    conflict = conflicts["pinned_model_backend_unsupported"]
-    assert "GEMINI_API_KEY" in conflict.detail
-    assert "GEMINI_API_KEY" in conflict.resolution
 
 
 def test_gcs_advice_is_never_offered_on_the_gemini_api() -> None:
@@ -1613,7 +1589,7 @@ def test_a_360p_request_reaches_only_the_model_that_has_360p() -> None:
 
 
 def test_the_360p_route_is_the_cheapest_video_render_planned() -> None:
-    """The draft tier's whole point: a third of 720p, under even Veo Lite."""
+    """The draft tier's whole point: a third of 720p, under every Veo tier."""
     draft = plan_generation(
         "a clip of a robot",
         RoutingConstraints(media_kind="video", resolution="360p"),
@@ -1893,18 +1869,16 @@ def test_camera_vocabulary_does_not_overrule_someone_who_said_photo(
 def test_a_transition_brief_excludes_models_that_cannot_interpolate() -> None:
     """The module docstring names this as an example it catches.
 
-    It ranked Veo 3.1 Lite anyway: the need was keyed on the chosen tool, and
-    with no endpoint URIs yet — which is how an agent asks before it has the
-    stills — the tool was generate_video and nothing needed anything.
+    It once ranked a model that cannot interpolate anyway: the need was keyed
+    on the chosen tool, and with no endpoint URIs yet — which is how an agent
+    asks before it has the stills — the tool was generate_video and nothing
+    needed anything.
     """
     plan = plan_generation("a smooth transition from sunrise to snowfall")
     rejected = {r.model for r in plan.rejected}
-    assert VEO_LITE in rejected, [r.model for r in plan.routes]
-    assert OMNI_MODEL in rejected, "the preview model cannot interpolate either"
+    assert OMNI_MODEL in rejected, [r.model for r in plan.routes]
     assert all(
-        "first+last-frame" in r.reason
-        for r in plan.rejected
-        if r.model in (VEO_LITE, OMNI_MODEL)
+        "first+last-frame" in r.reason for r in plan.rejected if r.model == OMNI_MODEL
     )
 
 
@@ -1960,7 +1934,7 @@ def test_a_deprecated_model_never_outranks_its_replacement() -> None:
     omni = [r for r in plan.routes if is_omni_model(r.model)]
     assert [r.model for r in omni][0] == OMNI_1_1_MODEL
     deprecated = next(r for r in omni if r.model == OMNI_MODEL)
-    assert any("deprecated" in c and "2026-09-30" in c for c in deprecated.caveats)
+    assert any("deprecated" in c and "2026-10-22" in c for c in deprecated.caveats)
     # The GA model carries no such caveat.
     ga = next(r for r in omni if r.model == OMNI_1_1_MODEL)
     assert not any("deprecated" in c for c in ga.caveats)
@@ -2172,12 +2146,10 @@ def test_a_reference_route_is_priced_and_parameterised_for_the_mode_it_runs() ->
     assert any("exactly 8s" in c for c in route.caveats)
 
 
-def test_a_mode_the_gemini_api_bills_but_cannot_serve_is_called_out() -> None:
-    """reference_to_video returns an empty result there and bills anyway.
-
-    The worst failure shape in the table, and the route recommended it with
-    caveats=().
-    """
+def test_a_veo_route_on_an_unknown_backend_says_it_needs_vertex() -> None:
+    """When the backend is not known the route is still offered, but Veo is
+    refused on the Gemini Developer API, so the route must say so — a caveat
+    that may not apply is cheaper than a refused call."""
     plan = plan_generation(
         "a product spinning on a turntable",
         RoutingConstraints(
@@ -2187,7 +2159,9 @@ def test_a_mode_the_gemini_api_bills_but_cannot_serve_is_called_out() -> None:
         ),
     )
     route = next(r for r in plan.routes if r.tool == "generate_video")
-    assert any("reference_to_video" in c for c in route.caveats)
+    assert any("Vertex AI only" in c and "2026-10-22" in c for c in route.caveats), (
+        route.caveats
+    )
 
 
 def test_a_plain_text_to_video_route_gains_no_reference_caveats() -> None:

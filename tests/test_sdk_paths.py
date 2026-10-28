@@ -86,8 +86,11 @@ class FakeApiClient:
 
 
 class FakeVeoClient:
+    """Vertex by default: Veo runs on Vertex AI only, and the impl refuses any
+    other client before it sends anything."""
+
     def __init__(
-        self, operation: FakeOperation | None = None, vertexai: bool = False
+        self, operation: FakeOperation | None = None, vertexai: bool = True
     ) -> None:
         op = operation or FakeOperation()
         self.models = FakeModels(op)
