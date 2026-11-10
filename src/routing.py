@@ -20,7 +20,7 @@ tool-level routing rules) are defined here.
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Protocol, get_args
 
 from .image import (
@@ -31,25 +31,39 @@ from .image import (
     resolve_image_model,
 )
 from .omni import (
-    _MAX_DURATION as OMNI_MAX_DURATION,  # pyright: ignore[reportPrivateUsage]
-)
-from .omni import (
     _MIN_DURATION as OMNI_MIN_DURATION,  # pyright: ignore[reportPrivateUsage]
 )
 from .omni import (
     _SUPPORTED_ASPECT_RATIOS as OMNI_ASPECT_RATIOS,  # pyright: ignore[reportPrivateUsage]
 )
 from .omni import (
-    OMNI_1_1_MODEL,
+    _TASK_UPSCALE as OMNI_TASK_UPSCALE,  # pyright: ignore[reportPrivateUsage]
+)
+from .omni import (
+    _TASK_EXTEND as OMNI_TASK_EXTEND,  # pyright: ignore[reportPrivateUsage]
+)
+
+from .omni import (
+    OMNI_1_2_MODEL,
+    DEFAULT_OMNI_MODEL,
     OMNI_DEFAULT_RESOLUTION,
     omni_preview_is_sunset,
     OMNI_MODEL,
     OMNI_PREVIEW_MODEL,
     OMNI_PREVIEW_SUNSET,
     OMNI_RESOLUTIONS,
+    OMNI_SPECS,
+    OmniModelSpec,
     is_omni_model,
-    omni_extension_output_lengths,
+    canonical_omni_model,
+    omni_continuation_upper_bound,
+    omni_extension_duration_refusal,
     omni_extension_priced_lengths,
+    omni_extension_refusal,
+    omni_inline_delivery_policy,
+    omni_model_is_retired,
+    omni_model_reroute_warning,
+    omni_source_limit_seconds,
     omni_spec,
 )
 from .video import (
@@ -77,6 +91,7 @@ ToolName = Literal[
     "generate_video",
     "generate_video_omni",
     "extend_video_omni",
+    "upscale_video_omni",
     "generate_clip",
     "generate_transition",
     "generate_bridge",
@@ -128,28 +143,45 @@ VEO_MAX_EXTENDED_SECONDS = (
 # ceiling hid that: a "10 second video" was capped to an 8s clip, flagged
 # needs_extension, and routed to loop_extend -- which needs a video_uri the
 # caller does not have -- plus a two-step seed+extend workflow, when
-# generate_video_omni(duration_seconds=10) is one call. OMNI_MAX_DURATION was
-# already imported for _duration_rejection and simply never consulted here.
-MAX_SINGLE_RENDER_SECONDS = max(VEO_MAX_CLIP_SECONDS, float(OMNI_MAX_DURATION))
+# generate_video_omni(duration_seconds=10) is one call. Read from each omni
+# model's own record (1.2 reaches 15s) rather than a flat constant, so it
+# stays "the longest any model renders" if one model's limit moves; a model
+# that cannot reach a given length is rejected per route by _duration_rejection.
+MAX_SINGLE_RENDER_SECONDS = max(
+    float(VEO_MAX_CLIP_SECONDS),
+    *(float(spec.max_duration_seconds) for spec in OMNI_SPECS.values()),
+)
+
+# The longest single-shot ask a Veo route still answers with one clip snapped
+# down to 8s, at most 2s short and said in a caveat. Past it, a Veo route
+# reaches the runtime the way it always has, by extending an 8s seed with
+# loop_extend. This is where every model's single render topped out before
+# 1.2 reached 15s; once that moved MAX_SINGLE_RENDER_SECONDS, a 12s or 15s
+# ask planned Veo at 8s and ranked it first, a third or more short.
+VEO_SNAP_MAX_SECONDS = 10.0
 
 # Veo output resolutions (src/video.py validates against exactly this set).
 VEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p", "4K")
 
 # What an omni render comes back as when nothing asks otherwise, and the only
-# thing gemini-omni-flash-preview can produce at all. gemini-omni-1.1-flash
+# thing gemini-omni-flash-preview can produce at all. gemini-omni-1.2-flash
 # takes a real resolution parameter (OMNI_RESOLUTIONS) on top of this default.
 OMNI_RESOLUTION = OMNI_DEFAULT_RESOLUTION
 
-# Omni 1.1's draft tier: a third of the 720p price, and the cheapest render
+# The Omni draft tier: a third of the 720p price, and the cheapest render
 # this server can issue. Named here because the workflow builder recommends it
 # by name as the preview pass.
 OMNI_DRAFT_RESOLUTION = "360p"
 
 # Every resolution some video model here can render, which is what a request
-# is validated against: Veo's three plus omni 1.1's 360p draft tier.
+# is validated against: Veo's three plus Omni's 360p draft tier.
 VIDEO_RESOLUTIONS: tuple[str, ...] = tuple(
     dict.fromkeys((*VEO_RESOLUTIONS, *OMNI_RESOLUTIONS))
 )
+
+# The backends an omni interaction can be recorded on; an interaction lives
+# on one of them and resolves on no other.
+_INTERACTION_BACKENDS: tuple[str, ...] = ("vertex", "gemini_api")
 
 # Aspect ratios the video path accepts. src/video.py hard-errors on anything
 # else, and omni documents the same pair.
@@ -159,7 +191,9 @@ VIDEO_ASPECT_RATIOS: tuple[str, ...] = OMNI_ASPECT_RATIOS
 # max_refs) — beyond that the extras are dropped by the SDK call.
 MAX_IMAGE_REFERENCE_IMAGES = 14
 
-# Veo accepts at most 3 reference images (asset type), per src/video.py.
+# Veo accepts at most 3 reference images (asset type), per src/video.py, which
+# sends the first 3 of a longer list; _veo_reference_rejection keeps the
+# planner from offering that route.
 MAX_VIDEO_REFERENCE_IMAGES = 3
 
 # generate_clip hard-errors above this beat count. Mirrored from
@@ -323,7 +357,8 @@ class ScoringWeights:
             requested budget. Second-heaviest: cost is the most common reason
             a caller regrets a model choice.
         quality_ceiling: Raw output fidelity, consulted when the request is
-            quality-led (budget="best", 4K, print). This is where a
+            quality-led (budget="best", 4K, print; a video 4K ask under
+            budget="cheap" is not, since the caller ranked cost first). This is where a
             size/resolution demand is scored — every model still in the race
             already passed the hard size rule, so re-scoring it as a
             capability would only tilt a satisfied demand toward the priciest
@@ -331,7 +366,9 @@ class ScoringWeights:
         speed_fit: Turnaround, consulted when the request is draft-led.
         default_affinity: A deliberate thumb on the scale for each tool's
             documented default, so an otherwise-even race resolves to the
-            option the rest of the server already assumes.
+            option the rest of the server already assumes. Applied only under
+            the balanced budget: a caller who said cheap or best has stated
+            the preference the nudge stands in for.
     """
 
     capability_fit: float = 0.45
@@ -403,7 +440,7 @@ class VideoCapabilities:
     supports_reference_images: bool
     supports_4k: bool
     supports_1080p: bool
-    # Omni 1.1's draft tier. Veo publishes no 360p rate and src/video.py
+    # Omni's draft tier. Veo publishes no 360p rate and src/video.py
     # rejects the value, so a 360p ask has to exclude every Veo model rather
     # than reach one and be dropped (or, worse, be quoted at the 720p rate).
     supports_360p: bool
@@ -455,8 +492,9 @@ _VIDEO_PROFILES: dict[str, ModelProfile] = {
     OMNI_MODEL: ModelProfile(
         model=OMNI_MODEL,
         media_kind="video",
-        # Grounded in the published rates, not vibes: omni is $0.10136/s
-        # against Fast's $0.10/s, so it is marginally the DEARER of the two.
+        # Grounded in the published rates, not vibes: the preview is
+        # $0.10136/s against Fast's $0.10/s, so it is marginally the DEARER of
+        # the two. (Its 1.2 successor, below, is cheaper than both.)
         # It sat at 0.0 — the cheapest slot in the family — which made a
         # budget=cheap request rank a $0.4054 route above a $0.40 one.
         cost_index=0.27,
@@ -465,27 +503,25 @@ _VIDEO_PROFILES: dict[str, ModelProfile] = {
         text_rendering_index=0.0,
         summary="fastest 720p/24fps drafts with conversational editing",
     ),
-    OMNI_1_1_MODEL: ModelProfile(
-        model=OMNI_1_1_MODEL,
+    OMNI_1_2_MODEL: ModelProfile(
+        model=OMNI_1_2_MODEL,
         media_kind="video",
-        # Identical published token rate to the preview model at 720p
-        # ($0.10136/s), so it sits on exactly the same rung — the index tracks
-        # real $/s at 720p and nothing else, which is what keeps a
-        # budget=cheap request from ranking a dearer route as the cheap one.
-        # Its 360p draft tier IS a third of that ($0.0338/s), the cheapest
-        # video render in the catalog, but that is a resolution the caller
+        # On the same $/s-at-720p scale as every row here, where Veo
+        # standard's $0.40/s is 1.0 and Fast's $0.10/s is 0.25: 1.2 bills
+        # 5,792 tokens/s at $12/M, $0.069504/s, so 0.069504 / 0.40 = 0.17. It
+        # sat at 0.0 once, and the budget term scores distance from the
+        # target, so under the default balanced budget (0.5) the cheapest
+        # renderer here ranked LAST, level with the $0.40/s tier. Its 360p
+        # draft tier is cheaper still, but that is a resolution the caller
         # chooses per call, not a property of the model's standing.
-        cost_index=0.27,
+        cost_index=0.17,
         # Above the preview model on every axis that is not price: real 1080p
         # and 4K output, keyframe interpolation, video references and native
         # audio. Below full-fat Veo, which is still the finishing renderer.
-        fidelity_index=0.65,
-        speed_index=0.95,
+        fidelity_index=0.75,
+        speed_index=1.0,
         text_rendering_index=0.0,
-        summary=(
-            "fast 360p-4K renders with conversational editing, video "
-            "extension, keyframe interpolation and video references"
-        ),
+        summary="3-15s video with native audio, stronger references, conversational editing and upscaling",
     ),
     "veo-3.1-fast-generate-001": ModelProfile(
         model="veo-3.1-fast-generate-001",
@@ -525,15 +561,15 @@ _VIDEO_CAPABILITIES: dict[str, VideoCapabilities] = {
         supports_audio=False,
         supports_conversational_edit=True,
         min_duration_seconds=float(OMNI_MIN_DURATION),
-        max_duration_seconds=float(OMNI_MAX_DURATION),
+        max_duration_seconds=float(OMNI_SPECS[OMNI_MODEL].max_duration_seconds),
     ),
-    # Omni 1.1: everything the preview model does, plus the four capabilities
+    # Omni 1.2: everything the preview model does, plus the four capabilities
     # that used to force a Veo route — resolution control up to 4K, video
     # extension, first/last-frame interpolation and native audio — while
     # keeping conversational editing, which no Veo tier has. Still no seed and
     # no negative_prompt: the reference lists both as unsupported, along with
     # system instructions, temperature and top_p.
-    OMNI_1_1_MODEL: VideoCapabilities(
+    OMNI_1_2_MODEL: VideoCapabilities(
         supports_first_last_frame=True,
         supports_extension=True,
         supports_reference_images=True,
@@ -542,14 +578,14 @@ _VIDEO_CAPABILITIES: dict[str, VideoCapabilities] = {
         supports_360p=True,
         supports_seed=False,
         supports_negative_prompt=False,
-        # 1.1 generates an audio track natively ("The model generates a video
+        # 1.2 generates an audio track natively ("The model generates a video
         # with audio based on your text description") and the prompt guide has
         # a section on directing it. What it has no switch for is turning it
         # OFF — a caveat, not a reason to exclude it when audio is wanted.
         supports_audio=True,
         supports_conversational_edit=True,
         min_duration_seconds=float(OMNI_MIN_DURATION),
-        max_duration_seconds=float(OMNI_MAX_DURATION),
+        max_duration_seconds=float(OMNI_SPECS[OMNI_1_2_MODEL].max_duration_seconds),
     ),
 }
 
@@ -579,14 +615,29 @@ def image_profile(model: str) -> ModelProfile | None:
     return _IMAGE_PROFILES.get(model)
 
 
+def _served_video_model(model: str) -> str:
+    """The model a call naming ``model`` runs on.
+
+    Folds a retired omni ID onto its replacement, which is what the omni
+    tools render, price and report for it.
+    """
+    return canonical_omni_model(model) if is_omni_model(model) else model
+
+
 def video_profile(model: str) -> ModelProfile | None:
-    """Return the scoring profile for a video model, or None if unknown."""
-    return _VIDEO_PROFILES.get(model)
+    """Return the scoring profile for the video model a call naming ``model``
+    runs on, or None if unknown."""
+    return _VIDEO_PROFILES.get(_served_video_model(model))
 
 
 def video_capabilities(model: str) -> VideoCapabilities | None:
-    """Return the hard capability set for a video model, or None if unknown."""
-    return _VIDEO_CAPABILITIES.get(model)
+    """Return the hard capability set for the video model a call naming
+    ``model`` runs on, or None if unknown.
+
+    A call naming the retired gemini-omni-1.1-flash runs on 1.2, so 1.2's
+    limits are the ones that apply to it.
+    """
+    return _VIDEO_CAPABILITIES.get(_served_video_model(model))
 
 
 # ============================================================================
@@ -1054,6 +1105,9 @@ _COMPOUND_DURATION_PATTERN = re.compile(
 # extension of a clip nobody asked to extend.
 _ADDED_DURATION_PATTERN = re.compile(
     r"(?<!\w)(?:by|add|plus|another)\s+(?:another\s+)?(\d+(?:\.\d+)?)\s*"
+    # "by 3 more seconds" is the same delta; without this it matched nothing,
+    # and the extension went out at the tool's 10s default.
+    r"(?:(?:more|extra|additional)\s+)?"
     r"(?:-|\s)?\s*(s\b|sec\b|secs\b|second\b|seconds\b"
     r"|m\b|min\b|mins\b|minute\b|minutes\b)"
     # An optional adjacent seconds part, so "by another 2 minutes 30 seconds"
@@ -1273,6 +1327,28 @@ _NEGATORS: tuple[str, ...] = (
     "skip",
 )
 
+# A verb is negated by an auxiliary as often as by "no": "but don't upscale
+# it", "we won't need to upscale it". Without these the upscale check read
+# both as requests, chained a paid upscale onto the render and cut the
+# render's prompt at "but don't". ("do not" is already caught by "not".)
+_VERB_NEGATORS: tuple[str, ...] = _NEGATORS + (
+    "don't",
+    "dont",
+    "doesn't",
+    "doesnt",
+    "won't",
+    "wont",
+    "shouldn't",
+    "shouldnt",
+    "can't",
+    "cant",
+    "cannot",
+    "mustn't",
+    "mustnt",
+    "needn't",
+    "neednt",
+)
+
 # Negators that can only be talking about the soundtrack. "a silent video of
 # rain" is a video request with the sound off, but a negator scoped to nothing
 # read "silent" as cancelling "video" and planned a still image — 5 of 15
@@ -1321,7 +1397,8 @@ def _negator_precedes(prefix: str, negators: tuple[str, ...]) -> bool:
     """
     clause = _CLAUSE_BREAK_PATTERN.split(prefix)[-1]
     for word in reversed(clause.split()[-_NEGATION_WINDOW:]):
-        cleaned = word.strip("-\"'")
+        # A typographic apostrophe ("don’t") is folded to a plain one.
+        cleaned = word.replace("\u2019", "'").strip("-\"'")
         if cleaned in _CLAUSE_BREAK_WORDS:
             return False
         if cleaned in negators:
@@ -1329,7 +1406,7 @@ def _negator_precedes(prefix: str, negators: tuple[str, ...]) -> bool:
     return False
 
 
-def _is_negated(text: str, term: str) -> bool:
+def _is_negated(text: str, term: str, negators: tuple[str, ...] | None = None) -> bool:
     """Whether every occurrence of ``term`` in ``text`` sits under a negator.
 
     Keyword matching alone read "no audio" as an audio request, which flipped
@@ -1337,7 +1414,8 @@ def _is_negated(text: str, term: str) -> bool:
     occurrence to be negated is the conservative reading: a sentence that
     mentions the term both ways keeps the positive signal.
     """
-    negators = _AUDIO_NEGATORS if term in _AUDIO_TERMS else _NEGATORS
+    if negators is None:
+        negators = _AUDIO_NEGATORS if term in _AUDIO_TERMS else _NEGATORS
     pattern = _term_pattern(term)
     found = False
     for match in pattern.finditer(text):
@@ -1613,17 +1691,41 @@ class RoutingConstraints:
             None means unknown. On a Vertex deployment it decides which
             backend omni runs on, and so which upload ceiling an omni
             extension is priced against.
+        video_gcs_bucket_configured: Whether the server has a
+            VIDEO_GCS_BUCKET, which a Veo extension on Vertex AI is written
+            to when no output_gcs_uri is given; without either it is
+            refused. None means unknown.
         num_beats: How many distinct shots the output has.
         is_draft: This render is throwaway.
         is_iterating: The caller is refining an existing result.
         needs_seed: Reproducibility via a fixed seed is required.
         needs_negative_prompt: A negative prompt is required.
         resolution: Exact video resolution ("360p"/"720p"/"1080p"/"4K");
-            360p exists on gemini-omni-1.1-flash only.
+            360p exists on Omni 1.2 only.
         num_images: How many images to generate (cost estimation only).
         pinned_model: A model the caller insists on. Rules still apply, but a
             violation is reported as a conflict rather than a quiet swap.
         previous_interaction_id: An omni interaction to keep editing.
+        previous_interaction_model: The omni model recorded for
+            previous_interaction_id, as the server's sidecar has it; None when
+            nothing is recorded. An interaction cannot change models, so a
+            continuation is planned on this model alone, and one recorded on
+            a retired model is not planned at all.
+        previous_interaction_backend: The backend the interaction was
+            recorded on ("vertex" / "gemini_api"); None when unknown. An
+            interaction lives on one backend, so a continuation is planned
+            there, and named there when the server's OMNI_BACKEND pin is
+            the other one. Ignored without previous_interaction_id, as are
+            the two below and the model.
+        previous_interaction_resolution: The resolution the interaction
+            rendered at, as recorded; an upscale starts from it.
+        previous_interaction_video_url: Where the interaction's clip was
+            saved, as recorded: the input_video_uri a conflict offers when
+            the interaction itself cannot be continued.
+        previous_interaction_seconds: The interaction's clip length, as
+            recorded; None when unknown. An extension measures a runtime
+            total against it and prices its turns from it, as
+            extend_video_omni's own quote does.
     """
 
     budget: BudgetPreference | None = None
@@ -1644,6 +1746,7 @@ class RoutingConstraints:
     wants_gcs_output: bool | None = None
     backend: Backend = "unknown"
     gemini_api_key_available: bool | None = None
+    video_gcs_bucket_configured: bool | None = None
     # The server's OMNI_BACKEND pin, when it has one ("vertex" / "gemini_api");
     # None means "auto". Omni's backend is otherwise inferred from the two
     # fields above, and a pinned server would price the wrong ceiling.
@@ -1657,6 +1760,11 @@ class RoutingConstraints:
     num_images: int | None = None
     pinned_model: str | None = None
     previous_interaction_id: str | None = None
+    previous_interaction_model: str | None = None
+    previous_interaction_backend: str | None = None
+    previous_interaction_resolution: str | None = None
+    previous_interaction_video_url: str | None = None
+    previous_interaction_seconds: float | None = None
 
     def __post_init__(self) -> None:
         """Reject impossible constraint values up front.
@@ -1706,6 +1814,38 @@ class RoutingConstraints:
                 "duration_seconds must be a positive finite number, got "
                 f"{self.duration_seconds!r}."
             )
+        if self.previous_interaction_model is not None and not is_omni_model(
+            self.previous_interaction_model
+        ):
+            # Only omni models hold interactions. Anything else would plan a
+            # continuation on a model the tools cannot call.
+            raise ValueError(
+                "previous_interaction_model must be an omni model, got "
+                f"'{self.previous_interaction_model}'."
+            )
+        if self.previous_interaction_backend not in (None, *_INTERACTION_BACKENDS):
+            raise ValueError(
+                "previous_interaction_backend must be one of "
+                f"{', '.join(_INTERACTION_BACKENDS)}, got "
+                f"'{self.previous_interaction_backend}'."
+            )
+        if (
+            self.previous_interaction_resolution is not None
+            and self.previous_interaction_resolution not in VIDEO_RESOLUTIONS
+        ):
+            raise ValueError(
+                "previous_interaction_resolution must be one of "
+                f"{', '.join(VIDEO_RESOLUTIONS)}, got "
+                f"'{self.previous_interaction_resolution}'."
+            )
+        if self.previous_interaction_seconds is not None and not (
+            math.isfinite(self.previous_interaction_seconds)
+            and self.previous_interaction_seconds > 0
+        ):
+            raise ValueError(
+                "previous_interaction_seconds must be a positive finite number, "
+                f"got {self.previous_interaction_seconds!r}."
+            )
 
 
 @dataclass(frozen=True)
@@ -1724,6 +1864,7 @@ class ResolvedRequest:
     # None when the caller did not say, i.e. a Gemini-API-only model might
     # work; False is a positive statement that it cannot.
     gemini_api_key_available: bool | None
+    video_gcs_bucket_configured: bool | None
     needs_text_rendering: bool
     needs_4k: bool
     image_size: str
@@ -1760,6 +1901,18 @@ class ResolvedRequest:
     resolution: str | None
     pinned_model: str | None
     previous_interaction_id: str | None
+    # As recorded, a retired ID included: folding it onto its replacement
+    # would plan a continuation on a model that never held the interaction.
+    previous_interaction_model: str | None = None
+    previous_interaction_backend: str | None = None
+    previous_interaction_resolution: str | None = None
+    previous_interaction_video_url: str | None = None
+    previous_interaction_seconds: float | None = None
+    # Whether budget=cheap was asked for (the budget argument, or a draft)
+    # rather than read off a word in the brief: "a restaurant going from
+    # cheap then upscale" describes the restaurant, and must not drop the
+    # render to the 360p tier.
+    budget_stated: bool = False
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -1812,6 +1965,10 @@ def resolve_request(
     pinned_model = given.pinned_model
     if pinned_model is not None:
         pinned_model = _CANONICAL_VIDEO_MODEL_IDS.get(pinned_model, pinned_model)
+        # A retired omni ID likewise plans as the model the omni tools run it
+        # on; plan_generation notes the redirect.
+        if is_omni_model(pinned_model):
+            pinned_model = canonical_omni_model(pinned_model)
 
     # Media kind: explicit, then inferred from the text, then inferred from
     # constraints that only exist for video (frames to interpolate between, a
@@ -1888,16 +2045,14 @@ def resolve_request(
     # that value capped at the longest single render available — anything
     # longer has to come from extensions or several beats.
     #
-    # Capped at MAX_SINGLE_RENDER_SECONDS rather than Veo's 8s so an 8-10s ask
-    # stays a one-render request. Veo routes still VALIDATE and PRICE
-    # correctly: the omni duration capability check in _duration_rejection
-    # returns early for non-omni models, and _video_params snaps a Veo clip
-    # into the 4/6/8s ladder and says so in a caveat. What this does NOT do is
-    # re-rank: for a 9-10s ask a Veo route snapped to 8s can still score above
-    # the omni route that renders the full length, because the ranker weighs
-    # cost and fidelity, not duration shortfall. The caveat discloses the
-    # shortfall; preferring the model that meets the duration is a ranking
-    # policy decision left open here.
+    # Capped at MAX_SINGLE_RENDER_SECONDS rather than Veo's 8s so an ask some
+    # model renders in one call stays a one-render request. A Veo route does
+    # not render it in one call: up to VEO_SNAP_MAX_SECONDS _video_params
+    # snaps it into the 4/6/8s ladder and says so in a caveat, and the ranker
+    # does not re-rank for that shortfall (a 9-10s ask can still lead with a
+    # Veo route at 8s). Past it, _plan_video plans the Veo route as a seed
+    # render extended with loop_extend (_veo_chains_runtime), and ranks a
+    # route that renders the whole runtime in one call above that chain.
     total_duration = _first_not_none(given.duration_seconds, signals.duration_seconds)
     if total_duration is None:
         clip_duration = DEFAULT_VIDEO_DURATION_SECONDS
@@ -1940,10 +2095,21 @@ def resolve_request(
     # nothing they could run. A caller who does want a chain can still ask for
     # it -- `needs_extension` and the "longer/continue" vocabulary both still
     # win here.
+    #
+    # Never for a transition: its last frame has to end the shot, and an
+    # extension carries the shot on past it, so a seed-and-extend chain is
+    # not a longer transition but a different video. A transition no model
+    # interpolates in one render is reported as such (_plan_video).
+    transition = (
+        has_first_frame
+        and has_last_frame
+        or (num_beats <= 1 and (signals.wants_transition or signals.wants_bridge))
+    )
     implied_extension = (
         total_duration is not None
         and total_duration > MAX_SINGLE_RENDER_SECONDS
         and num_beats <= 1
+        and not transition
     )
     needs_extension = _first_not_none(
         given.needs_extension,
@@ -1958,6 +2124,7 @@ def resolve_request(
     resolution = given.resolution
     if resolution is None and needs_4k and media_kind == "video":
         resolution = "4K"
+    continuing = given.previous_interaction_id is not None
 
     return ResolvedRequest(
         intent=intent,
@@ -1966,6 +2133,7 @@ def resolve_request(
         backend=given.backend,
         omni_backend=given.omni_backend,
         gemini_api_key_available=given.gemini_api_key_available,
+        video_gcs_bucket_configured=given.video_gcs_bucket_configured,
         needs_text_rendering=bool(needs_text_rendering),
         needs_4k=needs_4k,
         image_size=image_size,
@@ -2005,6 +2173,23 @@ def resolve_request(
         resolution=resolution,
         pinned_model=pinned_model,
         previous_interaction_id=given.previous_interaction_id,
+        # Meaningless without the id they describe.
+        previous_interaction_model=(
+            given.previous_interaction_model if continuing else None
+        ),
+        previous_interaction_backend=(
+            given.previous_interaction_backend if continuing else None
+        ),
+        previous_interaction_resolution=(
+            given.previous_interaction_resolution if continuing else None
+        ),
+        previous_interaction_video_url=(
+            given.previous_interaction_video_url if continuing else None
+        ),
+        previous_interaction_seconds=(
+            given.previous_interaction_seconds if continuing else None
+        ),
+        budget_stated=given.budget is not None or is_draft,
     )
 
 
@@ -2105,6 +2290,9 @@ class RoutingPlan:
     conflicts: tuple[RoutingConflict, ...] = ()
     workflow: tuple[WorkflowStep, ...] = ()
     notes: tuple[str, ...] = ()
+    # A step the request needs was refused, though routes for the rest
+    # survived: a render that its upscale cannot take.
+    workflow_blocked: bool = False
 
     @property
     def recommended(self) -> RoutedCall | None:
@@ -2113,8 +2301,9 @@ class RoutingPlan:
 
     @property
     def is_satisfiable(self) -> bool:
-        """Whether at least one route survived every capability rule."""
-        return bool(self.routes)
+        """Whether a route survived every rule, and no step the request needs
+        was refused."""
+        return bool(self.routes) and not self.workflow_blocked
 
 
 # ============================================================================
@@ -2173,7 +2362,14 @@ def _score_route(
     speed_is_demanded = request.is_draft or request.is_iterating
     speed_term = profile.speed_index if speed_is_demanded else NEUTRAL_TERM
 
-    default_term = 1.0 if profile.model == default_model else 0.0
+    # The nudge settles an otherwise-even race, and a stated budget is not
+    # one. On the $/s scale the cheap video models sit close together (Omni
+    # 1.2 at 0.17, Veo Fast at 0.25), so a 30% cheaper route gains only 0.02
+    # on budget, and the default's 0.05 made budget=cheap recommend the
+    # dearer default.
+    default_term = (
+        1.0 if profile.model == default_model and request.budget == "balanced" else 0.0
+    )
 
     score = (
         WEIGHTS.capability_fit * capability_term
@@ -2190,21 +2386,23 @@ def _rank(
 ) -> tuple[RoutedCall, ...]:
     """Order routes best-first, deterministically.
 
-    Ties break first on whether the model has a published shutdown date — a
-    deprecated model scored level with its GA replacement was being offered as
-    an equal choice, which is how a caller ends up building on an endpoint
-    with weeks left — then on fidelity (the more capable model is the safer
-    default when the score cannot separate them) and then on the model ID, so
-    the ordering is a total order that never depends on insertion or set
-    iteration order.
+    A model with a published shutdown date ranks after every model without
+    one, whatever it scores. A deprecated model offered as an equal choice is
+    how a caller ends up building on an endpoint with weeks left, and a tie
+    break was not enough: it held only while the preview had a GA twin that
+    scored level with it (gemini-omni-1.1-flash), and the balanced budget
+    scores the preview's price ABOVE its real replacement's, 1.2. Then the
+    score, then fidelity (the more capable model is the safer default when
+    the score cannot separate them) and then the model ID, so the ordering is
+    a total order that never depends on insertion or set iteration order.
     """
 
-    def sort_key(route: RoutedCall) -> tuple[float, bool, float, str, str]:
+    def sort_key(route: RoutedCall) -> tuple[bool, float, float, str, str]:
         profile = profiles.get(route.model)
         fidelity = profile.fidelity_index if profile else 0.0
         return (
-            -route.score,
             route.model in DEPRECATED_VIDEO_MODELS,
+            -route.score,
             -fidelity,
             route.model,
             route.tool,
@@ -2507,11 +2705,11 @@ _VIDEO_CAPABILITY_RULES: tuple[_CapabilityRule, ...] = (
         need_attr="draft_360p",
         capability_attr="supports_360p",
         reason=(
-            "{model} excluded: 360p is gemini-omni-1.1-flash's draft tier; "
+            "{model} excluded: 360p is the Omni models' draft tier; "
             "this model publishes neither the output nor a rate for it"
         ),
         resolution=(
-            "Render the 360p draft on gemini-omni-1.1-flash via "
+            f"Render the 360p draft on {DEFAULT_OMNI_MODEL} via "
             "generate_video_omni, then finalize at 720p or above."
         ),
     ),
@@ -2555,8 +2753,8 @@ _VIDEO_CAPABILITY_RULES: tuple[_CapabilityRule, ...] = (
             "the prompt instead of amending the previous result"
         ),
         resolution=(
-            "Conversational edits run on gemini-omni-flash-preview via "
-            "edit_video with the prior interaction_id."
+            f"Conversational edits run on the Omni models ({DEFAULT_OMNI_MODEL} "
+            "by default) via edit_video with the prior interaction_id."
         ),
     ),
 )
@@ -2586,9 +2784,9 @@ def _capability_rejection(
 def _duration_rejection(model: str, needs: VideoNeeds) -> str | None:
     """Return a reason when the clip length is outside the model's range.
 
-    The omni models are the only ones with a real range here (3-10s); Veo
-    snaps instead of failing, so a Veo mismatch is a caveat rather than a
-    rejection.
+    The omni models are the only ones with a real range here (3-10s, 3-15s on
+    1.2); Veo snaps instead of failing, so a Veo mismatch is a caveat rather
+    than a rejection.
     """
     capabilities = _VIDEO_CAPABILITIES.get(model)
     if capabilities is None or not is_omni_model(model):
@@ -2613,6 +2811,298 @@ def _duration_rejection(model: str, needs: VideoNeeds) -> str | None:
             f"({duration:g}s requested)."
         )
     return None
+
+
+# The tools that render one shot between two endpoints.
+_TRANSITION_TOOLS: tuple[ToolName, ...] = ("generate_transition", "generate_bridge")
+
+
+def _transition_limit(model: str) -> tuple[float, float]:
+    """(longest transition ``model`` renders, longest ask it is planned for).
+
+    An omni model interpolates up to its keyframe ceiling. Veo renders 8s and
+    snaps an ask up to VEO_SNAP_MAX_SECONDS onto it with a caveat, as a plain
+    render does.
+    """
+    if is_omni_model(model):
+        longest = float(omni_spec(model).max_keyframe_seconds)
+        return longest, longest
+    return float(VEO_MAX_CLIP_SECONDS), VEO_SNAP_MAX_SECONDS
+
+
+def _transition_too_long(
+    tool: ToolName, model: str, request: ResolvedRequest
+) -> str | None:
+    """A reason when ``model`` cannot render this transition at its length.
+
+    A transition cannot be lengthened by extending it: the extension carries
+    the shot on past its last frame. So a model whose longest interpolation
+    falls short of the ask is excluded, not planned short -- a 12s ask was
+    ranked first as an 8s Veo transition.
+    """
+    seconds = request.total_duration_seconds
+    if tool not in _TRANSITION_TOOLS or seconds is None:
+        return None
+    longest, allowed = _transition_limit(model)
+    if seconds <= allowed:
+        return None
+    return (
+        f"{model} excluded: it interpolates between two endpoints in one "
+        f"render of at most {longest:g}s ({seconds:g}s requested), and "
+        "extending that render would carry the shot past its last frame."
+    )
+
+
+def _longest_transition_conflict(
+    tool: ToolName, request: ResolvedRequest, candidates: list[str]
+) -> RoutingConflict | None:
+    """A conflict when no candidate renders the transition at its length."""
+    seconds = request.total_duration_seconds
+    if tool not in _TRANSITION_TOOLS or seconds is None:
+        return None
+    live = [
+        model
+        for model in candidates
+        if not (model in DEPRECATED_VIDEO_MODELS and omni_preview_is_sunset())
+        and _VIDEO_CAPABILITIES[model].supports_first_last_frame
+    ]
+    if not live or any(seconds <= _transition_limit(m)[1] for m in live):
+        return None
+    longest = max(live, key=lambda model: _transition_limit(model)[0])
+    limit = _transition_limit(longest)[0]
+    return RoutingConflict(
+        code="transition_too_long",
+        detail=(
+            f"No model renders a transition {seconds:g}s long: the longest "
+            f"interpolation between two endpoints is {limit:g}s, on {longest}, "
+            "and extending one would carry the shot past its last frame."
+        ),
+        resolution=(
+            f"Ask for {limit:g}s or less. For a longer shot, render the "
+            "transition and then extend it (extend_video_omni, or loop_extend "
+            "on Veo); the last frame then falls inside the shot, not at its end."
+        ),
+    )
+
+
+def _omni_model_rendering(seconds: float, excluding: str) -> str | None:
+    """Another omni model that renders ``seconds`` in one call today, or None.
+
+    Skips a model that is switched off, so the fix offered for one exclusion
+    is never a model the same plan excludes.
+    """
+    for other in sorted(_VIDEO_CAPABILITIES):
+        capabilities = _VIDEO_CAPABILITIES[other]
+        if (
+            other != excluding
+            and is_omni_model(other)
+            and not (other in DEPRECATED_VIDEO_MODELS and omni_preview_is_sunset())
+            and capabilities.min_duration_seconds
+            <= seconds
+            <= capabilities.max_duration_seconds
+        ):
+            return other
+    return None
+
+
+# What a clip that can no longer be continued is passed to instead, per
+# continuation: the tool that takes it as input_video_uri, and the verb. An
+# edit goes to generate_video_omni, because edit_video takes no input video.
+# Mirrors src/__main__._retired_interaction_refusal, so the plan and the
+# tool's refusal give the same way out.
+_SAVED_CLIP_TOOLS: dict[str, tuple[ToolName, str]] = {
+    "edit": ("generate_video_omni", "edit"),
+    "extend": ("extend_video_omni", "extend"),
+    "upscale": ("upscale_video_omni", "upscale"),
+}
+
+
+def _saved_clip_resolution(task: str, request: ResolvedRequest) -> str:
+    """How to work on a clip whose interaction cannot be continued.
+
+    Names the saved clip when the server recorded where it went, as the
+    tool's own refusal does, so the fix is a value to pass rather than one
+    to go and find.
+    """
+    tool, verb = _SAVED_CLIP_TOOLS[task]
+    saved = request.previous_interaction_video_url
+    source = (
+        f"input_video_uri='{saved}' (the clip it saved)"
+        if saved
+        else "the clip it saved (the video_url in its manifest) as input_video_uri"
+    )
+    return (
+        f"To {verb} that clip on {DEFAULT_OMNI_MODEL}, call {tool} with "
+        f"{source} in place of previous_interaction_id."
+    )
+
+
+def _lost_interaction_conflict(
+    request: ResolvedRequest, task: str
+) -> RoutingConflict | None:
+    """A conflict when the interaction to continue lives on a model nothing calls.
+
+    An interaction cannot change models, so one recorded on a retired model
+    (redirected to its replacement, which never held it) or on a switched-off
+    one has no continuation at all. The tools refuse it before spending
+    anything; planning it would hand over a route they refuse.
+    """
+    recorded = request.previous_interaction_model
+    if request.previous_interaction_id is None or recorded is None:
+        return None
+    if omni_model_is_retired(recorded):
+        code = "interaction_model_retired"
+        where = f"{recorded}, which this server has retired"
+    elif recorded in DEPRECATED_VIDEO_MODELS and omni_preview_is_sunset():
+        code = "interaction_model_switched_off"
+        where = (
+            f"{recorded}, whose endpoint was switched off on "
+            f"{DEPRECATED_VIDEO_MODELS[recorded]}"
+        )
+    else:
+        return None
+    return RoutingConflict(
+        code=code,
+        detail=(
+            f"Interaction {request.previous_interaction_id} was created on "
+            f"{where}, and an interaction cannot change models, so it cannot "
+            f"be continued on {DEFAULT_OMNI_MODEL}."
+        ),
+        resolution=_saved_clip_resolution(task, request),
+    )
+
+
+def _backend_label(backend: str) -> str:
+    return "Vertex AI" if backend == "vertex" else "the Gemini Developer API"
+
+
+def _omni_backend_reachable(backend: str, request: ResolvedRequest) -> bool | None:
+    """Whether this server can send an omni call to ``backend``; None if unknown.
+
+    Mirrors the server's own test (_omni_backend_decision): Vertex AI needs a
+    Vertex primary client, and the Gemini Developer API needs a key, which a
+    Gemini-API primary client is.
+    """
+    if request.backend == "unknown":
+        return None
+    if backend == "vertex":
+        return request.backend == "vertex"
+    if request.backend == "gemini_api":
+        return True
+    return request.gemini_api_key_available
+
+
+def _interaction_backend_conflict(
+    request: ResolvedRequest, task: str
+) -> RoutingConflict | None:
+    """A conflict when the interaction lives on a backend this server cannot reach.
+
+    An interaction resolves on the backend that minted it and on no other, so
+    a continuation sent anywhere else fails -- after the tool has refused the
+    other backend's pin, or with the service's own error.
+    """
+    recorded = request.previous_interaction_backend
+    if request.previous_interaction_id is None or recorded is None:
+        return None
+    if _omni_backend_reachable(recorded, request) is not False:
+        return None
+    where = _backend_label(recorded)
+    reach = (
+        "Vertex AI credentials (GOOGLE_GENAI_USE_VERTEXAI=true)"
+        if recorded == "vertex"
+        else "a GEMINI_API_KEY"
+    )
+    fix = _saved_clip_resolution(task, request)
+    return RoutingConflict(
+        code="interaction_backend_unreachable",
+        detail=(
+            f"Interaction {request.previous_interaction_id} was created on "
+            f"{where}, and an interaction lives on the backend that created "
+            f"it, which this server cannot reach."
+        ),
+        resolution=(
+            f"Give the server {reach} to continue it there. Or: "
+            f"{fix[0].lower()}{fix[1:]}"
+        ),
+    )
+
+
+def _continuation_backend_param(request: ResolvedRequest) -> str | None:
+    """The omni_backend a continuation route sends, or None to leave it unset.
+
+    Named only when the server pins OMNI_BACKEND to the other backend: left
+    unset, the tool then refuses the call, while with no pin it continues on
+    the recorded backend by itself.
+    """
+    recorded = request.previous_interaction_backend
+    if recorded is None or request.omni_backend in (None, recorded):
+        return None
+    return recorded
+
+
+def _continuation_backend_caveat(request: ResolvedRequest) -> str:
+    """Why a continuation route names omni_backend."""
+    recorded = str(request.previous_interaction_backend)
+    return (
+        f"omni_backend is {recorded}: interaction "
+        f"{request.previous_interaction_id} lives on {_backend_label(recorded)}, "
+        f"and this server's OMNI_BACKEND default, {request.omni_backend}, "
+        "cannot continue it."
+    )
+
+
+def _continuation_model(request: ResolvedRequest) -> str:
+    """The one omni model a continuation of previous_interaction_id runs on.
+
+    The recorded model when the server has one, else a pinned omni model,
+    else the default: the model the tools take when nothing is recorded.
+    """
+    if request.previous_interaction_model is not None:
+        return canonical_omni_model(request.previous_interaction_model)
+    if request.pinned_model is not None and is_omni_model(request.pinned_model):
+        return request.pinned_model
+    return DEFAULT_OMNI_MODEL
+
+
+def _continuation_omni_model_param(request: ResolvedRequest) -> str | None:
+    """The omni_model a continuation route sends, or None to leave it unset.
+
+    Sent only when it is known to be the model that recorded the interaction
+    (or the caller pinned it). Otherwise the tool resolves an unset omni_model
+    to the recorded model itself; naming one here made every route but the
+    recorded model's a call the tool refuses, and the top route was one of
+    them whenever the interaction lived on the other model.
+    """
+    if request.previous_interaction_model is not None or (
+        request.pinned_model is not None and is_omni_model(request.pinned_model)
+    ):
+        return _continuation_model(request)
+    return None
+
+
+def _continuation_model_caveat(
+    tool: ToolName, model: str, request: ResolvedRequest
+) -> str:
+    """What a continuation route's omni_model (or its absence) means."""
+    if request.previous_interaction_model is not None:
+        return (
+            f"omni_model is {model}, the model this server recorded for "
+            "previous_interaction_id: an interaction's video context lives "
+            "with the model that made it, so a continuation cannot switch "
+            "models."
+        )
+    if _continuation_omni_model_param(request) is not None:
+        return (
+            f"omni_model is the pinned {model}. It must be the model that "
+            "made previous_interaction_id, since an interaction cannot change "
+            f"models; {tool} refuses the call otherwise."
+        )
+    return (
+        f"omni_model is left unset, so {tool} continues on the model that "
+        "made previous_interaction_id (an interaction cannot change models). "
+        f"The quote is {model}'s, the model the tool uses when this server "
+        "has no record of the interaction."
+    )
 
 
 def _backend_rejection(model: str, request: ResolvedRequest) -> tuple[str, str] | None:
@@ -2640,7 +3130,7 @@ def _backend_rejection(model: str, request: ResolvedRequest) -> tuple[str, str] 
             f"{model} excluded: Veo is not available on the Gemini Developer "
             f"API, where Google switched off its Veo 3.1 models on "
             f"{VEO_GEMINI_API_SHUTDOWN}.",
-            f"Use {OMNI_1_1_MODEL}, Google's named replacement, or run the "
+            f"Use {DEFAULT_OMNI_MODEL}, Google's named replacement, or run the "
             "server with Vertex AI credentials, where Veo 3.1 stays generally "
             "available.",
         )
@@ -2686,6 +3176,24 @@ def _select_video_tool(request: ResolvedRequest) -> ToolName:
     return "generate_video"
 
 
+def _veo_chains_runtime(request: ResolvedRequest) -> bool:
+    """Whether a single-shot Veo route reaches this runtime by extending a seed.
+
+    True for a runtime past VEO_SNAP_MAX_SECONDS that is still one render on
+    some other model; anything longer implies an extension for every model
+    in resolve_request already. A Veo route there renders an 8s seed and
+    extends it, as every route did before Omni 1.2 rendered 15s in one call,
+    rather than snapping the whole ask to 8s.
+    """
+    return (
+        _select_video_tool(request) == "generate_video"
+        and request.total_duration_seconds is not None
+        and VEO_SNAP_MAX_SECONDS
+        < request.total_duration_seconds
+        <= MAX_SINGLE_RENDER_SECONDS
+    )
+
+
 def _route_tool(tool: ToolName, model: str) -> ToolName:
     """Return the tool a given model is actually reached through.
 
@@ -2717,12 +3225,126 @@ def _omni_serves_on_vertex(request: ResolvedRequest) -> bool:
     chain the tool quoted at $9.14 on the same server. An UNKNOWN key
     (None) is read as absent, which prices the higher Vertex ceiling -- the
     direction a quote may err in.
+
+    A continuation runs where its interaction was recorded, whatever the
+    pin: the route names that backend when the pin is the other one
+    (_continuation_backend_param), so its quote and delivery advice are that
+    backend's too.
     """
+    recorded = request.previous_interaction_backend
+    if request.previous_interaction_id is not None and recorded is not None:
+        return recorded == "vertex"
     if request.omni_backend == "vertex":
         return True
     if request.omni_backend == "gemini_api":
         return False
     return request.backend == "vertex" and request.gemini_api_key_available is not True
+
+
+# Why the plan recommends a bucket, said beside the tools' own warning: what
+# a large inline delivery risks is paying for a render that never arrives.
+_WHY_A_BUCKET = (
+    "If the response arrives without the video, the render has still been "
+    "billed; written to a bucket, it is kept either way."
+)
+
+
+def _inline_delivery_caveat(
+    tool: ToolName,
+    spec: OmniModelSpec,
+    *,
+    vertexai: bool,
+    resolution: str | None,
+    task: str | None,
+    output_seconds: float | None,
+    seconds_are_bound: bool = False,
+    chain_turns: int = 1,
+) -> tuple[str | None, bool]:
+    """What a route with no output_gcs_uri says about a large Omni output.
+
+    The tools decide this before rendering with omni_inline_delivery_policy,
+    so the plan asks the same function, with what the route sends, rather
+    than restating the policy: by default a large output on Vertex AI is
+    requested inline with a warning, and when the server is set to refuse
+    such a request the function raises, which the plan reports as a
+    requirement. The router is never given a bucket, so it never sends one.
+
+    Returns:
+        The caveat (None when there is nothing to say), and whether the tool
+        refuses the call without output_gcs_uri.
+    """
+    try:
+        warning = omni_inline_delivery_policy(
+            spec,
+            vertexai=vertexai,
+            output_gcs_uri=None,
+            resolution=resolution,
+            task=task,
+            output_seconds=output_seconds,
+            seconds_are_bound=seconds_are_bound,
+            chain_turns=chain_turns,
+        )
+    except ValueError as refusal:
+        # The tool's own refusal, less its "Nothing was rendered or billed",
+        # which a plan has no call to report.
+        return (
+            f"Before rendering, {tool} refuses this call without "
+            "output_gcs_uri. "
+            + str(refusal).removesuffix(" Nothing was rendered or billed."),
+            True,
+        )
+    if warning is None:
+        return None, False
+    return f"{warning} {_WHY_A_BUCKET}", False
+
+
+def _omni_route_delivery_caveat(
+    tool: ToolName, model: str, request: ResolvedRequest, params: dict[str, Any]
+) -> str | None:
+    """The inline-delivery caveat for an Omni render route, or None.
+
+    Fed what each tool feeds the policy for the same params: a fresh render
+    its requested length, an edit the upper bound of a source this planner
+    cannot see, and an extension chain its turns.
+    """
+    if request.wants_gcs_output:
+        # The caller already means to send one.
+        return None
+    vertexai = _omni_serves_on_vertex(request)
+    spec = omni_spec(model)
+    resolution = params.get("resolution")
+    if tool == "edit_video":
+        caveat, _ = _inline_delivery_caveat(
+            tool,
+            spec,
+            vertexai=vertexai,
+            resolution=resolution,
+            task="edit",
+            output_seconds=omni_continuation_upper_bound(
+                spec, "edit", None, vertexai=vertexai
+            ),
+            seconds_are_bound=True,
+        )
+    elif tool == "extend_video_omni":
+        caveat, _ = _inline_delivery_caveat(
+            tool,
+            spec,
+            vertexai=vertexai,
+            resolution=resolution,
+            task=OMNI_TASK_EXTEND,
+            output_seconds=None,
+            chain_turns=int(params.get("times", 1)),
+        )
+    else:
+        caveat, _ = _inline_delivery_caveat(
+            tool,
+            spec,
+            vertexai=vertexai,
+            resolution=resolution,
+            task=None,
+            output_seconds=params.get("duration_seconds"),
+        )
+    return caveat
 
 
 def _clip_bridges_possible(request: ResolvedRequest) -> bool:
@@ -2806,6 +3428,266 @@ def _veo_generation_mode(tool: ToolName, request: ResolvedRequest) -> str | None
     return "text_to_video"
 
 
+def _splits_runtime(tool: ToolName, request: ResolvedRequest) -> bool:
+    """Whether a runtime the caller named is shared out across beats."""
+    return (
+        tool in ("generate_clip", "generate_storyboard")
+        and request.num_beats > 1
+        and request.total_duration_seconds is not None
+    )
+
+
+def _beat_seconds(request: ResolvedRequest) -> float:
+    """One beat's share of the runtime asked for, before any snap.
+
+    The runtime a multi-shot brief names is the whole clip's, so each beat
+    gets its share of it. Every beat took the whole runtime instead (capped at
+    one render): "a 3 shot commercial, 12 seconds total" planned three 8s
+    beats, 24s, and a 2-beat 12s brief said "12s snaps to 8s".
+    """
+    if _splits_runtime("generate_clip", request):
+        return float(request.total_duration_seconds or 0) / request.num_beats
+    return request.clip_duration_seconds
+
+
+def _veo_extension_gcs_caveat(request: ResolvedRequest) -> str | None:
+    """Where a Veo extension on Vertex AI is delivered, or None off Vertex.
+
+    The tool refuses one with neither an output_gcs_uri nor the server's
+    VIDEO_GCS_BUCKET, its dry run included, so a server known to have no
+    bucket gets a caveat that asks for the key rather than describes it.
+    """
+    if request.backend != "vertex":
+        return None
+    if request.video_gcs_bucket_configured is False:
+        return (
+            "Add output_gcs_uri (a prefix such as gs://bucket/renders/): a Veo extension on "
+            "Vertex AI is delivered only to Cloud Storage, and this server has "
+            "no VIDEO_GCS_BUCKET to fall back on, so the call is refused "
+            "without one."
+        )
+    if request.video_gcs_bucket_configured:
+        return (
+            "On Vertex AI the extended video is written to Cloud Storage: to "
+            "this server's VIDEO_GCS_BUCKET, or to output_gcs_uri if given."
+        )
+    return (
+        "On Vertex AI, extension requires output_gcs_uri (or a VIDEO_GCS_BUCKET "
+        "set on the server) — the combined video exceeds the inline response "
+        "limit."
+    )
+
+
+def _omni_seed_seconds(spec: OmniModelSpec) -> float:
+    """How long an omni extension chain's seed render is.
+
+    The longest source the chain's turn count assumes (_video_params measures
+    what is left to render from it), within one render.
+    """
+    return float(min(spec.max_uploaded_source_seconds, spec.max_duration_seconds))
+
+
+def _omni_extension_turn_seconds(
+    spec: OmniModelSpec,
+    added_seconds: float | None,
+    times: int,
+    *,
+    continues_interaction: bool,
+) -> int | None:
+    """The per-turn duration_seconds an omni extension route sends, or None.
+
+    gemini-omni-1.2-flash sets each turn's length (a whole second from 3 up
+    to the step), so an ask for fewer seconds than whole turns would add goes
+    out as a shorter turn. Without it, "extend this by 6 seconds" planned one
+    default turn, which renders and bills 10s. Only an explicit delta counts:
+    a runtime total is measured against a source the planner cannot see.
+    None leaves the tool's default step, as when the ask already fills every
+    turn, or when extend_video_omni would refuse the duration
+    (omni_extension_duration_refusal), so the route stays callable as given.
+    """
+    step = spec.extension_step_seconds
+    if added_seconds is None or step <= 0 or times < 1:
+        return None
+    seconds = min(step, max(OMNI_MIN_DURATION, math.ceil(added_seconds / times)))
+    if seconds >= step:
+        return None
+    if omni_extension_duration_refusal(
+        spec,
+        duration_seconds=seconds,
+        continues_interaction=continues_interaction,
+        times=times,
+    ):
+        return None
+    return int(seconds)
+
+
+def _omni_seed_cost(model: str, request: ResolvedRequest) -> CostEstimateLike | None:
+    """What the generate_video_omni seed of an omni extension chain costs."""
+    return _estimate_video_cost(
+        model,
+        _omni_seed_seconds(omni_spec(model)),
+        (request.resolution if omni_spec(model).supports_resolution else None)
+        or OMNI_RESOLUTION,
+        request.needs_audio,
+    )
+
+
+def _veo_seed_cost(model: str, request: ResolvedRequest) -> CostEstimateLike | None:
+    """What the 8s generate_video seed of a Veo extension chain costs.
+
+    Priced as the seed step's own params render it (_build_workflow): 8s at
+    720p, with the chain's audio choice.
+    """
+    return _estimate_video_cost(
+        model, float(VEO_MAX_CLIP_SECONDS), OMNI_RESOLUTION, request.needs_audio
+    )
+
+
+def _veo_chain_total(
+    model: str, request: ResolvedRequest, params: dict[str, Any]
+) -> str:
+    """The seed's cost and the chain's total, said beside a quote that has neither.
+
+    A chain route's cost is loop_extend's own quote, which covers the
+    extensions alone -- the figure its dry run gives for the same params. Said
+    without the seed, a 12s Veo Fast chain read as $0.70 beside Omni 1.2's
+    $0.84 single render, and really costs $1.50.
+    """
+    seed = _veo_seed_cost(model, request)
+    extensions = _video_cost("loop_extend", model, request, params)
+    if seed is None or extensions is None:
+        return ""
+    return (
+        f" The seed costs about ${seed.usd:.2f}, so the chain costs about "
+        f"${seed.usd + extensions.usd:.2f} in all; this route's quote covers "
+        "the extensions alone."
+    )
+
+
+def _omni_source_over_limit(limit: float, seconds: float) -> bool:
+    """Whether a recorded source is over an Omni source limit, as the tools judge it.
+
+    With the tools' one frame of tolerance (_omni_source_length_refusal):
+    this server's renders measure a frame over their nominal length, so a
+    recorded 15.03s clip that edit_video and upscale_video_omni both take was
+    refused here.
+    """
+    from .pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
+
+    return seconds > limit + OMNI_ENCODER_ALLOWANCE_SECONDS
+
+
+def _omni_input_rejection(
+    tool: ToolName, model: str, request: ResolvedRequest
+) -> tuple[str, str, str] | None:
+    """(code, reason, fix) when an Omni tool would refuse this route's inputs.
+
+    The planner offered routes the tools refuse before they render: an edit
+    of a recorded 25s clip (1.2 edits up to 15s), an extension of a clip
+    already at the ceiling (priced at nothing, blamed on the price book), and
+    7 reference images where 1.2 takes 6, or 3 on a Vertex AI edit, which
+    carries at most 2 images.
+    """
+    if not is_omni_model(model):
+        return None
+    # The loop carries the generic tool (generate_video, loop_extend); the
+    # rules below are the Omni tool's.
+    tool = _route_tool(tool, model)
+    vertexai = _omni_serves_on_vertex(request)
+    spec = omni_spec(model, vertexai=vertexai)
+    references = request.num_reference_images or 0
+    if tool in ("generate_video_omni", "edit_video", "extend_video_omni"):
+        if references > spec.max_reference_images:
+            return (
+                "too_many_reference_images",
+                f"{model} takes at most {spec.max_reference_images} reference "
+                f"images, and {references} were asked for.",
+                _reference_limit_fix(references),
+            )
+        if (
+            tool == "edit_video"
+            and vertexai
+            and spec.max_vertex_edit_images
+            and references > spec.max_vertex_edit_images
+        ):
+            return (
+                "too_many_edit_images",
+                f"A Vertex AI edit on {model} carries at most "
+                f"{spec.max_vertex_edit_images} images, and {references} "
+                "reference images were asked for.",
+                f"Pass at most {spec.max_vertex_edit_images}, or edit an "
+                "interaction created on the Gemini API, which takes up to "
+                f"{omni_spec(model).max_reference_images}.",
+            )
+    seconds = (
+        request.previous_interaction_seconds
+        if request.previous_interaction_id is not None
+        else None
+    )
+    if seconds is None:
+        return None
+    if tool == "edit_video":
+        cap = omni_source_limit_seconds(spec, task="edit")
+        if cap and _omni_source_over_limit(cap, seconds):
+            return (
+                "source_too_long",
+                f"{model} edits clips up to {cap:g}s, and interaction "
+                f"{request.previous_interaction_id}'s clip is {seconds:g}s, as "
+                "this server recorded it.",
+                f"Trim the clip it saved to {cap:g}s or less and pass it as "
+                "input_video_uri to generate_video_omni.",
+            )
+    if tool == "extend_video_omni":
+        refusal = omni_extension_refusal(spec, seconds)
+        if refusal is not None:
+            return (
+                "source_at_extension_ceiling",
+                refusal.split(" Nothing was rendered", 1)[0],
+                refusal.split("Nothing was rendered or billed. ", 1)[-1],
+            )
+    return None
+
+
+def _veo_reference_rejection(
+    model: str, request: ResolvedRequest
+) -> tuple[str, str, str] | None:
+    """(code, reason, fix) when a Veo route would drop reference images.
+
+    Veo takes 3 reference images, and generate_video sends the first 3 of a
+    longer list with a warning. A planner that offers that route for 4 to 6
+    references ranks a render that ignores some of them beside an Omni route
+    that uses all of them, so it is excluded rather than offered.
+    """
+    references = request.num_reference_images or 0
+    if is_omni_model(model) or references <= MAX_VIDEO_REFERENCE_IMAGES:
+        return None
+    return (
+        "too_many_reference_images",
+        f"{model} takes at most {MAX_VIDEO_REFERENCE_IMAGES} reference images, "
+        f"and {references} were asked for; the rest would not be sent.",
+        _reference_limit_fix(references),
+    )
+
+
+def _reference_limit_fix(references: int) -> str:
+    """The one fix for a reference count over a video model's limit.
+
+    Omni and Veo routes refuse the same brief for the same reason, so they
+    share one sentence: two ("Pass at most 6 ... Pass at most 3 ...") read
+    as contradictory advice when every model was excluded.
+    """
+    omni_max = omni_spec(DEFAULT_OMNI_MODEL).max_reference_images
+    if references <= omni_max:
+        return (
+            f"Use {DEFAULT_OMNI_MODEL}, which takes up to {omni_max} reference "
+            f"images, or pass at most {MAX_VIDEO_REFERENCE_IMAGES} for Veo."
+        )
+    return (
+        f"Pass at most {omni_max} reference images for {DEFAULT_OMNI_MODEL}, "
+        f"or at most {MAX_VIDEO_REFERENCE_IMAGES} for Veo."
+    )
+
+
 def _video_params(
     tool: ToolName, model: str, request: ResolvedRequest
 ) -> tuple[dict[str, Any], list[str]]:
@@ -2826,7 +3708,18 @@ def _video_params(
     if aspect_ratio is None:
         aspect_ratio = "9:16" if tool == "generate_clip" else "16:9"
 
-    duration = request.clip_duration_seconds
+    duration = (
+        _beat_seconds(request)
+        if tool == "generate_clip"
+        else request.clip_duration_seconds
+    )
+    if is_omni_model(model) and request.has_first_frame and request.has_last_frame:
+        if duration > omni_spec(model).max_keyframe_seconds:
+            caveats.append(
+                f"First/last-frame interpolation is limited to {omni_spec(model).max_keyframe_seconds}s; "
+                f"this route shortens the requested {duration:g}s clip to that limit."
+            )
+        duration = min(duration, float(omni_spec(model).max_keyframe_seconds))
     if not is_omni_model(model):
         # The mode decides the length before the ladder does. generate_video
         # derives it from the same inputs, and src/video.py then FORCES 8s for
@@ -2843,12 +3736,24 @@ def _video_params(
                     f"{VEO_REFERENCE_MODE_SECONDS:g}s."
                 )
             duration = VEO_REFERENCE_MODE_SECONDS
-        else:
+        elif tool != "loop_extend":
+            # loop_extend takes no duration: it appends ~7s steps to a clip,
+            # and the runtime asked for sets how many.
             snapped = _snap_veo_duration(duration)
-            if float(snapped) != duration:
+            ladder = "/".join(str(d) for d in VEO_DURATIONS_SECONDS)
+            if float(snapped) != duration and _splits_runtime(tool, request):
+                # Said per beat: "12s snaps to 8s" read as the whole clip cut
+                # short, beside beats that add up to more than was asked.
+                beats = min(request.num_beats, MAX_CLIP_BEATS)
                 caveats.append(
-                    f"Veo renders {'/'.join(str(d) for d in VEO_DURATIONS_SECONDS)}s "
-                    f"clips; {duration:g}s snaps to {snapped}s."
+                    f"Each of the {beats} beats is {round(duration, 2):g}s of "
+                    f"the {request.total_duration_seconds:g}s asked; Veo renders "
+                    f"{ladder}s clips, so each snaps to {snapped}s "
+                    f"({snapped * beats}s in all)."
+                )
+            elif float(snapped) != duration:
+                caveats.append(
+                    f"Veo renders {ladder}s clips; {duration:g}s snaps to {snapped}s."
                 )
             duration = float(snapped)
         if request.backend == "unknown":
@@ -2864,35 +3769,41 @@ def _video_params(
         params = {
             "previous_interaction_id": request.previous_interaction_id,
             "prompt": request.intent,
-            # Emitted so the call runs on the model this route was priced
-            # for. Both omni models quote identically at 720p, but the plan
-            # naming one and the tool defaulting to the other is exactly the
-            # drift this pass-through exists to prevent.
-            "omni_model": model,
             "aspect_ratio": aspect_ratio,
             "duration_seconds": duration,
         }
+        continued_on = _continuation_omni_model_param(request)
+        if continued_on is not None:
+            params["omni_model"] = continued_on
+        backend_param = _continuation_backend_param(request)
+        if backend_param is not None:
+            params["omni_backend"] = backend_param
         if omni_spec(model).supports_resolution and request.resolution is not None:
             params["resolution"] = request.resolution
-        caveats.append(
-            "omni_model must be the model that produced "
-            "previous_interaction_id — the interaction's video context lives "
-            "with it, so an edit cannot switch models mid-conversation."
-        )
+        caveats.append(_continuation_model_caveat(tool, model, request))
+        if backend_param is not None:
+            caveats.append(_continuation_backend_caveat(request))
         caveats.append(
             "An edit does not send duration or aspect ratio — the API rejects "
             "them on an edit task — and the rendered length is chosen by the "
             "service, predictable from neither the request nor the source. "
             "Cost is measured from the rendered file; a quote is an upper bound."
         )
+        # The route model's own ceiling, which is also what _video_cost prices
+        # this edit at. A flat 15s here would tell a preview route (10s) that
+        # its quote was 15s, beside a quote computed at 10s.
+        render_max = float(omni_spec(model).max_duration_seconds)
+        edit_cap = omni_source_limit_seconds(omni_spec(model), task="edit")
         caveats.append(
-            f"The quote is Omni's {OMNI_MAX_DURATION:g}s per-render maximum, "
-            "the same upper bound edit_video's own dry_run reports for a clip "
-            f"this planner cannot measure — not the {duration:g}s above, which "
-            "is never sent. If the interaction is a clip you already extended "
-            f"past {OMNI_MAX_DURATION:g}s, the tool's dry_run reads its real "
-            "length from the sidecar and quotes higher; this figure assumes a "
-            "single-render source."
+            f"The quote is {model}'s {render_max:g}s per-render maximum, "
+            "the same upper bound edit_video's own dry_run reports — not the "
+            f"{duration:g}s above, which is never sent."
+            + (
+                f" {model} edits clips up to {edit_cap:g}s; a longer one is "
+                "refused before it renders."
+                if edit_cap
+                else ""
+            )
         )
     elif tool == "loop_extend":
         times = 1
@@ -2922,6 +3833,19 @@ def _video_params(
         }
         if request.source_video_uri is not None:
             params["video_uri"] = request.source_video_uri
+        elif request.extension_implied or _veo_chains_runtime(request):
+            # No clip exists yet, and only the top route gets the seed step
+            # laid out as a workflow; a lower-ranked chain has to say it too.
+            planned = int(params["times"])
+            reached = VEO_MAX_CLIP_SECONDS + VEO_EXTENSION_SECONDS * planned
+            caveats.append(
+                f"No clip exists yet: render the opening {VEO_MAX_CLIP_SECONDS}s "
+                f"with generate_video on {model}, then pass its video_url as "
+                f"video_uri. With {planned} extension{'s' if planned != 1 else ''} "
+                f"it runs about {reached}s against the "
+                f"{request.total_duration_seconds:g}s asked."
+                + _veo_chain_total(model, request, params)
+            )
         else:
             caveats.append(
                 "Add video_uri: loop_extend needs the existing Veo clip to continue."
@@ -2930,38 +3854,35 @@ def _video_params(
             f"Each extension adds ~{VEO_EXTENSION_SECONDS}s and output is 720p; "
             f"Veo allows at most {VEO_MAX_EXTENSIONS} extensions."
         )
-        if request.backend == "vertex":
-            caveats.append(
-                "On Vertex AI, extension requires output_gcs_uri — the combined "
-                "video exceeds the inline response limit."
-            )
+        gcs = _veo_extension_gcs_caveat(request)
+        if gcs is not None:
+            caveats.append(gcs)
     elif tool == "extend_video_omni":
-        spec = omni_spec(model)
+        spec = omni_spec(model, vertexai=_omni_serves_on_vertex(request))
         step = float(spec.extension_step_seconds)
         wanted = request.added_duration_seconds
+        # The delta a per-turn duration may be cut to: an explicit one, or a
+        # total measured against a source whose length was recorded.
+        exact_delta = wanted
         if wanted is None and request.total_duration_seconds is not None:
             # A total was named instead of a delta. Omni extends footage that
             # already exists, so what has to be rendered is the difference
-            # above the source — measured from the longest source omni will
+            # above the source — measured from the recorded clip when this
+            # server rendered it, else from the longest source omni will
             # take, rather than from zero, which would bill the caller for
             # seconds they already have.
-            wanted = request.total_duration_seconds - spec.max_uploaded_source_seconds
+            source = request.previous_interaction_seconds
+            wanted = request.total_duration_seconds - (
+                source or spec.max_uploaded_source_seconds
+            )
+            if source is not None and wanted > 0:
+                exact_delta = wanted
         times = max(1, math.ceil((wanted or step) / step))
-        # How many turns actually FIT, given the source this planner has to
-        # assume. Capping at max_extended/step alone planned a fourth turn
-        # that had no room and was priced as three — the plan and its own
-        # quote disagreeing about how many renders it was recommending.
-        ceiling = max(
-            1,
-            len(
-                omni_extension_output_lengths(
-                    spec,
-                    None,
-                    spec.max_extended_seconds,
-                    vertexai=_omni_serves_on_vertex(request),
-                )
-            ),
-        )
+        # The most full-step turns the cumulative ceiling allows. An unknown
+        # source is priced conservatively (see _video_cost), but does not
+        # decide how many turns fit: the tool measures the source and trims
+        # the chain on the Developer API, and Vertex keeps a rolling window.
+        ceiling = spec.max_extended_seconds // spec.extension_step_seconds
         if times > ceiling:
             caveats.append(
                 f"{times} extension turns would be needed but omni caps a clip "
@@ -2969,11 +3890,25 @@ def _video_params(
                 f"{spec.extension_step_seconds}s steps; planned at the "
                 f"{ceiling}-turn maximum."
             )
-        params = {
-            "prompt": request.intent,
-            "omni_model": model,
-            "times": min(times, ceiling),
-        }
+        # A continuation names its model only when it is known to be the one
+        # that holds the interaction; any other source is new to the model.
+        omni_model_param = (
+            _continuation_omni_model_param(request)
+            if request.previous_interaction_id is not None
+            else model
+        )
+        params = {"prompt": request.intent}
+        if omni_model_param is not None:
+            params["omni_model"] = omni_model_param
+        params["times"] = min(times, ceiling)
+        turn_seconds = _omni_extension_turn_seconds(
+            spec,
+            exact_delta,
+            int(params["times"]),
+            continues_interaction=request.previous_interaction_id is not None,
+        )
+        if turn_seconds is not None:
+            params["duration_seconds"] = turn_seconds
         if spec.supports_resolution and request.resolution is not None:
             # Priced at request.resolution below, so it has to be SENT. It was
             # the one omni branch that quoted a resolution its own params
@@ -2982,8 +3917,32 @@ def _video_params(
             params["resolution"] = request.resolution
         if request.previous_interaction_id is not None:
             params["previous_interaction_id"] = request.previous_interaction_id
+            caveats.append(_continuation_model_caveat(tool, model, request))
+            backend_param = _continuation_backend_param(request)
+            if backend_param is not None:
+                params["omni_backend"] = backend_param
+                caveats.append(_continuation_backend_caveat(request))
         elif request.source_video_uri is not None:
             params["input_video_uri"] = request.source_video_uri
+        elif request.extension_implied:
+            # No clip exists yet, as on the Veo chain: the seed is rendered
+            # first, and only the top route gets it laid out as a workflow.
+            seed = _omni_seed_seconds(spec)
+            reached = min(seed + step * int(params["times"]), spec.max_extended_seconds)
+            seed_cost = _omni_seed_cost(model, request)
+            priced = (
+                f" (est. ${seed_cost.usd:.2f}, on top of this route's quote)"
+                if seed_cost is not None
+                else ""
+            )
+            caveats.append(
+                f"No clip exists yet: render the opening {seed:g}s with "
+                f"generate_video_omni on {model}{priced}, then pass its "
+                "interaction_id as previous_interaction_id. With "
+                f"{params['times']} turn{'s' if params['times'] != 1 else ''} it "
+                f"runs about {reached:g}s against the "
+                f"{request.total_duration_seconds:g}s asked."
+            )
         else:
             caveats.append(
                 "Add previous_interaction_id (a clip this server generated) or "
@@ -2991,20 +3950,32 @@ def _video_params(
                 "existing footage to continue."
             )
         caveats.append(
-            f"Each turn appends up to {spec.extension_step_seconds}s using the "
-            f"last {spec.extension_step_seconds}s of the source as context, to "
-            f"a cumulative {spec.max_extended_seconds}s. An uploaded source "
-            f"must be {spec.max_uploaded_source_seconds:g}s or shorter; a "
-            "multi-turn source has no such limit."
+            f"Each turn appends {OMNI_MIN_DURATION}-{spec.extension_step_seconds}s "
+            "using the final 10s as context. "
+            + (
+                f"Vertex retains up to the last {spec.extension_window_seconds}s "
+                "of the source on each turn; longer input videos are supported."
+                if spec.extension_window_seconds
+                else "The Gemini API limits the assembled clip to "
+                f"{spec.max_extended_seconds}s."
+            )
+        )
+        recorded_source = (
+            request.previous_interaction_seconds
+            if request.previous_interaction_id is not None
+            else None
         )
         caveats.append(
-            "Each turn renders the ASSEMBLED clip, not the increment it "
-            "appends, so every turn re-bills the footage before it and the "
-            "cost grows quadratically in `times` — measured: a 3.01s source "
-            "extended once returned 13.01s. The planner cannot see the "
-            f"source's length, so it assumes the documented "
-            f"{spec.max_uploaded_source_seconds:g}s maximum; the tool's own "
-            "dry_run measures it and quotes lower."
+            "Each turn bills its assembled output. "
+            + (
+                f"The quote projects each turn from the {recorded_source:g}s "
+                "this server recorded for the source, as the tool's own quote "
+                "does."
+                if recorded_source is not None
+                else "The source length is unknown, so the quote uses the "
+                f"{spec.max_extended_seconds}s output bound per turn. Use the "
+                "tool's dry_run with a local source for a measured projection."
+            )
         )
     elif tool in ("generate_transition", "generate_bridge"):
         params = {
@@ -3076,13 +4047,22 @@ def _video_params(
             "shot's own description — they are seeded from the intent."
         )
     elif tool == "generate_video_omni":
+        spec = omni_spec(model)
+        if request.is_draft and request.total_duration_seconds is None:
+            # A throwaway pass with no runtime asked for renders the shortest
+            # clip the model takes; the 6s default is a deliverable's length.
+            duration = float(OMNI_MIN_DURATION)
+            caveats.append(
+                f"Planned at {OMNI_MIN_DURATION}s, the shortest render, because "
+                "this is a draft and no duration was given; pass "
+                "duration_seconds for the length the deliverable will run."
+            )
         params = {
             "prompt": request.intent,
             "omni_model": model,
             "aspect_ratio": aspect_ratio,
             "duration_seconds": duration,
         }
-        spec = omni_spec(model)
         # Frames the caller supplied, bound to their roles. Emitted here
         # because a transition-shaped request now reaches this tool: routing
         # omni for two stills and then dropping the stills would hand over a
@@ -3108,29 +4088,41 @@ def _video_params(
                 "neither URI."
             )
         if spec.supports_resolution:
+            cheap_tier = (
+                request.resolution is None
+                and request.budget == "cheap"
+                and request.budget_stated
+                and OMNI_DRAFT_RESOLUTION in spec.resolutions
+            )
             if request.resolution is not None:
                 params["resolution"] = request.resolution
+            elif cheap_tier:
+                # budget=cheap (a draft implies it) gets the cheapest tier
+                # rather than a caveat pointing at it.
+                params["resolution"] = OMNI_DRAFT_RESOLUTION
+                caveats.append(
+                    f"Planned at {OMNI_DRAFT_RESOLUTION}, a third of the 720p "
+                    "price, because budget is cheap; pass resolution='720p' or "
+                    "higher for the deliverable."
+                )
             caveats.append(
                 f"{model} renders {'/'.join(spec.resolutions)} (1080p and 4K "
                 "upscaled from the base render) and has no seed or "
                 "negative_prompt; keep the returned interaction_id to edit or "
                 "extend it conversationally."
             )
-            if request.resolution in (None, OMNI_RESOLUTION):
+            if not cheap_tier and request.resolution in (None, OMNI_RESOLUTION):
                 # The one saving worth naming unprompted: a 360p pass is a
-                # third of the 720p price, which makes it the cheapest video
-                # render this server can issue.
-                caveats.append(
-                    "resolution='360p' renders a draft at a third of the 720p "
-                    "price (Google's launch post; the pricing page publishes "
-                    "only the 720p rate) — the cheapest preview available here."
-                )
+                # third of the 720p price (1,931 against 5,792 tokens/s on the
+                # pricing page; src/pricing.py), which makes it the cheapest
+                # video render this server can issue.
+                caveats.append(_OMNI_360P_TIP)
         else:
             caveats.append(
                 f"{model} output is {spec.rendered_resolution}/24fps with no "
                 "seed or negative_prompt; keep the returned interaction_id to "
                 "edit it conversationally. Pass "
-                f"omni_model='{OMNI_1_1_MODEL}' for resolution control, video "
+                f"omni_model='{DEFAULT_OMNI_MODEL}' for resolution control, video "
                 "extension and first/last-frame interpolation."
             )
     else:  # generate_video
@@ -3169,6 +4161,11 @@ def _video_params(
             "individually with generate_video if the resolution matters."
         )
 
+    if is_omni_model(model):
+        delivery = _omni_route_delivery_caveat(tool, model, request, params)
+        if delivery is not None:
+            caveats.append(delivery)
+
     if request.wants_gcs_output and tool != "edit_video":
         if request.backend == "gemini_api":
             caveats.append(
@@ -3190,9 +4187,9 @@ def _video_params(
         caveats.append(
             f"{model} is deprecated: its endpoint is switched off on {sunset}. "
             "It ranks below any equally-scored replacement and should not be "
-            f"built on. The GA successor is {OMNI_1_1_MODEL}, which renders "
-            "the same 720p at the same published rate and adds resolution "
-            "control, video extension and first/last-frame interpolation."
+            f"built on. The GA successor is {DEFAULT_OMNI_MODEL}, which renders "
+            "720p at a lower published rate and adds resolution control, "
+            "video extension and first/last-frame interpolation."
         )
 
     return params, caveats
@@ -3250,6 +4247,9 @@ def _aggregate_video_cost(
         # by hand here, it would otherwise report no source at all.
         source=getattr(probe, "source", None),
         source_note=getattr(probe, "source_note", None),
+        # And its date: a 1.2 multi-render plan was dated by the full
+        # re-read, before the 1.2 table was verified.
+        as_of=getattr(probe, "as_of", None),
         detail=(
             f"{segments} render{'s' if segments != 1 else ''} totalling "
             f"{quoted_seconds:g}s @ {resolution} on "
@@ -3279,11 +4279,28 @@ def _video_cost(
 
     # What an omni route is actually rendered at: the preview model has no
     # resolution parameter, so a 4K ask cannot reach it and must not be priced
-    # as if it had; 1.1 renders what it is given.
+    # as if it had; 1.2 renders what it is given.
     def _omni_resolution(candidate: str) -> str:
-        if not omni_spec(candidate).supports_resolution:
+        spec = omni_spec(candidate)
+        if not spec.supports_resolution:
             return OMNI_RESOLUTION
-        return request.resolution or OMNI_RESOLUTION
+        # A continuation the caller names no resolution for sends the one the
+        # interaction was recorded at, as the tools do; a 360p clip's
+        # extension was quoted at 720p.
+        inherited = (
+            request.previous_interaction_resolution
+            if "previous_interaction_id" in params
+            and request.previous_interaction_resolution in spec.resolutions
+            else None
+        )
+        # The route's own resolution first: a budget=cheap route is planned at
+        # 360p without the request naming one, and was quoted at 720p.
+        return (
+            params.get("resolution")
+            or request.resolution
+            or inherited
+            or OMNI_RESOLUTION
+        )
 
     if tool == "edit_video":
         # An edit's rendered length is chosen by the service: two measurements
@@ -3293,7 +4310,10 @@ def _video_cost(
         # is the one thing a pre-flight may not do. include_audio mirrors the
         # tool's own call so the two quotes are identical down to the detail.
         return _estimate_video_cost(
-            model, float(OMNI_MAX_DURATION), _omni_resolution(model), False
+            model,
+            float(omni_spec(model).max_duration_seconds),
+            _omni_resolution(model),
+            False,
         )
 
     if tool == "extend_video_omni":
@@ -3310,7 +4330,15 @@ def _video_cost(
         # turns while extend_video_omni's own quote said $12.18 -- and a
         # max_cost_usd taken from the plan was refused by the tool.
         lengths = omni_extension_priced_lengths(
-            omni_spec(model), None, turns, vertexai=_omni_serves_on_vertex(request)
+            omni_spec(model),
+            # The recorded clip, as the tool's own quote reads it; anything
+            # else is unknown and priced at the bound.
+            request.previous_interaction_seconds
+            if "previous_interaction_id" in params
+            else None,
+            turns,
+            vertexai=_omni_serves_on_vertex(request),
+            per_turn_seconds=params.get("duration_seconds"),
         )
         if not lengths:
             return None
@@ -3453,7 +4481,8 @@ def _plan_storyboard_route(request: ResolvedRequest) -> RoutedCall | None:
         "shots": [
             {
                 "prompt": request.intent,
-                "duration_seconds": request.clip_duration_seconds,
+                # The beat's share: the shot list feeds generate_clip.
+                "duration_seconds": _beat_seconds(request),
             }
             for _ in range(shots)
         ],
@@ -3526,8 +4555,8 @@ def _plan_video(
                 code="gcs_output_on_gemini_api",
                 detail=(
                     "output_gcs_uri was requested but the server is on the Gemini "
-                    "Developer API, which returns media inline and rejects an "
-                    "explicit GCS target."
+                    "Developer API, which has no Cloud Storage destination and "
+                    "rejects an explicit GCS target."
                 ),
                 resolution=(
                     "Run against Vertex AI for GCS output, or accept the inline "
@@ -3595,8 +4624,8 @@ def _plan_video(
             RoutingConflict(
                 code="conversational_edit_without_seed_support",
                 detail=(
-                    "Conversational editing only exists on "
-                    f"{OMNI_MODEL}, which has no seed parameter."
+                    "Conversational editing only exists on the Omni models, "
+                    "which have no seed parameter."
                 ),
                 resolution=(
                     "Drop the seed requirement, or re-render on Veo with a fixed "
@@ -3626,7 +4655,7 @@ def _plan_video(
         "generate_video_omni",
         "edit_video",
         "loop_extend",
-        # Two stills and a prompt is exactly omni 1.1's interpolation, so it
+        # Two stills and a prompt is exactly omni 1.2's interpolation, so it
         # belongs in the running for a transition. The preview model is then
         # excluded by the first/last-frame capability rule, as it should be.
         # generate_bridge stays Veo-only: it SAMPLES its endpoints out of two
@@ -3641,6 +4670,51 @@ def _plan_video(
         candidates = sorted(LIVE_VIDEO_MODELS)
     else:
         candidates = sorted(LIVE_VIDEO_MODELS)
+
+    # A continuation runs on the model that holds the interaction and on no
+    # other: an interaction cannot change models, and the tools refuse any
+    # omni_model but that one. One route per tool, on that model -- a route
+    # per omni model handed over calls the tool refuses, and the top-ranked
+    # one was refused whenever the interaction lived on the other model.
+    continuing = request.previous_interaction_id is not None
+    continuation_task = "extend" if tool == "loop_extend" else "edit"
+    lost = (
+        _lost_interaction_conflict(request, continuation_task)
+        or _interaction_backend_conflict(request, continuation_task)
+        if continuing
+        else None
+    )
+    continued_on = _continuation_model(request) if continuing else None
+    recorded = request.previous_interaction_model
+    if lost is not None:
+        conflicts.append(lost)
+    elif (
+        recorded is not None
+        and request.pinned_model is not None
+        and is_omni_model(request.pinned_model)
+        and request.pinned_model != continued_on
+    ):
+        conflicts.append(
+            RoutingConflict(
+                code="pinned_model_cannot_continue_interaction",
+                detail=(
+                    f"pinned_model={request.pinned_model} cannot continue "
+                    f"interaction {request.previous_interaction_id}, which was "
+                    f"created on {recorded}: an interaction cannot change models."
+                ),
+                resolution=(
+                    f"Drop pinned_model (or pin {continued_on}) to continue it on "
+                    f"{continued_on}, or start a new interaction from the clip it "
+                    "saved by passing it as input_video_uri to "
+                    f"{_SAVED_CLIP_TOOLS[continuation_task][0]}."
+                ),
+            )
+        )
+
+    chains_runtime = _veo_chains_runtime(request)
+    too_long = _longest_transition_conflict(tool, request, candidates)
+    if too_long is not None:
+        conflicts.append(too_long)
 
     # The fix for each exclusion, kept: when EVERY candidate is excluded the
     # plan used to return no routes and no conflicts, and the resolutions the
@@ -3661,18 +4735,42 @@ def _plan_video(
                     tool=_route_tool(tool, model),
                 )
             )
-            exclusion_fixes.append(f"Use {OMNI_1_1_MODEL}, the GA successor.")
+            exclusion_fixes.append(f"Use {DEFAULT_OMNI_MODEL}, the GA successor.")
             continue
 
-        capability_hit = _capability_rejection(model, needs)
-        duration_reason = _duration_rejection(model, needs)
+        # Past VEO_SNAP_MAX_SECONDS a Veo route chains a seed and extensions
+        # instead of rendering one clip short; omni routes render the whole
+        # runtime, or are excluded for their ceiling.
+        model_tool: ToolName = (
+            "loop_extend" if chains_runtime and not is_omni_model(model) else tool
+        )
+        model_needs = needs if model_tool == tool else _video_needs(request, model_tool)
+        capability_hit = _capability_rejection(model, model_needs)
+        duration_reason = _duration_rejection(model, model_needs)
+        transition_reason = _transition_too_long(tool, model, request)
         backend_hit = _backend_rejection(model, request)
+        source_hit = _omni_input_rejection(
+            model_tool, model, request
+        ) or _veo_reference_rejection(model, request)
         reason = None
         code = None
         resolution = None
         if capability_hit is not None:
             rule, reason = capability_hit
             code, resolution = rule.code, rule.resolution
+            if (
+                recorded is not None
+                and model == continued_on
+                and _capability_rejection(DEFAULT_OMNI_MODEL, needs) is None
+            ):
+                # The interaction's own model cannot do this, and no other
+                # model can continue it; the clip it saved can still go to
+                # one that can. The rule's own fix (a Veo route, say) would
+                # drop the interaction the request is about.
+                resolution = (
+                    "An interaction cannot change models. "
+                    + _saved_clip_resolution(continuation_task, request)
+                )
         elif duration_reason is not None:
             reason = duration_reason
             code = "duration_out_of_range"
@@ -3681,14 +4779,73 @@ def _plan_video(
                 f"{'/'.join(str(d) for d in VEO_DURATIONS_SECONDS)}s clips and can "
                 "be extended."
             )
+            longer = _omni_model_rendering(needs.clip_duration_seconds, model)
+            if longer is not None:
+                # Omni ceilings differ by model (10s on the preview, 15s on
+                # 1.2), so "use Veo" is not the nearest fix for a pinned
+                # preview asked for 13s: 1.2 renders it in one call, and for
+                # less.
+                resolution = (
+                    f"Use {longer}, which renders up to "
+                    f"{_VIDEO_CAPABILITIES[longer].max_duration_seconds:g}s in "
+                    f"one call. Or: {resolution[0].lower()}{resolution[1:]}"
+                )
+        elif transition_reason is not None:
+            reason = transition_reason
+            code = "transition_too_long"
+            resolution = too_long.resolution if too_long is not None else None
         elif backend_hit is not None:
             reason, resolution = backend_hit
             code = "backend_unsupported"
+        elif source_hit is not None:
+            code, reason, resolution = source_hit
+
+        if (
+            reason is None
+            and continuing
+            and is_omni_model(model)
+            and (lost is not None or model != continued_on)
+        ):
+            # Capable, but not the model holding the interaction. A model
+            # that cannot do this at all keeps its own reason above.
+            if (
+                lost is not None
+                and lost.code == "interaction_backend_unreachable"
+                and model == continued_on
+            ):
+                why = (
+                    f"interaction {request.previous_interaction_id} lives on "
+                    f"{_backend_label(str(request.previous_interaction_backend))}"
+                    ", which this server cannot reach"
+                )
+            elif recorded is not None:
+                why = (
+                    f"interaction {request.previous_interaction_id} was created "
+                    f"on {recorded}, and an interaction cannot change models"
+                )
+            elif _continuation_omni_model_param(request) is not None:
+                why = f"the plan is pinned to {continued_on}"
+            else:
+                why = (
+                    f"one {_route_tool(tool, model)} route covers the "
+                    "interaction, with omni_model left unset so the tool "
+                    "continues on the model that made it"
+                )
+            rejected.append(
+                RejectedRoute(
+                    model=model,
+                    reason=f"{model} not planned: {why}.",
+                    tool=_route_tool(tool, model),
+                )
+            )
+            continue
 
         if reason is not None:
-            route_tool = _route_tool(tool, model)
+            route_tool = _route_tool(model_tool, model)
             rejected.append(RejectedRoute(model=model, reason=reason, tool=route_tool))
-            if resolution:
+            # A model that cannot read an interaction has no fix to offer a
+            # continuation of one: "use Omni" is what the request already is.
+            if resolution and not (continuing and not is_omni_model(model)):
                 exclusion_fixes.append(resolution)
             if request.pinned_model == model:
                 conflicts.append(
@@ -3700,13 +4857,19 @@ def _plan_video(
                 )
             continue
 
-        route_tool = _route_tool(tool, model)
+        route_tool = _route_tool(model_tool, model)
 
         params, caveats = _video_params(route_tool, model, request)
 
         demanded: list[float] = []
         reasons: list[str] = []
-        if request.needs_4k or request.resolution in ("1080p", "4K"):
+        # Every route still here meets the size rule, so under budget=cheap
+        # the size is not a capability to prefer the higher-fidelity (and
+        # dearer) model for: scored as one on top of quality_ceiling, it
+        # ranked Veo Fast ($1.80) above Omni 1.2 ($1.26) for a cheap 4K brief.
+        if (
+            request.needs_4k or request.resolution in ("1080p", "4K")
+        ) and request.budget != "cheap":
             demanded.append(profile.fidelity_index)
             reasons.append(f"{request.resolution or '4K'} output")
         if request.num_reference_images > 0:
@@ -3715,12 +4878,28 @@ def _plan_video(
         if request.needs_audio:
             demanded.append(profile.fidelity_index)
             reasons.append("a controllable audio track")
+        if chains_runtime:
+            # The runtime is a stated demand, and a route that renders all of
+            # it in one call owns it; a seed-and-extend chain reaches it in
+            # two paid renders and overshoots to the next ~7s step, so it
+            # only has some of it. Without this the default-model nudge kept
+            # the Veo chain on top of a 12s ask that Omni 1.2 renders whole.
+            if route_tool == "loop_extend":
+                demanded.append(NEUTRAL_TERM)
+            else:
+                demanded.append(1.0)
+                reasons.append(
+                    f"the {request.total_duration_seconds:g}s runtime in one render"
+                )
 
         score = _score_route(
             profile,
             request,
             demanded_capabilities=tuple(demanded),
-            quality_is_demanded=request.budget == "best" or request.needs_4k,
+            # Under budget=cheap a 4K ask is a met requirement, not a call for
+            # fidelity; scored as one, Omni led a cheap 4K brief by 0.005.
+            quality_is_demanded=request.budget == "best"
+            or (request.needs_4k and request.budget != "cheap"),
             default_model=DEFAULT_VIDEO_MODEL,
         )
 
@@ -3743,9 +4922,10 @@ def _plan_video(
 
     if tool == "generate_video" and request.is_draft:
         notes.append(
-            "generate_video(draft=True) is an equivalent shortcut to the omni "
-            "route: it renders the draft on gemini-omni-flash and reports which "
-            "Veo-only parameters it ignored."
+            "generate_video(draft=True) is a shortcut to the omni route: it "
+            f"renders the draft on {DEFAULT_OMNI_MODEL} at the length the Veo "
+            "render will run (4, 6 or 8s) and reports which Veo-only "
+            "parameters it ignored."
         )
     if request.num_beats > 1:
         # Reported at the count the emitted route actually carries, which
@@ -3777,9 +4957,12 @@ def _plan_video(
                     rejected.append(
                         RejectedRoute(
                             model=other.model,
+                            # Named as planned, not as asked: a pin on a
+                            # retired ID is planned as its replacement, and
+                            # the notes say why.
                             reason=(
-                                f"{other.model} not planned: pinned_model="
-                                f"{request.pinned_model} was requested."
+                                f"{other.model} not planned: the plan is "
+                                f"pinned to {request.pinned_model}."
                             ),
                             tool=other.tool,
                         )
@@ -3794,13 +4977,21 @@ def _plan_video(
         # plan with no explanation. The planner's own agreement test calls
         # that silence, and it is right to.
         reasons = list(dict.fromkeys(r.reason for r in rejected))
-        fixes = list(dict.fromkeys(exclusion_fixes))
+        # A fix that points at a model this same plan rejected is no fix: the
+        # preview's "use 1.2" sat beside 1.2's own refusal at the ceiling.
+        rejected_models = {r.model for r in rejected}
+        fixes = [
+            fix
+            for fix in dict.fromkeys(exclusion_fixes)
+            if not any(fix.startswith(f"Use {m},") for m in rejected_models)
+        ]
+        # Named by kind, not by the generic tool: an Omni extension's route is
+        # extend_video_omni, and "every candidate for loop_extend" named a
+        # Veo tool the request was never routed to.
         conflicts.append(
             RoutingConflict(
                 code="no_model_can_serve_request",
-                detail=(
-                    f"Every candidate for {tool} was excluded: " + " ".join(reasons)
-                ),
+                detail=("Every candidate model was excluded: " + " ".join(reasons)),
                 resolution=(
                     " ".join(fixes)
                     if fixes
@@ -3832,13 +5023,14 @@ def _animatic_rationale(
     """Explain the animatic preflight without claiming a saving that is not there.
 
     Live testing caught this rationale selling the animatic as the cheap
-    preview of an expensive render, which is only true against the standard
-    Veo tier. Omni bills $0.10136/s and Veo 3.1 Fast $0.10/s, so 3 x 8s beats
-    cost $2.43 as an animatic against $2.40 for the real thing — and $1.20 on
-    Veo 3.1 Lite (since removed), which the animatic then cost double. The
-    preview keeps its place (catching a bad creative call before the delivery
-    render is paid for is worth something on its own), but the claim has to
-    match the arithmetic.
+    preview of an expensive render, which was only true against the standard
+    Veo tier: the preview model billed $0.10136/s against Veo 3.1 Fast's
+    $0.10/s, so 3 x 8s beats cost $2.43 as an animatic against $2.40 for the
+    real thing. The animatic now renders on 1.2 at 360p, which is cheaper than
+    every Veo tier, but rates move, so the saving is still read off the two
+    quotes rather than assumed. The preview keeps its place either way
+    (catching a bad creative call before the delivery render is paid for is
+    worth something on its own), but the claim has to match the arithmetic.
 
     Args:
         beats: How many beats the animatic renders.
@@ -3959,7 +5151,7 @@ def _build_workflow(
 
     if (
         best.tool == "loop_extend"
-        and request.extension_implied
+        and (request.extension_implied or _veo_chains_runtime(request))
         and request.source_video_uri is None
     ):
         # A continuous shot longer than one Veo render can only be made by
@@ -3970,20 +5162,37 @@ def _build_workflow(
             "prompt": request.intent,
             "model": best.params.get("model", best.model),
             "duration_seconds": float(VEO_MAX_CLIP_SECONDS),
+            # The chain's audio choice: generate_video defaults to none, so a
+            # seed left at the default went silent under extensions with audio.
+            "include_audio": request.needs_audio,
         }
         if "aspect_ratio" in best.params:
             seed_params["aspect_ratio"] = best.params["aspect_ratio"]
         extend_params = dict(best.params)
         extend_params["video_uri"] = "<video_url from step 1>"
+        if request.backend == "vertex" and request.video_gcs_bucket_configured is False:
+            # The step cannot run without one here; workflow params carry
+            # placeholders for what the caller must fill in.
+            extend_params["output_gcs_uri"] = "<gs:// destination for the extension>"
+        # Each step says what it costs, since the route's quote is the
+        # extensions' alone.
+        seed_cost = _veo_seed_cost(str(seed_params["model"]), request)
+        seed_priced = f" (est. ${seed_cost.usd:.2f})" if seed_cost is not None else ""
+        extend_priced = (
+            f" (est. ${best.cost.usd:.2f}; about "
+            f"${seed_cost.usd + best.cost.usd:.2f} for the chain)"
+            if seed_cost is not None and best.cost is not None
+            else ""
+        )
         return (
             WorkflowStep(
                 order=1,
                 tool="generate_video",
                 params=seed_params,
                 rationale=(
-                    f"Render the opening {VEO_MAX_CLIP_SECONDS}s seed clip — a "
-                    "continuous shot longer than one Veo render can only be "
-                    "made by extending an existing clip."
+                    f"Render the opening {VEO_MAX_CLIP_SECONDS}s seed clip"
+                    f"{seed_priced} — a continuous shot longer than one Veo "
+                    "render can only be made by extending an existing clip."
                 ),
             ),
             WorkflowStep(
@@ -3992,8 +5201,62 @@ def _build_workflow(
                 params=extend_params,
                 rationale=(
                     f"Extend the seed clip {extend_params.get('times', 1)} "
-                    "time(s) (~7s each) to reach the requested runtime, using "
-                    "step 1's video_url."
+                    f"time(s) (~7s each){extend_priced} to reach the requested "
+                    "runtime, using step 1's video_url."
+                ),
+            ),
+        )
+
+    if (
+        best.tool == "extend_video_omni"
+        and request.extension_implied
+        and request.source_video_uri is None
+        and request.previous_interaction_id is None
+    ):
+        # The omni twin of the Veo chain above: no clip exists yet, so the
+        # chain opens with the seed render it continues conversationally.
+        model = str(best.params.get("omni_model", best.model))
+        seed_params: dict[str, Any] = {
+            "prompt": request.intent,
+            "omni_model": model,
+            "duration_seconds": _omni_seed_seconds(omni_spec(model)),
+            "aspect_ratio": (
+                request.aspect_ratio
+                if request.aspect_ratio in VIDEO_ASPECT_RATIOS
+                else "16:9"
+            ),
+        }
+        if "resolution" in best.params:
+            seed_params["resolution"] = best.params["resolution"]
+        extend_params = dict(best.params)
+        extend_params["previous_interaction_id"] = "<interaction_id from step 1>"
+        seed_cost = _omni_seed_cost(model, request)
+        seed_priced = f" (est. ${seed_cost.usd:.2f})" if seed_cost is not None else ""
+        extend_priced = (
+            f" (est. ${best.cost.usd:.2f}, an upper bound until the tool "
+            "measures the seed)"
+            if best.cost is not None
+            else ""
+        )
+        return (
+            WorkflowStep(
+                order=1,
+                tool="generate_video_omni",
+                params=seed_params,
+                rationale=(
+                    f"Render the opening {seed_params['duration_seconds']:g}s "
+                    f"seed clip on {model}{seed_priced}: extend_video_omni "
+                    "continues existing footage, and none exists yet."
+                ),
+            ),
+            WorkflowStep(
+                order=2,
+                tool="extend_video_omni",
+                params=extend_params,
+                rationale=(
+                    f"Extend it {extend_params.get('times', 1)} time(s)"
+                    f"{extend_priced} to reach the requested runtime, "
+                    "continuing step 1's interaction_id."
                 ),
             ),
         )
@@ -4002,12 +5265,12 @@ def _build_workflow(
         # Draft-then-finalize for a single render. Only worth a step when the
         # delivery render is dear enough that discovering a bad creative call
         # after paying for it hurts — and only when the preview is genuinely
-        # cheaper, which is exactly what omni 1.1's 360p tier made possible.
+        # cheaper, which is exactly what omni's 360p draft tier makes possible.
         # A caller who has already said the render is throwaway needs no
         # preview of a preview.
         if (
             request.is_draft
-            or best.model == OMNI_1_1_MODEL
+            or best.model == DEFAULT_OMNI_MODEL
             and (best.params.get("resolution") == OMNI_DRAFT_RESOLUTION)
         ):
             return ()
@@ -4019,7 +5282,7 @@ def _build_workflow(
             return ()
         draft_params: dict[str, Any] = {
             "prompt": request.intent,
-            "omni_model": OMNI_1_1_MODEL,
+            "omni_model": DEFAULT_OMNI_MODEL,
             "resolution": OMNI_DRAFT_RESOLUTION,
             "duration_seconds": best.params.get(
                 "duration_seconds", request.clip_duration_seconds
@@ -4033,7 +5296,7 @@ def _build_workflow(
             if frame in best.params:
                 draft_params[frame] = best.params[frame]
         draft_cost = _estimate_video_cost(
-            OMNI_1_1_MODEL,
+            DEFAULT_OMNI_MODEL,
             float(draft_params["duration_seconds"]),
             OMNI_DRAFT_RESOLUTION,
             False,
@@ -4042,7 +5305,7 @@ def _build_workflow(
             best.cost is not None and draft_cost.usd >= best.cost.usd
         ):
             return ()
-        lead = f"Preview on {OMNI_1_1_MODEL} at {OMNI_DRAFT_RESOLUTION} first"
+        lead = f"Preview on {DEFAULT_OMNI_MODEL} at {OMNI_DRAFT_RESOLUTION} first"
         if best.cost is not None:
             lead += (
                 f" (est. ${draft_cost.usd:.2f} against ${best.cost.usd:.2f} for "
@@ -4086,7 +5349,7 @@ def _build_workflow(
 
     animatic_params = dict(best.params)
     animatic_params["animatic"] = True
-    # Bridges are a Veo first/last-frame feature; generate_clip ignores them
+    # An animatic previews the beats only; generate_clip ignores bridges
     # in animatic mode, so the preview step should not ask for them.
     animatic_params["add_bridges"] = False
     # Preview at 360p on the model that has resolutions. This is what turns
@@ -4095,7 +5358,7 @@ def _build_workflow(
     # Naming the resolution is what selects the model; generate_clip's
     # animatic_resolution is documented that way.
     animatic_params["animatic_resolution"] = OMNI_DRAFT_RESOLUTION
-    animatic_model = OMNI_1_1_MODEL
+    animatic_model = DEFAULT_OMNI_MODEL
     beat_duration = float(best.params["beats"][0].get("duration_seconds", 0.0))
     animatic_cost = _aggregate_video_cost(
         animatic_model,
@@ -4136,8 +5399,872 @@ def _build_workflow(
 
 
 # ============================================================================
+# Upscaling
+# ============================================================================
+
+# upscale_video_omni refuses a longer source ("Standalone upscaling supports
+# videos up to 15 seconds"); mirrored here so a plan never chains an upscale
+# onto a render the tool will refuse.
+OMNI_UPSCALE_MAX_SOURCE_SECONDS = omni_source_limit_seconds(
+    omni_spec(OMNI_1_2_MODEL), task=OMNI_TASK_UPSCALE
+)
+
+# The resolutions an upscale can produce, and the ones only an upscale's
+# output (never its source) can be.
+_UPSCALE_TARGETS: tuple[str, ...] = ("720p", "1080p", "4K")
+_UPSCALE_ONLY_RESOLUTIONS: tuple[str, ...] = ("1080p", "4K")
+
+# Upscaling as an operation on a video, not the adjective ("an upscale hotel
+# lobby"): the verb followed by its object or its destination, or the bare
+# verb ending its clause after "then" ("make a video of a dog then upscale").
+# The bare form takes "then" alone: after "and" or "finally" a clause-final
+# "upscale" is as often the adjective ("a lobby that feels modern and
+# upscale"), and misreading it plans an upscale nobody asked to pay for.
+# Even after "then" it is the adjective when the "then" orders two looks,
+# which _upscale_request checks.
+_UPSCALE_PATTERN = re.compile(
+    r"\b(?:upscale|upscaling|upsample|upsampling)\s+"
+    r"(?:(?:my|our|this|that|the|a|an|existing|saved|approved|source|input|generated|previous|rendered)\s+)*"
+    r"(?:video|clip|footage|draft|render|result|output|it|to|into|from|360p|720p|1080p|4k)\b"
+    r"|\b(?:video|clip|footage)\s+(?:upscaling|upsampling)\b"
+    r"|(?<=\bthen\s)(?:upscale|upsample)\b(?=\s*(?:[,.;:!?)\]]|$))",
+    re.IGNORECASE,
+)
+_UPSCALE_DESTINATION_PATTERN = re.compile(
+    r"\b(?:to|into)\s+(360p|720p|1080p|4k)\b", re.IGNORECASE
+)
+
+# A change of state in the words before a bare "then upscale": there the
+# "then" orders two looks, and "upscale" is the second ("a street that is
+# shabby at first, then upscale"; "a restaurant going from cheap then
+# upscale"). Read as the verb, the brief lost its second half and gained a
+# paid upscale step. Erring this way costs a caller who meant the verb
+# nothing but a rephrase, which the plan's note asks for.
+_STATE_CHANGE_PATTERN = re.compile(
+    r"\b(?:first|initially|start(?:s|ing)?|begin(?:s|ning)?|turn(?:s|ing)?"
+    r"|becom(?:e|es|ing)|go(?:es|ing)|get(?:s|ting)|grow(?:s|ing)"
+    r"|chang(?:e|es|ing)|transform(?:s|ing)?|shift(?:s|ing)?|evolv(?:e|es|ing)"
+    r"|morph(?:s|ing)?)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_END_PATTERN = re.compile(r"[.!?;]")
+
+
+def _upscale_request(intent: str) -> tuple[re.Match[str] | None, str | None]:
+    """The first _UPSCALE_PATTERN match that asks for an upscale, and a note.
+
+    A bare clause-final "then upscale" is skipped where the words before it
+    in its sentence describe a change of state, which makes it the
+    adjective; the note says so, and how to ask for the upscale instead.
+    """
+    note = None
+    for match in _UPSCALE_PATTERN.finditer(intent):
+        word = match.group(0)
+        if not word.isalpha():
+            # The verb with its object or destination, or "video upscaling".
+            return match, note
+        before = _SENTENCE_END_PATTERN.split(intent[: match.start()])[-1]
+        state = _STATE_CHANGE_PATTERN.search(before)
+        if state is None:
+            return match, note
+        note = note or (
+            f"'then {word}' is read as the adjective here, since the brief "
+            f"describes a change of state ('{state.group(0)}'), so no upscale "
+            f"step is planned. To upscale the render, say 'then {word} it'."
+        )
+    return None, note
+
+
+_UPSCALE_SOURCE_PATTERN = re.compile(
+    r"\b(?:from\s+)?(360p|720p|1080p|4k)\s+(?:to|into)\s+", re.IGNORECASE
+)
+
+# A request for a NEW video: an imperative creation verb whose object, within
+# a few words, is a video noun, or a brief that opens by describing one ("a
+# 4 shot reel about shoes, then upscale it"), the planner's usual verbless
+# form. Base-form verbs only, so "the clip I generated" reads as a source
+# rather than a request. A possessive, a demonstrative or "the" anywhere on
+# the way to the noun ("render my draft video", "render the video I
+# uploaded", "create a sharper version of the video"), or "I shot"/"you made"
+# straight after it marks a clip that already exists. Erring that way is the
+# safe direction: misreading an existing clip as a new one plans a render
+# nobody asked to pay for, while the reverse leaves an upscale route that asks
+# for its source.
+_NEW_VIDEO_PATTERN = re.compile(
+    r"(?:(?P<verb>\b(?:generate|create|make|render|produce|shoot|film|animate))\s+"
+    r"(?!sure\b)|^\W*(?=an?\s))"
+    r"(?:(?!(?:the|my|our|your|this|that|these|those|existing|saved|approved"
+    r"|previous|uploaded)\b)[\w'-]+\s+){0,8}?"
+    r"(?:video|clip|footage|animation|reel|movie)s?\b"
+    r"(?!\s+(?:i|we|you)\s+(?:\w+ed|shot|made|took|had|have|got|already)\b)",
+    re.IGNORECASE,
+)
+
+# What marks a clip as one the caller already has: an owner, or a word for
+# capturing or keeping footage. Read in the words that follow a verbless
+# brief ("a video of my dog that I recorded", "a video from my phone"), which
+# has no imperative to say it asks for something new, and in the upscale's
+# own object ("upscale my video of a cat"), which names its source outright.
+_EXISTING_CLIP_PATTERN = re.compile(
+    r"\b(?:my|our|your|his|her|their|i|we|existing|saved|uploaded|previous"
+    r"|original|recorded|filmed|captured|shot|took|taken|downloaded)\b",
+    re.IGNORECASE,
+)
+
+# _NEGATORS is written for nouns ("no audio"); a creation verb is negated by
+# an auxiliary too ("don't make a video").
+_CREATION_NEGATORS: tuple[str, ...] = _VERB_NEGATORS
+
+# What joins a render clause to the upscale that follows it ("..., then
+# upscale it", "... and upscale to 1080p", "... (then upscale it)"), stripped
+# from the render's prompt.
+_UPSCALE_JOINER_PATTERN = re.compile(
+    r"(?:[\s,;:(\[\u2013\u2014-]|\b(?:and|then|afterwards|finally)\b)*$",
+    re.IGNORECASE,
+)
+_CLAUSE_END_PATTERN = re.compile(r"[,.;!?)\]]")
+# A word that only qualifies the upscale's target ("to 4K resolution"), so it
+# leaves the render's prompt with the target.
+_UPSCALE_TARGET_QUALIFIER = re.compile(
+    r"\s+(?:resolution|res|quality|output|format)\b", re.IGNORECASE
+)
+
+
+def _normalize_upscale_resolution(value: str) -> str:
+    """Spell an upscale resolution as this server does publicly: 4K, 1080p."""
+    return "4K" if value.lower() == "4k" else value.lower()
+
+
+def _split_render_and_upscale(
+    intent: str, upscale: re.Match[str]
+) -> tuple[str, str] | None:
+    """Split a generate-then-upscale intent into (render, upscale) text.
+
+    "Generate a video of a fox, then upscale it to 4K" upscales a video this
+    plan has to make first; "Upscale my video to 4K" upscales one the caller
+    already has. Only the first has a creation request ahead of the upscale,
+    and for it this returns the intent without the upscale clause (and the
+    word joining it) — what the render is planned and prompted from. Left in,
+    "4K" made the render itself 4K and the prompt asked the video model to
+    upscale. None when there is no creation request: a standalone upscale.
+    """
+    head = intent[: upscale.start()]
+    # "Upscale my video of a cat" names a clip the caller has, whatever came
+    # before it: chained onto an earlier render, that clip was never upscaled.
+    if _EXISTING_CLIP_PATTERN.search(upscale.group(0)):
+        return None
+    creation = None
+    for match in _NEW_VIDEO_PATTERN.finditer(head):
+        if _negator_precedes(head[: match.start()].lower(), _CREATION_NEGATORS):
+            continue
+        # A verbless brief has no imperative asking for something new, so
+        # the words after its noun decide: "a video of a cat, then upscale
+        # it" is a brief, "a video from my phone: upscale it" is a source.
+        if match.group("verb") is None and _EXISTING_CLIP_PATTERN.search(
+            head[match.end() :]
+        ):
+            continue
+        creation = match
+    if creation is None:
+        return None
+    # The upscale clause ends at its target ("to 4K", plus a word qualifying
+    # it), so a modifier after it stays with the render ("..., then upscale
+    # it to 4K with audio" still asks for audio). With no target named it
+    # runs to the next clause break; anything after that is still part of
+    # the brief ("..., upscale it, and keep it moody").
+    clause_end = _CLAUSE_END_PATTERN.search(intent, upscale.end())
+    end = clause_end.start() if clause_end else len(intent)
+    target = _UPSCALE_DESTINATION_PATTERN.search(intent, upscale.start(), end)
+    if target is not None:
+        end = target.end()
+        qualifier = _UPSCALE_TARGET_QUALIFIER.match(intent, end)
+        if qualifier is not None:
+            end = qualifier.end()
+    render = _UPSCALE_JOINER_PATTERN.sub("", head)
+    # A parenthesised upscale clause takes its closing bracket with it ("a fox
+    # (then upscale it to 4K)" left "a fox ("), and the clause's own end
+    # punctuation is dropped where the render text already ends a sentence:
+    # "a fox. Then upscale it to 4K." left "a fox..".
+    tail = intent[end:]
+    joiner = head[len(render) :]
+    for opener, closer in (("(", ")"), ("[", "]")):
+        if opener in joiner and closer in tail:
+            at = tail.index(closer)
+            tail = tail[:at] + tail[at + 1 :]
+    if tail[:1] in (".", "!", "?", ";", ",") and render[-1:] in (".", "!", "?"):
+        tail = tail[1:]
+    render = (render + tail).strip()
+    if not render:
+        return None
+    return render, intent[upscale.start() : end]
+
+
+# What joins a declined upscale clause to the words before it ("..., but
+# don't upscale it", "... it. Actually, don't upscale it"), removed with it.
+_DECLINE_JOINER_PATTERN = re.compile(
+    r"(?:[\s,;:(\[\u2013\u2014-]|\b(?:and|but|then|so|actually|also|please"
+    r"|just|though|however|ok|okay)\b)*$",
+    re.IGNORECASE,
+)
+_WORD_PATTERN = re.compile(r"\S+")
+
+
+def _without_declined_upscales(intent: str) -> tuple[str, bool]:
+    """The intent minus every upscale clause it declines, and whether it declines.
+
+    "a 4K video of a dog, don't upscale it" planned the render with the whole
+    text as its prompt, asking the video model not to upscale; and "..., then
+    upscale it. actually don't upscale it" planned the upscale, because a
+    mention counted as declined only when every mention was negated. The last
+    mention decides, as a correction does, and a declined clause leaves the
+    render's prompt from its negator to the end of its clause.
+
+    Returns:
+        The intent without its declined clauses, and True when the last
+        mention of an upscale is a declined one. An intent that would be left
+        empty is returned unchanged.
+    """
+    declined: list[tuple[int, int]] = []
+    last_declines = False
+    for match in _UPSCALE_PATTERN.finditer(intent):
+        head = intent[: match.start()]
+        clause = _CLAUSE_BREAK_PATTERN.split(head)[-1]
+        clause_start = len(head) - len(clause)
+        negator_at = None
+        for word in reversed(
+            list(_WORD_PATTERN.finditer(head, clause_start))[-_NEGATION_WINDOW:]
+        ):
+            cleaned = word.group(0).replace("\u2019", "'").strip("-\"'").lower()
+            if cleaned in _CLAUSE_BREAK_WORDS:
+                break
+            if cleaned in _VERB_NEGATORS:
+                negator_at = word.start()
+                break
+        last_declines = negator_at is not None
+        if negator_at is None:
+            continue
+        # The declined clause runs from its own start -- a clause break, or a
+        # conjunction like "but" -- when that is a few words back: cut at the
+        # negator, "but do not upscale it" left "but do" in the prompt.
+        lead = list(_WORD_PATTERN.finditer(intent, clause_start, negator_at))
+        for at in range(len(lead) - 1, -1, -1):
+            if lead[at].group(0).lower() in _CLAUSE_BREAK_WORDS:
+                lead = lead[at:]
+                break
+        if lead and len(lead) <= _NEGATION_WINDOW + 1:
+            negator_at = lead[0].start()
+        end = len(intent)
+        clause_end = _CLAUSE_END_PATTERN.search(intent, match.end())
+        if clause_end is not None:
+            end = clause_end.start()
+        for word in _WORD_PATTERN.finditer(intent, match.end(), end):
+            if word.group(0).lower() in _CLAUSE_BREAK_WORDS:
+                end = word.start()
+                break
+        declined.append((negator_at, end))
+    text = intent
+    for start, end in reversed(declined):
+        head = _DECLINE_JOINER_PATTERN.sub("", text[:start])
+        tail = text[end:]
+        if not head or head[-1:] in (".", "!", "?"):
+            # The clause's own punctuation goes with it where the words before
+            # it already end a sentence ("a fox. Don't upscale it." left "a
+            # fox..").
+            tail = tail.lstrip(" ,;:.!?")
+        text = head + (" " if head and tail[:1].isalnum() else "") + tail
+    text = " ".join(text.split())
+    if not text:
+        return intent, last_declines
+    return text, last_declines
+
+
+@dataclass(frozen=True)
+class _PlannedSource:
+    """The video an upscale follow-on runs on, when this plan renders it.
+
+    Attributes:
+        params: The source parameter, as a placeholder for the step's output.
+        resolution: What that render comes back as.
+        seconds: How long it was asked to be.
+        delivered_seconds: How long upscale_video_omni will measure it: an
+            Omni render comes back about one frame over its nominal length,
+            and the tool prices and judges inline delivery on what it
+            measures. None means the same as ``seconds``.
+    """
+
+    params: dict[str, Any]
+    resolution: str
+    seconds: float
+    delivered_seconds: float | None = None
+
+
+def _upscale_delivery(target: str, delivered: float | None) -> tuple[str | None, bool]:
+    """The inline-delivery caveat for an upscale, and whether it is required.
+
+    Judged as upscale_video_omni judges it: on Vertex AI, at the target, on
+    the length the tool will measure, or at the 15s bound for a source it
+    cannot measure.
+    """
+    return _inline_delivery_caveat(
+        "upscale_video_omni",
+        omni_spec(OMNI_1_2_MODEL),
+        vertexai=True,
+        resolution=target,
+        task=OMNI_TASK_UPSCALE,
+        output_seconds=(
+            OMNI_UPSCALE_MAX_SOURCE_SECONDS if delivered is None else delivered
+        ),
+        seconds_are_bound=delivered is None,
+    )
+
+
+def _upscale_conflict(
+    code: str, detail: str, resolution: str
+) -> tuple[
+    tuple[RoutedCall, ...],
+    tuple[RejectedRoute, ...],
+    tuple[RoutingConflict, ...],
+    tuple[str, ...],
+]:
+    """An upscale plan with no route, only the conflict that explains why."""
+    return ((), (), (RoutingConflict(code, detail, resolution),), ())
+
+
+def _plan_upscale(
+    request: ResolvedRequest, source: _PlannedSource | None = None
+) -> tuple[
+    tuple[RoutedCall, ...],
+    tuple[RejectedRoute, ...],
+    tuple[RoutingConflict, ...],
+    tuple[str, ...],
+]:
+    """Route an explicit upscale to the operation that preserves the video.
+
+    Args:
+        request: The resolved request: backend, pin, target resolution, any
+            source the caller supplied, and the words describing the upscale.
+        source: The render this plan makes first, for a generate-then-upscale
+            intent. Its output is the source, its resolution and length are
+            known, and a pinned model governs that render, not the upscale.
+    """
+    # upscale_video_omni runs on Vertex AI whatever OMNI_BACKEND says (it
+    # names the backend itself), so only a server with no Vertex client at
+    # all cannot upscale.
+    if request.backend == "gemini_api":
+        return _upscale_conflict(
+            "upscale_backend",
+            "Standalone upscaling requires Vertex AI.",
+            "Use a Vertex server and a saved video or Vertex interaction.",
+        )
+    if source is None:
+        lost = _lost_interaction_conflict(request, OMNI_TASK_UPSCALE)
+        if lost is not None:
+            return ((), (), (lost,), ())
+        if request.previous_interaction_backend == "gemini_api":
+            # The upscale is a turn on the interaction, on Vertex AI, where an
+            # interaction the Developer API minted does not exist.
+            return _upscale_conflict(
+                "upscale_interaction_backend",
+                f"Interaction {request.previous_interaction_id} was created on "
+                "the Gemini Developer API, and standalone upscaling runs only "
+                "on Vertex AI, where that interaction does not exist.",
+                _saved_clip_resolution(OMNI_TASK_UPSCALE, request),
+            )
+        recorded = request.previous_interaction_model
+        if recorded is not None and canonical_omni_model(recorded) != OMNI_1_2_MODEL:
+            # upscale_video_omni refuses it: the upscale is a turn on the
+            # interaction, and only 1.2 upscales.
+            return _upscale_conflict(
+                "upscale_interaction_model",
+                f"Interaction {request.previous_interaction_id} was created on "
+                f"{recorded}; standalone upscaling runs on {OMNI_1_2_MODEL}, and "
+                "an interaction cannot change models.",
+                _saved_clip_resolution(OMNI_TASK_UPSCALE, request),
+            )
+    if (
+        source is None
+        and request.pinned_model
+        and request.pinned_model != OMNI_1_2_MODEL
+    ):
+        return _upscale_conflict(
+            "upscale_model",
+            "Standalone upscaling requires Omni 1.2.",
+            f"Use {OMNI_1_2_MODEL}.",
+        )
+    destination = _UPSCALE_DESTINATION_PATTERN.search(request.intent)
+    target = _normalize_upscale_resolution(
+        request.resolution or (destination.group(1) if destination else "1080p")
+    )
+    if target not in _UPSCALE_TARGETS:
+        return _upscale_conflict(
+            "upscale_resolution",
+            "Upscaling targets must be 720p, 1080p or 4K.",
+            "Select a higher output resolution than the source.",
+        )
+    params: dict[str, Any] = {"resolution": target}
+    caveats: list[str] = []
+    seconds: float | None = None
+    # What the tool will measure, which is what it prices and what decides
+    # its delivery; the nominal ``seconds`` is what the caveats name.
+    delivered: float | None = None
+    source_resolution: str | None = None
+    if source is not None:
+        params.update(source.params)
+        source_resolution = source.resolution
+        params["source_resolution"] = source_resolution
+        seconds = source.seconds
+        delivered = (
+            source.delivered_seconds
+            if source.delivered_seconds is not None
+            else seconds
+        )
+        caveats.append("Vertex AI only.")
+    else:
+        recorded_seconds = (
+            request.previous_interaction_seconds
+            if request.previous_interaction_id
+            else None
+        )
+        if recorded_seconds is not None:
+            # The tool reads this same record, and prices and judges delivery
+            # on it; the 15s bound here quoted a 6s clip at 2.5x the tool.
+            if _omni_source_over_limit(
+                OMNI_UPSCALE_MAX_SOURCE_SECONDS, recorded_seconds
+            ):
+                return _upscale_conflict(
+                    "upscale_source_too_long",
+                    f"Interaction {request.previous_interaction_id}'s clip is "
+                    f"{recorded_seconds:g}s, as this server recorded it, and "
+                    "standalone upscaling takes at most "
+                    f"{OMNI_UPSCALE_MAX_SOURCE_SECONDS:g}s.",
+                    f"Trim the clip it saved to {OMNI_UPSCALE_MAX_SOURCE_SECONDS:g}s "
+                    "or less and pass it as input_video_uri.",
+                )
+            seconds = delivered = recorded_seconds
+            caveats.append(
+                f"Vertex AI only. The quote uses the {recorded_seconds:g}s this "
+                f"server recorded for interaction {request.previous_interaction_id}, "
+                "as the tool's own quote does."
+            )
+        else:
+            caveats.append(
+                "Vertex AI only; source video must be at most "
+                f"{OMNI_UPSCALE_MAX_SOURCE_SECONDS:g}s. A quote uses the "
+                f"{OMNI_UPSCALE_MAX_SOURCE_SECONDS:g}s upper bound until the tool "
+                "measures the source."
+            )
+        if request.previous_interaction_id:
+            params["previous_interaction_id"] = request.previous_interaction_id
+        elif request.source_video_uri:
+            params["input_video_uri"] = request.source_video_uri
+        else:
+            caveats.append(
+                "Supply input_video_uri or previous_interaction_id for the "
+                "source video."
+            )
+        named = _UPSCALE_SOURCE_PATTERN.search(request.intent)
+        recorded_resolution = request.previous_interaction_resolution
+        if recorded_resolution is not None:
+            # The tool reads the same record, and refuses a source_resolution
+            # that disagrees with it, so none is sent; quoted for "a 360p
+            # source" instead, a recorded 720p clip's upscale to 720p was a
+            # route the tool refused.
+            source_resolution = recorded_resolution
+            if named and _normalize_upscale_resolution(named.group(1)) != (
+                recorded_resolution
+            ):
+                caveats.append(
+                    f"The intent names a {named.group(1)} source, but this "
+                    "server recorded interaction "
+                    f"{request.previous_interaction_id} at {recorded_resolution}: "
+                    f"the upscale starts from {recorded_resolution}."
+                )
+        elif named:
+            source_resolution = named.group(1).lower()
+            params["source_resolution"] = source_resolution
+        else:
+            caveats.append(
+                "Supply source_resolution (360p or 720p) if the source has no "
+                "recorded metadata."
+            )
+
+    # Past the 4 MB inline response limit (above 720p, or past 10s on 1.2)
+    # upscale_video_omni settles delivery with the shared policy before it
+    # renders, so the plan asks the same policy, with the length the tool
+    # will measure or the 15s bound it takes for a source it cannot. The
+    # router is never given a bucket, so the key is named, not invented.
+    spec = omni_spec(OMNI_1_2_MODEL)
+    delivery, _ = _upscale_delivery(target, delivered)
+    if delivery is not None:
+        if delivered is None and target not in _UPSCALE_ONLY_RESOLUTIONS:
+            # Large only if the source is: a measured one of 10s or less is
+            # not, and the tool's real run measures it when it can.
+            delivery = (
+                f"If the source runs longer than {spec.max_inline_output_seconds:g}s, "
+                "or upscale_video_omni cannot download it to measure it: "
+                f"{delivery[0].lower()}{delivery[1:]}"
+            )
+        caveats.append(delivery)
+
+    cost = None
+    try:
+        from .pricing import estimate_omni_upscale_cost
+    except ImportError:
+        # Pricing is optional here, as everywhere in the planner; the
+        # tool still validates the resolution pair before it renders.
+        pass
+    else:
+        priced_seconds = (
+            OMNI_UPSCALE_MAX_SOURCE_SECONDS if delivered is None else delivered
+        )
+        if source_resolution is not None:
+            try:
+                cost = estimate_omni_upscale_cost(
+                    priced_seconds, source_resolution, target
+                )
+            except ValueError as exc:
+                recorded_at = (
+                    f"Interaction {request.previous_interaction_id} rendered "
+                    f"at {source_resolution}, as this server recorded it. "
+                    if source is None
+                    and request.previous_interaction_resolution is not None
+                    else ""
+                )
+                return _upscale_conflict(
+                    "upscale_resolution",
+                    f"{recorded_at}{exc}",
+                    "Upscale to a resolution above the source's: 360p goes to "
+                    "720p or 1080p, 720p to 1080p or 4K. For 360p to 4K, "
+                    "upscale to 720p first, then upscale that output to 4K.",
+                )
+        else:
+            # The source's resolution is not known here, but the target
+            # narrows it to the transitions that reach it. Quoting the
+            # dearest keeps the figure an upper bound; a missing quote read
+            # as "pricing module not installed", which it was not.
+            quotes = []
+            for candidate in ("360p", "720p"):
+                try:
+                    quotes.append(
+                        (
+                            estimate_omni_upscale_cost(
+                                priced_seconds, candidate, target
+                            ),
+                            candidate,
+                        )
+                    )
+                except ValueError:
+                    continue
+            if quotes:
+                cost, dearest = max(quotes, key=lambda quote: quote[0].usd)
+                caveats.append(
+                    f"Quoted for a {dearest} source, the only one an upscale "
+                    f"to {target} takes."
+                    if len(quotes) == 1
+                    else f"Quoted for a {dearest} source, the dearer of the "
+                    f"transitions to {target}, because the source's "
+                    "resolution is not known here; a 720p source costs less."
+                )
+    return (
+        (
+            RoutedCall(
+                tool="upscale_video_omni",
+                model=OMNI_1_2_MODEL,
+                params=params,
+                score=1.0,
+                rationale=(
+                    "Upscale the approved video while preserving its timing and audio."
+                ),
+                caveats=tuple(caveats),
+                cost=cost,
+            ),
+        ),
+        (),
+        (),
+        (),
+    )
+
+
+# The tools whose output is one video an upscale can take as its source. A
+# generate_clip manifest is several, and an extension chain outgrows the 15s
+# source ceiling.
+_UPSCALABLE_RENDER_TOOLS: frozenset[str] = frozenset(
+    {"generate_video", "generate_video_omni"}
+)
+
+
+# The one source resolution an upscale to each of these targets takes.
+_UPSCALE_SOURCE_RESOLUTION: dict[str, str] = {"720p": "360p", "4K": "720p"}
+
+# The Omni route's unprompted tip, kept as one string so a render that must
+# not be 360p (an upscale to 4K's source) can leave it out.
+_OMNI_360P_TIP = (
+    "resolution='360p' renders a draft at a third of the 720p price — the "
+    "cheapest preview available here."
+)
+
+
+@dataclass(frozen=True)
+class _RenderThenUpscale:
+    """A generate-then-upscale plan: the render ranked, the upscale chained."""
+
+    request: ResolvedRequest
+    routes: tuple[RoutedCall, ...]
+    rejected: tuple[RejectedRoute, ...]
+    conflicts: tuple[RoutingConflict, ...]
+    workflow: tuple[WorkflowStep, ...]
+    notes: tuple[str, ...]
+    # The upscale the brief asks for could not be planned on the render.
+    workflow_blocked: bool = False
+
+
+def _plan_render_then_upscale(
+    request: ResolvedRequest,
+    constraints: RoutingConstraints | None,
+    render_intent: str,
+    upscale_text: str,
+) -> _RenderThenUpscale:
+    """Plan "generate X, then upscale it": the render first, the upscale after.
+
+    The routes are the render's, ranked as any render is; the upscale is a
+    workflow step on the render's output, because it is a follow-on to the
+    render rather than an alternative to it. Routing the whole intent to the
+    upscale planner returned one upscale route with no source and no render.
+
+    When the render cannot feed an upscale (upscaling is Vertex-only, takes
+    one video of at most 15s, and this render is not that), the target
+    resolution is planned as the render's own instead, and a note says why.
+    """
+    named = _UPSCALE_DESTINATION_PATTERN.search(upscale_text)
+    if named:
+        target = _normalize_upscale_resolution(named.group(1))
+    elif request.resolution in _UPSCALE_ONLY_RESOLUTIONS:
+        target = str(request.resolution)
+    else:
+        target = "1080p"
+
+    # The output-resolution ask belongs to the upscale. Left on the render,
+    # "then upscale it to 4K" rendered 4K and left nothing to upscale. A
+    # 360p/720p resolution the caller set is the render's own and stays;
+    # otherwise the render takes the default, except that the only source an
+    # upscale to 720p accepts is 360p.
+    given = constraints or RoutingConstraints()
+    render_resolution = (
+        None if given.resolution in _UPSCALE_ONLY_RESOLUTIONS else given.resolution
+    )
+    if render_resolution is None:
+        # The cheapest source the target takes, where it is the only one or
+        # where budget is cheap: an upscale to 720p takes only 360p, one to
+        # 4K only 720p. Left unset, budget="cheap" planned a 4K brief's
+        # render at 360p, which no upscale takes to 4K, and the plan came
+        # back as a conflict. A 1080p target takes either, so it is left to
+        # the render: 360p on a cheap budget, else the 720p default, at which
+        # the Veo routes stay in the running.
+        render_resolution = _UPSCALE_SOURCE_RESOLUTION.get(target)
+    # media_kind stays what the whole intent resolved to: the render clause on
+    # its own may carry no video keyword at all. needs_4k is False rather than
+    # unset because the render clause is re-read: "make a 4K video of a dog,
+    # then upscale it to 4K" inferred 4K from the render's own words, planned
+    # a 4K render, and then reported its 4K-to-4K upscale as a conflict. A 4K
+    # ask in either clause is the deliverable's, which the upscale reaches.
+    render_constraints = replace(
+        given, media_kind="video", needs_4k=False, resolution=render_resolution
+    )
+    render_request = resolve_request(
+        render_intent, infer_signals(render_intent), render_constraints
+    )
+    routes, rejected, conflicts, notes = _plan_video(render_request)
+    if target == "4K" and given.resolution is None:
+        # No upscale takes a 360p render to 4K, so the route's 360p tip would
+        # point at a source this plan cannot use.
+        routes = tuple(
+            replace(
+                route,
+                caveats=tuple(c for c in route.caveats if c != _OMNI_360P_TIP),
+            )
+            for route in routes
+        )
+        notes = (
+            *notes,
+            "The render is planned at 720p, the only resolution an upscale to "
+            "4K takes; a 360p render costs less, but cannot be upscaled to 4K.",
+        )
+    workflow = _build_workflow(render_request, routes)
+
+    renders = [route for route in routes if route.tool != "generate_storyboard"]
+    if not renders:
+        # Nothing renders, so there is nothing to upscale; the render's own
+        # rejections and conflicts already say why.
+        return _RenderThenUpscale(
+            render_request, routes, rejected, conflicts, workflow, notes
+        )
+    # The upscale's source is what the plan finally delivers: the last
+    # workflow step when there is a sequence, else the top render.
+    if workflow:
+        last = workflow[-1]
+        delivery_tool, delivery_params, step = last.tool, last.params, last.order
+    else:
+        delivery_tool, delivery_params, step = renders[0].tool, renders[0].params, 1
+    seconds = float(
+        delivery_params.get("duration_seconds", render_request.clip_duration_seconds)
+    )
+    fallback = None
+    # upscale_video_omni runs on Vertex AI whatever OMNI_BACKEND says, so a
+    # render the pin sends to the Gemini Developer API is still upscaled,
+    # from the file it saved (see source_params below).
+    if request.backend == "gemini_api":
+        fallback = "upscale_video_omni runs on Vertex AI only"
+    elif delivery_tool not in _UPSCALABLE_RENDER_TOOLS:
+        fallback = (
+            f"upscale_video_omni takes one video, and this plan delivers "
+            f"through {delivery_tool}"
+        )
+    elif seconds > OMNI_UPSCALE_MAX_SOURCE_SECONDS:
+        fallback = (
+            f"upscale_video_omni takes at most "
+            f"{OMNI_UPSCALE_MAX_SOURCE_SECONDS:g}s, and this render is "
+            f"{seconds:g}s"
+        )
+
+    if fallback is not None:
+        direct = replace(
+            render_request,
+            resolution=target,
+            needs_4k=render_request.needs_4k or target == "4K",
+        )
+        routes, rejected, conflicts, notes = _plan_video(direct)
+        return _RenderThenUpscale(
+            direct,
+            routes,
+            rejected,
+            conflicts,
+            _build_workflow(direct, routes),
+            (
+                *notes,
+                f"No upscale step is planned: {fallback}. The {target} ask is "
+                f"planned on the render itself, as if the brief had asked for "
+                f"a {target} video; each route's caveats say whether it can "
+                "reach it.",
+            ),
+        )
+
+    model = delivery_params.get("omni_model") or delivery_params.get("model")
+    # What upscale_video_omni will measure: an Omni render lands about one
+    # frame over its nominal length, so a 10s render is a 10.04s source, past
+    # the 10s inline line the tool judges on. Judged on the nominal 10s, the
+    # plan said nothing about delivery for a step the tool warns about.
+    try:
+        from .pricing import quote_duration_for
+    except ImportError:  # pragma: no cover - pricing is a sibling module
+        delivered = seconds
+    else:
+        delivered = quote_duration_for(str(model), seconds) if model else seconds
+    if model == OMNI_1_2_MODEL and _omni_serves_on_vertex(render_request):
+        # A 1.2 interaction on Vertex upscales in place: its resolution and
+        # length are on record, and nothing is re-uploaded.
+        source_params: dict[str, Any] = {
+            "previous_interaction_id": f"<interaction_id from step {step}>"
+        }
+    else:
+        # upscale_video_omni takes a previous interaction only from 1.2 on
+        # Vertex; any other render is passed as the file it produced.
+        source_params = {"input_video_uri": f"<video_url from step {step}>"}
+    source_resolution = str(delivery_params.get("resolution") or OMNI_RESOLUTION)
+    upscale_routes, _, upscale_conflicts, _ = _plan_upscale(
+        replace(request, intent=upscale_text, resolution=target),
+        _PlannedSource(source_params, source_resolution, seconds, delivered),
+    )
+    if not upscale_routes:
+        # The render routes still stand, and are kept for what they say, but
+        # the brief asked for the upscale too: is_satisfiable read true
+        # beside an upscale conflict and an empty workflow.
+        return _RenderThenUpscale(
+            render_request,
+            routes,
+            rejected,
+            (*conflicts, *upscale_conflicts),
+            workflow,
+            notes,
+            workflow_blocked=True,
+        )
+    if not workflow:
+        workflow = (
+            WorkflowStep(
+                order=1,
+                tool=renders[0].tool,
+                params=renders[0].params,
+                rationale=(
+                    f"Render the {source_resolution} source on "
+                    f"{renders[0].model}; step 2 upscales its output."
+                ),
+            ),
+        )
+
+    upscale = upscale_routes[0]
+    upscale_params = dict(upscale.params)
+    if _upscale_delivery(target, delivered)[1]:
+        # Only where the server refuses a large inline upscale. By default the
+        # tool delivers inline without a bucket, so a placeholder would read
+        # as a value the step cannot run without; here it is one. Workflow
+        # params carry placeholders for what the caller must fill in, as the
+        # source above does for an earlier step's output.
+        upscale_params["output_gcs_uri"] = "<gs:// destination for the upscale>"
+    # A step has no caveats of its own, so what the route would have said
+    # beyond "Vertex AI only" (the delivery advice) rides in the rationale.
+    said = tuple(caveat for caveat in upscale.caveats if caveat != "Vertex AI only.")
+    lead = (
+        f"Once step {step}'s {source_resolution} render is approved, upscale "
+        f"it to {target} on {OMNI_1_2_MODEL}"
+    )
+    if upscale.cost is not None:
+        lead += f" (est. ${upscale.cost.usd:.2f})"
+    return _RenderThenUpscale(
+        render_request,
+        routes,
+        rejected,
+        conflicts,
+        (
+            *workflow,
+            WorkflowStep(
+                order=step + 1,
+                tool="upscale_video_omni",
+                params=upscale_params,
+                rationale=" ".join(
+                    (
+                        f"{lead}: frames, timing and audio are kept, and the "
+                        "upscale is paid for only on a take worth keeping.",
+                        *said,
+                    )
+                ),
+            ),
+        ),
+        (
+            *notes,
+            f"The upscale to {target} is workflow step {step + 1}, after the "
+            "render; the routes rank the render alone.",
+        ),
+    )
+
+
+# ============================================================================
 # Public entry point
 # ============================================================================
+
+
+def _pricing_installed() -> bool:
+    """Whether the price book can be imported at all.
+
+    So a route without a quote is explained truthfully: "pricing module not
+    installed" was said whenever any route lacked one, including a price
+    book that was installed and could not price that route.
+    """
+    try:
+        # The ``from .pricing import`` form, as the planner's own imports use:
+        # it goes through sys.modules, where a missing module shows.
+        from .pricing import estimate_video_cost  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def plan_generation(
@@ -4145,8 +6272,10 @@ def plan_generation(
 ) -> RoutingPlan:
     """Plan how to generate what ``intent`` describes.
 
-    Pure and deterministic: no network, no filesystem, no clock. The same
-    arguments always produce an identical plan.
+    Pure and deterministic: no network, no filesystem. The one clock read is
+    Google's published model calendar (the preview switch-off), checked per
+    call so a long-running server changes its plans on the day; on any one
+    date the same arguments produce an identical plan.
 
     Args:
         intent: Natural-language description of the desired output, e.g.
@@ -4173,12 +6302,62 @@ def plan_generation(
     signals = infer_signals(intent)
     request = resolve_request(intent, signals, constraints)
 
-    if request.media_kind == "image":
+    # Settled before the request is split: a declined upscale ("but don't
+    # upscale it") is no upscale at all, and its clause is no part of the
+    # render's prompt.
+    render_intent, declined = _without_declined_upscales(intent)
+    upscale, adjective_note = _upscale_request(render_intent)
+    if declined and upscale is not None:
+        # Asked for, then retracted ("then upscale it. actually don't"): the
+        # retracted clause leaves the prompt too.
+        retracted = _split_render_and_upscale(render_intent, upscale)
+        if retracted is not None:
+            render_intent = retracted[0]
+    if render_intent != intent:
+        signals = infer_signals(render_intent)
+        request = resolve_request(render_intent, signals, constraints)
+    if upscale is not None and (request.media_kind != "video" or declined):
+        upscale = None
+    split = _split_render_and_upscale(render_intent, upscale) if upscale else None
+    workflow: tuple[WorkflowStep, ...] | None = None
+    workflow_blocked = False
+    if split is not None:
+        # "Generate X, then upscale it": the upscale needs the render first.
+        chained = _plan_render_then_upscale(request, constraints, *split)
+        request = chained.request
+        routes, rejected, conflicts = (
+            chained.routes,
+            chained.rejected,
+            chained.conflicts,
+        )
+        notes, workflow = chained.notes, chained.workflow
+        workflow_blocked = chained.workflow_blocked
+    elif upscale is not None:
+        routes, rejected, conflicts, notes = _plan_upscale(request)
+    elif request.media_kind == "image":
         routes, rejected, conflicts, notes = _plan_image(request)
     else:
         routes, rejected, conflicts, notes = _plan_video(request)
 
     extra_notes = list(notes)
+    if upscale is None and adjective_note is not None and request.media_kind == "video":
+        extra_notes.append(adjective_note)
+    if declined and request.media_kind == "video":
+        extra_notes.append(
+            "No upscale step is planned: the brief's last word on upscaling "
+            "declines it, and the render's prompt leaves that clause out."
+        )
+    pinned = constraints.pinned_model if constraints is not None else None
+    redirect = omni_model_reroute_warning(pinned)
+    if redirect:
+        # resolve_request already planned the pin as the model that serves
+        # it, so every route and quote above is that model's. First, because
+        # it explains why the routes name a model the caller did not pin.
+        extra_notes.insert(
+            0,
+            f"pinned_model={pinned}: {redirect} This plan is for "
+            f"{request.pinned_model}.",
+        )
     if signals.media_kind is None and (
         constraints is None or constraints.media_kind is None
     ):
@@ -4198,9 +6377,14 @@ def plan_generation(
         extra_notes.append(
             "Cost estimates are unavailable (pricing module not installed); "
             "routes are ranked on capability and relative cost tier only."
+            if not _pricing_installed()
+            else "Some routes carry no cost estimate: the price book could not "
+            "price them. Those are ranked on capability and relative cost "
+            "tier only."
         )
 
-    workflow = _build_workflow(request, routes)
+    if workflow is None:
+        workflow = _build_workflow(request, routes)
 
     return RoutingPlan(
         intent=intent,
@@ -4212,4 +6396,5 @@ def plan_generation(
         conflicts=conflicts,
         workflow=workflow,
         notes=tuple(extra_notes),
+        workflow_blocked=workflow_blocked,
     )

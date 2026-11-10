@@ -28,6 +28,26 @@ import src.image as image
 import src.omni as omni
 import src.pricing as pricing
 
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "live: a paid test against the real API; runs only with OMNI_LIVE_SPEND=1",
+    )
+
+
+def live_spend_enabled(node: pytest.Item) -> bool:
+    """Whether this is a paid live test the caller explicitly switched on.
+
+    Such a test talks to the real services on purpose, so the fixtures that
+    keep the hermetic suite off the network stand aside for it.
+    """
+    return (
+        node.get_closest_marker("live") is not None
+        and os.environ.get("OMNI_LIVE_SPEND") == "1"
+    )
+
+
 # Before OMNI_PREVIEW_SUNSET (2026-10-22), so the preview model still serves and
 # the suite tests the pre-sunset behaviour it was written for. Any date before
 # the sunset would do; this one is fixed so a failure is never about "when".
@@ -109,6 +129,36 @@ def _forget_service_account_credentials(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(creds, "_project", None, raising=False)
     monkeypatch.setattr(_server, "_service_account_creds", None, raising=False)
     monkeypatch.setattr(_server, "_service_account_project", None, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cloud_storage(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Make an unstubbed gs:// fetch fail at once instead of reaching GCS.
+
+    fetch() builds a real google-cloud-storage client for a gs:// URI. In a
+    test that did not stub it, that meant ~12s of credential discovery per
+    call offline, and on a machine with Application Default Credentials a
+    real download from whatever bucket the test named. A test that wants the
+    client stubs ``src.__main__.storage.Client`` itself (function-scoped, so
+    it runs after this and wins) or stubs fetch().
+
+    An enabled live test is the exception: L8 reads back the object it just
+    rendered to the caller's bucket, and with this stub in place the upscale
+    could not measure its source and failed after the first render billed.
+    """
+    if live_spend_enabled(request.node):
+        return
+
+    def _refuse(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(
+            "This test reached real Cloud Storage: stub src.__main__.fetch or "
+            "src.__main__.storage.Client."
+        )
+
+    monkeypatch.setattr(_server.storage, "Client", _refuse)
+    monkeypatch.setattr(_server, "_storage_client", None)
 
 
 @functools.lru_cache(maxsize=1)

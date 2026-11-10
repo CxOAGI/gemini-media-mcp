@@ -3,11 +3,17 @@
 import asyncio
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from src.omni import OMNI_MODEL, OMNI_PREVIEW_MODEL, generate_video_omni
+from src.omni import (
+    OMNI_1_2_MODEL,
+    OMNI_MODEL,
+    OMNI_PREVIEW_MODEL,
+    generate_video_omni,
+)
 
 # ============================================================================
 # Test Doubles
@@ -427,13 +433,155 @@ async def test_no_video_anywhere_raises(tmp_path: Path) -> None:
     interaction = FakeInteraction(id="int-6", status="completed")
     client = FakeGenaiClient(FakeInteractions(create_result=interaction))
 
-    with pytest.raises(ValueError, match="no inline video data and no file URI"):
+    with pytest.raises(ValueError) as raised:
         await generate_video_omni(
             client=client,  # type: ignore[arg-type]
             model=OMNI_PREVIEW_MODEL,
             prompt="p",
             videos_dir=videos_dir,
         )
+    message = str(raised.value)
+    assert "Interaction int-6 completed, but its response carried no video" in message
+    assert "requested inline" in message
+    # Nothing about this request was large, so no size is blamed.
+    assert "4 MB" not in message
+
+
+class _VertexFakeGenaiClient(FakeGenaiClient):
+    """A fake that reports Vertex AI where the impl reads the backend."""
+
+    _api_client = SimpleNamespace(vertexai=True)
+
+
+def _vertex_fake_client(interaction: FakeInteraction) -> Any:
+    return _VertexFakeGenaiClient(FakeInteractions(create_result=interaction))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+@pytest.mark.parametrize(
+    "kwargs, large",
+    [
+        ({"resolution": "4K"}, "A 4K render can exceed the 4 MB inline response limit"),
+        (
+            {"duration_seconds": 12},
+            "A 12s render can exceed the 4 MB inline response limit",
+        ),
+        ({"resolution": "720p", "duration_seconds": 6}, None),
+    ],
+)
+async def test_a_large_inline_render_that_returns_no_bytes_says_why_and_how(
+    tmp_path: Path, kwargs: dict[str, Any], large: str | None
+) -> None:
+    """The one path the delivery policy lets through by default -- a large
+    render requested inline on Vertex AI -- failed with a bare "no inline
+    video data and no file URI", hiding both the likely cause and the fix."""
+    client = _vertex_fake_client(FakeInteraction(id="int-big", status="completed"))
+    with pytest.raises(ValueError) as raised:
+        await generate_video_omni(
+            client=client,
+            model=OMNI_1_2_MODEL,
+            prompt="p",
+            videos_dir=tmp_path,
+            **kwargs,
+        )
+    message = str(raised.value)
+    assert "Interaction int-big completed, but its response carried no video" in message
+    assert "requested inline (no output_gcs_uri was sent)" in message
+    assert "Pass output_gcs_uri (a prefix such as gs://bucket/renders/)" in message
+    if large:
+        assert large in message
+        assert "which is the likely reason" in message
+    else:
+        assert "4 MB" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+@pytest.mark.parametrize(
+    "kwargs, large",
+    [
+        # An edit sends no duration; the pre-flight judged it at its bound.
+        (
+            {"previous_interaction_id": "prior"},
+            "A render that could run up to 15s can exceed the 4 MB inline",
+        ),
+        # On 1.2 the bound is the 15s per-render maximum whatever the source.
+        (
+            {"previous_interaction_id": "prior", "source_duration_seconds": 5.0},
+            "A render that could run up to 15s can exceed the 4 MB inline",
+        ),
+        # An upscale sends none either, and keeps the source's length.
+        (
+            {"task": "upscale", "resolution": "720p", "source_duration_seconds": 12.0},
+            "A 12s render can exceed the 4 MB inline",
+        ),
+        (
+            {"task": "upscale", "resolution": "720p"},
+            "A render that could run up to 15s can exceed the 4 MB inline",
+        ),
+        (
+            {"task": "upscale", "resolution": "720p", "source_duration_seconds": 6.0},
+            None,
+        ),
+    ],
+    ids=[
+        "edit-unmeasured",
+        "edit-short",
+        "upscale-12s",
+        "upscale-unmeasured",
+        "upscale-6s",
+    ],
+)
+async def test_an_edit_or_upscale_with_no_video_is_judged_as_its_pre_flight_was(
+    tmp_path: Path, kwargs: dict[str, Any], large: str | None
+) -> None:
+    """Neither sends a duration, so judged on the sent duration alone the
+    edit its pre-flight had warned about at its 15s bound, and a 720p upscale
+    of a 12s source, were never blamed on size when nothing came back."""
+    client = _vertex_fake_client(FakeInteraction(id="int-big", status="completed"))
+    if kwargs.get("task") == "upscale":
+        kwargs = {
+            **kwargs,
+            "input_video_bytes": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom",
+        }
+    with pytest.raises(ValueError) as raised:
+        await generate_video_omni(
+            client=client,
+            model=OMNI_1_2_MODEL,
+            prompt="p",
+            videos_dir=tmp_path,
+            **kwargs,
+        )
+    message = str(raised.value)
+    assert "requested inline (no output_gcs_uri was sent)" in message
+    assert "Pass output_gcs_uri (a prefix such as gs://bucket/renders/)" in message
+    if large:
+        assert large in message
+        assert "which is the likely reason" in message
+    else:
+        assert "4 MB" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2.0)
+async def test_a_gcs_delivery_that_returns_nothing_does_not_blame_inline_size(
+    tmp_path: Path,
+) -> None:
+    client = _vertex_fake_client(FakeInteraction(id="int-gcs", status="completed"))
+    with pytest.raises(ValueError) as raised:
+        await generate_video_omni(
+            client=client,
+            model=OMNI_1_2_MODEL,
+            prompt="p",
+            videos_dir=tmp_path,
+            resolution="4K",
+            output_gcs_uri="gs://bucket/out.mp4",
+        )
+    assert str(raised.value) == (
+        "Interaction int-gcs completed, but its response carried no video: "
+        "no inline bytes and no file URI."
+    )
 
 
 # ============================================================================
@@ -498,7 +646,7 @@ async def test_duration_clamped_with_warning(tmp_path: Path) -> None:
     )
     assert result["duration_seconds"] == 10
     assert interactions.create_kwargs["response_format"][0]["duration"] == "10s"
-    assert any("clamped to 10s" in w for w in result["warnings"])
+    assert any("it renders 10s" in w for w in result["warnings"])
 
 
 @pytest.mark.asyncio
@@ -647,7 +795,7 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
         pytest.skip("google-genai request normalizer not importable at this path")
 
     from src.omni import (
-        OMNI_1_1_MODEL,
+        OMNI_1_2_MODEL,
         OMNI_PREVIEW_MODEL,
         _build_create_kwargs,
         _image_part,
@@ -703,12 +851,12 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     assert edit_out["previous_interaction_id"] == "int-1"
     assert edit_out["response_format"] == [{"type": "video"}]
 
-    # Variant 3: gemini-omni-1.1-flash keyframe interpolation at 4K. The
+    # Variant 3: gemini-omni-1.2-flash keyframe interpolation at 4K. The
     # resolution must survive the SDK's typed response_format (older SDKs
     # silently drop it), the API spelling is lowercase "4k", and the media
-    # parts lead the prompt the way every 1.1 example shows.
+    # parts lead the prompt the way every 1.2 example shows.
     keyframe_body = _build_create_kwargs(
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         prompt="[# Sources <FIRST_FRAME>@Image1 <LAST_FRAME>@Image2] sunrise to dusk",
         image_parts=[_image_part(png), _image_part(png)],
         video_parts=[],
@@ -732,10 +880,11 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
         "text",
     ]
 
-    # Variant 4: an uploaded-video extension. The task travels, and the
-    # continuation carries neither duration nor aspect ratio.
+    # Variant 4: an uploaded-video extension. The task travels, the
+    # continuation carries no aspect ratio, and its duration is the per-turn
+    # length 1.2 documents.
     extend_body = _build_create_kwargs(
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         prompt="Continue the scene.",
         image_parts=[],
         video_parts=[_inline_video_part(b"\x00\x00\x00\x18ftypmp42" + b"x" * 16)],
@@ -750,6 +899,8 @@ def test_create_kwargs_accepted_by_real_sdk_normalizer() -> None:
     assert set(extend_body) <= _CREATE_BODY_KEYS
     extend_out = _normalize_create_body(dict(extend_body))
     assert extend_out["generation_config"]["video_config"]["task"] == "extend"
-    # An extend rejects aspect_ratio (live 400) and duration goes with it, so
-    # only the resolution rides alongside the type.
-    assert extend_out["response_format"] == [{"type": "video", "resolution": "360p"}]
+    # An extend rejects aspect_ratio (live 400); the per-turn duration and the
+    # resolution ride alongside the type.
+    assert extend_out["response_format"] == [
+        {"type": "video", "duration": "6s", "resolution": "360p"}
+    ]

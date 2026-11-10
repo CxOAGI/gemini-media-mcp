@@ -123,9 +123,9 @@ def measure_video_duration_bytes(data: bytes, extension: str = ".mp4") -> float 
 
     The same probe as ``measure_video_duration`` for a video that has not been
     written to disk — an input the caller handed us, which the omni tools have
-    to measure BEFORE spending anything on it: Google documents a 10s ceiling
-    on an uploaded edit/extension source and a 3s ceiling on a video
-    reference, and both are properties of the bytes, not of the request.
+    to measure BEFORE spending anything on it: Google documents a 15s ceiling
+    on a 1.2 edit or upscale source and a 3s ceiling on a video reference,
+    and both are properties of the bytes, not of the request.
 
     Never raises, for the same reason: a probe failure must degrade to "length
     unknown" rather than refuse a clip that may well be fine.
@@ -148,6 +148,40 @@ def measure_video_duration_bytes(data: bytes, extension: str = ".mp4") -> float 
     if isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0:
         return float(duration)
     return None
+
+
+def measure_video_metadata_bytes(
+    data: bytes, extension: str = ".mp4"
+) -> tuple[float | None, tuple[int, int] | None]:
+    """Read an in-memory clip's (duration, (width, height)) in one probe.
+
+    Each probe spawns an ffmpeg subprocess, and a caller that needs both
+    figures ran three on the same bytes (the source-length check, then the
+    duration, then the dimensions). One read answers both. Never raises:
+    either figure is None when it cannot be determined, exactly as from
+    measure_video_duration_bytes.
+    """
+    try:
+        import imageio.v3 as iio
+
+        meta = iio.immeta(BytesIO(data), extension=extension, plugin="FFMPEG")
+    except Exception:
+        logger.debug("Could not probe an in-memory clip", exc_info=True)
+        return None, None
+    duration = meta.get("duration")
+    size = meta.get("size")
+    return (
+        float(duration)
+        if isinstance(duration, (int, float))
+        and math.isfinite(duration)
+        and duration > 0
+        else None,
+        (int(size[0]), int(size[1]))
+        if isinstance(size, (tuple, list))
+        and len(size) == 2
+        and all(isinstance(value, int) and value > 0 for value in size)
+        else None,
+    )
 
 
 def assert_frame_decoding_available() -> None:

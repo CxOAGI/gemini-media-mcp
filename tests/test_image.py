@@ -1806,7 +1806,7 @@ def test_input_image_decoding_does_not_run_on_the_event_loop() -> None:
     coroutine blocks every request: no other render, no Veo LRO polling, no
     ctx.info progress.
 
-    Source-level, matching the ffmpeg executor guard in test_omni_1_1.py:
+    Source-level, matching the ffmpeg executor guard in test_omni_capabilities.py:
     calling the real thing with fifteen near-limit images to prove it takes
     seconds would cost those seconds on every run.
     """

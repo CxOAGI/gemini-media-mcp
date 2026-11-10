@@ -1257,7 +1257,15 @@ async def test_generate_video_refuses_a_gemini_api_client(tmp_path: Path) -> Non
     assert str(refused.value) == VEO_GEMINI_API_REFUSAL
     assert "2026-10-22" in str(refused.value)
     assert "generate_video_omni" in str(refused.value)
-    assert "gemini-omni-1.1-flash" in str(refused.value)
+    # Not the gemini-omni-1.1-flash Google's deprecation table names: this
+    # server has retired it.
+    assert "gemini-omni-1.1-flash" not in str(refused.value)
+    # The way out is Omni's default; src.video cannot import the constant
+    # (src.omni imports src.video), so this keeps the spelled-out name from
+    # drifting.
+    from src.omni import DEFAULT_OMNI_MODEL
+
+    assert f"with {DEFAULT_OMNI_MODEL}" in str(refused.value)
     assert "Vertex AI credentials" in str(refused.value)
     assert sent == []
 

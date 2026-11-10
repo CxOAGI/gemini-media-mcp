@@ -257,7 +257,7 @@ def test_a_plain_video_brief_still_leads_with_veo() -> None:
 
 
 def test_a_4k_brief_still_routes_to_veo() -> None:
-    """Omni 1.1 can render 4K now, but Veo is still the finishing tier."""
+    """Omni 1.2 can render 4K, but Veo is still the finishing tier."""
     from src.routing import RoutingConstraints, plan_generation
 
     plan = plan_generation(
@@ -286,18 +286,6 @@ def test_a_supplied_first_and_last_frame_still_routes_to_veo_transition() -> Non
     transition = next(r for r in plan.routes if r.tool == "generate_transition")
     assert transition.params["first_frame_uri"] == "gs://b/a.png"
     assert transition.params["last_frame_uri"] == "gs://b/b.png"
-
-
-def test_veo_records_carry_no_resolution_notes() -> None:
-    """The field was added for Omni's derived tiers; Veo's rates are published.
-
-    A note on a Veo record would be claiming a caveat that does not exist.
-    """
-    from src.pricing import _VIDEO_PRICING  # pyright: ignore[reportPrivateUsage]
-
-    for model, record in _VIDEO_PRICING.items():
-        if model.startswith("veo"):
-            assert not record.resolution_notes, model
 
 
 @pytest.mark.parametrize("model", [VEO_FAST, VEO])

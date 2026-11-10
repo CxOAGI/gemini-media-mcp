@@ -6,9 +6,9 @@ Three of them, from one review:
     the square of `times` and `times` accepts 20;
   * a date-aware refusal of gemini-omni-flash-preview on its sunset, because
     from that day a deprecation warning is a lie beside a dead endpoint;
-  * an actionable error when Vertex refuses omni 1.1, because the raw 404 says
-    nothing about the allowlist, the GA route one credential away, or the
-    preview model that still answers until the sunset.
+  * an actionable error when a backend refuses an omni model, because the
+    raw 404 says nothing about what to check or, for the preview model, that
+    the generally available default is the way off it.
 
 Plus the omni docs' own prompting advice: negatives inline, not dropped.
 """
@@ -228,7 +228,9 @@ async def test_the_preview_model_is_refused_from_its_sunset_day(
         )
     )
     assert "switched off on 2026-10-22" in after["error"]
-    assert "gemini-omni-1.1-flash" in after["error"]
+    # The successor is the current default, never the retired 1.1.
+    assert omni_mod.DEFAULT_OMNI_MODEL in after["error"]
+    assert omni_mod.OMNI_1_1_MODEL not in after["error"]
 
 
 def test_the_planner_stops_offering_the_preview_model_from_its_sunset(
@@ -244,7 +246,7 @@ def test_the_planner_stops_offering_the_preview_model_from_its_sunset(
     )
     offered = {r.model for r in plan.routes}
     assert "gemini-omni-flash-preview" not in offered
-    assert "gemini-omni-1.1-flash" in offered
+    assert omni_mod.DEFAULT_OMNI_MODEL in offered
     assert any(
         r.model == "gemini-omni-flash-preview" and "switched off" in r.reason
         for r in plan.rejected
@@ -256,27 +258,34 @@ def test_the_planner_stops_offering_the_preview_model_from_its_sunset(
 # --------------------------------------------------------------------------
 
 
-def test_a_vertex_404_for_omni_says_allowlist_and_names_the_ga_route() -> None:
+def test_an_omni_404_says_what_to_check_and_names_the_ga_route() -> None:
     """The raw error names an endpoint and a project. The useful facts are
-    that the model is Preview-gated on Vertex, GA one credential away, and
-    that the preview model still answers until its sunset."""
-    from src.omni import _access_refusal  # pyright: ignore[reportPrivateUsage]
+    what to check, and -- for the preview model, whose endpoint is going
+    away -- that the generally available default is the way off it."""
+    from src.omni import (  # pyright: ignore[reportPrivateUsage]
+        DEFAULT_OMNI_MODEL,
+        OMNI_1_2_MODEL,
+        OMNI_PREVIEW_MODEL,
+        _access_refusal,
+    )
 
     exc = RuntimeError(
-        "404 NOT_FOUND: Publisher Model `gemini-omni-1.1-flash-preview` not found"
+        f"404 NOT_FOUND: Publisher Model `{OMNI_PREVIEW_MODEL}` not found"
     )
-    advice = _access_refusal(exc, "gemini-omni-1.1-flash-preview", vertexai=True)
-    assert advice is not None
-    text = str(advice)
-    assert "allowlist" in text
-    assert "GEMINI_API_KEY" in text
-    assert "gemini-omni-flash-preview" in text  # still an option before the sunset
+    for vertexai, backend in ((True, "Vertex AI"), (False, "Gemini Developer API")):
+        advice = _access_refusal(exc, OMNI_PREVIEW_MODEL, vertexai=vertexai)
+        assert advice is not None
+        text = str(advice)
+        assert backend in text
+        assert "Interactions API" in text
+        assert DEFAULT_OMNI_MODEL in text
+
+    on_1_2 = _access_refusal(exc, OMNI_1_2_MODEL, vertexai=True)
+    assert on_1_2 is not None and "generally available" in str(on_1_2)
 
     assert (
         _access_refusal(RuntimeError("deadline exceeded"), "m", vertexai=True) is None
     )
-    on_gemini = _access_refusal(exc, "gemini-omni-1.1-flash", vertexai=False)
-    assert on_gemini is not None and "Interactions API" in str(on_gemini)
 
 
 # --------------------------------------------------------------------------
@@ -628,10 +637,11 @@ async def test_an_over_long_reference_clip_is_caught_by_the_quote(
 async def test_a_folded_model_id_is_disclosed_on_the_quote_too(
     tmp_path: Path,
 ) -> None:
-    """Omni swallowed a backend-specific spelling; Veo discloses the reroute.
+    """Omni swallowed a folded model ID; Veo discloses the reroute.
 
-    A caller who pins the Vertex ID gets the canonical one back with no
-    signal the name changed. The render was fixed first and the quote left
+    A caller who pins an ID that folds onto another -- now the retired 1.1,
+    in either backend's spelling -- gets the canonical one back, and must be
+    told the name changed. The render was fixed first and the quote left
     silent — the half of every fix this codebase keeps missing — so this
     covers the pre-flight, where the disclosure is still free to act on.
     """
@@ -645,21 +655,21 @@ async def test_a_folded_model_id_is_disclosed_on_the_quote_too(
             dry_run=True,
         )
     )
-    assert payload["model"] == "gemini-omni-1.1-flash"
+    assert payload["model"] == "gemini-omni-1.2-flash"
     assert payload["requested_model"] == "gemini-omni-1.1-flash-preview"
-    assert any("backend-specific spelling" in w for w in payload["warnings"])
+    assert any("is retired on this server" in w for w in payload["warnings"])
 
     # The canonical spelling discloses nothing, or the notice is just noise.
     clean = json.loads(
         await generate_video_omni(
             ctx=_ctx(tmp_path, vertexai=False),
             prompt="x",
-            omni_model="gemini-omni-1.1-flash",
+            omni_model="gemini-omni-1.2-flash",
             dry_run=True,
         )
     )
     assert "requested_model" not in clean
-    assert not any("backend-specific" in w for w in clean.get("warnings", []))
+    assert not any("retired" in w for w in clean.get("warnings", []))
 
 
 def test_a_mixed_role_call_says_why_it_sent_no_task() -> None:
@@ -694,7 +704,7 @@ def test_one_wording_for_the_reference_ceiling_whichever_path_finds_it() -> None
     )
     from src.omni import omni_spec
 
-    spec = omni_spec("gemini-omni-1.1-flash")
+    spec = omni_spec("gemini-omni-1.2-flash")
     assert "reference_video_uris[1] is 5.00s" in _reference_video_over_ceiling(
         spec, 1, 5.0
     )
@@ -710,17 +720,16 @@ def test_one_wording_for_the_reference_ceiling_whichever_path_finds_it() -> None
 async def test_a_chain_at_the_ceiling_is_refused_not_attempted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A 40s source plans zero turns. The quote said planned_turns: 0 with a
-    null cost, the render attempted every turn anyway, and max_cost_usd could
-    not stop it: an unpriced plan reads as $0.00, and 0.0 is under any cap.
-    A call the quote cannot price must not run."""
+    """A source at the ceiling plans zero turns. The quote said
+    planned_turns: 0 with a null cost, the render attempted every turn anyway,
+    and max_cost_usd could not stop it: an unpriced plan reads as $0.00, and
+    0.0 is under any cap. A call the quote cannot price must not run."""
     import src.__main__ as main_mod
 
-    # Only reachable through a prior interaction: an UPLOADED 40s source is
-    # refused earlier by the 10s upload limit. The sidecar of a chain that has
-    # already reached the ceiling records 40s, which is what is stubbed here.
+    # The sidecar of a chain that has already reached the Gemini API's 30s
+    # cumulative ceiling records 30s, which is what is stubbed here.
     async def at_ceiling(*args: Any, **kwargs: Any) -> float | None:
-        return 40.0
+        return 30.0
 
     calls: list[Any] = []
 
@@ -728,13 +737,13 @@ async def test_a_chain_at_the_ceiling_is_refused_not_attempted(
         calls.append(kwargs)
         return {
             "video_url": "gs://bkt/out/x.mp4",
-            "duration_seconds": 40,
+            "duration_seconds": 30,
             "interaction_id": "i",
         }
 
     async def prior_at_ceiling(*args: Any, **kwargs: Any) -> Any:
         return main_mod.PriorInteraction(
-            backend="gemini_api", model="gemini-omni-1.1-flash", duration_seconds=40.0
+            backend="gemini_api", model="gemini-omni-1.2-flash", duration_seconds=30.0
         )
 
     # The quote reads the prior one way and the render another; stub both.
@@ -744,6 +753,7 @@ async def test_a_chain_at_the_ceiling_is_refused_not_attempted(
     for extra in ({"dry_run": True}, {}, {"max_cost_usd": 0.01}):
         payload = json.loads(
             await main_mod.extend_video_omni(
+                omni_model="gemini-omni-1.2-flash",
                 ctx=_ctx(tmp_path, vertexai=False),
                 prompt="c",
                 previous_interaction_id="i-chain",
@@ -751,7 +761,7 @@ async def test_a_chain_at_the_ceiling_is_refused_not_attempted(
                 **extra,
             )
         )
-        assert "40s ceiling" in payload["error"], (extra, payload)
+        assert "30s ceiling" in payload["error"], (extra, payload)
     assert calls == [], "a turn was attempted on a chain that cannot grow"
 
 
@@ -786,7 +796,7 @@ def test_task_source_says_a_conversational_turn_sends_no_task() -> None:
     from src.omni import _build_create_kwargs  # pyright: ignore[reportPrivateUsage]
 
     kwargs = _build_create_kwargs(
-        model="gemini-omni-1.1-flash",
+        model="gemini-omni-1.2-flash",
         prompt="x",
         image_parts=[],
         video_parts=[],

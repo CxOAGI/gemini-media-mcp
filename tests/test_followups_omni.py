@@ -149,7 +149,7 @@ async def test_download_at_cap_succeeds(
     with a token payload well under it (which proves nothing about the edge):
     cap bytes must pass, cap+1 must raise.
     """
-    # The preview model is the one whose cap is this constant; 1.1 can emit
+    # The preview model is the one whose cap is this constant; 1.2 can emit
     # 4K and 40s chains and gets a larger one, so patching this and then
     # calling the default model would exercise neither boundary.
     monkeypatch.setattr("src.omni._MAX_DELIVERED_VIDEO_BYTES", 64)

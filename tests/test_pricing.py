@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from src.image import _MODEL_SHUTDOWNS
-from src.omni import OMNI_1_1_MODEL, OMNI_MODEL, OMNI_PREVIEW_MODEL
+from src.omni import OMNI_1_1_MODEL, OMNI_1_2_MODEL, OMNI_MODEL, OMNI_PREVIEW_MODEL
 from src.pricing import (
     _IMAGE_PRICING,
     _VIDEO_PRICING,
@@ -92,15 +92,11 @@ def test_pricing_as_of_is_an_iso_date() -> None:
 def test_every_source_is_an_official_google_url() -> None:
     for url in PRICING_SOURCES.values():
         assert url.startswith("https://")
-        # blog.google carries the Omni 1.1 launch post, the only Google source
-        # that states the 360p tier's ratio to 720p. Still first-party, so it
-        # belongs here — the point of the check is that no rate is sourced to
-        # a third-party summary.
-        assert (
-            "google.dev" in url
-            or "cloud.google.com" in url
-            or url.startswith("https://blog.google/")
-        )
+        # The point of the check is that no rate is sourced to a third-party
+        # summary. (The Omni 1.1 launch post on blog.google left with 1.1's
+        # derived 360p rate: every Omni rate now is a published pricing-page
+        # figure.)
+        assert "google.dev" in url or "cloud.google.com" in url
 
     for pricing in (*_IMAGE_PRICING.values(), *_VIDEO_PRICING.values()):
         assert pricing.source in PRICING_SOURCES.values()
@@ -136,6 +132,7 @@ def test_known_models_includes_current_retired_and_video_ids() -> None:
     # Gemini-API Veo spelling, which generate_video reports back to callers.
     assert "veo-3.1-generate-preview" in models
     assert OMNI_PREVIEW_MODEL in models
+    # Retired, but still accepted: a request naming it runs on 1.2.
     assert OMNI_1_1_MODEL in models
 
 
@@ -144,7 +141,7 @@ def test_priced_models_are_the_canonical_ids_only() -> None:
         "gemini-3-pro-image",
         "gemini-3.1-flash-image",
         "gemini-3.1-flash-lite-image",
-        OMNI_1_1_MODEL,
+        "gemini-omni-1.2-flash",
         OMNI_PREVIEW_MODEL,
         "veo-3.1-fast-generate-001",
         "veo-3.1-generate-001",
@@ -406,7 +403,7 @@ def test_resolution_spelling_is_normalized() -> None:
 
 
 def test_veo_has_no_published_360p_rate_so_returns_none() -> None:
-    # 360p is omni 1.1's draft tier; Veo publishes no rate for it.
+    # 360p is omni's draft tier; Veo publishes no rate for it.
     assert estimate_video_cost("veo-3.1-generate-001", 8, "360p") is None
 
 
@@ -427,6 +424,18 @@ def test_audio_flag_does_not_change_the_price_but_is_explained() -> None:
     assert with_audio.usd == without_audio.usd
     assert "no discount" in without_audio.detail
     assert "no discount" not in with_audio.detail
+
+
+@pytest.mark.parametrize("model", [OMNI_1_2_MODEL, OMNI_PREVIEW_MODEL])
+def test_an_omni_cost_never_says_its_audio_was_disabled(model: str) -> None:
+    # Omni has no audio switch, yet every omni call site prices with
+    # include_audio=False; a live L8 cost read "audio disabled" for a render
+    # that carried its native audio.
+    quoted = estimate_video_cost(model, 3, "720p", include_audio=False)
+    metered = actual_video_cost(model, 3.03, "720p", include_audio=False)
+    assert quoted is not None and metered is not None
+    for cost in (quoted, metered):
+        assert "audio" not in cost.detail, cost.detail
 
 
 def test_omni_prices_a_non_720p_request_at_what_it_actually_renders() -> None:
@@ -1136,7 +1145,11 @@ def test_sum_costs_drops_a_note_the_components_do_not_share() -> None:
     )
     assert total.unit == "mixed"
     assert total.source == PRICING_SOURCES["gemini_api"]
-    assert total.source_note is None
+    # Neither component's caveat; only that they differ.
+    assert total.source_note is not None
+    assert total.source_note.startswith(
+        "Its components were priced from tables with different notes"
+    )
 
 
 def test_sum_costs_does_not_lend_provenance_to_a_sourceless_component() -> None:
@@ -1156,7 +1169,8 @@ def test_sum_costs_does_not_lend_provenance_to_a_sourceless_component() -> None:
     for components in ([beat, assembled_elsewhere], [assembled_elsewhere, beat]):
         total = sum_costs(components)
         assert total.source is None
-        assert total.source_note is None
+        assert beat.source_note is not None
+        assert beat.source_note not in str(total.source_note)
 
 
 def test_an_unpriced_component_does_not_erase_the_shared_source() -> None:
@@ -1327,3 +1341,91 @@ def test_actual_image_cost_bills_text_the_modality_list_left_out() -> None:
     assert cost.breakdown["output_image_tokens"] == 1120.0
     assert cost.breakdown["output_text_tokens"] == 380.0
     assert cost.usd == pytest.approx((1120 * 60 + 380 * 3) / 1e6)
+
+
+# ============================================================================
+# Per-table verification dates
+# ============================================================================
+#
+# PRICING_AS_OF is the date of the last FULL re-read. A table verified on its
+# own after that (Omni 1.2, which launched later) reports its own date, so its
+# quotes are not dated before the rates existed, and nothing else is claimed
+# to have been re-checked that day.
+
+
+def test_a_table_verified_after_the_full_reread_reports_its_own_date() -> None:
+    from src.omni import OMNI_1_2_MODEL
+    from src.pricing import estimate_omni_upscale_cost
+
+    later = _VIDEO_PRICING[OMNI_1_2_MODEL].as_of
+    assert later is not None and later > PRICING_AS_OF
+    # The record's own prose names the date; the field must agree with it.
+    assert "November 6, 2026" in (_VIDEO_PRICING[OMNI_1_2_MODEL].source_note or "")
+    assert later == "2026-11-06"
+
+    for estimate in (
+        estimate_video_cost(OMNI_1_2_MODEL, 10, "720p"),
+        actual_video_cost(OMNI_1_2_MODEL, 10.0, "720p", False),
+        estimate_omni_upscale_cost(10, "720p", "4K"),
+    ):
+        payload = cost_to_dict(estimate)
+        assert payload is not None
+        assert payload["pricing_as_of"] == later
+    described = describe_model_pricing(OMNI_1_2_MODEL)
+    assert described is not None and described["pricing_as_of"] == later
+
+
+def test_tables_not_reverified_keep_the_full_reread_date() -> None:
+    for estimate in (
+        estimate_video_cost(OMNI_PREVIEW_MODEL, 10, "720p"),
+        estimate_video_cost("veo-3.1-generate-001", 8, "720p"),
+        estimate_image_cost("gemini-3.1-flash-image", "2K", 1),
+    ):
+        payload = cost_to_dict(estimate)
+        assert payload is not None
+        assert payload["pricing_as_of"] == PRICING_AS_OF
+    assert pricing_coverage()["pricing_as_of"] == PRICING_AS_OF
+
+
+def test_every_record_date_is_iso_and_not_before_the_full_reread() -> None:
+    for model, record in _VIDEO_PRICING.items():
+        if record.as_of is None:
+            continue
+        year, month, day = record.as_of.split("-")
+        assert (len(year), len(month), len(day)) == (4, 2, 2), model
+        assert record.as_of >= PRICING_AS_OF, model
+
+
+def test_a_total_is_dated_by_its_stalest_rate() -> None:
+    from src.omni import OMNI_1_2_MODEL
+
+    newer = estimate_video_cost(OMNI_1_2_MODEL, 10, "720p")
+    older = estimate_video_cost(OMNI_PREVIEW_MODEL, 10, "720p")
+    assert newer is not None and older is not None
+    same = cost_to_dict(sum_costs([newer, newer]))
+    mixed = cost_to_dict(sum_costs([newer, older]))
+    assert same is not None and mixed is not None
+    assert same["pricing_as_of"] == newer.as_of
+    assert mixed["pricing_as_of"] == PRICING_AS_OF
+
+
+# ============================================================================
+# Standalone upscaling: metered versus estimated
+# ============================================================================
+
+
+def test_a_measured_upscale_is_metered_without_the_encoder_allowance() -> None:
+    """The convention every other omni cost follows: a length measured from
+    the rendered file is what billed, so it gets no one-frame allowance and
+    is not labelled an estimate."""
+    from src.pricing import OMNI_ENCODER_ALLOWANCE_SECONDS, estimate_omni_upscale_cost
+
+    quoted = estimate_omni_upscale_cost(6.0, "720p", "1080p")
+    metered = estimate_omni_upscale_cost(6.0, "720p", "1080p", actual=True)
+    assert quoted.is_estimate is True
+    assert quoted.breakdown["seconds"] == pytest.approx(
+        6.0 + OMNI_ENCODER_ALLOWANCE_SECONDS
+    )
+    assert metered.is_estimate is False
+    assert metered.breakdown["seconds"] == 6.0
+    assert metered.usd == pytest.approx(6.0 * 2896 * 12.0 / 1_000_000)

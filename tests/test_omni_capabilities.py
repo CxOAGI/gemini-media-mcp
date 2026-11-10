@@ -1,16 +1,20 @@
-"""gemini-omni-1.1-flash: the capabilities the preview model does not have.
+"""The capabilities the preview model does not have, on gemini-omni-1.2-flash.
+
+Written for gemini-omni-1.1-flash, which introduced them. 1.1 is retired on
+this server (its redirect and the refusal of its interactions are pinned in
+tests/test_omni_1_1_retired.py), and every test of behaviour 1.2 shares now
+runs on 1.2; the ones that pinned 1.1's own numbers went with it.
 
 The wire shapes are pinned in tests/test_wire_contract_omni.py. This file
 covers everything either side of the wire: which requests are refused before
-anything is spent, how the role declarations are built, what the new
-resolutions cost, and what the tools quote for a render nobody has paid for
-yet.
+anything is spent, how the role declarations are built, what the resolutions
+cost, and what the tools quote for a render nobody has paid for yet.
 
-The recurring hazard is a SILENT downgrade. Every argument here exists only on
-1.1, so the failure mode for each is the same: the preview model accepts the
-call, renders something else, and the caller is billed for what they asked for
-rather than what they got. Hence a refusal — never a dropped field — for every
-one of them.
+The recurring hazard is a SILENT downgrade. Every argument here is missing
+from the preview model, so the failure mode for each is the same: the preview
+model accepts the call, renders something else, and the caller is billed for
+what they asked for rather than what they got. Hence a refusal — never a
+dropped field — for every one of them.
 """
 
 import json
@@ -24,6 +28,7 @@ import pytest
 from src.__main__ import AppContext
 from src.omni import (
     OMNI_1_1_MODEL,
+    OMNI_1_2_MODEL,
     OMNI_PREVIEW_MODEL,
     OMNI_RESOLUTIONS,
     _build_media_role_prompt,  # pyright: ignore[reportPrivateUsage]
@@ -45,7 +50,7 @@ _MP4_HEADER = b"\x00\x00\x00\x18ftypmp42"
 
 def test_both_models_are_omni_and_nothing_else_is() -> None:
     assert is_omni_model(OMNI_PREVIEW_MODEL)
-    assert is_omni_model(OMNI_1_1_MODEL)
+    assert is_omni_model(OMNI_1_2_MODEL)
     assert not is_omni_model("veo-3.1-fast-generate-001")
     assert not is_omni_model(None)
 
@@ -61,20 +66,21 @@ def test_the_preview_model_advertises_none_of_the_new_capabilities() -> None:
     assert spec.rendered_resolution == "720p"
 
 
-def test_the_1_1_spec_matches_the_published_limits() -> None:
+def test_the_1_2_spec_matches_the_published_limits() -> None:
     """Every number here is quoted from the reference, not chosen."""
-    spec = omni_spec(OMNI_1_1_MODEL)
+    spec = omni_spec(OMNI_1_2_MODEL)
     assert spec.resolutions == OMNI_RESOLUTIONS == ("360p", "720p", "1080p", "4K")
     assert spec.rendered_resolution == "720p"
     # "Video references support a maximum of 3 clips, up to 3 seconds each."
     assert spec.max_reference_videos == 3
     assert spec.max_reference_video_seconds == 3.0
-    # "You can extend videos by 10s, up to a total length of 40s."
+    # "a 3 to 10 second continuation (10 seconds by default ...)", to a 30s
+    # total on the Gemini API (Vertex's figures are its own; see omni_spec).
     assert spec.extension_step_seconds == 10
-    assert spec.max_extended_seconds == 40
-    # "Input videos for editing and extension must be 10 seconds or less when
-    # uploading."
-    assert spec.max_uploaded_source_seconds == 10.0
+    assert spec.max_extended_seconds == 30
+    # "Maximum input video length (upscaling): 15 seconds", and editing takes
+    # the same 15s.
+    assert spec.max_uploaded_source_seconds == 15.0
 
 
 def test_an_unknown_model_is_named_not_defaulted() -> None:
@@ -102,7 +108,7 @@ def test_resolution_spellings_normalize(
 
 
 # ============================================================================
-# Refusals: every 1.1-only argument on the preview model
+# Refusals: every argument the preview model lacks
 # ============================================================================
 
 
@@ -134,38 +140,41 @@ def test_the_preview_model_refuses_what_it_cannot_do(
     try:
         _ = validate_omni_request(OMNI_PREVIEW_MODEL, **kwargs)
     except ValueError as exc:
-        assert OMNI_1_1_MODEL in str(exc)
+        assert OMNI_1_2_MODEL in str(exc)
 
 
 def test_a_fourth_reference_video_is_refused() -> None:
     """Three clips is a hard documented ceiling, so a fourth has nowhere to go."""
     with pytest.raises(ValueError, match="at most 3"):
-        _ = validate_omni_request(OMNI_1_1_MODEL, reference_video_count=4)
-    assert validate_omni_request(OMNI_1_1_MODEL, reference_video_count=3)
+        _ = validate_omni_request(OMNI_1_2_MODEL, reference_video_count=4)
+    assert validate_omni_request(OMNI_1_2_MODEL, reference_video_count=3)
 
 
 def test_a_last_frame_without_a_first_is_refused() -> None:
     """<LAST_FRAME> is documented as only usable with <FIRST_FRAME>."""
     with pytest.raises(ValueError, match="requires a first frame"):
-        _ = validate_omni_request(OMNI_1_1_MODEL, has_last_frame=True)
+        _ = validate_omni_request(OMNI_1_2_MODEL, has_last_frame=True)
 
 
 def test_inferred_and_explicit_image_roles_cannot_be_mixed() -> None:
     """The two describe the same images two ways; one of them has to lose."""
     with pytest.raises(ValueError, match="cannot be combined"):
         _ = validate_omni_request(
-            OMNI_1_1_MODEL, inferred_image_count=1, reference_image_count=1
+            OMNI_1_2_MODEL, inferred_image_count=1, reference_image_count=1
         )
 
 
-def test_an_unsupported_resolution_is_refused_on_1_1_too() -> None:
+def test_an_unsupported_resolution_is_refused_on_1_2_too() -> None:
     with pytest.raises(ValueError, match="Unsupported resolution '8K'"):
-        _ = validate_omni_request(OMNI_1_1_MODEL, resolution="8K")
+        _ = validate_omni_request(OMNI_1_2_MODEL, resolution="8K")
 
 
 def test_an_unknown_task_is_refused() -> None:
-    with pytest.raises(ValueError, match="Unknown task 'upscale'"):
-        _ = validate_omni_request(OMNI_1_1_MODEL, task="upscale")
+    with pytest.raises(ValueError, match="Unknown task 'interpolate'"):
+        _ = validate_omni_request(OMNI_1_2_MODEL, task="interpolate")
+    # And a documented task the model does not have.
+    with pytest.raises(ValueError, match="does not support standalone upscaling"):
+        _ = validate_omni_request(OMNI_PREVIEW_MODEL, task="upscale")
 
 
 # ============================================================================
@@ -276,6 +285,7 @@ class _FakeFiles:
 
 async def _prepare(data: bytes, model: str, files: Any) -> dict[str, Any]:
     client = MagicMock()
+    client._api_client.vertexai = False
     client.files = files
     warnings: list[str] = []
 
@@ -300,7 +310,7 @@ async def _prepare(data: bytes, model: str, files: Any) -> dict[str, Any]:
 @pytest.mark.timeout(5.0)
 async def test_a_small_video_still_rides_inline() -> None:
     files = _FakeFiles([])
-    part = await _prepare(_MP4_HEADER + b"tiny", OMNI_1_1_MODEL, files)
+    part = await _prepare(_MP4_HEADER + b"tiny", OMNI_1_2_MODEL, files)
     assert part["type"] == "video"
     assert files.uploaded is None
     assert part["_warnings"] == []
@@ -308,18 +318,20 @@ async def test_a_small_video_still_rides_inline() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_a_large_video_is_uploaded_and_referenced_as_a_document() -> None:
+async def test_a_large_video_is_uploaded_and_referenced_by_uri() -> None:
     """Base64 inflates by a third, so a big clip cannot ride in the body.
 
-    The reference's own answer is the Files API and a `document` part; without
-    it the request is simply too large and the extension feature is unusable
-    on real footage.
+    The reference's own answer is the Files API, referenced by URI as a
+    `video` part; without it the request is simply too large and the
+    extension feature is unusable on real footage. The upload is polled out
+    of PROCESSING before it is referenced.
     """
     big = _MP4_HEADER + b"x" * (9 * 1024 * 1024)
     files = _FakeFiles(["PROCESSING", "ACTIVE"])
-    part = await _prepare(big, OMNI_1_1_MODEL, files)
-    assert part["type"] == "document"
+    part = await _prepare(big, OMNI_1_2_MODEL, files)
+    assert part["type"] == "video"
     assert part["uri"] == "files/abc"
+    assert part["mime_type"] == "video/mp4"
     assert files.uploaded == big
     assert files.mime_type == "video/mp4"
 
@@ -327,17 +339,21 @@ async def test_a_large_video_is_uploaded_and_referenced_as_a_document() -> None:
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
 async def test_the_preview_model_warns_instead_of_uploading() -> None:
-    """It documents no `document` part, so sending one would be a guess.
+    """It documents no Files API input, so sending one would be a guess.
 
     The call is left exactly as it was and the caller is told why it may be
     refused — and which model does handle it.
     """
+    from src.omni import DEFAULT_OMNI_MODEL
+
     big = _MP4_HEADER + b"x" * (9 * 1024 * 1024)
     files = _FakeFiles([])
     part = await _prepare(big, OMNI_PREVIEW_MODEL, files)
     assert part["type"] == "video"
     assert files.uploaded is None
-    assert OMNI_1_1_MODEL in part["_warnings"][0]
+    # The default, never the retired 1.1.
+    assert DEFAULT_OMNI_MODEL in part["_warnings"][0]
+    assert OMNI_1_1_MODEL not in part["_warnings"][0]
 
 
 @pytest.mark.asyncio
@@ -346,7 +362,7 @@ async def test_a_failed_upload_is_not_silently_referenced() -> None:
     files = _FakeFiles(["PROCESSING", "FAILED"])
     with pytest.raises(ValueError, match="FAILED"):
         _ = await _prepare(
-            _MP4_HEADER + b"x" * (9 * 1024 * 1024), OMNI_1_1_MODEL, files
+            _MP4_HEADER + b"x" * (9 * 1024 * 1024), OMNI_1_2_MODEL, files
         )
 
 
@@ -355,50 +371,8 @@ async def test_a_failed_upload_is_not_silently_referenced() -> None:
 # ============================================================================
 
 
-def test_360p_is_quoted_at_a_third_of_720p() -> None:
-    """The launch post's figure, and the only statement about the draft tier."""
-    from src.pricing import estimate_video_cost
-
-    draft = estimate_video_cost(OMNI_1_1_MODEL, 6, "360p")
-    standard = estimate_video_cost(OMNI_1_1_MODEL, 6, "720p")
-    assert draft is not None and standard is not None
-    assert draft.usd == pytest.approx(standard.usd / 3.0)
-
-
-def test_the_360p_quote_says_where_its_ratio_came_from() -> None:
-    """It is not on the pricing page, so the estimate has to admit that.
-
-    Every other rate in the module is read off a pricing table; presenting a
-    figure derived from a blog post the same way would launder it.
-    """
-    from src.pricing import estimate_video_cost
-
-    draft = estimate_video_cost(OMNI_1_1_MODEL, 6, "360p")
-    assert draft is not None
-    note = draft.source_note or ""
-    assert "launch post" in note
-    assert "not from the pricing page" in note
-
-
-def test_upscaled_tiers_bill_at_the_published_720p_rate_and_say_so() -> None:
-    """Google publishes one omni token rate and pins it to 720p.
-
-    Inventing a multiplier for the upscaled tiers would be fabrication, so
-    the published rate is applied and its limits are stated on the figure.
-    """
-    from src.pricing import estimate_video_cost
-
-    base = estimate_video_cost(OMNI_1_1_MODEL, 6, "720p")
-    assert base is not None
-    for resolution in ("1080p", "4K"):
-        quote = estimate_video_cost(OMNI_1_1_MODEL, 6, resolution)
-        assert quote is not None
-        assert quote.usd == pytest.approx(base.usd)
-        assert "upscaled" in (quote.source_note or "")
-
-
 def test_the_preview_model_still_reprices_a_resolution_it_cannot_render() -> None:
-    """1.1 gaining real resolutions must not change what the preview quotes."""
+    """1.2 having real resolutions must not change what the preview quotes."""
     from src.pricing import estimate_video_cost
 
     quote = estimate_video_cost(OMNI_PREVIEW_MODEL, 6, "1080p")
@@ -418,10 +392,10 @@ def test_the_preview_model_has_no_360p_price_to_hand_out() -> None:
 
 
 def test_the_new_model_carries_the_omni_encoder_allowance() -> None:
-    """Omni renders land a frame over nominal; 1.1 must not skip the allowance."""
+    """Omni renders land a frame over nominal; 1.2 must not skip the allowance."""
     from src.pricing import OMNI_ENCODER_ALLOWANCE_SECONDS, quote_duration_for
 
-    assert quote_duration_for(OMNI_1_1_MODEL, 6.0) == pytest.approx(
+    assert quote_duration_for(OMNI_1_2_MODEL, 6.0) == pytest.approx(
         6.0 + OMNI_ENCODER_ALLOWANCE_SECONDS
     )
 
@@ -462,26 +436,27 @@ async def test_a_360p_dry_run_quotes_the_draft_tier(tmp_path: Path) -> None:
         await generate_video_omni(
             ctx=_ctx(tmp_path),
             prompt="a robot",
-            omni_model=OMNI_1_1_MODEL,
+            omni_model=OMNI_1_2_MODEL,
             resolution="360p",
             duration_seconds=6,
             dry_run=True,
         )
     )
-    assert payload["model"] == OMNI_1_1_MODEL
+    assert payload["model"] == OMNI_1_2_MODEL
     assert payload["resolution"] == "360p"
     at_720 = json.loads(
         await generate_video_omni(
             ctx=_ctx(tmp_path),
             prompt="a robot",
-            omni_model=OMNI_1_1_MODEL,
+            omni_model=OMNI_1_2_MODEL,
             duration_seconds=6,
             dry_run=True,
         )
     )
+    # 1.2 publishes its 360p rate: 1,931 tokens/s against 5,792 at 720p.
     # The payload rounds to cents-of-a-cent, so compare at that precision.
     assert payload["estimated_cost"]["usd"] == pytest.approx(
-        at_720["estimated_cost"]["usd"] / 3.0, abs=1e-6
+        at_720["estimated_cost"]["usd"] * 1931 / 5792, abs=1e-5
     )
 
 
@@ -528,12 +503,18 @@ async def test_extend_needs_exactly_one_source(tmp_path: Path) -> None:
     from src.__main__ import extend_video_omni
 
     neither = json.loads(
-        await extend_video_omni(ctx=_ctx(tmp_path), prompt="Continue.", dry_run=True)
+        await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
+            ctx=_ctx(tmp_path),
+            prompt="Continue.",
+            dry_run=True,
+        )
     )
     assert "exactly one source" in neither["error"]
 
     both = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-1",
@@ -560,8 +541,19 @@ async def test_extend_quotes_each_turn_at_the_assembled_clip(
     from src.__main__ import extend_video_omni
     from src.pricing import estimate_video_cost
 
+    (tmp_path / "videos").mkdir(exist_ok=True)
+    (tmp_path / "videos" / "prior.json").write_text(
+        json.dumps(
+            {
+                "interaction_id": "i-1",
+                "duration_seconds": 5.0,
+                "duration_source": "measured from the rendered video",
+            }
+        )
+    )
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue the scene.",
             previous_interaction_id="i-1",
@@ -570,12 +562,12 @@ async def test_extend_quotes_each_turn_at_the_assembled_clip(
         )
     )
     assert payload["times"] == 3
-    # Source unknown here, so the documented 10s maximum is assumed: the turns
-    # render 20s, 30s and 40s of assembled clip.
-    assert payload["turn_output_seconds"] == [20.0, 30.0, 40.0]
-    assert payload["billed_seconds"] == 90.0
-    assert payload["assembled_seconds"] == 40.0
-    assert payload["cumulative_cap_seconds"] == 40
+    # A recorded 5s source: the turns render 15s, 25s and then the 30s
+    # ceiling of assembled clip.
+    assert payload["turn_output_seconds"] == [15.0, 25.0, 30.0]
+    assert payload["billed_seconds"] == 70.0
+    assert payload["assembled_seconds"] == 30.0
+    assert payload["cumulative_cap_seconds"] == 30
 
     # Priced at the published 720p rate, per turn, each carrying the one-frame
     # encoder allowance every omni quote carries. Note estimate_video_cost
@@ -584,15 +576,16 @@ async def test_extend_quotes_each_turn_at_the_assembled_clip(
     # legitimately exceeds.
     from src.pricing import OMNI_ENCODER_ALLOWANCE_SECONDS
 
-    probe = estimate_video_cost(OMNI_1_1_MODEL, 6, "720p")
+    probe = estimate_video_cost(OMNI_1_2_MODEL, 6, "720p")
     assert probe is not None
     rate = probe.breakdown["usd_per_second"]
     assert payload["estimated_cost"]["usd"] == pytest.approx(
-        sum((n + OMNI_ENCODER_ALLOWANCE_SECONDS) * rate for n in (20, 30, 40)),
-        abs=1e-6,
+        sum((n + OMNI_ENCODER_ALLOWANCE_SECONDS) * rate for n in (15, 25, 30)),
+        abs=1e-5,
     )
-    # The increment-only quote this replaced would have been ~3x under.
-    assert payload["estimated_cost"]["usd"] > 3 * 10 * rate * 2.5
+    # The increment-only quote this replaced (10 + 10 + 5 = 25s) would have
+    # been well under.
+    assert payload["estimated_cost"]["usd"] > 2.5 * 25 * rate
 
 
 @pytest.mark.asyncio
@@ -600,10 +593,12 @@ async def test_extend_quotes_each_turn_at_the_assembled_clip(
 async def test_a_measured_source_bounds_how_many_turns_fit(
     tmp_path: Path,
 ) -> None:
-    """The 40s ceiling counts the source, so a long source leaves fewer turns.
+    """The cumulative ceiling counts the source, so a long source leaves fewer
+    turns.
 
-    Extending a 35s clip has room for one 5s turn, not four 10s ones — and
-    quoting four would bill for footage the service will not produce.
+    On the Gemini API, extending a 25s clip has room for one 5s turn, not
+    three 10s ones — and quoting three would bill for footage the service
+    will not produce.
     """
     from src.__main__ import extend_video_omni
 
@@ -614,7 +609,7 @@ async def test_a_measured_source_bounds_how_many_turns_fit(
             {
                 "kind": "omni_video",
                 "interaction_id": "i-long",
-                "duration_seconds": 35.0,
+                "duration_seconds": 25.0,
                 "duration_source": "measured from the rendered video",
             }
         )
@@ -622,38 +617,41 @@ async def test_a_measured_source_bounds_how_many_turns_fit(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue the scene.",
             previous_interaction_id="i-long",
-            times=4,
+            times=3,
             dry_run=True,
         )
     )
-    assert payload["source_duration_seconds"] == 35.0
-    # 35s + 10s clamps at the 40s ceiling; the other three turns have no room.
-    assert payload["turn_output_seconds"] == [40.0]
+    assert payload["source_duration_seconds"] == 25.0
+    # 25s + 10s clamps at the 30s ceiling; the other two turns have no room.
+    assert payload["turn_output_seconds"] == [30.0]
     assert payload["planned_turns"] == 1
-    assert payload["assembled_seconds"] == 40.0
+    assert payload["assembled_seconds"] == 30.0
     assert payload["appended_seconds"] == 5.0
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_extend_refuses_more_turns_than_the_40s_ceiling_allows(
+async def test_extend_refuses_more_turns_than_the_ceiling_allows(
     tmp_path: Path,
 ) -> None:
     from src.__main__ import extend_video_omni
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-1",
-            times=5,
+            times=4,
             dry_run=True,
         )
     )
-    assert "at most 4 turns" in payload["error"]
+    # 30s on the Gemini API in 10s turns.
+    assert "at most 3 turns" in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -700,7 +698,7 @@ async def test_extend_chains_each_turn_into_the_next(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": f"i-{len(calls)}",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": None,
             "aspect_ratio": None,
@@ -712,6 +710,7 @@ async def test_extend_chains_each_turn_into_the_next(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue the scene.",
             input_video_uri=f"file://{source}",
@@ -732,8 +731,8 @@ async def test_extend_chains_each_turn_into_the_next(
     # every turn after the first was recorded as an edit of a chain the caller
     # had asked to extend.
     assert all(call["task"] == "extend" for call in calls)
-    # No turn carries a duration: the service rejects it on an extend request
-    # and the increment is fixed, so there is nothing to send.
+    # No turn carries a duration the caller did not ask for: unset, each turn
+    # appends the documented 10s default.
     assert all(call["duration_seconds"] is None for call in calls)
     assert payload["interaction_id"] == "i-2"
     assert len(payload["segments"]) == 2
@@ -741,47 +740,7 @@ async def test_extend_chains_each_turn_into_the_next(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_an_over_long_uploaded_source_is_refused_before_it_is_uploaded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """10s is a documented hard limit on an UPLOADED extension source.
-
-    It is a property of the bytes in hand, so it is measured here rather than
-    discovered from a 400 after the transfer — and the message points at the
-    multi-turn path, which has no such limit.
-    """
-    import numpy as np
-    import imageio.v3 as iio
-
-    from src.__main__ import extend_video_omni
-
-    frames = [
-        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 12)
-    ]
-    buf = BytesIO()
-    iio.imwrite(buf, frames, extension=".mp4", fps=24)
-    source = tmp_path / "long.mp4"
-    source.write_bytes(buf.getvalue())
-
-    async def should_not_run(**kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("nothing may be sent for an over-long source")
-
-    monkeypatch.setattr("src.__main__.generate_video_omni_impl", should_not_run)
-
-    payload = json.loads(
-        await extend_video_omni(
-            ctx=_ctx(tmp_path),
-            prompt="Continue.",
-            input_video_uri=f"file://{source}",
-        )
-    )
-    assert "10s or shorter" in payload["error"]
-    assert "previous_interaction_id" in payload["error"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(20.0)
-async def test_a_chain_that_would_pass_the_40s_ceiling_says_so(
+async def test_a_chain_that_would_pass_the_ceiling_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Warned, not refused: each turn's real contribution is the service's.
@@ -810,7 +769,7 @@ async def test_a_chain_that_would_pass_the_40s_ceiling_says_so(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": None,
             "aspect_ratio": None,
@@ -822,14 +781,16 @@ async def test_a_chain_that_would_pass_the_40s_ceiling_says_so(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             input_video_uri=f"file://{source}",
-            times=4,
+            times=3,
         )
     )
     assert "error" not in payload
-    assert any("40s" in warning for warning in payload["warnings"])
+    # 9s + 3 x 10s = 39s, past the Gemini API's 30s ceiling.
+    assert any("30s" in warning for warning in payload["warnings"])
 
 
 @pytest.mark.asyncio
@@ -840,17 +801,15 @@ async def test_a_clamped_chain_renders_exactly_the_turns_it_quoted(
     """The render may not run a turn the quote did not price.
 
     omni_extension_output_lengths stops emitting once the assembled clip
-    reaches the 40s ceiling, but the render loop was `range(1, times + 1)`
-    with no clamp. A 25s source with times=4 was quoted for 2 turns ($7.61)
-    and billed for 4 ($15.73) -- and because max_cost_usd was projected off
-    the clamped list, a $10 cap passed and then billed ~$14. Under-quoting is
-    the one direction this module forbids, on the one tool the cap exists for.
+    reaches the ceiling, but the render loop was `range(1, times + 1)` with
+    no clamp. A 25s source with times=4 was quoted for 2 turns ($7.61) and
+    billed for 4 ($15.73) -- and because max_cost_usd was projected off the
+    clamped list, a $10 cap passed and then billed ~$14. Under-quoting is the
+    one direction this module forbids, on the one tool the cap exists for.
 
-    Extends a prior interaction rather than an upload, because two other
-    guards fire first on that route: an UPLOADED source over 10s is refused
-    outright on the Gemini Developer API, and `times` is statically capped at
-    40/10 = 4 turns. A recorded 25s interaction is under neither, and reaches
-    the ceiling in two turns (25 -> 35 -> 40), so turns 3 and 4 append nothing.
+    `times` is statically capped at 30/10 = 3 turns on the Gemini API. A
+    recorded 25s interaction reaches the 30s ceiling in one turn
+    (25 -> 30), so turns 2 and 3 append nothing.
 
     Counts impl calls rather than reading the payload: the payload agreeing
     with itself is what the bug already did.
@@ -865,7 +824,7 @@ async def test_a_clamped_chain_renders_exactly_the_turns_it_quoted(
             {
                 "interaction_id": "i-prior",
                 "duration_seconds": 25.0,
-                "model": OMNI_1_1_MODEL,
+                "model": OMNI_1_2_MODEL,
                 "backend": "gemini_api",
             }
         )
@@ -882,7 +841,7 @@ async def test_a_clamped_chain_renders_exactly_the_turns_it_quoted(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": f"i-{calls}",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": None,
             "aspect_ratio": None,
@@ -894,22 +853,23 @@ async def test_a_clamped_chain_renders_exactly_the_turns_it_quoted(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-prior",
-            times=4,
+            times=3,
         )
     )
     assert "error" not in payload, payload
-    # The ceiling allowed two turns, so exactly two turns billed.
-    assert calls == 2, f"quoted 2 turns, rendered {calls}"
-    assert payload["planned_turns"] == 2
-    assert payload["completed_turns"] == 2
+    # The ceiling allowed one turn, so exactly one turn billed.
+    assert calls == 1, f"quoted 1 turn, rendered {calls}"
+    assert payload["planned_turns"] == 1
+    assert payload["completed_turns"] == 1
     # `times` still reports what was asked for, and a warning reconciles it.
-    assert payload["times"] == 4
-    assert any(
-        "only 2 of the 4 requested turn(s)" in w for w in payload["warnings"]
-    ), payload["warnings"]
+    assert payload["times"] == 3
+    assert any("only 1 of the 3 requested turn(s)" in w for w in payload["warnings"]), (
+        payload["warnings"]
+    )
 
 
 @pytest.mark.asyncio
@@ -923,14 +883,15 @@ async def test_a_clamped_chain_is_not_billed_past_a_cost_cap(
     turns bill, so a cap set to the quote passed and was then exceeded.
     """
     from src.__main__ import _omni_cumulative_cap_warning
-    from src.omni import DEFAULT_OMNI_MODEL, omni_extension_output_lengths, omni_spec
+    from src.omni import omni_extension_output_lengths, omni_spec
 
-    spec = omni_spec(DEFAULT_OMNI_MODEL)
+    spec = omni_spec(OMNI_1_2_MODEL)
+    # The Gemini API's 30s ceiling.
     for source_seconds, times, expected in [
-        (10.0, 4, 3),
-        (25.0, 4, 2),
-        (35.0, 3, 1),
-        (3.0, 3, 3),
+        (5.0, 3, 3),
+        (15.0, 3, 2),
+        (25.0, 3, 1),
+        (3.0, 2, 2),
     ]:
         lengths = omni_extension_output_lengths(spec, source_seconds, times)
         assert len(lengths) == expected, (source_seconds, times, lengths)
@@ -947,7 +908,7 @@ async def test_a_clamped_chain_is_not_billed_past_a_cost_cap(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_edit_video_can_choose_a_resolution_on_1_1(tmp_path: Path) -> None:
+async def test_edit_video_can_choose_a_resolution_on_1_2(tmp_path: Path) -> None:
     from src.__main__ import edit_video
 
     payload = json.loads(
@@ -955,14 +916,14 @@ async def test_edit_video_can_choose_a_resolution_on_1_1(tmp_path: Path) -> None
             ctx=_ctx(tmp_path),
             previous_interaction_id="i-1",
             prompt="make it anime",
-            omni_model=OMNI_1_1_MODEL,
+            omni_model=OMNI_1_2_MODEL,
             resolution="1080p",
             dry_run=True,
         )
     )
-    assert payload["model"] == OMNI_1_1_MODEL
+    assert payload["model"] == OMNI_1_2_MODEL
     assert payload["resolution"] == "1080p"
-    assert payload["duration_seconds"] == 10.0
+    assert payload["duration_seconds"] == 15.0
 
 
 @pytest.mark.asyncio
@@ -973,7 +934,7 @@ async def test_a_real_run_bills_the_resolution_that_rendered(
     """The metered cost follows the RENDER, not the request.
 
     The preview model renders 720p whatever it is asked for, so billing from
-    the request would charge a 4K price for a 720p file. 1.1 reports back what
+    the request would charge a 4K price for a 720p file. 1.2 reports back what
     it rendered, and that is what the cost, the response and the sidecar all
     have to agree on.
     """
@@ -1000,7 +961,7 @@ async def test_a_real_run_bills_the_resolution_that_rendered(
             "message": "ok",
             "video_url": f"file://{rendered}",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "text_to_video",
             "duration_seconds": 6,
             "aspect_ratio": "16:9",
@@ -1014,23 +975,23 @@ async def test_a_real_run_bills_the_resolution_that_rendered(
         await generate_video_omni(
             ctx=_ctx(tmp_path),
             prompt="a robot",
-            omni_model=OMNI_1_1_MODEL,
+            omni_model=OMNI_1_2_MODEL,
             resolution="360p",
         )
     )
 
-    assert captured["model"] == OMNI_1_1_MODEL
+    assert captured["model"] == OMNI_1_2_MODEL
     assert captured["resolution"] == "360p"
     # Measured from the file that rendered, priced at the tier that rendered.
     metered = actual_video_cost(
-        OMNI_1_1_MODEL, payload["duration_seconds"], "360p", False
+        OMNI_1_2_MODEL, payload["duration_seconds"], "360p", False
     )
     assert metered is not None
     assert payload["cost"]["usd"] == pytest.approx(metered.usd, abs=1e-6)
     assert payload["cost"]["is_estimate"] is False
     # And a 720p bill would be three times that, so the two are not confusable.
     at_720 = actual_video_cost(
-        OMNI_1_1_MODEL, payload["duration_seconds"], "720p", False
+        OMNI_1_2_MODEL, payload["duration_seconds"], "720p", False
     )
     assert at_720 is not None
     assert payload["cost"]["usd"] < at_720.usd / 2
@@ -1038,14 +999,26 @@ async def test_a_real_run_bills_the_resolution_that_rendered(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_too_many_input_images_is_refused(tmp_path: Path) -> None:
+async def test_too_many_input_images_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server-wide cap guards memory for a model with no lower limit.
+
+    1.2's own limit of 6 references sits under it, so the cap is reached
+    here through a record that documents none, as 1.1's did.
+    """
+    from dataclasses import replace
+
+    import src.omni as omni
     from src.__main__ import MAX_OMNI_INPUT_IMAGES, generate_video_omni
 
+    unlimited = replace(omni.OMNI_SPECS[OMNI_1_2_MODEL], max_reference_images=99)
+    monkeypatch.setitem(omni.OMNI_SPECS, OMNI_1_2_MODEL, unlimited)
     payload = json.loads(
         await generate_video_omni(
             ctx=_ctx(tmp_path),
             prompt="x",
-            omni_model=OMNI_1_1_MODEL,
+            omni_model=OMNI_1_2_MODEL,
             reference_image_uris=["gs://b/i.png"] * (MAX_OMNI_INPUT_IMAGES + 1),
             dry_run=True,
         )
@@ -1079,7 +1052,7 @@ async def test_a_resolution_is_refused_when_the_sdk_would_drop_it(
             client=MagicMock(),
             prompt="a robot",
             videos_dir=tmp_path,
-            model=OMNI_1_1_MODEL,
+            model=OMNI_1_2_MODEL,
             resolution="4K",
         )
 
@@ -1106,7 +1079,7 @@ async def test_a_request_without_a_resolution_is_unaffected_by_the_sdk_floor(
         client=client,
         prompt="a robot",
         videos_dir=tmp_path,
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
     )
     assert result["rendered_resolution"] == "720p"
 
@@ -1296,7 +1269,7 @@ async def test_a_mid_chain_failure_keeps_the_turns_already_billed(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": 20.0,
             "aspect_ratio": None,
@@ -1308,6 +1281,7 @@ async def test_a_mid_chain_failure_keeps_the_turns_already_billed(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-0",
@@ -1343,7 +1317,7 @@ async def test_the_chain_separates_billed_assembled_and_appended(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": "i-x",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": next(lengths),
             "aspect_ratio": None,
@@ -1355,6 +1329,7 @@ async def test_the_chain_separates_billed_assembled_and_appended(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-0",
@@ -1369,10 +1344,10 @@ async def test_the_chain_separates_billed_assembled_and_appended(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_generate_video_omni_also_enforces_the_10s_source_cap(
+async def test_generate_video_omni_also_enforces_the_source_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ "Editing AND extension" is one documented limit, checked on both paths.
+    """The edit-source limit is checked on the edit path, before the transfer.
 
     Enforced only on extend_video_omni, a 30s clip handed to the edit path was
     fetched whole and uploaded through the Files API before the service
@@ -1384,7 +1359,7 @@ async def test_generate_video_omni_also_enforces_the_10s_source_cap(
     from src.__main__ import generate_video_omni
 
     frames = [
-        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 12)
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 16)
     ]
     buf = BytesIO()
     iio.imwrite(buf, frames, extension=".mp4", fps=24)
@@ -1400,11 +1375,11 @@ async def test_generate_video_omni_also_enforces_the_10s_source_cap(
         await generate_video_omni(
             ctx=_ctx(tmp_path),
             prompt="make the mirror ripple",
-            omni_model=OMNI_1_1_MODEL,
+            omni_model=OMNI_1_2_MODEL,
             input_video_uri=f"file://{source}",
         )
     )
-    assert "10s or shorter" in payload["error"]
+    assert "15s or shorter" in payload["error"]
 
 
 def test_the_reference_clip_probe_runs_off_the_event_loop() -> None:
@@ -1430,11 +1405,13 @@ def test_the_published_token_rate_reconciles_with_every_resolution_price() -> No
     """
     from src.pricing import describe_model_pricing
 
-    record = describe_model_pricing(OMNI_1_1_MODEL)
+    record = describe_model_pricing(OMNI_1_2_MODEL)
     assert record is not None
     per_resolution = record["tokens_per_second_by_resolution"]
     assert per_resolution["720p"] == record["tokens_per_second"]
-    assert per_resolution["360p"] == pytest.approx(record["tokens_per_second"] / 3)
+    # 1.2's published per-resolution token rates.
+    assert per_resolution["360p"] == pytest.approx(1931)
+    assert per_resolution["4K"] == pytest.approx(17376)
     for resolution, tokens in per_resolution.items():
         assert tokens * record["output_video_usd_per_mtok"] / 1e6 == pytest.approx(
             record["usd_per_second"][resolution]
@@ -1551,13 +1528,13 @@ def test_the_uri_delivery_rule_matches_the_documented_threshold() -> None:
     """ ">720p", plus an extension, which renders the whole growing clip."""
     from src.omni import wants_uri_delivery
 
-    one_one = omni_spec(OMNI_1_1_MODEL)
-    assert wants_uri_delivery(one_one, "4K", "text_to_video")
-    assert wants_uri_delivery(one_one, "1080p", "text_to_video")
-    assert wants_uri_delivery(one_one, None, "extend")
-    assert not wants_uri_delivery(one_one, "720p", "text_to_video")
-    assert not wants_uri_delivery(one_one, "360p", "text_to_video")
-    assert not wants_uri_delivery(one_one, None, "edit")
+    one_two = omni_spec(OMNI_1_2_MODEL)
+    assert wants_uri_delivery(one_two, "4K", "text_to_video")
+    assert wants_uri_delivery(one_two, "1080p", "text_to_video")
+    assert wants_uri_delivery(one_two, None, "extend")
+    assert not wants_uri_delivery(one_two, "720p", "text_to_video")
+    assert not wants_uri_delivery(one_two, "360p", "text_to_video")
+    assert not wants_uri_delivery(one_two, None, "edit")
     # The preview model cannot render anything that large.
     assert not wants_uri_delivery(omni_spec(OMNI_PREVIEW_MODEL), None, "edit")
 
@@ -1612,6 +1589,7 @@ async def test_the_source_cap_does_not_fire_on_a_model_with_no_such_limit(
 
     payload = json.loads(
         await generate_video_omni(
+            omni_model=OMNI_PREVIEW_MODEL,
             ctx=_ctx(tmp_path),
             prompt="make the sky stormy",
             input_video_uri=f"file://{source}",
@@ -1622,27 +1600,28 @@ async def test_the_source_cap_does_not_fire_on_a_model_with_no_such_limit(
 
 
 def test_an_unmeasurable_extension_is_bounded_by_what_it_can_render() -> None:
-    """Not by the 10s per-render maximum, which under-bills a chain ~3x.
+    """Not by the per-render maximum, which under-bills a chain ~3x.
 
-    An extension returns the whole growing clip: turn four renders 40s. An
-    edit is the other way round — the one measurement in hand put a 3s
-    source's edit at the per-render maximum — and a source longer than that is
-    only reachable by extending here, which writes a sidecar. So an
-    unrecorded edit source is a short one.
+    An extension returns the whole growing clip, up to the cumulative
+    ceiling. An edit is the other way round — the one measurement in hand put
+    a 3s source's edit at the per-render maximum — and no edit source is
+    longer than the model's edit-source cap, recorded or not.
     """
     from src.omni import omni_continuation_upper_bound
 
-    one_one = omni_spec(OMNI_1_1_MODEL)
+    one_two = omni_spec(OMNI_1_2_MODEL)
     preview = omni_spec(OMNI_PREVIEW_MODEL)
 
     # A turn renders the assembled clip, so the bound is source + one
-    # increment, and the documented ceiling when the source is unknown.
-    assert omni_continuation_upper_bound(one_one, "extend", 10.0) == 20.0
-    assert omni_continuation_upper_bound(one_one, "extend", 35.0) == 40.0
-    assert omni_continuation_upper_bound(one_one, "extend", None) == 40.0
-    assert omni_continuation_upper_bound(one_one, "edit", 3.0) == 10.0
-    assert omni_continuation_upper_bound(one_one, "edit", 30.0) == 30.0
-    assert omni_continuation_upper_bound(one_one, "edit", None) == 10.0
+    # increment, and the documented ceiling (30s on the Gemini API) when the
+    # source is unknown.
+    assert omni_continuation_upper_bound(one_two, "extend", 10.0) == 20.0
+    assert omni_continuation_upper_bound(one_two, "extend", 25.0) == 30.0
+    assert omni_continuation_upper_bound(one_two, "extend", None) == 30.0
+    # An edit renders up to 1.2's 15s maximum, which is also its edit cap.
+    assert omni_continuation_upper_bound(one_two, "edit", 3.0) == 15.0
+    assert omni_continuation_upper_bound(one_two, "edit", 30.0) == 15.0
+    assert omni_continuation_upper_bound(one_two, "edit", None) == 15.0
     # The preview model cannot extend, so nothing it renders exceeds 10s.
     assert omni_continuation_upper_bound(preview, "extend", 10.0) == 10.0
     assert omni_continuation_upper_bound(preview, "edit", None) == 10.0
@@ -1662,7 +1641,7 @@ async def test_an_unmeasurable_extension_bills_the_assembled_ceiling(
             # gs:// cannot be opened to measure, which is the whole point.
             "video_url": "gs://bucket/out/clip.mp4",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": None,
             "aspect_ratio": None,
@@ -1674,6 +1653,7 @@ async def test_an_unmeasurable_extension_bills_the_assembled_ceiling(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-0",
@@ -1681,7 +1661,9 @@ async def test_an_unmeasurable_extension_bills_the_assembled_ceiling(
         )
     )
     segment = payload["segments"][0]
-    assert segment["duration_seconds"] == 40.0
+    # The Gemini API's 30s assembled ceiling, not one 10s increment.
+    assert segment["duration_seconds"] is None
+    assert segment["duration_upper_bound_seconds"] == 30.0
     assert "upper bound" in segment["duration_source"]
 
 
@@ -1707,7 +1689,7 @@ async def test_a_chain_pins_its_backend_from_the_result_not_the_sidecar(
             "message": "ok",
             "video_url": f"file://{rendered}",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "text_to_video",
             "duration_seconds": 6,
             "aspect_ratio": "16:9",
@@ -1722,7 +1704,7 @@ async def test_a_chain_pins_its_backend_from_the_result_not_the_sidecar(
         ctx.request_context.lifespan_context,
         ctx,
         prompt="a robot",
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
     )
     assert result["backend"] == "gemini_api"
 
@@ -1755,6 +1737,7 @@ async def test_extending_another_models_interaction_is_refused(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-preview",
@@ -1773,6 +1756,7 @@ async def test_the_extend_path_caps_its_reference_images(tmp_path: Path) -> None
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-1",
@@ -1791,9 +1775,11 @@ async def test_a_large_render_on_vertex_is_disclosed_even_though_it_cannot_help(
     """Vertex has no bare delivery='uri', so silence was the only outcome.
 
     A 4K request with no output_gcs_uri went out inline, in violation of the
-    reference's own >4MB rule, with nothing said about it.
+    reference's own >4MB rule, with nothing said about it. The tool says so
+    now, from omni_inline_delivery_policy in its pre-flight (its dry run says
+    it too; see tests/test_omni_1_2_tools.py).
     """
-    from src.__main__ import _omni_generate_and_manifest
+    from src.__main__ import generate_video_omni
 
     rendered = tmp_path / "videos" / "out.mp4"
     rendered.parent.mkdir(exist_ok=True)
@@ -1805,7 +1791,7 @@ async def test_a_large_render_on_vertex_is_disclosed_even_though_it_cannot_help(
             "message": "ok",
             "video_url": f"file://{rendered}",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "text_to_video",
             "duration_seconds": 6,
             "aspect_ratio": "16:9",
@@ -1826,10 +1812,12 @@ async def test_a_large_render_on_vertex_is_disclosed_even_though_it_cannot_help(
         "src.__main__._get_omni_vertex_global_client", lambda: app_ctx.client
     )
 
-    result = await _omni_generate_and_manifest(
-        app_ctx, ctx, prompt="a drone shot", model=OMNI_1_1_MODEL, resolution="4K"
+    result = json.loads(await generate_video_omni(ctx, "a drone shot", resolution="4K"))
+    assert result["backend"] == "vertex"
+    assert any(
+        "inline response limit" in w and "output_gcs_uri" in w
+        for w in result["warnings"]
     )
-    assert any("output_gcs_uri" in w for w in result["warnings"])
 
 
 def test_the_download_cap_clears_what_the_new_model_can_emit() -> None:
@@ -1843,7 +1831,7 @@ def test_the_download_cap_clears_what_the_new_model_can_emit() -> None:
     )
 
     assert _delivered_video_cap(omni_spec(OMNI_PREVIEW_MODEL)) == 50 * 1024 * 1024
-    assert _delivered_video_cap(omni_spec(OMNI_1_1_MODEL)) > 200 * 1024 * 1024
+    assert _delivered_video_cap(omni_spec(OMNI_1_2_MODEL)) > 200 * 1024 * 1024
 
 
 # ============================================================================
@@ -1851,123 +1839,50 @@ def test_the_download_cap_clears_what_the_new_model_can_emit() -> None:
 # ============================================================================
 
 
-def test_the_model_is_spelled_differently_on_each_backend() -> None:
-    """Vertex publishes 1.1 as `gemini-omni-1.1-flash-preview`.
+def test_the_uploaded_source_ceiling_is_the_models() -> None:
+    """1.2 documents one 15s edit and upscale source cap, on both backends.
 
-    Confirmed on four Gemini Enterprise Agent Platform model pages
-    (generate-videos-from-text / -from-an-image / -from-references and
-    extend-videos), none of which lists the bare name. Sending the Developer
-    API spelling to Vertex reaches no model at all — the same split
-    src/video.py already carries for Veo.
-    """
-    from src.omni import canonical_omni_model, served_omni_model
-
-    assert (
-        served_omni_model(OMNI_1_1_MODEL, vertexai=True)
-        == "gemini-omni-1.1-flash-preview"
-    )
-    assert served_omni_model(OMNI_1_1_MODEL, vertexai=False) == OMNI_1_1_MODEL
-    # The preview model is spelled the same on both.
-    assert served_omni_model(OMNI_PREVIEW_MODEL, vertexai=True) == OMNI_PREVIEW_MODEL
-    # And a Vertex ID coming back resolves to the same spec, so it still routes.
-    assert canonical_omni_model("gemini-omni-1.1-flash-preview") == OMNI_1_1_MODEL
-    assert is_omni_model("gemini-omni-1.1-flash-preview")
-    assert omni_spec("gemini-omni-1.1-flash-preview").model == OMNI_1_1_MODEL
-
-
-def test_the_vertex_spelling_prices_as_the_same_model() -> None:
-    """Otherwise a render reported back by Vertex looks unpriced."""
-    from src.pricing import estimate_video_cost, resolve_model_id, unpriced_models
-
-    assert resolve_model_id("gemini-omni-1.1-flash-preview") == OMNI_1_1_MODEL
-    served = estimate_video_cost("gemini-omni-1.1-flash-preview", 6, "360p")
-    canonical = estimate_video_cost(OMNI_1_1_MODEL, 6, "360p")
-    assert served is not None and canonical is not None
-    assert served.usd == pytest.approx(canonical.usd)
-    assert unpriced_models() == ()
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(20.0)
-async def test_the_served_model_goes_on_the_wire_and_is_reported_separately(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The wire gets the backend's spelling; the result keeps the canonical one.
-
-    Swapping the reported ID would break every downstream lookup keyed on it
-    (pricing, sidecars, a follow-up call); not swapping the wire one would
-    reach no model.
-    """
-    import src.omni as omni
-
-    sent: dict[str, Any] = {}
-
-    client = MagicMock()
-    client._api_client.vertexai = True
-
-    def create(**kwargs: Any) -> Any:
-        sent.update(kwargs)
-        return {
-            "id": "i-1",
-            "status": "completed",
-            "steps": [
-                {
-                    "content": [
-                        {"type": "video", "mime_type": "video/mp4", "data": "AAAA"}
-                    ]
-                }
-            ],
-        }
-
-    client.interactions.create = create
-
-    result = await omni.generate_video_omni(
-        client=client, prompt="a robot", videos_dir=tmp_path, model=OMNI_1_1_MODEL
-    )
-    assert sent["model"] == "gemini-omni-1.1-flash-preview"
-    assert result["model"] == OMNI_1_1_MODEL
-    assert result["served_model"] == "gemini-omni-1.1-flash-preview"
-
-
-def test_the_uploaded_source_ceiling_is_the_backends() -> None:
-    """10s on the Developer API "when uploading"; 1-30s on Vertex.
-
-    Reading the stricter figure onto both refused a legitimate 20s Vertex
-    source before anything was even sent.
+    An extension has none: it reads only the final 10s of a source of any
+    length.
     """
     from src.omni import omni_source_limit_seconds
 
-    one_one = omni_spec(OMNI_1_1_MODEL)
-    assert omni_source_limit_seconds(one_one, vertexai=False) == 10.0
-    assert omni_source_limit_seconds(one_one, vertexai=True) == 30.0
-    # The preview model documents no ceiling at all, on either backend.
+    one_two = omni_spec(OMNI_1_2_MODEL)
+    assert omni_source_limit_seconds(one_two) == 15.0
+    assert omni_source_limit_seconds(one_two, task="upscale") == 15.0
+    assert omni_source_limit_seconds(one_two, task="extend") == 0.0
+    # The preview model documents no ceiling at all.
     preview = omni_spec(OMNI_PREVIEW_MODEL)
-    assert omni_source_limit_seconds(preview, vertexai=False) == 0.0
-    assert omni_source_limit_seconds(preview, vertexai=True) == 0.0
+    assert omni_source_limit_seconds(preview) == 0.0
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_a_20s_source_is_accepted_on_vertex_and_refused_on_the_dev_api(
+async def test_a_16s_source_is_refused_for_an_edit_on_both_backends(
     tmp_path: Path,
 ) -> None:
-    """The two backends' limits, reached through the real check."""
+    """The model's limit, reached through the real check: the same on both
+    backends, and not applied to an extension."""
     import imageio.v3 as iio
     import numpy as np
 
     from src.__main__ import _check_omni_source_video
 
     frames = [
-        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 20)
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 16)
     ]
     buf = BytesIO()
     iio.imwrite(buf, frames, extension=".mp4", fps=24)
     clip = buf.getvalue()
-    spec = omni_spec(OMNI_1_1_MODEL)
+    spec = omni_spec(OMNI_1_2_MODEL)
 
-    assert await _check_omni_source_video(spec, clip, vertexai=True) == []
-    with pytest.raises(ValueError, match="10s or shorter"):
-        _ = await _check_omni_source_video(spec, clip, vertexai=False)
+    for vertexai in (True, False):
+        with pytest.raises(ValueError, match="15s or shorter"):
+            _ = await _check_omni_source_video(spec, clip, vertexai=vertexai)
+        assert (
+            await _check_omni_source_video(spec, clip, vertexai=vertexai, task="extend")
+            == []
+        )
 
 
 def test_duration_is_no_longer_warned_about() -> None:
@@ -1976,12 +1891,12 @@ def test_duration_is_no_longer_warned_about() -> None:
     It lists `duration` among VideoResponseFormat's fields ("integers between
     3 and 10, followed by 's'"), and Vertex's extend request sends it.
     """
-    assert omni_spec(OMNI_1_1_MODEL).duration_is_documented
+    assert omni_spec(OMNI_1_2_MODEL).duration_is_documented
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_a_fresh_1_1_render_carries_no_duration_caveat(
+async def test_a_fresh_1_2_render_carries_no_duration_caveat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import src.omni as omni
@@ -2000,7 +1915,7 @@ async def test_a_fresh_1_1_render_carries_no_duration_caveat(
         client=client,
         prompt="a robot",
         videos_dir=tmp_path,
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         duration_seconds=6,
     )
     assert result["duration_seconds"] == 6
@@ -2045,12 +1960,12 @@ async def test_a_draft_resolution_changes_what_the_draft_costs(
             dry_run=True,
         )
     )
-    assert at_720["model"] == OMNI_1_1_MODEL
+    assert at_720["model"] == OMNI_1_2_MODEL
     assert at_720["resolution"] == "720p"
-    assert at_360["model"] == OMNI_1_1_MODEL
+    assert at_360["model"] == OMNI_1_2_MODEL
     assert at_360["resolution"] == "360p"
     assert at_360["estimated_cost"]["usd"] == pytest.approx(
-        at_720["estimated_cost"]["usd"] / 3.0, abs=1e-6
+        at_720["estimated_cost"]["usd"] * 1931 / 5792, abs=1e-6
     )
 
 
@@ -2081,10 +1996,10 @@ async def test_an_animatic_can_preview_the_whole_reel_at_360p(
             dry_run=True,
         )
     )
-    assert at_720["model"] == OMNI_1_1_MODEL
-    assert at_360["model"] == OMNI_1_1_MODEL
+    assert at_720["model"] == OMNI_1_2_MODEL
+    assert at_360["model"] == OMNI_1_2_MODEL
     assert at_360["estimated_cost"]["usd"] == pytest.approx(
-        at_720["estimated_cost"]["usd"] / 3.0, abs=1e-6
+        at_720["estimated_cost"]["usd"] * 1931 / 5792, abs=1e-6
     )
 
 
@@ -2132,7 +2047,7 @@ async def test_the_animatic_resolution_reaches_the_beat_renders(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": f"i-{len(calls)}",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "text_to_video",
             "duration_seconds": 4,
             "aspect_ratio": "9:16",
@@ -2152,7 +2067,7 @@ async def test_the_animatic_resolution_reaches_the_beat_renders(
     )
     assert "error" not in payload, payload.get("error")
     assert calls, "the animatic never rendered"
-    assert calls[0]["model"] == OMNI_1_1_MODEL
+    assert calls[0]["model"] == OMNI_1_2_MODEL
     assert calls[0]["resolution"] == "360p"
     # And the segment records what rendered, so the clip total prices 360p.
     segment = payload["segments"][0]
@@ -2214,7 +2129,7 @@ def test_the_deprecated_model_says_when_it_stops() -> None:
         OMNI_PREVIEW_SUNSET,
     )
 
-    assert DEFAULT_OMNI_MODEL == OMNI_1_1_MODEL, "the default must be the GA model"
+    assert DEFAULT_OMNI_MODEL == OMNI_1_2_MODEL, "the default must be the GA model"
     assert OMNI_PREVIEW_SUNSET == "2026-10-22"
 
 
@@ -2243,10 +2158,15 @@ async def test_pinning_the_deprecated_model_warns_with_its_end_date(
     )
     warnings = result.get("warnings") or []
     assert any("2026-10-22" in w for w in warnings), warnings
-    assert any(OMNI_1_1_MODEL in w for w in warnings), warnings
+    # Points at the default, never the retired 1.1.
+    assert any(f"model='{omni.DEFAULT_OMNI_MODEL}'" in w for w in warnings), warnings
+    assert not any(OMNI_1_1_MODEL in w for w in warnings), warnings
     # And the GA model carries no such warning.
     fresh = await omni.generate_video_omni(
-        client=client, prompt="a robot", videos_dir=tmp_path, model=OMNI_1_1_MODEL
+        client=client,
+        prompt="a robot",
+        videos_dir=tmp_path,
+        model=OMNI_1_2_MODEL,
     )
     assert not any("deprecated" in w for w in fresh.get("warnings") or [])
 
@@ -2263,7 +2183,7 @@ def test_a_chain_grows_from_its_source_and_reproduces_the_measurement() -> None:
         omni_extension_output_lengths,
     )
 
-    spec = omni_spec(OMNI_1_1_MODEL)
+    spec = omni_spec(OMNI_1_2_MODEL)
     assert omni_extension_output_lengths(spec, 3.01, 1) == [13.01]
     two = omni_extension_output_lengths(spec, 3.01, 2)
     assert two == pytest.approx([13.01, 23.01])
@@ -2271,10 +2191,9 @@ def test_a_chain_grows_from_its_source_and_reproduces_the_measurement() -> None:
     assert sum(two) == pytest.approx(36.02)
     assert omni_extension_appended_seconds(3.01, two) == pytest.approx(20.0)
     # The ceiling is on the assembled clip, so a long source leaves one turn.
-    assert omni_extension_output_lengths(spec, 35.0, 4) == [40.0]
-    # A per-turn duration is not a thing the service accepts; passing one
-    # cannot change the projection.
-    assert omni_extension_output_lengths(spec, 10.0, 2, 5.0) == [20.0, 30.0]
+    assert omni_extension_output_lengths(spec, 25.0, 3) == [30.0]
+    # 1.2 documents a per-turn duration, and it is what each turn appends.
+    assert omni_extension_output_lengths(spec, 10.0, 2, 5.0) == [15.0, 20.0]
 
 
 # ============================================================================
@@ -2285,44 +2204,49 @@ def test_a_chain_grows_from_its_source_and_reproduces_the_measurement() -> None:
 def test_the_quote_covers_the_measured_bill_for_the_reported_render() -> None:
     """The exact case that broke the invariant: 3.01s source -> 13.01s output.
 
-    Reported quote $0.3393 against a $0.4396 bill at 360p. The quote priced the
-    10s increment; the service billed the assembled clip.
+    Reported quote $0.3393 against a $0.4396 bill at 360p (on 1.1, which
+    measured it). The quote priced the 10s increment; the service billed the
+    assembled clip.
     """
     from src.pricing import actual_video_cost
     from src.omni import omni_extension_output_lengths
 
-    spec = omni_spec(OMNI_1_1_MODEL)
+    spec = omni_spec(OMNI_1_2_MODEL)
     projected = omni_extension_output_lengths(spec, 3.01, 1)
     assert projected == [13.01]
 
     billed = actual_video_cost(
-        OMNI_1_1_MODEL, 13.01, "360p", False, snap_duration=False
+        OMNI_1_2_MODEL, 13.01, "360p", False, snap_duration=False
     )
     quoted = actual_video_cost(
-        OMNI_1_1_MODEL, 13.01 + (1.0 / 24), "360p", False, snap_duration=False
+        OMNI_1_2_MODEL, 13.01 + (1.0 / 24), "360p", False, snap_duration=False
     )
     assert billed is not None and quoted is not None
     assert quoted.usd >= billed.usd, "a quote may over-state, never under"
-    # And the figure that was wrong is now unreachable from the projection.
-    assert quoted.usd == pytest.approx(0.4410, abs=5e-4)
+    # The assembled clip at 1.2's published 360p rate (1,931 tokens/s at $12/M).
+    assert quoted.usd == pytest.approx(
+        (13.01 + 1.0 / 24) * 1931 * 12 / 1_000_000, abs=5e-4
+    )
 
 
 def test_the_snapping_price_path_no_longer_clamps_an_extension() -> None:
-    """estimate_video_cost clamps omni to [3, 10] — right for a fresh render.
+    """estimate_video_cost clamps omni to its per-render range ([3, 15] on 1.2)
+    — right for a fresh render.
 
     An extension's output legitimately exceeds it, and clamping there reported
     $0.3393 for a render that billed $0.4396: a silent 30% under-quote on the
-    one path that runs past the range.
+    one path that runs past the range. 23.01s is a two-turn chain off a 3s
+    source.
     """
     from src.pricing import actual_video_cost, estimate_video_cost
 
     metered = actual_video_cost(
-        OMNI_1_1_MODEL, 13.01, "360p", False, snap_duration=False
+        OMNI_1_2_MODEL, 23.01, "360p", False, snap_duration=False
     )
     extend_mode = estimate_video_cost(
-        OMNI_1_1_MODEL, 13.01, "360p", False, generation_mode="extend_video"
+        OMNI_1_2_MODEL, 23.01, "360p", False, generation_mode="extend_video"
     )
-    fresh = estimate_video_cost(OMNI_1_1_MODEL, 13.01, "360p", False)
+    fresh = estimate_video_cost(OMNI_1_2_MODEL, 23.01, "360p", False)
     assert metered is not None and extend_mode is not None and fresh is not None
     assert extend_mode.usd >= metered.usd
     # A fresh render still clamps, because the API clamps it too.
@@ -2349,6 +2273,7 @@ async def test_the_extension_dry_run_uses_the_source_it_already_measured(
     )
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-src",
@@ -2414,7 +2339,7 @@ async def test_a_timeout_after_create_carries_the_interaction_id(
             client=client,
             prompt="a robot",
             videos_dir=tmp_path,
-            model=OMNI_1_1_MODEL,
+            model=OMNI_1_2_MODEL,
             timeout_seconds=1,
         )
 
@@ -2543,6 +2468,7 @@ async def test_a_local_extend_source_is_measured_by_the_pre_flight(
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             input_video_uri=f"file://{source}",
@@ -2551,89 +2477,82 @@ async def test_a_local_extend_source_is_measured_by_the_pre_flight(
         )
     )
     assert payload["source_duration_seconds"] == pytest.approx(3.0, abs=0.2)
-    # 3s source + one 10s increment, not the 10s-maximum assumption.
+    # 3s source + one 10s increment, not the ceiling an unmeasured source is
+    # priced at.
     assert payload["turn_output_seconds"][0] == pytest.approx(13.0, abs=0.2)
     assert payload["assembled_seconds"] == pytest.approx(13.0, abs=0.2)
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20.0)
-async def test_the_pre_flight_refuses_an_over_length_local_source(
+async def test_the_pre_flight_extends_a_long_local_source_it_would_not_edit(
     tmp_path: Path,
 ) -> None:
-    """A quote must not price a call the real run refuses."""
+    """A quote must refuse exactly what the real run refuses, and no more."""
     import imageio.v3 as iio
     import numpy as np
 
     from src.__main__ import extend_video_omni
 
     frames = [
-        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 13)
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 16)
     ]
     buf = BytesIO()
     iio.imwrite(buf, frames, extension=".mp4", fps=24)
-    source = tmp_path / "thirteen.mp4"
+    source = tmp_path / "sixteen.mp4"
     source.write_bytes(buf.getvalue())
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             input_video_uri=f"file://{source}",
             dry_run=True,
         )
     )
-    assert "10s or shorter" in payload["error"]
-    assert "estimated_cost" not in payload
-
-
-def test_the_documented_chain_costs_are_the_ones_that_will_be_billed() -> None:
-    """The docstring quotes dollars, so the dollars have to stay true.
-
-    A cost table in prose rots silently; this is what stops it. Figures are
-    for a 3s source, which is the measured case.
-    """
-    from src.omni import omni_extension_output_lengths
-    from src.pricing import actual_video_cost
-
-    spec = omni_spec(OMNI_1_1_MODEL)
-    expected = {
-        ("360p", 1): 0.44,
-        ("360p", 2): 1.22,
-        ("360p", 3): 2.33,
-        ("720p", 1): 1.32,
-        ("720p", 2): 3.65,
-        ("720p", 3): 6.99,
-    }
-    for (resolution, turns), documented in expected.items():
-        billed = sum(omni_extension_output_lengths(spec, 3.0, turns))
-        cost = actual_video_cost(
-            OMNI_1_1_MODEL, billed, resolution, False, snap_duration=False
-        )
-        assert cost is not None
-        assert cost.usd == pytest.approx(documented, abs=0.005), (
-            resolution,
-            turns,
-            cost.usd,
-        )
+    # 1.2 extends from the final 10s of a source of any length, so the 15s
+    # edit cap must not refuse it -- and the quote is built on the
+    # measurement, 16s + one 10s turn.
+    assert "error" not in payload, payload
+    assert payload["source_duration_seconds"] == pytest.approx(16.0, abs=0.2)
+    assert payload["turn_output_seconds"][0] == pytest.approx(26.0, abs=0.2)
 
 
 def test_the_pricing_date_does_not_contradict_its_own_records() -> None:
-    """Anything automated reads PRICING_AS_OF, not the prose beside it.
+    """Anything automated reads a record's date field, not the prose beside it.
 
-    A per-record note claiming a later verification than the field is a
-    contradiction, not a refinement.
+    A record's date is its own ``as_of`` when it was verified on its own, else
+    PRICING_AS_OF. A note claiming a later verification than that field is a
+    contradiction, not a refinement. Prose dates count in either spelling: the
+    1.2 note says "November 6, 2026", which an ISO-only scan never saw, so the
+    check passed without reading the one note that carries its own date.
     """
+    import datetime
     import re
 
     from src.pricing import PRICING_AS_OF, _VIDEO_PRICING
 
+    def dates_in(text: str) -> list[str]:
+        found = re.findall(r"\b20\d\d-\d\d-\d\d\b", text)
+        for written in re.findall(r"\b[A-Z][a-z]+ \d{1,2}, 20\d\d\b", text):
+            try:
+                parsed = datetime.datetime.strptime(written, "%B %d, %Y")
+            except ValueError:
+                continue
+            found.append(parsed.date().isoformat())
+        return found
+
+    read_prose = 0
     for model, record in _VIDEO_PRICING.items():
-        for text in (record.source_note or "", *record.resolution_notes.values()):
-            for found in re.findall(r"\b20\d\d-\d\d-\d\d\b", text):
-                assert found <= PRICING_AS_OF, (
-                    f"{model} cites {found}, after PRICING_AS_OF {PRICING_AS_OF}"
+        field = record.as_of or PRICING_AS_OF
+        for text in (record.source_note or "",):
+            for found in dates_in(text):
+                read_prose += 1
+                assert found <= field, (
+                    f"{model} cites {found}, after its recorded date {field}"
                 )
+    assert read_prose, "no record cites a verification date; the scan read nothing"
 
 
 def test_one_suppression_gets_one_explanation() -> None:
@@ -2783,7 +2702,7 @@ async def test_clip_segments_carry_measured_resolution_provenance(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "text_to_video",
             "duration_seconds": 2,
             "aspect_ratio": "9:16",
@@ -2819,32 +2738,26 @@ async def test_an_uploaded_edit_source_is_measured_at_the_quote(
 ) -> None:
     """generate_video_omni's dry_run passed prior_duration=None for an upload.
 
-    Two consequences, both of them the pre-flight failing at its job:
     `_check_omni_source_video` never ran, so a quote succeeded for a source
-    the real run refuses; and the upper bound was the model's 10s maximum
-    regardless of the source, which on Vertex (30s ceiling) under-quotes an
-    edit of a 25s clip by 2.5x. extend_video_omni's dry_run already measured
-    local sources this way.
-
-    Asserted through the ceiling refusal because it is reachable on the
-    Gemini Developer API, whose limit is 10s; the under-quote itself only
-    shows on Vertex, where a source may legitimately exceed 10s.
+    the real run refuses. extend_video_omni's dry_run already measured local
+    sources this way.
     """
     import imageio.v3 as iio
     import numpy as np
 
     from src.__main__ import generate_video_omni
 
-    # 11s at 24fps: over the Gemini Developer API's 10s upload ceiling.
+    # 16s at 24fps: over 1.2's 15s edit-source cap.
     frames = [
-        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 11)
+        np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(24 * 16)
     ]
     buf = BytesIO()
     iio.imwrite(buf, frames, extension=".mp4", fps=24)
-    source = tmp_path / "eleven.mp4"
+    source = tmp_path / "sixteen.mp4"
     source.write_bytes(buf.getvalue())
 
     out = await generate_video_omni(
+        omni_model="gemini-omni-1.2-flash",
         ctx=_ctx(tmp_path),
         prompt="make it anime",
         input_video_uri=f"file://{source}",
@@ -2852,7 +2765,7 @@ async def test_an_uploaded_edit_source_is_measured_at_the_quote(
     )
     payload = json.loads(out[0].text if isinstance(out, list) else out)
     assert "error" in payload, payload
-    assert "10s or shorter" in payload["error"]
+    assert "15s or shorter" in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -2873,6 +2786,7 @@ async def test_an_in_range_uploaded_edit_source_still_quotes(tmp_path: Path) -> 
     source.write_bytes(buf.getvalue())
 
     out = await generate_video_omni(
+        omni_model="gemini-omni-1.2-flash",
         ctx=_ctx(tmp_path),
         prompt="make it anime",
         input_video_uri=f"file://{source}",
@@ -2884,7 +2798,7 @@ async def test_an_in_range_uploaded_edit_source_still_quotes(tmp_path: Path) -> 
     # An edit's length is the service's choice, so the quote is still the
     # documented upper bound -- measuring the source does not make it a
     # prediction.
-    assert payload["duration_seconds"] == 10.0
+    assert payload["duration_seconds"] == 15.0
     assert "upper bound" in payload["duration_source"]
 
 
@@ -2908,26 +2822,28 @@ async def test_an_unmeasured_source_quotes_every_turn_the_loop_will_run(
 
     The loop cannot clamp such a chain (the fallback is a pessimistic guess,
     and cutting a short real source's chain on it would under-render), so it
-    runs all four turns -- and the quote must say four, priced at the ceiling
-    past the fallback, not three. Before: planned_turns=3 / $9.14 against four
-    impl calls billing at least $10.15.
+    runs every requested turn -- and the quote must price every one, at the
+    ceiling. Before: planned_turns=3 / $9.14 against four impl calls billing
+    at least $10.15. On 1.2 the fallback is the ceiling itself, so the
+    clamped list would plan no turns at all.
     """
     from src.__main__ import extend_video_omni
 
     ctx = _ctx(tmp_path)
     quote = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=ctx,
             prompt="Continue.",
             previous_interaction_id="i-never-recorded",
-            times=4,
+            times=3,
             dry_run=True,
         )
     )
     assert "error" not in quote, quote
-    assert quote["planned_turns"] == 4
-    # 10s fallback -> 20, 30, 40, then the fourth priced AT the ceiling.
-    assert quote["turn_output_seconds"] == [20.0, 30.0, 40.0, 40.0]
+    assert quote["planned_turns"] == 3
+    # Every turn priced AT the Gemini API's 30s ceiling.
+    assert quote["turn_output_seconds"] == [30.0, 30.0, 30.0]
 
     calls = 0
 
@@ -2941,7 +2857,7 @@ async def test_an_unmeasured_source_quotes_every_turn_the_loop_will_run(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": f"i-{calls}",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": None,
             "aspect_ratio": None,
@@ -2952,15 +2868,16 @@ async def test_an_unmeasured_source_quotes_every_turn_the_loop_will_run(
     monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
     run = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=ctx,
             prompt="Continue.",
             previous_interaction_id="i-never-recorded",
-            times=4,
+            times=3,
         )
     )
     assert "error" not in run, run
-    assert calls == 4
-    assert run["planned_turns"] == 4 == run["completed_turns"]
+    assert calls == 3
+    assert run["planned_turns"] == 3 == run["completed_turns"]
 
 
 @pytest.mark.asyncio
@@ -2968,23 +2885,28 @@ async def test_an_unmeasured_source_quotes_every_turn_the_loop_will_run(
 async def test_a_cap_between_the_clamped_and_real_projection_now_refuses(
     tmp_path: Path,
 ) -> None:
-    """$10 sat above the 3-turn figure and below the 4-turn one, and passed."""
+    """$10 sat above the 3-turn figure and below the 4-turn one, and passed.
+
+    On 1.2 the clamped list for an unmeasured source is empty ($0), so any
+    cap passed it; three turns priced at the ceiling are ~$6.26.
+    """
     from src.__main__ import extend_video_omni
 
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
             previous_interaction_id="i-never-recorded",
-            times=4,
-            max_cost_usd=10.0,
+            times=3,
+            max_cost_usd=5.0,
         )
     )
     assert "error" in payload, payload
     assert "Refused before rendering" in payload["error"]
     # Priced as a ceiling, and it says so -- not as a "floor".
     assert "UPPER BOUND" in payload["error"]
-    assert "for 4 extension turn(s)" in payload["error"]
+    assert "for 3 extension turn(s)" in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -2997,6 +2919,7 @@ async def test_a_clamped_chain_treats_its_last_turn_as_the_last(
     On a chain the ceiling cut from 4 to 2 turns, no turn ever equalled 4, so
     the caller's output_gcs_uri was silently never sent and every sidecar
     recorded of_turns=4 for a 2-turn chain. Both follow the clamped count now.
+    (On 1.2 and the Gemini API: a 15s source, 3 turns asked, 2 fit in 30s.)
     """
     from src.__main__ import extend_video_omni
 
@@ -3004,9 +2927,9 @@ async def test_a_clamped_chain_treats_its_last_turn_as_the_last(
     (tmp_path / "videos" / "prior.json").write_text(
         json.dumps(
             {
-                "interaction_id": "i-25s",
-                "duration_seconds": 25.0,
-                "model": OMNI_1_1_MODEL,
+                "interaction_id": "i-15s",
+                "duration_seconds": 15.0,
+                "model": OMNI_1_2_MODEL,
                 "backend": "gemini_api",
             }
         )
@@ -3021,7 +2944,7 @@ async def test_a_clamped_chain_treats_its_last_turn_as_the_last(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": f"i-{len(seen)}",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": None,
             "aspect_ratio": None,
@@ -3032,17 +2955,18 @@ async def test_a_clamped_chain_treats_its_last_turn_as_the_last(
     monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
-            previous_interaction_id="i-25s",
-            times=4,
+            previous_interaction_id="i-15s",
+            times=3,
         )
     )
     assert "error" not in payload, payload
     assert payload["planned_turns"] == 2 and len(seen) == 2
     # manifest_extra is folded into the sidecar by the wrapper, so the record
     # on disk is where of_turns lands -- and where a later reader would see a
-    # 2-turn chain labelled as 4.
+    # 2-turn chain labelled as 3.
     sidecars = [
         json.loads(p.read_text())
         for p in (tmp_path / "videos").glob("*.json")
@@ -3054,28 +2978,6 @@ async def test_a_clamped_chain_treats_its_last_turn_as_the_last(
     )
     assert [m["turn"] for m in chain] == [1, 2]
     assert all(m["of_turns"] == 2 for m in chain), chain
-
-
-def test_the_unknown_source_fallbacks_use_the_backends_upload_limit() -> None:
-    """Vertex documents 30s for the same upload the Developer API caps at 10s.
-
-    Both fallbacks read the model's 10s figure on both backends, so a Vertex
-    quote for an unmeasurable source under-stated by up to 20s a turn -- the
-    module's own "assume the longest documented source" invariant, unkept.
-    """
-    from src.omni import (
-        omni_continuation_upper_bound,
-        omni_extension_output_lengths,
-        omni_spec,
-    )
-
-    spec = omni_spec(OMNI_1_1_MODEL)
-    assert omni_extension_output_lengths(spec, None, 1) == [20.0]
-    assert omni_extension_output_lengths(spec, None, 1, vertexai=True) == [40.0]
-    assert omni_continuation_upper_bound(spec, "edit", None) == 10.0
-    assert omni_continuation_upper_bound(spec, "edit", None, vertexai=True) == 30.0
-    # A measured source is unaffected by the backend.
-    assert omni_continuation_upper_bound(spec, "edit", 25.0, vertexai=True) == 25.0
 
 
 @pytest.mark.parametrize(
@@ -3106,10 +3008,13 @@ def test_a_known_non_access_code_is_not_rewrapped_as_allowlist_advice(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30.0)
-async def test_the_servers_own_ten_second_render_can_be_edited(tmp_path: Path) -> None:
-    """omni's 10s renders measure 10.01s; a strict ceiling refused them.
+async def test_the_servers_own_fifteen_second_render_can_be_edited(
+    tmp_path: Path,
+) -> None:
+    """omni's renders measure a frame over nominal; a strict ceiling refused
+    them at the edit cap.
 
-    241 frames at 24fps measures 10.04s and must pass; 252 (10.5s) must not.
+    361 frames at 24fps measures 15.04s and must pass; 372 (15.5s) must not.
     """
     import imageio.v3 as iio
     import numpy as np
@@ -3120,7 +3025,10 @@ async def test_the_servers_own_ten_second_render_can_be_edited(tmp_path: Path) -
         buf = BytesIO()
         iio.imwrite(
             buf,
-            [np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8) for i in range(frames)],
+            [
+                np.full((32, 32, 3), (i * 3) % 256, dtype=np.uint8)
+                for i in range(frames)
+            ],
             extension=".mp4",
             fps=24,
         )
@@ -3133,9 +3041,10 @@ async def test_the_servers_own_ten_second_render_can_be_edited(tmp_path: Path) -
 
     ok = body(
         await generate_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="anime",
-            input_video_uri=f"file://{clip(241, 'own_render.mp4')}",
+            input_video_uri=f"file://{clip(361, 'own_render.mp4')}",
             dry_run=True,
         )
     )
@@ -3143,13 +3052,14 @@ async def test_the_servers_own_ten_second_render_can_be_edited(tmp_path: Path) -
 
     refused = body(
         await generate_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="anime",
-            input_video_uri=f"file://{clip(252, 'too_long.mp4')}",
+            input_video_uri=f"file://{clip(372, 'too_long.mp4')}",
             dry_run=True,
         )
     )
-    assert "10s or shorter" in refused["error"]
+    assert "15s or shorter" in refused["error"]
 
 
 @pytest.mark.asyncio
@@ -3169,7 +3079,7 @@ async def test_a_remote_delivery_still_records_its_interaction(
             "message": "ok",
             "video_url": "gs://bucket/out/v1.mp4",
             "interaction_id": "remote-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "generate",
             "duration_seconds": None,
             "aspect_ratio": "16:9",
@@ -3178,13 +3088,15 @@ async def test_a_remote_delivery_still_records_its_interaction(
         }
 
     monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
-    out = await generate_video_omni(ctx=_ctx(tmp_path), prompt="a cat")
+    out = await generate_video_omni(
+        omni_model="gemini-omni-1.2-flash", ctx=_ctx(tmp_path), prompt="a cat"
+    )
     payload = json.loads(out[0].text if isinstance(out, list) else out)
     assert "error" not in payload, payload
     assert "sidecar_url" not in payload  # nothing local to point at...
     prior = _prior_interaction(tmp_path / "videos", "remote-1")
     assert prior.backend == "gemini_api"  # ...yet the id is still on record
-    assert prior.model == OMNI_1_1_MODEL
+    assert prior.model == OMNI_1_2_MODEL
 
 
 # ============================================================================
@@ -3203,13 +3115,13 @@ def _vertex_ctx(tmp_path: Path) -> Any:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_an_unrecorded_edit_source_is_bounded_by_the_backends_ceiling(
+async def test_an_unrecorded_edit_source_is_bounded_on_either_backend(
     tmp_path: Path,
 ) -> None:
-    """omni_continuation_upper_bound grew a vertexai= parameter and no caller
-    passed it, so a Vertex edit of an unrecorded source was still bounded at
-    the Developer API's 10s (~$1.02) against Vertex's 30s (~$3.04). All three
-    callers pass it now; this covers the two quote paths."""
+    """An edit of an unrecorded source is bounded by the model's 15s edit cap,
+    on Vertex as on the Gemini API: the two quote paths, on both backends.
+    (On 1.1 the backends' caps differed, and the Vertex bound was once read
+    off the Developer API's.)"""
     from src.__main__ import edit_video, generate_video_omni
 
     def body(out: Any) -> dict[str, Any]:
@@ -3217,6 +3129,7 @@ async def test_an_unrecorded_edit_source_is_bounded_by_the_backends_ceiling(
 
     vertex = body(
         await edit_video(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_vertex_ctx(tmp_path),
             previous_interaction_id="i-unrecorded",
             prompt="make it anime",
@@ -3224,28 +3137,30 @@ async def test_an_unrecorded_edit_source_is_bounded_by_the_backends_ceiling(
         )
     )
     assert "error" not in vertex, vertex
-    assert vertex["duration_seconds"] == 30.0
+    assert vertex["duration_seconds"] == 15.0
 
     gemini = body(
         await edit_video(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             previous_interaction_id="i-unrecorded",
             prompt="make it anime",
             dry_run=True,
         )
     )
-    assert gemini["duration_seconds"] == 10.0
+    assert gemini["duration_seconds"] == 15.0
 
     # generate_video_omni's edit path (previous_interaction_id) on Vertex.
     via_generate = body(
         await generate_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_vertex_ctx(tmp_path),
             prompt="make it anime",
             previous_interaction_id="i-unrecorded",
             dry_run=True,
         )
     )
-    assert via_generate["duration_seconds"] == 30.0
+    assert via_generate["duration_seconds"] == 15.0
 
 
 @pytest.mark.asyncio
@@ -3261,9 +3176,9 @@ async def test_a_mid_chain_failure_reports_the_clamped_denominator(
     (tmp_path / "videos" / "prior.json").write_text(
         json.dumps(
             {
-                "interaction_id": "i-25s",
-                "duration_seconds": 25.0,
-                "model": OMNI_1_1_MODEL,
+                "interaction_id": "i-15s",
+                "duration_seconds": 15.0,
+                "model": OMNI_1_2_MODEL,
                 "backend": "gemini_api",
             }
         )
@@ -3281,7 +3196,7 @@ async def test_a_mid_chain_failure_reports_the_clamped_denominator(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": "i-1",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "extend",
             "duration_seconds": None,
             "aspect_ratio": None,
@@ -3292,15 +3207,16 @@ async def test_a_mid_chain_failure_reports_the_clamped_denominator(
     monkeypatch.setattr("src.__main__.generate_video_omni_impl", one_then_fail)
     payload = json.loads(
         await extend_video_omni(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_ctx(tmp_path),
             prompt="Continue.",
-            previous_interaction_id="i-25s",
-            times=4,
+            previous_interaction_id="i-15s",
+            times=3,
         )
     )
     assert payload["planned_turns"] == 2
     assert "1 of 2 turn(s)" in payload["error"], payload["error"]
-    assert "of 4" not in payload["error"]
+    assert "of 3" not in payload["error"]
 
 
 def test_a_remote_record_stays_findable_whatever_the_prompt_length(
@@ -3322,7 +3238,7 @@ def test_a_remote_record_stays_findable_whatever_the_prompt_length(
     manifest = {
         "interaction_id": "remote-long",
         "backend": "vertex",
-        "model": OMNI_1_1_MODEL,
+        "model": OMNI_1_2_MODEL,
         "duration_seconds": 9.0,
         "video_url": "gs://b/x.mp4",
         "prompt": "p" * (_SIDECAR_MAX_BYTES + 1024),
@@ -3332,7 +3248,11 @@ def test_a_remote_record_stays_findable_whatever_the_prompt_length(
     entry = _interaction_index_path(videos_dir, "remote-long")
     assert entry.stat().st_size < 4096
     prior = _prior_interaction(videos_dir, "remote-long")
-    assert (prior.backend, prior.model, prior.duration_seconds) == ("vertex", OMNI_1_1_MODEL, 9.0)
+    assert (prior.backend, prior.model, prior.duration_seconds) == (
+        "vertex",
+        OMNI_1_2_MODEL,
+        9.0,
+    )
 
 
 # ============================================================================
@@ -3365,7 +3285,12 @@ async def test_omni_on_a_vertex_server_with_a_key_says_where_it_went_and_why(
     from src.__main__ import generate_video_omni
 
     quote = _body(
-        await generate_video_omni(ctx=_vertex_with_key_ctx(tmp_path), prompt="a cat", dry_run=True)
+        await generate_video_omni(
+            omni_model="gemini-omni-1.2-flash",
+            ctx=_vertex_with_key_ctx(tmp_path),
+            prompt="a cat",
+            dry_run=True,
+        )
     )
     assert quote["backend"] == "gemini_api"
     assert "GEMINI_API_KEY is set" in quote["backend_reason"]
@@ -3381,7 +3306,9 @@ async def test_omni_backend_vertex_keeps_the_call_in_the_vertex_project(
 
     vertex_client = MagicMock()
     vertex_client._api_client.vertexai = True
-    monkeypatch.setattr("src.__main__._get_omni_vertex_global_client", lambda: vertex_client)
+    monkeypatch.setattr(
+        "src.__main__._get_omni_vertex_global_client", lambda: vertex_client
+    )
     seen: dict[str, Any] = {}
 
     async def mock_impl(**kwargs: Any) -> dict[str, Any]:
@@ -3392,7 +3319,7 @@ async def test_omni_backend_vertex_keeps_the_call_in_the_vertex_project(
             "message": "ok",
             "video_url": f"file://{out}",
             "interaction_id": "i-v",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "task": "generate",
             "duration_seconds": 6.0,
             "aspect_ratio": "16:9",
@@ -3403,7 +3330,10 @@ async def test_omni_backend_vertex_keeps_the_call_in_the_vertex_project(
     monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_impl)
     result = _body(
         await generate_video_omni(
-            ctx=_vertex_with_key_ctx(tmp_path), prompt="a cat", omni_backend="vertex"
+            omni_model="gemini-omni-1.2-flash",
+            ctx=_vertex_with_key_ctx(tmp_path),
+            prompt="a cat",
+            omni_backend="vertex",
         )
     )
     assert "error" not in result, result
@@ -3421,21 +3351,33 @@ async def test_an_unsatisfiable_omni_backend_is_refused_not_substituted(
 
     on_gemini = _body(
         await generate_video_omni(
-            ctx=_ctx(tmp_path), prompt="a cat", omni_backend="vertex", dry_run=True
+            omni_model="gemini-omni-1.2-flash",
+            ctx=_ctx(tmp_path),
+            prompt="a cat",
+            omni_backend="vertex",
+            dry_run=True,
         )
     )
     assert "GOOGLE_GENAI_USE_VERTEXAI" in on_gemini["error"]
 
     on_vertex_no_key = _body(
         await generate_video_omni(
-            ctx=_vertex_ctx(tmp_path), prompt="a cat", omni_backend="gemini_api", dry_run=True
+            omni_model="gemini-omni-1.2-flash",
+            ctx=_vertex_ctx(tmp_path),
+            prompt="a cat",
+            omni_backend="gemini_api",
+            dry_run=True,
         )
     )
     assert "GEMINI_API_KEY" in on_vertex_no_key["error"]
 
     bogus = _body(
         await generate_video_omni(
-            ctx=_ctx(tmp_path), prompt="a cat", omni_backend="aws", dry_run=True
+            omni_model="gemini-omni-1.2-flash",
+            ctx=_ctx(tmp_path),
+            prompt="a cat",
+            omni_backend="aws",
+            dry_run=True,
         )
     )
     assert "auto, vertex, gemini_api" in bogus["error"]
@@ -3443,16 +3385,21 @@ async def test_an_unsatisfiable_omni_backend_is_refused_not_substituted(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10.0)
-async def test_an_interaction_cannot_be_moved_to_the_other_backend(tmp_path: Path) -> None:
+async def test_an_interaction_cannot_be_moved_to_the_other_backend(
+    tmp_path: Path,
+) -> None:
     """An id minted on one backend does not resolve on the other."""
     from src.__main__ import edit_video
 
     (tmp_path / "videos").mkdir(exist_ok=True)
     (tmp_path / "videos" / "p.json").write_text(
-        json.dumps({"interaction_id": "i-vx", "backend": "vertex", "model": OMNI_1_1_MODEL})
+        json.dumps(
+            {"interaction_id": "i-vx", "backend": "vertex", "model": OMNI_1_2_MODEL}
+        )
     )
     refused = _body(
         await edit_video(
+            omni_model="gemini-omni-1.2-flash",
             ctx=_vertex_with_key_ctx(tmp_path),
             previous_interaction_id="i-vx",
             prompt="anime",
@@ -3464,7 +3411,11 @@ async def test_an_interaction_cannot_be_moved_to_the_other_backend(tmp_path: Pat
     # Without a request, the continuation follows the interaction home.
     followed = _body(
         await edit_video(
-            ctx=_vertex_with_key_ctx(tmp_path), previous_interaction_id="i-vx", prompt="anime", dry_run=True
+            omni_model="gemini-omni-1.2-flash",
+            ctx=_vertex_with_key_ctx(tmp_path),
+            previous_interaction_id="i-vx",
+            prompt="anime",
+            dry_run=True,
         )
     )
     assert followed["backend"] == "vertex"
@@ -3478,13 +3429,22 @@ async def test_the_operator_default_pins_omni_server_wide(tmp_path: Path) -> Non
 
     ctx = _vertex_with_key_ctx(tmp_path)
     ctx.request_context.lifespan_context.omni_backend_default = "vertex"
-    quote = _body(await generate_video_omni(ctx=ctx, prompt="a cat", dry_run=True))
+    quote = _body(
+        await generate_video_omni(
+            omni_model="gemini-omni-1.2-flash", ctx=ctx, prompt="a cat", dry_run=True
+        )
+    )
     assert quote["backend"] == "vertex"
     assert "OMNI_BACKEND=vertex is this server's default" in quote["backend_reason"]
     # The extension quote follows the same pin, and prices Vertex's ceiling.
     chain = _body(
         await extend_video_omni(
-            ctx=ctx, prompt="go on", previous_interaction_id="i-none", times=1, dry_run=True
+            omni_model="gemini-omni-1.2-flash",
+            ctx=ctx,
+            prompt="go on",
+            previous_interaction_id="i-none",
+            times=1,
+            dry_run=True,
         )
     )
     assert chain["backend"] == "vertex"
@@ -3504,15 +3464,23 @@ async def test_the_operator_default_pins_omni_server_wide(tmp_path: Path) -> Non
     ],
 )
 def test_omni_backend_env_is_validated_at_startup(
-    monkeypatch: pytest.MonkeyPatch, value: str, primary_is_vertex: bool, has_key: bool, ok: bool
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    primary_is_vertex: bool,
+    has_key: bool,
+    ok: bool,
 ) -> None:
     """A pin the deployment cannot honour fails once, at startup, by name."""
     from src.__main__ import _parse_omni_backend_env
 
     monkeypatch.setenv("OMNI_BACKEND", value)
     if ok:
-        got = _parse_omni_backend_env(primary_is_vertex=primary_is_vertex, gemini_api_available=has_key)
+        got = _parse_omni_backend_env(
+            primary_is_vertex=primary_is_vertex, gemini_api_available=has_key
+        )
         assert got == (value.lower() or "auto")
     else:
         with pytest.raises(ValueError, match="OMNI_BACKEND"):
-            _parse_omni_backend_env(primary_is_vertex=primary_is_vertex, gemini_api_available=has_key)
+            _parse_omni_backend_env(
+                primary_is_vertex=primary_is_vertex, gemini_api_available=has_key
+            )

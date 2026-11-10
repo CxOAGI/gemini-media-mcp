@@ -742,8 +742,9 @@ async def test_the_planner_still_agrees_with_generate_videos_quote(
 
 # ============================================================================
 # An omni EDIT is any turn that continues footage — a prior interaction OR an
-# input video. Both send no duration and render a service-chosen ~10s length,
-# so both quote and both bill the 10s upper bound, never the request.
+# input video. Both send no duration and render a service-chosen length, so
+# both quote and both bill the model's per-render maximum as the upper bound,
+# never the request.
 # ============================================================================
 
 
@@ -757,26 +758,27 @@ async def test_an_input_video_edit_dry_run_quotes_the_upper_bound(
     already fixed, surviving because the guard keyed on previous_interaction_id
     while omni also treats input_video_uri as an edit."""
     from src.__main__ import edit_video, generate_video_omni
-    from src.omni import OMNI_VERTEX_SOURCE_MAX_SECONDS
+    from src.omni import OMNI_1_2_MODEL, omni_spec
 
     omni = json.loads(
         await generate_video_omni(
+            omni_model=OMNI_1_2_MODEL,
             ctx=_make_ctx(tmp_path),
             prompt="make it night",
-            input_video_uri="gs://bucket/source.mp4",
+            input_video_uri="gs://bkt/source.mp4",
             duration_seconds=3,
             dry_run=True,
         )
     )
-    # _make_ctx is a Vertex deployment, and an unrecorded source there may be
-    # a 30s upload: the bound is the backend's ceiling, not the 10s
-    # per-render figure that is the Developer API's.
-    assert omni["duration_seconds"] == OMNI_VERTEX_SOURCE_MAX_SECONDS
+    # An unrecorded source may be as long as the model's edit-source cap,
+    # which on 1.2 is also its per-render maximum, on either backend.
+    assert omni["duration_seconds"] == omni_spec(OMNI_1_2_MODEL).max_duration_seconds
     assert "upper bound" in omni["duration_source"]
 
     # It agrees with the tool built for edits, to the cent.
     edit = json.loads(
         await edit_video(
+            omni_model=OMNI_1_2_MODEL,
             ctx=_make_ctx(tmp_path),
             previous_interaction_id="i-1",
             prompt="make it night",
@@ -784,8 +786,9 @@ async def test_an_input_video_edit_dry_run_quotes_the_upper_bound(
         )
     )
     assert omni["estimated_cost"]["usd"] == edit["estimated_cost"]["usd"]
-    # And it does NOT collapse to the clamped-request price.
-    assert omni["estimated_cost"]["usd"] > 3 * 0.10136
+    # And it does NOT collapse to the clamped-request price (1.2's 720p rate
+    # is $0.069504/s).
+    assert omni["estimated_cost"]["usd"] > 3 * 0.069504
 
 
 @pytest.mark.asyncio
@@ -815,7 +818,7 @@ async def test_an_input_video_edit_bills_the_upper_bound_when_unmeasurable(
     not be measured and was billing the raw 3s request at metered confidence,
     3.3x under the ~10s an edit actually renders."""
     import src.__main__ as main_mod
-    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_1_2_MODEL
 
     (tmp_path / "videos").mkdir(exist_ok=True)
 
@@ -825,7 +828,7 @@ async def test_an_input_video_edit_bills_the_upper_bound_when_unmeasurable(
             "message": "ok",
             "video_url": "gs://bucket/out.mp4",
             "interaction_id": "i-new",
-            "model": OMNI_MODEL,
+            "model": OMNI_1_2_MODEL,
             "duration_seconds": None,
             "aspect_ratio": None,
         }
@@ -834,7 +837,7 @@ async def test_an_input_video_edit_bills_the_upper_bound_when_unmeasurable(
     monkeypatch.setattr(
         main_mod,
         "_client_for_omni",
-        lambda app_ctx, need_gcs=False, prefer_backend=None: MagicMock(),
+        lambda app_ctx, **_: MagicMock(),
     )
     app_ctx = _make_ctx(tmp_path).request_context.lifespan_context
 
@@ -845,7 +848,8 @@ async def test_an_input_video_edit_bills_the_upper_bound_when_unmeasurable(
         input_video_bytes=b"a video",
         duration_seconds=3.0,
     )
-    assert result["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert result["duration_seconds"] is None
+    assert result["duration_upper_bound_seconds"] == OMNI_MAX_DURATION_SECONDS
     assert result["duration_source"].startswith("upper bound")
     assert result["cost"]["is_estimate"] is True
     assert result["cost"]["usd"] > 3 * 0.10136

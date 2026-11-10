@@ -111,11 +111,16 @@ _CANONICAL_VIDEO_MODEL_IDS = {
 # moving to Vertex.
 VEO_GEMINI_API_SHUTDOWN = "2026-10-22"
 
+# Points at Omni's default, not at the gemini-omni-1.1-flash the table above
+# names: this server has retired 1.1 (and Google redirects it to 1.2), so
+# naming it sends a caller into a second migration. Spelled out rather than
+# read from src.omni.DEFAULT_OMNI_MODEL because src.omni imports this module;
+# tests/test_video.py checks the two still agree.
 VEO_GEMINI_API_REFUSAL = (
     "Veo is not available on the Gemini Developer API: Google switched off its "
     f"Veo 3.1 models there on {VEO_GEMINI_API_SHUTDOWN}. Use generate_video_omni "
-    "with gemini-omni-1.1-flash, Google's named replacement, or run this server "
-    "with Vertex AI credentials, where veo-3.1-generate-001 and "
+    "with gemini-omni-1.2-flash (its default), or run this server with "
+    "Vertex AI credentials, where veo-3.1-generate-001 and "
     "veo-3.1-fast-generate-001 remain generally available."
 )
 

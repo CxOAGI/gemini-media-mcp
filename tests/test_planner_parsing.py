@@ -201,8 +201,10 @@ def _tool_ctx(tmp_path: Path, *, vertexai: bool = True) -> MagicMock:
 
 
 # Half of the tool payload's last reported decimal: the only difference a
-# quote comparison may show.
-_PAYLOAD_ROUNDING_USD = 5e-7
+# quote comparison may show. A hair over, because a figure that sits exactly
+# on the half (a 3s 360p draft, $0.0704815) differs from its rounded payload
+# by 5e-7 plus float noise.
+_PAYLOAD_ROUNDING_USD = 5e-7 * (1 + 1e-6)
 
 # URIs the planner deliberately leaves out (it was never given them) but the
 # tool signature requires. Dry runs never fetch them, but they now validate
@@ -292,22 +294,27 @@ async def test_the_edit_route_quotes_the_same_upper_bound_as_the_tool(
     top = plan.recommended
     assert top is not None
     assert top.tool == "edit_video"
-    # Conversational editing is omni-only; which omni model wins is a ranking
-    # decision, but the emitted params must name the same one the route was
-    # priced for, or the caller's call and the plan's quote describe
-    # different renders.
+    # Nothing is recorded for int-1, so the route leaves omni_model unset and
+    # the tool continues on whatever model holds the interaction -- the
+    # default when it has no record, which is the model the route is priced
+    # for. Naming a model here was how a plan handed over edits the tool
+    # refused.
     assert top.model in OMNI_MODELS
-    assert top.params["omni_model"] == top.model
+    assert "omni_model" not in top.params
     assert top.cost is not None
     assert top.cost.usd == pytest.approx(
         await _tool_quote(top, tmp_path), abs=_PAYLOAD_ROUNDING_USD
     )
     # The route still shows the (unsent) duration, so the quote's basis has
-    # to be stated or the two numbers look like a contradiction — including
-    # the one case where the tool quotes HIGHER than the planner, an already-
-    # extended source whose length only the tool can read.
+    # to be stated or the two numbers look like a contradiction. It used to
+    # add that the tool "quotes higher" for an already-extended source; 1.2
+    # edits sources of at most 15s, so the tool refuses one instead.
     assert any("per-render maximum" in caveat for caveat in top.caveats)
-    assert any("quotes higher" in caveat for caveat in top.caveats)
+    assert any(
+        "edits clips up to 15s; a longer one is refused" in caveat
+        for caveat in top.caveats
+    ), top.caveats
+    assert not any("quotes higher" in caveat for caveat in top.caveats)
 
 
 _INVARIANT_INTENTS: list[tuple[str, RoutingConstraints | None]] = [
@@ -347,6 +354,9 @@ _INVARIANT_INTENTS: list[tuple[str, RoutingConstraints | None]] = [
         RoutingConstraints(media_kind="video", source_video_uri="gs://bucket/a.mp4"),
     ),
     ("make the sky stormy", RoutingConstraints(previous_interaction_id="int-1")),
+    # One render on Omni 1.2, a seed plus loop_extend on Veo: both shapes in
+    # one plan, each priced as its tool prices it.
+    ("a 12 second video of a dog", None),
 ]
 
 
@@ -435,6 +445,135 @@ async def test_the_planner_never_silently_hands_over_a_route_the_tool_refuses(
         ), f"{route.tool}/{route.model} on {backend}"
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(60.0)
+@pytest.mark.parametrize("recorded", [None, *OMNI_MODELS])
+@pytest.mark.parametrize(
+    ("intent", "extra"),
+    [
+        pytest.param("make it night", {}, id="edit"),
+        pytest.param(
+            "extend this clip by 10 seconds", {"media_kind": "video"}, id="extend"
+        ),
+        pytest.param("upscale it to 1080p", {"backend": "vertex"}, id="upscale"),
+    ],
+)
+async def test_every_continuation_route_is_one_the_tool_accepts(
+    recorded: str | None,
+    intent: str,
+    extra: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """plan_generation(intent, previous_interaction_id) offered a continuation
+    per omni model, each naming its own omni_model, and the tools refuse every
+    model but the one that recorded the interaction: the top route was refused
+    whenever the interaction lived on the other model. Whatever is recorded,
+    each route the plan hands over now runs, and anything it cannot hand over
+    is a conflict instead."""
+    import src.__main__ as server
+
+    vertex = extra.get("backend") == "vertex"
+
+    async def prior(videos_dir: Path, interaction_id: str | None) -> Any:
+        return server.PriorInteraction(
+            model=recorded,
+            backend="vertex" if vertex else "gemini_api",
+            resolution="720p",
+            duration_seconds=6.0,
+        )
+
+    monkeypatch.setattr(server, "_prior_interaction_or_empty", prior)
+    plan = plan_generation(
+        intent,
+        RoutingConstraints(
+            previous_interaction_id="abc",
+            previous_interaction_model=recorded,
+            gemini_api_key_available=not vertex,
+            **extra,
+        ),
+    )
+    assert plan.routes or plan.conflicts
+    for route in plan.routes:
+        kwargs = dict(route.params)
+        payload = json.loads(
+            await getattr(server, route.tool)(
+                ctx=_tool_ctx(tmp_path, vertexai=vertex), dry_run=True, **kwargs
+            )
+        )
+        assert "error" not in payload, (route.tool, route.model, payload["error"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+@pytest.mark.parametrize(
+    ("intent", "extra", "tool"),
+    [
+        pytest.param("make it night", {}, "edit_video", id="edit"),
+        pytest.param(
+            "extend this clip by 10 seconds",
+            {"media_kind": "video"},
+            "extend_video_omni",
+            id="extend",
+        ),
+        pytest.param(
+            "upscale it to 1080p",
+            {"backend": "vertex"},
+            "upscale_video_omni",
+            id="upscale",
+        ),
+    ],
+)
+async def test_a_retired_interaction_gets_the_same_way_out_from_plan_and_tool(
+    intent: str,
+    extra: dict[str, Any],
+    tool: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Continuing an interaction recorded on gemini-omni-1.1-flash is refused
+    by the tool; the plan refuses it too, and names the same tool to pass the
+    saved clip to as input_video_uri."""
+    import src.__main__ as server
+    from src.omni import OMNI_1_1_MODEL
+
+    vertex = extra.get("backend") == "vertex"
+
+    async def prior(videos_dir: Path, interaction_id: str | None) -> Any:
+        return server.PriorInteraction(
+            model=OMNI_1_1_MODEL,
+            backend="vertex" if vertex else "gemini_api",
+            video_url="gs://bucket/old11.mp4",
+        )
+
+    monkeypatch.setattr(server, "_prior_interaction_or_empty", prior)
+    plan = plan_generation(
+        intent,
+        RoutingConstraints(
+            previous_interaction_id="abc",
+            previous_interaction_model=OMNI_1_1_MODEL,
+            previous_interaction_video_url="gs://bucket/old11.mp4",
+            gemini_api_key_available=not vertex,
+            **extra,
+        ),
+    )
+    assert plan.routes == ()
+    [conflict] = plan.conflicts
+    params: dict[str, Any] = {"previous_interaction_id": "abc"}
+    if tool != "upscale_video_omni":
+        params["prompt"] = intent
+    payload = json.loads(
+        await getattr(server, tool)(
+            ctx=_tool_ctx(tmp_path, vertexai=vertex), dry_run=True, **params
+        )
+    )
+    refusal = payload["error"]
+    way_out = conflict.resolution.split(" call ")[1].split(" with ")[0]
+    assert f"call {way_out} with input_video_uri=" in refusal, (way_out, refusal)
+    assert conflict.resolution in refusal, (conflict.resolution, refusal)
+    assert "input_video_uri='gs://bucket/old11.mp4'" in conflict.resolution
+
+
 def test_on_the_gemini_api_the_planner_routes_4k_and_references_to_omni() -> None:
     """The capability table was per model; four Veo capabilities are per backend.
 
@@ -470,7 +609,7 @@ def test_a_gemini_api_clip_plan_hands_over_no_veo_clip() -> None:
     )
     assert not any(r.tool == "generate_clip" for r in plan.routes)
     conflict = next(c for c in plan.conflicts if c.code == "no_model_can_serve_request")
-    assert "gemini-omni-1.1-flash" in conflict.resolution
+    assert "gemini-omni-1.2-flash" in conflict.resolution
     assert "Vertex" in conflict.resolution
 
 
@@ -489,5 +628,743 @@ def test_an_all_excluded_plan_explains_itself_instead_of_returning_nothing() -> 
     codes = [c.code for c in plan.conflicts]
     assert "no_model_can_serve_request" in codes
     conflict = next(c for c in plan.conflicts if c.code == "no_model_can_serve_request")
-    assert "gemini-omni-1.1-flash" in conflict.resolution
+    assert "gemini-omni-1.2-flash" in conflict.resolution
     assert "Vertex" in conflict.resolution
+
+
+# ============================================================================
+# Upscale: a follow-on to a render, or an operation on an existing video
+# ============================================================================
+
+_VERTEX = RoutingConstraints(backend="vertex", gemini_api_key_available=False)
+
+
+@pytest.mark.parametrize(
+    ("intent", "target"),
+    [
+        pytest.param(
+            "Generate a 6 second video of a red fox running through snow, "
+            "then upscale it to 4K",
+            "4K",
+            id="generate_then_upscale_to_4k",
+        ),
+        pytest.param(
+            "Make a cinematic video of a sunrise and upscale to 1080p",
+            "1080p",
+            id="make_and_upscale_to_1080p",
+        ),
+        pytest.param(
+            "a video of a cat, then upscale it to 4K", "4K", id="verbless_brief"
+        ),
+        pytest.param(
+            "Create a video of a fox, upscale it to 4K, and keep it moody",
+            "4K",
+            id="upscale_clause_mid_brief",
+        ),
+    ],
+)
+def test_a_generate_then_upscale_intent_plans_the_render_first(
+    intent: str, target: str
+) -> None:
+    """The upscale verb used to replace video planning outright: these came
+    back as ONE upscale_video_omni route with no source and no render."""
+    plan = plan_generation(intent, _VERTEX)
+    tools = {route.tool for route in plan.routes}
+    assert "upscale_video_omni" not in tools
+    assert tools <= {"generate_video", "generate_video_omni"}, tools
+
+    render = plan.recommended
+    assert render is not None
+    # The render is prompted and sized without the upscale clause: left in,
+    # "4K" made the render itself 4K and the prompt asked the model to upscale.
+    assert "upscale" not in render.params["prompt"].lower()
+    assert render.params.get("resolution") in (None, "720p")
+    assert "moody" in render.params["prompt"] or "moody" not in intent
+
+    *_, source_step, upscale = plan.workflow
+    assert upscale.tool == "upscale_video_omni"
+    assert upscale.order == source_step.order + 1
+    assert upscale.params["resolution"] == target
+    assert upscale.params["source_resolution"] == "720p"
+    source = upscale.params.get("input_video_uri") or upscale.params.get(
+        "previous_interaction_id"
+    )
+    assert source is not None and f"step {source_step.order}" in source
+    assert any("workflow step" in note for note in plan.notes)
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        pytest.param("Upscale my video to 4K", id="possessive"),
+        pytest.param("Take the video I generated and upscale it to 4K", id="past"),
+        pytest.param("Render my draft video and upscale it to 4K", id="render_my"),
+        pytest.param("A clip I shot yesterday, upscale it to 4K", id="a_clip_i_shot"),
+        pytest.param(
+            "Don't generate a new video, just upscale my clip to 1080p",
+            id="negated_creation",
+        ),
+    ],
+)
+def test_upscaling_an_existing_video_is_still_a_standalone_upscale(
+    intent: str,
+) -> None:
+    """Only a request for a NEW video ahead of the upscale makes it a
+    follow-on; a clip the caller already has is upscaled directly."""
+    plan = plan_generation(intent, _VERTEX)
+    assert [route.tool for route in plan.routes] == ["upscale_video_omni"]
+    assert plan.workflow == ()
+
+
+@pytest.mark.parametrize(
+    ("constraints", "source_key"),
+    [
+        pytest.param(
+            RoutingConstraints(
+                backend="vertex",
+                gemini_api_key_available=False,
+                pinned_model="gemini-omni-1.2-flash",
+            ),
+            "previous_interaction_id",
+            id="omni_1_2_on_vertex_upscales_in_place",
+        ),
+        pytest.param(
+            RoutingConstraints(
+                backend="vertex",
+                gemini_api_key_available=True,
+                pinned_model="gemini-omni-1.2-flash",
+            ),
+            "input_video_uri",
+            id="omni_on_the_gemini_api_hands_over_the_file",
+        ),
+        pytest.param(
+            RoutingConstraints(
+                backend="vertex", pinned_model="veo-3.1-fast-generate-001"
+            ),
+            "input_video_uri",
+            id="veo_hands_over_the_file",
+        ),
+    ],
+)
+def test_the_follow_on_upscale_names_a_source_the_tool_accepts(
+    constraints: RoutingConstraints, source_key: str
+) -> None:
+    """upscale_video_omni takes a previous interaction only from 1.2 on
+    Vertex; anything else must be passed as the rendered file."""
+    plan = plan_generation(
+        "Generate a 6 second video of a fox, then upscale it to 4K", constraints
+    )
+    upscale = plan.workflow[-1]
+    assert upscale.tool == "upscale_video_omni"
+    assert set(upscale.params) & {"previous_interaction_id", "input_video_uri"} == {
+        source_key
+    }
+
+
+def test_a_render_too_long_to_upscale_is_planned_at_the_target_instead() -> None:
+    """upscale_video_omni takes one video of at most 15s; a 30s render is an
+    extension chain, so the 4K is asked of the render and the plan says so."""
+    plan = plan_generation(
+        "Generate a 30 second video of a fox and upscale it to 4K", _VERTEX
+    )
+    assert all(step.tool != "upscale_video_omni" for step in plan.workflow)
+    assert plan.request.resolution == "4K"
+    assert any("No upscale step is planned" in note for note in plan.notes)
+
+
+def test_on_the_gemini_api_the_target_goes_to_the_render() -> None:
+    """Upscaling is Vertex-only; on the Gemini API rendering at the target is
+    the one way to reach it."""
+    plan = plan_generation(
+        "Make a cinematic video of a sunrise and upscale to 1080p",
+        RoutingConstraints(backend="gemini_api"),
+    )
+    assert plan.recommended is not None
+    assert plan.recommended.params.get("resolution") == "1080p"
+    assert all(step.tool != "upscale_video_omni" for step in plan.workflow)
+    assert any("Vertex AI only" in note for note in plan.notes)
+
+
+def test_an_upscale_to_720p_renders_its_source_at_360p() -> None:
+    """360p is the only source an upscale to 720p accepts, so the render is
+    planned there rather than at 720p and then refused as a 720p->720p pair."""
+    plan = plan_generation("Generate a video of a fox then upscale it to 720p", _VERTEX)
+    assert plan.recommended is not None
+    assert plan.recommended.params["resolution"] == "360p"
+    upscale = plan.workflow[-1]
+    assert upscale.tool == "upscale_video_omni"
+    assert upscale.params["source_resolution"] == "360p"
+    assert not plan.conflicts
+
+
+# Upscale outputs past the 4 MB inline limit still come back inline on Vertex
+# when no output_gcs_uri is given; the plan recommends a bucket for them, in
+# the words of the policy the tool itself applies, rather than calling it a
+# requirement -- unless the server is set to refuse them.
+
+
+def _upscale_policy(target: str, seconds: float, *, bound: bool) -> str | None:
+    """What upscale_video_omni's own pre-render policy says for this upscale."""
+    from src.omni import OMNI_1_2_MODEL, omni_inline_delivery_policy, omni_spec
+
+    return omni_inline_delivery_policy(
+        omni_spec(OMNI_1_2_MODEL),
+        vertexai=True,
+        output_gcs_uri=None,
+        resolution=target,
+        task="upscale",
+        output_seconds=seconds,
+        seconds_are_bound=bound,
+    )
+
+
+@pytest.mark.parametrize("target", ["1080p", "4K"])
+def test_a_large_standalone_upscale_recommends_output_gcs_uri(
+    target: str,
+) -> None:
+    plan = plan_generation(f"Upscale my video from 720p to {target}", _VERTEX)
+    route = plan.recommended
+    assert route is not None and route.tool == "upscale_video_omni"
+    caveat = next(c for c in route.caveats if "output_gcs_uri" in c)
+    # The tool's own warning for the same upscale, then why a bucket is the
+    # safer choice. It used to say the tool refused the call.
+    policy = _upscale_policy(target, 15.0, bound=True)
+    assert policy is not None and caveat.startswith(policy)
+    assert "billed" in caveat[len(policy) :]
+    assert "refuse" not in caveat
+    # A RoutedCall names a key it cannot fill rather than inventing a value.
+    assert "output_gcs_uri" not in route.params
+
+
+def test_a_720p_upscale_of_unknown_length_names_the_10s_condition() -> None:
+    """Over 10s a 1.2 output is past the inline limit too; with the source
+    length unknown, the plan states the condition rather than asserting it."""
+    route = plan_generation("Upscale my video from 360p to 720p", _VERTEX).recommended
+    assert route is not None
+    caveat = next(c for c in route.caveats if "output_gcs_uri" in c)
+    assert caveat.startswith("If the source runs longer than 10s")
+    assert "refuse" not in caveat
+
+
+def test_a_short_720p_follow_on_upscale_needs_no_output_gcs_uri() -> None:
+    plan = plan_generation(
+        "Generate a 6 second video of a fox then upscale it to 720p", _VERTEX
+    )
+    upscale = plan.workflow[-1]
+    assert upscale.tool == "upscale_video_omni"
+    assert "output_gcs_uri" not in upscale.params
+    assert "output_gcs_uri" not in upscale.rationale
+
+
+def test_a_large_follow_on_upscale_recommends_output_gcs_uri_without_a_placeholder() -> (
+    None
+):
+    """The step carried output_gcs_uri='<gs:// destination ...>', which reads as
+    a value the step cannot run without; the tool delivers inline without one,
+    so the recommendation rides in the rationale and the params run as given."""
+    plan = plan_generation(
+        "Generate a 6 second video of a fox, then upscale it to 4K", _VERTEX
+    )
+    upscale = plan.workflow[-1]
+    assert upscale.tool == "upscale_video_omni"
+    assert "output_gcs_uri" not in upscale.params
+    assert "output_gcs_uri" in upscale.rationale
+    assert "refuse" not in upscale.rationale
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+@pytest.mark.parametrize(
+    ("intent", "extra", "tool"),
+    [
+        pytest.param("a 4K video of a dog", {}, "generate_video_omni", id="4k"),
+        pytest.param("a 12 second video of a dog", {}, "generate_video_omni", id="12s"),
+        pytest.param(
+            "make it night", {"previous_interaction_id": "abc"}, "edit_video", id="edit"
+        ),
+        pytest.param(
+            "extend this clip by 10 seconds",
+            {"previous_interaction_id": "abc", "media_kind": "video"},
+            "extend_video_omni",
+            id="extend",
+        ),
+        pytest.param(
+            "Upscale my video from 720p to 4K",
+            {"source_video_uri": "gs://bucket/a.mp4"},
+            "upscale_video_omni",
+            id="upscale",
+        ),
+    ],
+)
+async def test_the_plans_delivery_advice_is_the_tools_own_warning(
+    intent: str, extra: dict[str, Any], tool: str, tmp_path: Path
+) -> None:
+    """One policy for the four Omni tools, and the plan states it in the words
+    each tool's dry run uses for the same call: a large output on Vertex AI
+    without output_gcs_uri is delivered inline, with a warning."""
+    import dataclasses
+
+    import src.__main__ as server
+
+    plan = plan_generation(intent, dataclasses.replace(_VERTEX, **extra))
+    route = next(r for r in plan.routes if r.tool == tool)
+    ctx = _tool_ctx(tmp_path)
+    # No Gemini API key, so omni runs on Vertex AI, as the plan was told.
+    ctx.request_context.lifespan_context = dataclasses.replace(
+        ctx.request_context.lifespan_context, gemini_api_client=None
+    )
+    payload = json.loads(
+        await getattr(server, tool)(ctx=ctx, dry_run=True, **route.params)
+    )
+    assert "error" not in payload, payload
+    [warning] = [w for w in payload.get("warnings", []) if "output_gcs_uri" in w]
+    assert any(caveat.startswith(warning) for caveat in route.caveats), (
+        warning,
+        route.caveats,
+    )
+
+
+def test_a_server_that_refuses_large_inline_output_gets_a_required_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The policy's one switch, flipped: the tools refuse a large inline
+    output before rendering, so the plan says so and the follow-on step
+    carries the placeholder it cannot run without."""
+    import src.omni as omni
+
+    monkeypatch.setattr(omni, "OMNI_REFUSE_LARGE_INLINE_ON_VERTEX", True)
+    standalone = plan_generation("Upscale my video from 720p to 4K", _VERTEX)
+    route = standalone.recommended
+    assert route is not None
+    caveat = next(c for c in route.caveats if "output_gcs_uri" in c)
+    assert caveat.startswith("Before rendering, upscale_video_omni refuses")
+    assert "Nothing was rendered" not in caveat
+
+    chained = plan_generation(
+        "Generate a 6 second video of a fox, then upscale it to 4K", _VERTEX
+    )
+    step = chained.workflow[-1]
+    assert step.params["output_gcs_uri"].startswith("<")
+    assert "refuses" in step.rationale
+
+
+# ============================================================================
+# Integration follow-ups: the render/upscale split
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        pytest.param(
+            "Create a sharper version of the video and upscale it to 4K",
+            id="the_before_the_noun",
+        ),
+        pytest.param(
+            "Make an upscaled copy of the video: upscale it to 4K",
+            id="copy_of_the_video",
+        ),
+        pytest.param(
+            "A video of my dog that I recorded, upscale it to 4K",
+            id="verbless_recorded",
+        ),
+        pytest.param("A video from my phone: upscale it to 4K", id="verbless_phone"),
+        pytest.param(
+            "Generate a video of a fox. Upscale my video of a cat to 4K.",
+            id="upscale_names_its_own_source",
+        ),
+    ],
+)
+def test_an_existing_clip_is_not_turned_into_a_paid_render(intent: str) -> None:
+    """Each of these describes a clip the caller has; reading it as a request
+    for a new one planned a render nobody asked to pay for, and chained the
+    cat upscale onto a fox render."""
+    plan = plan_generation(intent, _VERTEX)
+    assert [route.tool for route in plan.routes] == ["upscale_video_omni"]
+    assert all(step.tool != "generate_video" for step in plan.workflow)
+
+
+@pytest.mark.parametrize(
+    ("intent", "prompt"),
+    [
+        pytest.param(
+            "Generate a video of a fox. Then upscale it to 4K.",
+            "Generate a video of a fox.",
+            id="sentence_end",
+        ),
+        pytest.param(
+            "Generate a video of a fox! And then upscale it to 4K!",
+            "Generate a video of a fox!",
+            id="exclamation",
+        ),
+        pytest.param(
+            "Create a video of a fox (then upscale it to 4K)",
+            "Create a video of a fox",
+            id="parenthesised",
+        ),
+        pytest.param(
+            "Generate a video of a fox, then upscale it to 4K (keep it moody)",
+            "Generate a video of a fox (keep it moody)",
+            id="brackets_in_the_brief_kept",
+        ),
+        pytest.param(
+            "Generate a video of a fox, then upscale it to 4K resolution",
+            "Generate a video of a fox",
+            id="target_qualifier",
+        ),
+        pytest.param(
+            "Generate a video of a fox, then upscale it to 4K, and keep it moody",
+            "Generate a video of a fox, and keep it moody",
+            id="brief_continues",
+        ),
+    ],
+)
+def test_the_render_prompt_carries_no_debris_from_the_upscale_clause(
+    intent: str, prompt: str
+) -> None:
+    """Splitting left "a fox..", "a fox!!" and "a fox (" in the prompt sent
+    to the video model."""
+    render = plan_generation(intent, _VERTEX).recommended
+    assert render is not None and render.tool != "upscale_video_omni"
+    assert render.params["prompt"] == prompt
+
+
+def test_a_modifier_after_the_upscale_target_stays_with_the_render() -> None:
+    """The upscale clause ran to the next clause break, so "with audio" left
+    with it and the render was planned silent."""
+    plan = plan_generation(
+        "Make a video of a fox, then upscale it to 4K with audio", _VERTEX
+    )
+    render = plan.recommended
+    assert render is not None
+    assert render.params["prompt"] == "Make a video of a fox with audio"
+    assert render.params.get("include_audio") is True
+    assert plan.workflow[-1].tool == "upscale_video_omni"
+
+
+def test_a_10s_omni_render_upscaled_to_720p_recommends_output_gcs_uri() -> None:
+    """An Omni render lands about one frame long, and upscale_video_omni judges
+    inline delivery on the measured ~10.04s: judged on the nominal 10s, the
+    plan said nothing about a step the tool flags as large."""
+    plan = plan_generation(
+        "Generate a 10 second video of a fox then upscale it to 720p",
+        RoutingConstraints(
+            backend="vertex",
+            gemini_api_key_available=False,
+            pinned_model="gemini-omni-1.2-flash",
+        ),
+    )
+    upscale = plan.workflow[-1]
+    assert upscale.tool == "upscale_video_omni"
+    assert "output_gcs_uri" not in upscale.params
+    from src.pricing import quote_duration_for
+
+    policy = _upscale_policy(
+        "720p", quote_duration_for("gemini-omni-1.2-flash", 10.0), bound=False
+    )
+    assert policy is not None and policy in upscale.rationale
+
+
+def test_a_standalone_upscale_of_an_unknown_source_is_quoted_as_an_upper_bound() -> (
+    None
+):
+    """With no source resolution the route carried no cost, and the plan said
+    the pricing module was not installed, which it was."""
+    from src.pricing import estimate_omni_upscale_cost
+
+    plan = plan_generation("Upscale my video to 1080p", _VERTEX)
+    route = plan.recommended
+    assert route is not None and route.cost is not None
+    # 360p to 1080p is the dearer of the two transitions that reach 1080p.
+    assert route.cost.usd == pytest.approx(
+        estimate_omni_upscale_cost(15, "360p", "1080p").usd
+    )
+    assert any("dearer" in caveat for caveat in route.caveats)
+    assert not any("not installed" in note for note in plan.notes)
+
+
+def test_a_route_the_installed_price_book_cannot_price_is_not_blamed_on_a_missing_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.pricing as pricing
+
+    def _cannot_price(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("no rate")
+
+    monkeypatch.setattr(pricing, "estimate_image_cost", _cannot_price)
+    plan = plan_generation("a picture of a cat")
+    assert all(route.cost is None for route in plan.routes)
+    assert not any("not installed" in note for note in plan.notes)
+    assert any("could not price" in note for note in plan.notes)
+
+
+# ============================================================================
+# Render-then-upscale: the bare verb, and a 4K ask in both clauses
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("intent", "prompt"),
+    [
+        pytest.param(
+            "Make a video of a dog then upscale", "Make a video of a dog", id="bare"
+        ),
+        pytest.param(
+            "Make a video of a dog, then upscale.",
+            "Make a video of a dog.",
+            id="period",
+        ),
+        pytest.param(
+            "Make a video of a dog, then upscale, and keep it moody",
+            "Make a video of a dog, and keep it moody",
+            id="brief_continues",
+        ),
+        pytest.param(
+            "Generate a video of a fox, then upscale the result to 4K",
+            "Generate a video of a fox",
+            id="the_result",
+        ),
+    ],
+)
+def test_a_bare_or_result_upscale_is_planned_after_the_render(
+    intent: str, prompt: str
+) -> None:
+    """ "then upscale" with no object was not read as an upscale at all: the
+    render was prompted with "then upscale" and no upscale step followed."""
+    plan = plan_generation(intent, _VERTEX)
+    render = plan.recommended
+    assert render is not None and render.tool != "upscale_video_omni"
+    assert render.params["prompt"] == prompt
+    upscale = plan.workflow[-1]
+    assert upscale.tool == "upscale_video_omni"
+    assert upscale.params["source_resolution"] == "720p"
+    assert not plan.conflicts
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        pytest.param("Make a 4K video of a dog, then upscale it to 4K", id="both"),
+        pytest.param("Make a 4K video of a dog, then upscale it", id="render_only"),
+    ],
+)
+def test_a_4k_render_clause_is_the_upscales_target(intent: str) -> None:
+    """The render clause was re-read on its own, inferred 4K from "a 4K video",
+    planned a 4K render, and reported its 4K-to-4K upscale as an
+    upscale_resolution conflict beside it."""
+    plan = plan_generation(intent, _VERTEX)
+    assert not plan.conflicts, plan.conflicts
+    render = plan.recommended
+    assert render is not None
+    assert render.params.get("resolution") in (None, "720p")
+    upscale = plan.workflow[-1]
+    assert upscale.tool == "upscale_video_omni"
+    assert upscale.params["resolution"] == "4K"
+    assert upscale.params["source_resolution"] == "720p"
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        pytest.param(
+            "Make a video of a hotel lobby that feels modern and upscale",
+            id="adjective_after_and",
+        ),
+        pytest.param("Make a video of an upscale restaurant", id="adjective"),
+        pytest.param(
+            "Make a video of a street that was upscale then", id="then_after_it"
+        ),
+    ],
+)
+def test_the_adjective_is_still_not_an_upscale(intent: str) -> None:
+    plan = plan_generation(intent, _VERTEX)
+    render = plan.recommended
+    assert render is not None and render.params["prompt"] == intent
+    assert all(step.tool != "upscale_video_omni" for step in plan.workflow)
+
+
+@pytest.mark.parametrize("backend", ["vertex", "gemini_api"])
+@pytest.mark.parametrize(
+    "intent, marker",
+    [
+        ("A video of a street that is shabby at first, then upscale", "first"),
+        (
+            "Make a time-lapse video of a neighborhood, first gritty, then upscale.",
+            "first",
+        ),
+        (
+            "A video of a dog walking through a park that turns rustic then upscale",
+            "turns",
+        ),
+        ("Make a video of a restaurant going from cheap then upscale", "going"),
+        ("Make a video of a cafe that becomes elegant then upscale", "becomes"),
+    ],
+)
+def test_then_upscale_after_a_change_of_state_is_the_adjective(
+    intent: str, marker: str, backend: str
+) -> None:
+    """A "then" that orders two looks makes "upscale" the second look. Read
+    as the verb, the render lost the brief's second half, Vertex gained a
+    paid upscale step, and the Gemini API's render was raised to 1080p "as if
+    the brief had asked for" it. The note says how to ask for the verb."""
+    plan = plan_generation(intent, RoutingConstraints(backend=backend))
+    render = plan.recommended
+    assert render is not None and render.params["prompt"] == intent
+    assert all(step.tool != "upscale_video_omni" for step in plan.workflow)
+    assert render.params.get("resolution") in (None, "720p")
+    [note] = [n for n in plan.notes if "adjective" in n]
+    assert f"('{marker}')" in note
+    assert "say 'then upscale it'" in note
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "Make a video of a dog then upscale",
+        "Make a video of a dog then upscale, and keep it moody",
+        # A change of state in an earlier sentence does not reach this one.
+        "Make a video of a dog. It starts calm. Then upscale.",
+        # With its object it is the verb, whatever came before.
+        "Make a video of a dog that turns around, then upscale it",
+    ],
+)
+def test_then_upscale_with_no_change_of_state_is_still_the_verb(intent: str) -> None:
+    plan = plan_generation(intent, _VERTEX)
+    assert [step.tool for step in plan.workflow][-1] == "upscale_video_omni"
+    assert not any("adjective" in note for note in plan.notes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+@pytest.mark.parametrize(
+    "intent, constraints",
+    [
+        ("Create a 12 second video of a dog", RoutingConstraints(budget="best")),
+        (
+            "Create a 12 second video of a dog",
+            RoutingConstraints(pinned_model="veo-3.1-generate-001"),
+        ),
+        ("Create a 30 second video of a dog with dialogue", None),
+    ],
+    ids=["best-12s", "pinned-12s", "audio-30s"],
+)
+async def test_a_veo_chain_says_what_its_seed_costs(
+    intent: str, constraints: RoutingConstraints | None, tmp_path: Path
+) -> None:
+    """A seed-and-extend chain's quote is loop_extend's own, which covers the
+    extensions alone: a 12s Veo standard chain read as $2.80 and costs $6.00
+    with the seed its own caveat asks for. The seed step names the figure
+    generate_video quotes for it, and the route and the step say the total."""
+    import src.__main__ as server
+
+    plan = plan_generation(intent, constraints)
+    seed, extend = plan.workflow
+    assert (seed.tool, extend.tool) == ("generate_video", "loop_extend")
+    top = plan.recommended
+    assert top is not None and top.tool == "loop_extend" and top.cost is not None
+    payload = json.loads(
+        await server.generate_video(
+            ctx=_tool_ctx(tmp_path), dry_run=True, **seed.params
+        )
+    )
+    seed_usd = float(payload["estimated_cost"]["usd"])
+    assert f"(est. ${seed_usd:.2f})" in seed.rationale
+    total = f"${seed_usd + top.cost.usd:.2f}"
+    assert f"about {total} for the chain" in extend.rationale
+    assert any(
+        f"The seed costs about ${seed_usd:.2f}, so the chain costs about {total}"
+        in caveat
+        for caveat in top.caveats
+    ), top.caveats
+    # The seed renders what the chain extends, audio included.
+    assert seed.params["include_audio"] == top.params["include_audio"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+@pytest.mark.parametrize("bucket", [True, False], ids=["bucket", "no-bucket"])
+async def test_a_vertex_veo_chain_says_whether_it_needs_output_gcs_uri(
+    tmp_path: Path, bucket: bool
+) -> None:
+    """loop_extend on Vertex AI is refused, dry run included, with neither an
+    output_gcs_uri nor the server's VIDEO_GCS_BUCKET. The plan only ever said
+    "requires output_gcs_uri" -- false where a bucket is configured, and on a
+    server with none its workflow step had no key to fill in."""
+    import src.__main__ as server
+
+    ctx = _tool_ctx(tmp_path)
+    if not bucket:
+        ctx.request_context.lifespan_context.video_gcs_bucket = None
+    fn = getattr(server.plan_generation, "fn", server.plan_generation)
+    plan = json.loads(
+        (
+            await fn(
+                ctx,
+                "Create a 12 second video of a dog",
+                pinned_model="veo-3.1-fast-generate-001",
+            )
+        )[0].text
+    )
+    [route] = plan["routes"]
+    assert route["tool"] == "loop_extend"
+    seed, extend = plan["workflow"]
+    stubbed = {**route["params"], "video_uri": "gs://bucket/a.mp4"}
+    payload = json.loads(await server.loop_extend(ctx=ctx, dry_run=True, **stubbed))
+    if bucket:
+        assert "error" not in payload, payload
+        assert any("this server's VIDEO_GCS_BUCKET" in c for c in route["caveats"])
+        assert "output_gcs_uri" not in extend["params"]
+        return
+    assert "requires output_gcs_uri" in payload["error"]
+    assert any(
+        c.startswith("Add output_gcs_uri (a prefix such as gs://bucket/renders/)")
+        and "no VIDEO_GCS_BUCKET" in c
+        for c in route["caveats"]
+    ), route["caveats"]
+    assert extend["params"]["output_gcs_uri"].startswith("<gs://")
+    # Filled in, the step the plan lays out runs.
+    filled = {**stubbed, "output_gcs_uri": "gs://bucket/out.mp4"}
+    assert "error" not in json.loads(
+        await server.loop_extend(ctx=ctx, dry_run=True, **filled)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30.0)
+@pytest.mark.parametrize("backend", ["gemini_api", "vertex"])
+async def test_an_implied_omni_extension_opens_with_its_seed(
+    tmp_path: Path, backend: str
+) -> None:
+    """An omni chain past one render had no seed workflow or caveat: its top
+    route asked for a previous_interaction_id the caller does not have yet,
+    with nothing saying where it comes from or what it costs."""
+    import src.__main__ as server
+
+    plan = plan_generation(
+        "Create a 20 second video of a dog",
+        RoutingConstraints(
+            backend=backend,
+            gemini_api_key_available=backend == "gemini_api",
+            pinned_model="gemini-omni-1.2-flash",
+        ),
+    )
+    [route] = plan.routes
+    assert route.tool == "extend_video_omni"
+    assert any(
+        c.startswith(
+            "No clip exists yet: render the opening 15s with generate_video_omni"
+        )
+        for c in route.caveats
+    ), route.caveats
+    seed, extend = plan.workflow
+    assert (seed.tool, extend.tool) == ("generate_video_omni", "extend_video_omni")
+    assert extend.params["previous_interaction_id"] == "<interaction_id from step 1>"
+    payload = json.loads(
+        await server.generate_video_omni(
+            ctx=_tool_ctx(tmp_path, vertexai=backend == "vertex"),
+            dry_run=True,
+            **seed.params,
+        )
+    )
+    assert "error" not in payload, payload
+    assert f"(est. ${float(payload['estimated_cost']['usd']):.2f})" in seed.rationale

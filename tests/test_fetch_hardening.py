@@ -603,3 +603,13 @@ async def test_wedged_probes_do_not_starve_render_work(
         release.set()
         await asyncio.gather(*probes, return_exceptions=True)
         render_pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_an_unstubbed_gcs_fetch_in_a_test_fails_fast() -> None:
+    """conftest refuses real Cloud Storage: four omni tests left fetch()
+    unstubbed and spent ~12s each in credential discovery, and on a machine
+    with Application Default Credentials would have downloaded from a real
+    bucket named "bucket"."""
+    assert await fetch("gs://bucket/src.mp4", allowed_gcs_buckets=frozenset()) is None
