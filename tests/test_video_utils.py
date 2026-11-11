@@ -65,6 +65,14 @@ def test_extract_frame_returns_png() -> None:
     img.close()
 
 
+def test_probe_buffered_video_dimensions() -> None:
+    from src.video_utils import measure_video_metadata_bytes
+
+    video = _make_video([(100, 100, 100)])
+    assert measure_video_metadata_bytes(video)[1] == (64, 64)
+    assert measure_video_metadata_bytes(b"invalid video") == (None, None)
+
+
 def test_frame_decoding_preflight_reports_a_usable_ffmpeg() -> None:
     """generate_bridge and generate_clip(add_bridges=True) decode frames out
     of videos, which needs an ffmpeg the host can run.

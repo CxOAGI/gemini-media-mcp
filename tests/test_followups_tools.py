@@ -377,11 +377,12 @@ async def test_generate_clip_dry_run_animatic_discloses_warnings(
         )
     )
     warnings = result["warnings"]
-    assert any("add_bridges is ignored in animatic mode" in w for w in warnings)
+    # add_bridges is honoured: an animatic bridges on Omni 1.2.
+    assert not any("add_bridges" in w for w in warnings)
     assert any("output_gcs_uri is ignored in animatic mode" in w for w in warnings)
     assert any("include_audio is ignored in animatic mode" in w for w in warnings)
     assert any("Veo-only beat params" in w for w in warnings)
-    assert any("add_bridges is ignored in animatic mode" in w for w in _emitted(ctx))
+    assert any("include_audio is ignored in animatic mode" in w for w in _emitted(ctx))
 
 
 @pytest.mark.asyncio
@@ -757,7 +758,7 @@ def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> 
         _prior_interaction,
         _write_sidecar,
     )
-    from src.omni import OMNI_1_1_MODEL
+    from src.omni import OMNI_1_2_MODEL
 
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(parents=True, exist_ok=True)
@@ -770,7 +771,7 @@ def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> 
         {
             "interaction_id": "i-buried",
             "backend": "gemini_api",
-            "model": OMNI_1_1_MODEL,
+            "model": OMNI_1_2_MODEL,
             "duration_seconds": 7.5,
         },
     )
@@ -784,7 +785,7 @@ def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> 
             {
                 "interaction_id": f"i-{i}",
                 "backend": "vertex",
-                "model": OMNI_1_1_MODEL,
+                "model": OMNI_1_2_MODEL,
                 "duration_seconds": 1.0,
             },
         )
@@ -795,7 +796,7 @@ def test_an_interaction_is_found_past_the_sidecar_read_limit(tmp_path: Path) -> 
 
     prior = _prior_interaction(videos_dir, "i-buried")
     assert prior.backend == "gemini_api"
-    assert prior.model == OMNI_1_1_MODEL
+    assert prior.model == OMNI_1_2_MODEL
     assert prior.duration_seconds == 7.5
 
 

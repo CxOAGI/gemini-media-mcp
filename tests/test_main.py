@@ -2741,7 +2741,10 @@ async def test_veo_tools_refuse_on_the_gemini_api(
     assert "Gemini Developer API" in error
     assert "2026-10-22" in error
     assert "generate_video_omni" in error
-    assert "gemini-omni-1.1-flash" in error
+    # The way out is the Omni default, never the retired 1.1 Google's own
+    # deprecation table names.
+    assert "gemini-omni-1.2-flash" in error
+    assert "gemini-omni-1.1-flash" not in error
     assert "Vertex AI credentials" in error
 
 
@@ -3341,10 +3344,17 @@ async def test_generate_video_draft_routes_to_omni(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5.0)
-async def test_generate_clip_animatic_uses_omni_and_skips_bridges(
+async def test_generate_clip_animatic_uses_omni_and_bridges_on_omni(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """An animatic's bridges render on Omni 1.2, from the beats' own frames."""
     from src.__main__ import generate_clip
+
+    monkeypatch.setattr("src.__main__.assert_frame_decoding_available", lambda: None)
+    monkeypatch.setattr(
+        "src.__main__.extract_frame_png",
+        lambda data, position: f"{data.decode()}-{position}".encode(),
+    )
 
     (tmp_path / "images").mkdir()
     videos_dir = tmp_path / "videos"
@@ -3352,11 +3362,13 @@ async def test_generate_clip_animatic_uses_omni_and_skips_bridges(
     ctx = _ctx_wrapping(_gemini_api_app_ctx(tmp_path))
 
     n = {"i": 0}
+    calls: list[dict[str, Any]] = []
 
     async def mock_omni(**kwargs: Any) -> dict[str, Any]:
         n["i"] += 1
+        calls.append(kwargs)
         out = videos_dir / f"a{n['i']}.mp4"
-        out.write_bytes(b"mp4")
+        out.write_bytes(f"clip{n['i']}".encode())
         return _omni_result(f"file://{out}", interaction_id=f"int-{n['i']}")
 
     async def veo_should_not_run(**kwargs: Any) -> dict[str, Any]:
@@ -3376,13 +3388,80 @@ async def test_generate_clip_animatic_uses_omni_and_skips_bridges(
     assert result["animatic"] is True
     # The animatic previews on whatever the omni default is, and that moved
     # to the GA model when the preview endpoint got a shutdown date.
-    assert result["model"] == "gemini-omni-1.1-flash"
+    assert result["model"] == "gemini-omni-1.2-flash"
     beat_segs = [s for s in result["segments"] if s.get("kind") == "beat"]
     assert len(beat_segs) == 2
     assert all(s["generation_mode"] == "animatic" for s in beat_segs)
-    # No bridge segments; add_bridges was ignored with a warning.
-    assert not any(s.get("kind") == "bridge" for s in result["segments"])
-    assert any("add_bridges is ignored" in w for w in result.get("warnings", []))
+    assert [s["kind"] for s in result["segments"]] == ["beat", "bridge", "beat"]
+    [bridge] = [s for s in result["segments"] if s["kind"] == "bridge"]
+    assert bridge["between_beats"] == [0, 1]
+    assert bridge["model"] == "gemini-omni-1.2-flash"
+    assert bridge["generation_mode"] == "animatic"
+    # Beat 1's last frame to beat 2's first, at 4s, on the animatic's model;
+    # rendered once both beats exist.
+    _, _, bridge_call = calls
+    assert bridge_call["first_frame_bytes"] == b"clip1-end"
+    assert bridge_call["last_frame_bytes"] == b"clip2-start"
+    assert bridge_call["duration_seconds"] == 4.0
+    assert bridge_call["model"] == "gemini-omni-1.2-flash"
+    assert not any("add_bridges" in w for w in result.get("warnings", []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5.0)
+@pytest.mark.parametrize("animatic", [True, False])
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_a_null_beat_duration_is_the_default_everywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, animatic: bool, dry_run: bool
+) -> None:
+    """``"duration_seconds": null`` passes validation, which reads null as
+    "not given". The quote and the animatic's delivery pre-flight then read it
+    with ``.get(key, 4.0)`` -- which returns the None -- and crashed the whole
+    call on float(None), while the render failed that beat alone. All three
+    now read it as the 4s default, so every beat renders at 4s."""
+    from src.__main__ import generate_clip
+
+    (tmp_path / "images").mkdir()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    # An animatic renders on omni, a clip on Veo, which runs on Vertex only.
+    ctx = _ctx_wrapping(
+        _gemini_api_app_ctx(tmp_path) if animatic else _vertex_app_ctx(tmp_path)
+    )
+    sent: list[float | None] = []
+
+    async def mock_render(**kwargs: Any) -> dict[str, Any]:
+        sent.append(kwargs.get("duration_seconds"))
+        out = videos_dir / f"b{len(sent)}.mp4"
+        out.write_bytes(b"mp4")
+        if animatic:
+            return _omni_result(f"file://{out}", interaction_id=f"int-{len(sent)}")
+        return {
+            "message": "Video generated successfully",
+            "video_url": f"file://{out}",
+            "model": kwargs.get("model"),
+            "generation_mode": "text_to_video",
+        }
+
+    monkeypatch.setattr("src.__main__.generate_video_omni_impl", mock_render)
+    monkeypatch.setattr("src.__main__.generate_video_impl", mock_render)
+
+    result = json.loads(
+        await generate_clip(
+            ctx=ctx,
+            beats=[{"prompt": "a", "duration_seconds": None}, {"prompt": "b"}],
+            animatic=animatic,
+            dry_run=dry_run,
+        )
+    )
+    assert "error" not in result, result
+    if dry_run:
+        assert result["estimated_cost"]["usd"] > 0
+        assert not sent
+    else:
+        assert not result.get("errors"), result
+        assert len(sent) == 2
+        assert sent[0] == sent[1]
 
 
 @pytest.mark.asyncio
@@ -3465,7 +3544,7 @@ async def test_generate_video_omni_caps_image_uris(tmp_path: Path) -> None:
             image_uris=[f"file:///img{i}.png" for i in range(9)],
         )
     )
-    assert "error" in result and "at most 8" in result["error"]
+    assert "error" in result and "at most 6" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -4585,7 +4664,7 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
             },
             # Draft renders on omni, which carries one frame of encoder
             # allowance so the quote is a true ceiling.
-            (8 + 1 / 24) * 0.10136,
+            (8 + 1 / 24) * 0.069504,
             id="draft_prices_omni_not_veo",
         ),
         pytest.param(
@@ -4618,7 +4697,7 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
         pytest.param(
             "generate_video_omni",
             {"prompt": "x", "duration_seconds": 6},
-            (6 + 1 / 24) * 0.10136,
+            (6 + 1 / 24) * 0.069504,
             id="omni",
         ),
         pytest.param(
@@ -4630,7 +4709,7 @@ async def test_clip_beat_with_unfetchable_first_frame_fails_that_beat(
             # 30s -- not Omni's 10s per-render figure, which is the Developer
             # API's upload ceiling -- plus one frame of encoder overhang so the
             # bound is a true ceiling.
-            (30 + 1 / 24) * 0.10136,
+            (15 + 1 / 24) * 0.069504,
             id="edit_quotes_the_worst_case",
         ),
     ],
@@ -4714,14 +4793,14 @@ async def test_clip_dry_run_prices_beats_and_bridges(
     # Two 4s bridge renders on the fast tier.
     assert bridged["bridge_count"] == 2
     assert bridged["estimated_cost"]["usd"] == pytest.approx(3 * 0.8 + 2 * 0.4)
-    assert animatic["model"] == "gemini-omni-1.1-flash"
-    # Writing this test surfaced the real economics: omni ($0.10136/s) is
+    assert animatic["model"] == "gemini-omni-1.2-flash"
+    # Writing this test surfaced the real economics: omni ($0.069504/s) is
     # price-PARITY with the fast tier ($0.10/s), not cheaper. The animatic's
     # value against the default model is avoiding a wasted full render, and
     # it IS ~4x cheaper than the standard/1080p tiers.
     # 3 beats x 8s, each carrying one frame of omni encoder allowance.
     assert animatic["estimated_cost"]["usd"] == pytest.approx(
-        3 * (8 + 1 / 24) * 0.10136
+        3 * (8 + 1 / 24) * 0.069504
     )
 
 
@@ -5216,7 +5295,7 @@ async def test_an_unmeasurable_edit_bills_the_upper_bound_not_the_source(
     points (3.00s and 3.01s sources both rendered 10.01s).
     """
     import src.__main__ as main_mod
-    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_1_2_MODEL
 
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir(exist_ok=True)
@@ -5230,7 +5309,7 @@ async def test_an_unmeasurable_edit_bills_the_upper_bound_not_the_source(
             "message": "ok",
             "video_url": "gs://bucket/edited.mp4",  # unmeasurable from here
             "interaction_id": "i-new",
-            "model": OMNI_MODEL,
+            "model": OMNI_1_2_MODEL,
             "duration_seconds": None,
             "aspect_ratio": "16:9",
         }
@@ -5245,11 +5324,12 @@ async def test_an_unmeasurable_edit_bills_the_upper_bound_not_the_source(
             prompt="x",
         )
     )
-    assert billed["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert billed["duration_seconds"] is None
+    assert billed["duration_upper_bound_seconds"] == OMNI_MAX_DURATION_SECONDS
     assert "upper bound" in billed["duration_source"]
     # A bound is an estimate; presenting it as metered would be a lie.
     assert billed["cost"]["is_estimate"] is True
-    assert billed["cost"]["usd"] >= OMNI_MAX_DURATION_SECONDS * 0.10136
+    assert billed["cost"]["usd"] >= OMNI_MAX_DURATION_SECONDS * 0.069504
 
 
 @pytest.mark.asyncio
@@ -5435,7 +5515,7 @@ async def test_an_animatic_bills_measured_beats_not_the_clamped_request(
     }
     # Metered because measured — and above the clamped figure it used to bill.
     assert manifest["cost"]["is_estimate"] is False
-    assert manifest["cost"]["usd"] > 3 * 3 * 0.10136
+    assert manifest["cost"]["usd"] > 3 * 3 * 0.069504
     # The invariant, on the tool where it compounds per beat.
     assert quote["estimated_cost"]["usd"] >= manifest["cost"]["usd"]
 
@@ -5488,7 +5568,7 @@ async def test_a_billing_upper_bound_is_never_read_back_as_a_source_length(
     than laundered into one a hop later.
     """
     import src.__main__ as main_mod
-    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_MODEL
+    from src.omni import OMNI_MAX_DURATION_SECONDS, OMNI_1_2_MODEL
 
     videos = tmp_path / "videos"
     videos.mkdir(exist_ok=True)
@@ -5501,7 +5581,7 @@ async def test_a_billing_upper_bound_is_never_read_back_as_a_source_length(
             "message": "ok",
             "video_url": "gs://bucket/edited.mp4",
             "interaction_id": "i-bound",
-            "model": OMNI_MODEL,
+            "model": OMNI_1_2_MODEL,
             "duration_seconds": None,
             "aspect_ratio": "16:9",
         }
@@ -5524,4 +5604,5 @@ async def test_a_billing_upper_bound_is_never_read_back_as_a_source_length(
     # length of that interaction: a ceiling is not an answer.
     (videos / "bound.json").write_text(json.dumps(manifest))
     assert main_mod._source_duration_for_interaction(videos, "i-bound") is None
-    assert manifest["duration_seconds"] == OMNI_MAX_DURATION_SECONDS
+    assert manifest["duration_seconds"] is None
+    assert manifest["duration_upper_bound_seconds"] == OMNI_MAX_DURATION_SECONDS

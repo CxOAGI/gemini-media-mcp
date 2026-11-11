@@ -12,7 +12,7 @@ Plan, generate, compose, and edit images and video with Gemini image models, Veo
 | **Author** | [CxOAGI](https://github.com/CxOAGI) |
 | **Repository** | [https://github.com/CxOAGI/gemini-media-mcp](https://github.com/CxOAGI/gemini-media-mcp) |
 
-## Available Tools (11)
+## Available Tools (13)
 
 | Tools provided by this Server | Short Description |
 |-------------------------------|-------------------|
@@ -23,9 +23,11 @@ Plan, generate, compose, and edit images and video with Gemini image models, Veo
 | `generate_clip` | Generate a whole multi-beat reel in one call, with optional bridges and a fast animatic preview |
 | `generate_transition` | Veo first+last-frame transition between two stills |
 | `generate_bridge` | Transition between two existing clips (frames extracted for you) |
-| `generate_video_omni` | Fast conversational video via `gemini-omni-1.1-flash` (Interactions API) |
+| `generate_video_omni` | Fast conversational video via `gemini-omni-1.2-flash` (Interactions API) |
+| `upscale_video_omni` | Upscale an approved Omni draft on Vertex AI |
 | `edit_video` | Conversationally edit a previously omni-generated video |
-| `extend_video_omni` | Append a seamless continuation to an existing video (`gemini-omni-1.1-flash`) |
+| `get_omni_interaction` | Check on, and save, an Omni render that outlived its tool call |
+| `extend_video_omni` | Append a seamless continuation to an existing video (`gemini-omni-1.2-flash`) |
 | `loop_extend` | Extend a Veo video multiple times in one call |
 
 ---
@@ -47,10 +49,18 @@ Decide how to generate something before spending anything. Returns ranked, ready
 | `needs_text_rendering` / `needs_4k` / `needs_audio` / `needs_extension` / `wants_gcs_output` / `is_draft` | boolean *optional* | Hard requirements |
 | `num_reference_images` | integer *optional* | How many references you'll supply |
 | `pinned_model` | string *optional* | A model you must use; reported as a conflict if it can't satisfy the request |
+| `resolution` | string *optional* | Exact video resolution (`360p`, `720p`, `1080p` or `4K`); for an upscale, the target |
+| `source_video_uri` / `previous_interaction_id` | string *optional* | An existing clip or Omni interaction the plan edits, extends or upscales; carried into the routes' `params` |
 
 **Notes:**
 - Catches impossible combinations before you pay for the failure (4K on a 1K-only model, Veo on the Gemini API, GCS on the Gemini API)
 - Every rejected model comes with a reason — nothing is dropped silently
+- With 4 to 6 reference images only the Omni route is planned: Veo takes 3 and would send only the first 3. More than 6 is a conflict for every model
+- A brief that asks for a new video and then an upscale (`..., then upscale it to 4K`, a bare `..., then upscale`, or `... and upscale the result`) is planned as two workflow steps: the render, then an `upscale_video_omni` call on its output, to 1080p when no target is named. A 4K named in the render clause (`a 4K video of a dog, then upscale it`) is the upscale's target, and the render is planned at 720p. The render is always planned at a resolution the target takes (720p for 4K, 360p for 720p, and 360p for 1080p on a cheap budget); a named render resolution the target cannot take is a conflict with `is_satisfiable: false`. On Vertex AI the upscale step says the output comes back inline unless you add `output_gcs_uri`; on the Gemini API, which has no standalone upscaling, the target resolution goes on the render instead
+- A single shot of 11 to 15 seconds is planned first on `gemini-omni-1.2-flash`, which renders it in one call. Veo routes for it are an 8s `generate_video` render followed by one `loop_extend` (about 15s in all), and rank first only with a pinned Veo model, a seed or negative prompt, or `budget="best"`
+- A transition between two frames is planned up to 10s, the longest any model interpolates between two endpoints; a longer one is the `transition_too_long` conflict, with no routes. With several beats, `duration_seconds` is the whole reel's runtime and each beat gets its share, snapped to Veo's 4/6/8s when it falls between them
+- A `previous_interaction_id` is planned on the model this server recorded for it, set as `omni_model` in the route's `params`, or left out when there is no record so the tool continues on the interaction's own model. One recorded on the retired `gemini-omni-1.1-flash` plans no routes; the `interaction_model_retired` conflict names the tool to pass its saved clip to as `input_video_uri`
+- On Vertex AI, an Omni route whose output is large (1080p or 4K, over 10s, an edit or an extension) carries the inline-delivery warning described under `generate_video_omni` as a caveat, unless `wants_gcs_output` is set
 
 *This tool is read-only.*
 
@@ -130,7 +140,7 @@ The server binds `0.0.0.0` inside a container so the published port is reachable
 
 ### Tool: **`generate_video`**
 
-Generate videos using VEO models, which run on Vertex AI only (with GCS output and Vertex-only features). Google switched off Veo 3.1 on the Gemini Developer API on October 22, 2026; on a server using a Gemini API key this tool refuses and points to `generate_video_omni` (`gemini-omni-1.1-flash`) or Vertex AI.
+Generate videos using VEO models, which run on Vertex AI only (with GCS output and Vertex-only features). Google switched off Veo 3.1 on the Gemini Developer API on October 22, 2026; on a server using a Gemini API key this tool refuses and points to `generate_video_omni` (`gemini-omni-1.2-flash`) or Vertex AI.
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
@@ -148,8 +158,8 @@ Generate videos using VEO models, which run on Vertex AI only (with GCS output a
 | `negative_prompt` | string *optional* | Things to avoid in the video |
 | `seed` | integer *optional* | Random seed for reproducibility |
 | `image_uri` | string *optional* | Input image URI for image-to-video generation |
-| `draft` | boolean *optional* | When `true`, renders a fast 720p draft on `gemini-omni-1.1-flash` instead of Veo (default `false`) |
-| `draft_resolution` | string *optional* | Resolution for a `draft=true` pass. Naming one renders the draft on `gemini-omni-1.1-flash`; `360p` is a third of the 720p price |
+| `draft` | boolean *optional* | When `true`, renders a fast 720p draft on `gemini-omni-1.2-flash` instead of Veo (default `false`). The draft runs as long as the Veo render will (4, 6 or 8 seconds), so a 3s request drafts at 4s, with a warning |
+| `draft_resolution` | string *optional* | Resolution for a `draft=true` pass. Naming one renders the draft on `gemini-omni-1.2-flash`; `360p` is a third of the 720p price. A draft has no Cloud Storage destination, so on Vertex AI a 1080p or 4K draft comes back inline with a warning |
 
 **Available Models** (no default — `model` must be supplied):
 - `veo-3.1-generate-001` - VEO 3.1 (4/6/8 seconds with audio support)
@@ -177,10 +187,10 @@ Generate a multi-beat short clip — the building block for a reel. One call ren
 | `beats` | array | Ordered beat specs: `{prompt, duration_seconds?, seed?, first_frame_uri?, negative_prompt?, audio_prompt?}`. Capped at 20 beats per call |
 | `aspect_ratio` | string *optional* | `9:16` (default, vertical social) or `16:9` |
 | `model` | string *optional* | Veo model for every beat (default `veo-3.1-fast-generate-001`) |
-| `include_audio` | boolean *optional* | Audio per beat (default `true`; Vertex only) |
+| `include_audio` | boolean *optional* | Audio per Veo beat (default `true`; Vertex only). Passing it with `animatic` is ignored with a warning |
 | `add_bridges` | boolean *optional* | Generate a transition between consecutive beats (requires local beat outputs) |
-| `animatic` | boolean *optional* | Render every beat with `gemini-omni-1.1-flash` for a fast 720p storyboard preview of the whole reel |
-| `animatic_resolution` | string *optional* | Resolution for the animatic pass. Naming one renders it on `gemini-omni-1.1-flash`; `360p` is a third of the 720p price |
+| `animatic` | boolean *optional* | Render every beat with `gemini-omni-1.2-flash` for a fast 720p storyboard preview of the whole reel. Each beat runs as long as the Veo delivery will render it (4, 6 or 8 seconds), with a warning when that changes it. With `add_bridges`, each bridge renders 4s on Omni 1.2 between the beats' frames |
+| `animatic_resolution` | string *optional* | Resolution for the animatic pass. Naming one renders it on `gemini-omni-1.2-flash`; `360p` is a third of the 720p price. An animatic has no Cloud Storage destination, so on Vertex AI a 1080p or 4K animatic, or a beat over 10s, comes back inline with a warning, given before any beat renders |
 | `output_gcs_uri` | string *optional* | GCS URI for all outputs |
 
 **Notes:**
@@ -233,34 +243,38 @@ Same as `generate_transition`, but takes two **clips** — it decodes the last f
 
 ### Tool: **`generate_video_omni`**
 
-Fast conversational video generation through Google's Omni models (Interactions API). This is the fast path for drafts and iteration and the only family with multi-turn conversational editing. See [Fast drafts vs. high-fidelity](#fast-drafts-vs-high-fidelity).
-
-`gemini-omni-1.1-flash` (the default) renders 360p/720p/1080p/4K with first/last-frame interpolation, image and video references, native audio, and scene extension (see `extend_video_omni`). It bills $0.10136/s at 720p — a hair above Veo Fast — and its `resolution="360p"` draft tier is about a third of that. `gemini-omni-flash-preview` was switched off on 2026-10-22 and is refused.
+Generate video with **`gemini-omni-1.2-flash`**, the default for Omni, drafts and animatics. It is generally available on both the Gemini API and Vertex AI under the same model ID.
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
-| `prompt` | string | Text description of the video to generate. Role tags you write yourself (`<FIRST_FRAME>`, `<IMAGE_REF_0>`, `[# Sources ...]`) pass through untouched; otherwise the declarations are generated from the media arguments and echoed back as `effective_prompt` |
-| `omni_model` | string *optional* | `gemini-omni-1.1-flash` (default). `gemini-omni-flash-preview` was switched off on 2026-10-22 and is refused. Arguments the model cannot honor are refused, never dropped |
-| `image_uris` | array *optional* | Image URIs whose role the model infers — at most 8 images in total; a longer list is rejected |
-| `first_frame_uri` / `last_frame_uri` | string *optional* | 1.1 only. Keyframe interpolation; `last_frame_uri` requires `first_frame_uri`, and the same URI for both loops the clip |
-| `reference_image_uris` | array *optional* | 1.1 only. Bound to `<IMAGE_REF_0>`, `<IMAGE_REF_1>`, … in order |
-| `reference_video_uris` | array *optional* | 1.1 only. Up to 3 clips of up to 3s each, bound to `<VIDEO_REF_0>`, … Audio in them is ignored |
-| `input_video_uri` | string *optional* | A video to edit. On 1.1 a clip too large to inline is uploaded through the Files API (Gemini API key required — Vertex has no Files API) |
-| `resolution` | string *optional* | 1.1 only. `360p`, `720p` (default), `1080p` or `4K`; the last two are upscaled from the base render |
-| `aspect_ratio` | string *optional* | `16:9` (default) or `9:16`. Not sent when the request is an edit (an `input_video_uri` or `previous_interaction_id` makes it one) — the API rejects it on an edit task |
-| `duration_seconds` | number *optional* | Video duration, 3–10 (default 6). Also not sent on an edit; the service then picks the rendered length |
-| `previous_interaction_id` | string *optional* | Continue editing a prior omni result |
-| `timeout_seconds` | integer *optional* | Deadline for create + polling (default 600); raise it for long queues |
+| `prompt` | string | Text description of the video. Direct continuous camera movement, reference consistency, dialogue, speaker assignments, music and sound effects here |
+| `omni_model` | string *optional* | `gemini-omni-1.2-flash` unless set; naming the retired `gemini-omni-1.1-flash` runs on 1.2 (see the notes below). Left unset with a `previous_interaction_id`, it is the model this server recorded for that interaction; naming a different one is refused, since an interaction cannot change models; the error gives the two ways out (leave `omni_model` unset, or pass the saved video as `input_video_uri` to start a new interaction). `edit_video` and `extend_video_omni` follow the same rule |
+| `omni_backend` | string *optional* | `auto` (default), `vertex`, or `gemini_api`. Auto prefers a configured Gemini API key; `OMNI_BACKEND=vertex` keeps requests on Vertex |
+| `duration_seconds` | number *optional* | 3 to 15 (default 6), rounded to a whole second. Under 3 (including 0) renders 3s and over 15 renders 15s, with a warning on the real run; a dry run reports `requested_duration_seconds` beside the length it priced. Negative or non-finite values are refused, as are the two combinations below that cannot render past 10s |
+| `resolution` | string *optional* | `360p`, `720p` (default), `1080p` or `4K`; the last two include upsampling. Left unset on a continuation of a `previous_interaction_id`, it is the resolution recorded for that clip |
+| `aspect_ratio` | string *optional* | `16:9` (default) or `9:16` |
+| `first_frame_uri` / `last_frame_uri` | string *optional* | Start/end keyframes. A last frame requires a first frame; interpolation renders 3–10s, and a `last_frame_uri` with a longer `duration_seconds` is refused rather than shortened. The same image twice makes a loop, sent once with both roles naming it |
+| `reference_image_uris` | array *optional* | Up to 6 subject/style references, with explicit role bindings |
+| `image_uris` | array *optional* | Images whose role the model infers |
+| `reference_video_uris` | array *optional* | Up to 3 clips of up to 3s each, for new generations only. Output over 10s takes at most 1: 2 or 3 with a longer `duration_seconds` is refused. Reference audio is ignored |
+| `input_video_uri` | string *optional* | A clip of up to 15s to edit. On Vertex AI a `gs://` source is read by the service directly (a real run also downloads it once, up to 50 MB, to check its length), and any other source is sent inline, up to 20 MB. On the Gemini API a clip too large to send inline is uploaded through the Files API. Editing an uploaded clip is not available in the European Economic Area (Google's restriction): the service refuses, and this server cannot check it first. |
+| `previous_interaction_id` | string *optional* | Continue an existing conversation on its original model and backend |
+| `output_gcs_uri` | string *optional* | Deliver to an allowed Cloud Storage bucket on Vertex AI; ignored with a warning on the Gemini API. Vertex AI treats the URI as a prefix and writes the video to a new object under it (`gs://bucket/clips/fox.mp4` gives `gs://bucket/clips/fox.mp4/<number>.mp4`), so pass a prefix ending in `/`; a URI ending in a file name gets a warning. The response's `video_url` names the object written, and the server downloads it once (up to the 50 MB fetch cap) to measure its length and resolution. The safer delivery for a large output on Vertex AI, which comes back inline without it (see the notes below) |
+| `timeout_seconds` | integer *optional* | Deadline for the whole interaction (default 210). A render still running at the deadline keeps rendering and bills: the error names its `interaction_id`, and `get_omni_interaction` collects it. A request refused with a 429 is sent again after the wait it asks for (else 10s, then 20s), at most twice, while the deadline leaves a render's worth of time. A create that fails with a server error is never sent again, since it may already have started a billed render |
+| `dry_run` | boolean *optional* | Validate and quote without rendering |
 | `director_notes` | string *optional* | What the clip must get right, in plain words. Gemini 4 Argon checks each take against them and retakes on a clear fail; see [Virtual director](#virtual-director) |
-| `max_retakes` | integer *optional* | Retakes the director may spend when a check fails, 0 to 2 (default 1) |
+| `max_retakes` | integer *optional* | Retakes the director may spend when a check fails, 0 to 2 (default 1). Each retake renders from your inputs again, not as an edit of the take before it |
 
 **Notes:**
-- No `seed` or `negative_prompt` on either model — put negatives in the prompt (`no dialogue`)
-- A render above 720p, or any extension, exceeds the 4 MB inline response limit: on the Gemini API it is requested with `delivery="uri"` and downloaded here automatically; on Vertex AI, pass `output_gcs_uri`
-- On an edit turn the response reports `duration_seconds: null`, and a `dry_run` quotes omni's 10s maximum as an upper bound
-- Response includes an `interaction_id` for multi-turn editing and extension
-- Google publishes one Omni output rate, pinned to 720p. 360p is quoted at the one-third ratio from the launch blog and 1080p/4K at the published 720p rate; every estimate says which in its `source_note`
-- All output carries SynthID watermarking
+- An edit (`input_video_uri` or `previous_interaction_id`) sends no `duration_seconds` or `aspect_ratio`, so `requested_duration_seconds` is null: the service picks the length, the real run reports the measured one, and a dry run quotes an upper bound. A real run that cannot measure its output reports `duration_seconds: null` and the bound it billed as `duration_upper_bound_seconds`
+- A render above 720p, an extension turn, an edit (which can run 15s), or any other output over 10s can exceed the 4 MB inline response limit the Gemini API reference gives, so the Gemini API requests it as a Google-hosted URI rather than inline, and it is downloaded automatically
+- **Large outputs on Vertex AI.** Vertex AI writes a render to Cloud Storage when the request carries `output_gcs_uri`, and otherwise returns the video bytes in the response, for which its [upscaling page](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/video/upscale-videos) states no size limit. One policy covers `generate_video_omni`, `edit_video`, `extend_video_omni` and `upscale_video_omni`: an output that is 1080p or 4K, over 10s, an edit (up to 15s), an extension turn, or an upscale of a source over 10s or of unknown length is rendered and returned inline when no `output_gcs_uri` is given. The dry run and the real response both carry a warning, given before anything renders, that `output_gcs_uri` is the safer delivery for an output that large. `generate_video` drafts and `generate_clip` animatics, which cannot deliver to Cloud Storage, get a warning suggesting a smaller output or `generate_video_omni` with `output_gcs_uri`
+- If a render completes but its response carries no video, the error says so: the video was requested inline and no bytes came back. It gives the size as the likely reason when the output was large, and names `output_gcs_uri`. The interaction completed, so the render has been billed, and rendering it again bills again
+- The model generates native synchronized audio. **Audio uploads, audio references and voice editing are unsupported by the current API**, even though launch demos show voice-conditioned examples
+- Output-video pricing is $12 per million tokens: **$0.023172/s at 360p, $0.069504/s at 720p, $0.104256/s at 1080p, and $0.208512/s at 4K**. Quotes include one frame of encoder allowance; input and text tokens are additional when reported. See the [API guide](https://aistudio.google.com/docs/omni) and [pricing](https://aistudio.google.com/docs/pricing#gemini-omni-1.2-flash)
+- **`gemini-omni-1.1-flash` is retired on this server.** A call that names it, or Vertex AI's spelling `gemini-omni-1.1-flash-preview`, runs on `gemini-omni-1.2-flash` with 1.2's capabilities and pricing. Its response, dry run included, reports `requested_model` and carries a warning saying the call ran on 1.2. Google applies the same redirect to that ID from **December 3, 2026**; this server applies it now, so a client that hard-codes the ID keeps working. `plan_generation` never offers 1.1, and plans a `pinned_model` of 1.1 as 1.2 with a note saying why
+- An interaction created on 1.1 cannot be continued, because an interaction cannot change models. `generate_video_omni`, `edit_video`, `extend_video_omni` and `upscale_video_omni` refuse a `previous_interaction_id` recorded on 1.1 before anything is fetched, quoted or billed, dry run included. The error names the clip that render saved (from its sidecar manifest, when one is recorded) and the call to make instead: pass the clip as `input_video_uri` to `extend_video_omni` or `upscale_video_omni`, or to `generate_video_omni` to edit it on 1.2
+- The old `gemini-omni-flash-preview` endpoint was switched off October 22; requests to it are refused
 
 *This tool may perform destructive updates.*
 
@@ -270,17 +284,24 @@ Fast conversational video generation through Google's Omni models (Interactions 
 
 ### Tool: **`edit_video`**
 
-Conversational edit of a previously omni-generated video. Omni holds the video context server-side (retained ~14 days on Vertex AI; longer on the paid Gemini API), so you describe only the change.
+Refine the same clip across multiple turns: pass `previous_interaction_id` and a `prompt` describing a background/product swap, lighting or weather change, or a new aspect ratio. Omni 1.2 accepts source clips up to **15s**. The edit runs on the model and backend that created the conversation.
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
-| `previous_interaction_id` | string | The `interaction_id` from a prior `generate_video_omni` response |
-| `prompt` | string | The edit instruction (e.g. `make the sky stormy`) |
-| `omni_model` | string *optional* | Must be the model that produced `previous_interaction_id` — the video context lives with it |
-| `resolution` | string *optional* | `gemini-omni-1.1-flash` only; the resolution to render the edit at |
-| `aspect_ratio` | string *optional* | Accepted but never sent — the API rejects it on an edit task, so it does not change the output |
-| `duration_seconds` | number *optional* | Accepted but never sent, and it does not set the output length: the service picks it, predictable from neither this value nor the source (a measured 3s source edited with `duration_seconds=4` rendered 10.01s). The response reports `duration_seconds: null`; a real run bills the measured file and `dry_run` quotes omni's 10s maximum |
-| `timeout_seconds` | integer *optional* | Deadline for the edit render (default 600) |
+| `previous_interaction_id` | string | The `interaction_id` from a prior Omni response |
+| `prompt` | string | The edit instruction; put framing changes here |
+| `omni_model` | string *optional* | Left unset, the model this server recorded for the interaction (1.2 when there is no record). Naming a different model is refused, since an interaction cannot change models. An interaction created on the retired `gemini-omni-1.1-flash` cannot be edited: the error names its saved clip, to pass as `input_video_uri` to `generate_video_omni` |
+| `omni_backend` | string *optional* | `auto` (default), `vertex` or `gemini_api`. One that contradicts the backend the interaction was created on is refused |
+| `reference_image_uris` | array *optional* | Images to guide the edit: up to 6 on the Gemini API and 2 on Vertex. More is refused before anything is fetched or quoted |
+| `resolution` | string *optional* | `360p`, `720p`, `1080p` or `4K`; left unset, the edit keeps the resolution recorded for the interaction (720p when none is recorded) |
+| `output_gcs_uri` | string *optional* | Deliver to an allowed Cloud Storage bucket (Vertex AI only). An edit can run 15s, so on Vertex AI without it the edit comes back inline with a warning |
+| `duration_seconds` / `aspect_ratio` | *optional* | Accepted for compatibility and omitted from the edit request |
+| `timeout_seconds` | integer *optional* | Deadline for the whole interaction (default 210) |
+| `dry_run` | boolean *optional* | Quote without rendering |
+
+**Notes:**
+- Real results report measured duration when available; dry runs use the model's maximum as a labelled bound
+- Vertex interaction context is retained up to 7 days
 
 *This tool may perform destructive updates.*
 
@@ -290,25 +311,81 @@ Conversational edit of a previously omni-generated video. Omni holds the video c
 
 ### Tool: **`extend_video_omni`**
 
-Append a seamless continuation to an existing video (`gemini-omni-1.1-flash` only). The model reads the last 10 seconds of the source as context and generates what happens next, keeping motion, characters and audio coherent across the join.
+Give exactly one `previous_interaction_id` or `input_video_uri`, plus a prompt that explicitly requests continuation. Omni uses the final **10s** of the source as context. Every turn renders the assembled clip, so each turn bills the footage from prior turns again.
 
 | Parameters | Type | Description |
 |-----------|------|-------------|
-| `prompt` | string | How the scene continues — `Extend this video`, `Continue the scene: the camera pans across the mountains`. In a timecode, `0s` is the start of the new footage |
-| `previous_interaction_id` | string *optional* | A clip this server rendered. Nothing is uploaded and dialogue may be added |
-| `input_video_uri` | string *optional* | A clip of your own — 10s or shorter on the Gemini API, 30s on Vertex AI (checked locally against the right one). Give exactly one of these two |
-| `times` | integer *optional* | Extension turns to chain (default 1, maximum 4 — each appends up to `duration_seconds`, to a cumulative 40s counting the source) |
-| `resolution` | string *optional* | `360p`, `720p` (default), `1080p` or `4K` |
-| `reference_image_uris` / `reference_video_uris` | array *optional* | References for introducing a new character or object; they ride along on the first turn |
-| `timeout_seconds` | integer *optional* | Deadline for EACH turn (default 600) |
+| `prompt` | string | How the scene continues; ask for the extension explicitly. A `previous_interaction_id` turn cannot declare its task, so the service infers extension from the prompt |
+| `previous_interaction_id` / `input_video_uri` | string | Exactly one: a clip this server generated, or a clip to upload |
+| `omni_model` | string *optional* | Left unset, continues a `previous_interaction_id` on the model this server recorded for it and extends an `input_video_uri` on 1.2; naming a model other than the recorded one is refused. An interaction created on the retired `gemini-omni-1.1-flash` cannot be extended: the error names its saved clip, to pass here as `input_video_uri` |
+| `duration_seconds` | number *optional* | Each turn's **3–10s** increment, as a whole number of seconds (any other value is refused, not rounded). Left unset, it is not sent and the service appends its default 10s; set, it is sent on every turn |
+| `times` | integer *optional* | Turns to chain (default 1), up to a **30s total on the Gemini API**, and at most 30 divided by the turn length per call (**3 turns** at the default 10s, 10 at 3s). Near the ceiling a turn appends the whole seconds that still fit (a 3.03s source's third 10s turn appends 6s, to 29.03s), and a turn with less than 3s left is not run. Vertex accepts inputs of any duration and retains up to their **last 30s** before appending each segment, so each output is at most **40s** |
+| `reference_image_uris` | array *optional* | Images that introduce new elements; video references are unsupported for extension |
+| `resolution` | string *optional* | As for `generate_video_omni` |
+| `output_gcs_uri` | string *optional* | Cloud Storage destination for the final turn (Vertex AI only). A turn returns the whole clip so far, so on Vertex AI each turn sent without it (every turn but the last, when it is given) comes back inline with a warning; to send every turn to Cloud Storage, extend one turn per call (`times=1`) with `output_gcs_uri` |
+| `omni_backend` | string *optional* | `auto` (default), `vertex` or `gemini_api`. The whole chain runs on one backend, and one that contradicts a `previous_interaction_id`'s backend is refused |
+| `max_cost_usd` | number *optional* | Refuse a chain whose estimate exceeds this, before the first turn |
+| `timeout_seconds` | integer *optional* | Deadline for each turn (default 210) |
+| `dry_run` | boolean *optional* | Estimate every turn without rendering |
 
 **Notes:**
-- Extension appends to the END of a clip only; prepending or extending the middle is not supported
-- Extending an *uploaded* video is unavailable in the EEA, Switzerland and the UK; extending a model-generated one works everywhere
-- **Cost grows quadratically.** A turn renders the whole assembled clip, not the 10s it appends (measured: a 3.01s source extended once returned 13.01s), so every turn re-bills the footage before it: `times=2` from a 3s source bills ~36s to make 20s of new footage. Each turn's `video_url` supersedes the previous one. Always `dry_run` a chain first
-- A chain that fails part-way still returns the turns that rendered, with the `interaction_id` to resume from
+- If the service reads a `previous_interaction_id` turn as an edit, a set duration makes it refuse the turn before rendering, and the error says nothing was billed for that turn and to ask for the extension explicitly in the prompt before continuing from the same id. With no duration set, such a turn is rendered and billed as an edit
+- The source's length prices each turn and trims the chain at the ceiling. It comes from this server's record of a `previous_interaction_id`, or from measuring an uploaded source: a local file on dry and real runs, anything else on a real run. A `gs://` source on Vertex is read by the service directly and downloaded once (up to 50 MB) only to measure it. A dry run does not download a remote source, so it prices an unmeasured one at an upper bound
+- Completed turns remain in the response if a later turn fails; the final `interaction_id` continues the chain
 
 *This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`upscale_video_omni`**
+
+Upscale an approved draft with Omni 1.2 on **Vertex AI** while preserving timing and audio. Provide exactly one `input_video_uri` or a Vertex `previous_interaction_id` from a 1.2 render, plus a target `resolution` (default `1080p`):
+
+| Source | Supported targets |
+| --- | --- |
+| 360p | 720p, 1080p |
+| 720p | 1080p, 4K |
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `input_video_uri` / `previous_interaction_id` | string | Exactly one: the video to upscale, at most **15s** long |
+| `resolution` | string *optional* | Target resolution (default `1080p`) |
+| `source_resolution` | string *optional* | `360p` or `720p`. Needed on a dry run of a remote source with no record, and for a source this server cannot download (a record without a resolution is settled by measuring the clip it saved, on a real run); a value that disagrees with the record or the measured dimensions is refused |
+| `output_gcs_uri` | string *optional* | Cloud Storage destination. Every 1080p or 4K target, the default included, and a 720p target from a source longer than 10s or of unknown length (counted as 15s), can exceed the 4 MB inline response limit. Without `output_gcs_uri` the upscale is rendered and returned inline, as Vertex AI's upscaling page documents, and the dry run and the real response carry a warning that `output_gcs_uri` is the safer delivery for an output that large |
+| `max_cost_usd` | number *optional* | Refuse an upscale whose estimate exceeds this |
+| `timeout_seconds` | integer *optional* | Deadline for the whole interaction (default 210) |
+| `dry_run` | boolean *optional* | Quote without rendering |
+
+**Notes:**
+- The source's resolution and length come from this server's record of the interaction, or from measuring the file. A local or HTTP source is sent inline, which Vertex caps at **20 MB**; a `gs://` source is read by the service directly, and a real run downloads it once (up to 50 MB) only to measure it
+- A `previous_interaction_id` recorded on the retired `gemini-omni-1.1-flash` is refused, and the error names its saved clip to pass as `input_video_uri`
+- An upscale interaction cannot be continued by id: the service refuses an upscale of one ("Exactly one input video is required for the upscale task"). Given one, `upscale_video_omni` and `extend_video_omni` send the clip it saved as `input_video_uri`, and `edit_video` edits that clip through `generate_video_omni`, at its recorded resolution; the response says so. When the clip is gone, the call is refused before anything is sent, naming it.
+- A 360p → 4K conversion needs two calls through 720p (the second can name the first's interaction); 1080p → 4K is unsupported
+- Standalone upscaling bills zero input tokens. Output rates are 2,896 tokens/s for 360p → 720p or 720p → 1080p, 5,792 for 360p → 1080p, and 11,584 for 720p → 4K, at $12 per million tokens. See [standalone upscaling](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/video/upscale-videos)
+- A quote prices the requested pair at the source's length (15s when unknown); a measured source is priced as measured, and a length that was not measured gets one frame of encoder allowance. `max_cost_usd` refuses a real run over the cap, and a dry run returns its quote with `would_be_refused`. A real run whose output comes back inline is metered at the length measured from the rendered file and at the resolution pair that actually rendered; if that pair has no published rate, the requested pair is priced and the cost detail says so. An output delivered to Cloud Storage is downloaded once (up to the 50 MB fetch cap) and measured the same way; one that cannot be read is priced as an estimate at the source's length, or 15s when that is unknown
+
+*This tool may perform destructive updates.*
+
+*This tool interacts with external entities.*
+
+---
+
+### Tool: **`get_omni_interaction`**
+
+Check on an Omni render by its `interaction_id`, and save it once it has finished: one whose tool call timed out (the error names the id) or was cut off by the MCP host. The service keeps rendering and bills it either way; this tool only reads, so it never bills.
+
+| Parameters | Type | Description |
+|-----------|------|-------------|
+| `interaction_id` | string | The id the timed-out call reported |
+| `omni_backend` | string *optional* | `gemini_api` or `vertex`, where the interaction was created. Defaults to the backend this server recorded for it (a call that times out records it), else `OMNI_BACKEND` |
+| `wait_seconds` | integer *optional* | How long to wait for a render still in progress, up to 1800 (default 0, one read). Many MCP hosts end a tool call near 240s |
+
+**Notes:**
+- The response carries the service's `status`; while the render is in progress nothing is saved
+- Once it has completed, the video is saved (or, delivered to Cloud Storage, left there and downloaded once to measure), and the response carries `video_url`, the measured `duration_seconds` and `resolution`, and `cost` at those measurements. An upscale is priced at its recorded source resolution; an interaction this server has no record of is priced as a render
+- The interaction is recorded like any render, so `edit_video`, `extend_video_omni` and `upscale_video_omni` can continue from its id. One already saved is returned from its record without reading the service
 
 *This tool interacts with external entities.*
 
@@ -342,12 +419,13 @@ Convenience wrapper that extends a Veo-generated video multiple times in one cal
 
 Two video paths, chosen by where you are in the workflow:
 
-- **`gemini-omni-1.1-flash` (fast turnaround)** — 360p/720p/1080p/4K, conversational multi-turn editing, first/last-frame interpolation, video references, native audio and scene extension. No seeds or negative prompts. Great for drafts, storyboards and iteration. Reached via `generate_video_omni`, `edit_video`, `extend_video_omni`, `generate_video` with `draft=true`, and `generate_clip` with `animatic=true`.
+- **`gemini-omni-1.2-flash` (fast turnaround)** — 360p/720p/1080p/4K, conversational multi-turn editing, first/last-frame interpolation, video references, native audio, scene extension and, on Vertex AI, standalone upscaling. No seeds or negative prompts. Great for drafts, storyboards and iteration. The default for `generate_video_omni`, `extend_video_omni`, `generate_video` with `draft=true` and `generate_clip` with `animatic=true`, and the only model `upscale_video_omni` runs. A continuation (`edit_video`, or any `previous_interaction_id`) stays on the model that created the interaction.
 - **Veo 3.1 / Fast (high-fidelity, Vertex AI only)** — up to 1080p/4K, seeds, first/last-frame control, reference images, extension. The path for final renders. Reached via `generate_video` (default) and `loop_extend`.
 
 Typical workflows:
 - **draft → finalize**: run `generate_video` with `draft=true` to preview quickly on omni, then re-run the same prompt with `draft=false` to render the final on Veo.
-- **animatic → final**: run `generate_clip` with `animatic=true` (default `false`) to render each beat through `gemini-omni-1.1-flash` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` to commit to full Veo renders.
+- **animatic → final**: run `generate_clip` with `animatic=true` (default `false`) to render each beat through `gemini-omni-1.2-flash` as a fast storyboard preview of the whole reel, then re-run with `animatic=false` to commit to full Veo renders.
+- **draft → upscale** (Vertex AI): approve a 360p or 720p render, then pass it to `upscale_video_omni` for a 1080p copy (or 4K from 720p) that keeps its frames, timing and audio. The copy comes back inline unless you pass `output_gcs_uri`, the safer delivery for it.
 
 ---
 

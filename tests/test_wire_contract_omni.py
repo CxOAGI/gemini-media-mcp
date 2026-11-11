@@ -24,7 +24,7 @@ import pytest
 from google import genai
 from google.genai.types import HttpOptions
 
-from src.omni import OMNI_1_1_MODEL, OMNI_MODEL, generate_video_omni
+from src.omni import OMNI_1_2_MODEL, OMNI_MODEL, generate_video_omni
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"OMNI" * 16
 
@@ -33,10 +33,22 @@ class _OmniStub:
     """An Interactions endpoint that stays in flight for a fixed number of polls."""
 
     def __init__(
-        self, in_flight_polls: int = 0, final_status: str = "completed"
+        self,
+        in_flight_polls: int = 0,
+        final_status: str = "completed",
+        create_error: tuple[int, str] | None = None,
+        final_errors: list[dict[str, str]] | None = None,
     ) -> None:
         self.in_flight_polls = in_flight_polls
         self.final_status = final_status
+        # The `errors` list a failed interaction carries, in the shape Vertex
+        # AI returned live for a capacity failure (2026-11-09).
+        self.final_errors = final_errors
+        # (HTTP status, message) to refuse the create call with, in the error
+        # envelope google-genai's Interactions models declare (its `code` is a
+        # string), so the SDK raises its real typed 4xx error rather than a
+        # failure to parse the stub.
+        self.create_error = create_error
         self.requests: list[dict[str, Any]] = []
         self.polls = 0
 
@@ -46,6 +58,8 @@ class _OmniStub:
             "id": "i-1",
             "status": status,
         }
+        if self.final_errors and status == self.final_status != "completed":
+            payload["errors"] = self.final_errors
         if status == "completed":
             payload["steps"] = [
                 {
@@ -83,9 +97,9 @@ def _make_handler(stub: _OmniStub) -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             """Silence the default stderr access log."""
 
-        def _reply(self, obj: dict[str, Any]) -> None:
+        def _reply(self, obj: dict[str, Any], status: int = 200) -> None:
             raw = json.dumps(obj).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
@@ -95,6 +109,13 @@ def _make_handler(stub: _OmniStub) -> type[BaseHTTPRequestHandler]:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
             stub.requests.append({"method": "POST", "path": self.path, "body": body})
+            if stub.create_error is not None:
+                status, message = stub.create_error
+                self._reply(
+                    {"error": {"code": "invalid_argument", "message": message}},
+                    status=status,
+                )
+                return
             self._reply(stub.create_response())
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -153,7 +174,7 @@ def test_the_interaction_is_created_as_a_background_render(
     videos_dir.mkdir()
 
     # Named explicitly: this test pins the PREVIEW model's verified request
-    # shape, and the default moved to 1.1 when the preview endpoint got a
+    # shape, and the default moved off it when the preview endpoint got a
     # shutdown date.
     result = _run(stub, videos_dir, model=OMNI_MODEL)
 
@@ -174,7 +195,7 @@ def test_the_interaction_is_created_as_a_background_render(
         pytest.param(3, "3s", 3, id="at_minimum"),
         pytest.param(10, "10s", 10, id="at_maximum"),
         pytest.param(1, "3s", 3, id="below_minimum_clamps_up"),
-        pytest.param(99, "10s", 10, id="above_maximum_clamps_down"),
+        pytest.param(99, "15s", 15, id="above_maximum_clamps_down"),
         pytest.param(6.4, "6s", 6, id="rounded_to_whole_seconds"),
     ],
 )
@@ -231,7 +252,7 @@ def test_a_clamped_duration_is_reported_as_a_warning(
 
     result = _run(stub, videos_dir, duration_seconds=99)
 
-    assert any("clamped to 10s" in w for w in result["warnings"])
+    assert any("it renders 15s" in w for w in result["warnings"])
 
 
 @pytest.mark.timeout(20.0)
@@ -263,6 +284,58 @@ def test_a_terminal_failure_status_raises(
 
     with pytest.raises(ValueError, match=status):
         _run(stub, videos_dir)
+
+
+@pytest.mark.timeout(20.0)
+def test_a_failed_interaction_reports_the_reason_in_its_errors_list(
+    tmp_path: Path, no_poll_delay: None
+) -> None:
+    """Vertex puts a failed render's reason in an ``errors`` list.
+
+    The SDK's Interaction has no singular ``error`` field, so reading only
+    that one reported a live capacity failure as "terminal or unrecognized
+    status". The reason, and that a capacity failure is not the request's
+    fault, must reach the caller.
+    """
+    stub = _OmniStub(
+        in_flight_polls=1,
+        final_status="failed",
+        final_errors=[
+            {
+                "code": "too_many_requests",
+                "message": "Resource exhausted. Please try again later.",
+            }
+        ],
+    )
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError) as raised:
+        _run(stub, videos_dir)
+    message = str(raised.value)
+    assert "Resource exhausted. Please try again later." in message
+    assert "too_many_requests" in message
+    assert "not this request" in message
+    assert "unrecognized" not in message
+
+
+@pytest.mark.timeout(20.0)
+def test_a_failure_that_is_not_capacity_does_not_say_to_send_it_again(
+    tmp_path: Path, no_poll_delay: None
+) -> None:
+    """Only a capacity code earns "send it again unchanged"."""
+    stub = _OmniStub(
+        in_flight_polls=1,
+        final_status="failed",
+        final_errors=[{"code": "internal", "message": "Internal error."}],
+    )
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with pytest.raises(ValueError) as raised:
+        _run(stub, videos_dir)
+    assert "Internal error. (code internal)" in str(raised.value)
+    assert "again unchanged" not in str(raised.value)
 
 
 @pytest.mark.timeout(20.0)
@@ -384,7 +457,8 @@ def test_an_edit_does_not_report_a_duration_it_never_sent(
     assert "duration" not in stub.response_format()
     # ...so nothing about duration is claimed on the way back.
     assert result["duration_seconds"] is None
-    assert result["requested_duration_seconds"] == 3
+    # Not even the request: it never reached the wire (as aspect_ratio).
+    assert result["requested_duration_seconds"] is None
     # A 3s source edited with duration_seconds=4 measured 10.01s, so the
     # warning must not promise either the source's length or the request.
     assert any(
@@ -410,7 +484,7 @@ def test_a_fresh_render_still_reports_the_duration_it_sent(
 
 
 # ============================================================================
-# gemini-omni-1.1-flash: the fields only it can send
+# gemini-omni-1.2-flash: the fields the preview model cannot send
 # ============================================================================
 #
 # Every one of these is a field that reaches the API silently or not at all.
@@ -449,7 +523,7 @@ def test_resolution_reaches_response_format(
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    result = _run(stub, videos_dir, model=OMNI_1_1_MODEL, resolution=requested)
+    result = _run(stub, videos_dir, model=OMNI_1_2_MODEL, resolution=requested)
 
     assert stub.response_format()["resolution"] == on_the_wire
     # And what the caller is told matches what was sent.
@@ -473,7 +547,7 @@ def test_no_resolution_asked_means_no_resolution_sent(
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    result = _run(stub, videos_dir, model=OMNI_1_1_MODEL)
+    result = _run(stub, videos_dir, model=OMNI_1_2_MODEL)
 
     assert "resolution" not in stub.response_format()
     assert result["resolution"] is None
@@ -488,10 +562,11 @@ def test_keyframe_interpolation_sends_both_frames_in_order(
 
     The role prefix names the images by position (@Image1, @Image2), so a
     reordering of the parts would silently swap the start and end of the
-    video. The task IS image_to_video: the GA release note says so outright
-    ("Generate a video transitioning between two images using the
-    image_to_video task with up to 2 images"), where the task guide describes
-    interpolation without naming one.
+    video. The task it is classified as is image_to_video (the GA release
+    note: "Generate a video transitioning between two images using the
+    image_to_video task with up to 2 images"), but 1.2 recommends prompting
+    first and a forced task restricts its references, so an inferred task is
+    reported and not sent.
     """
     stub = _OmniStub()
     videos_dir = tmp_path / "videos"
@@ -501,15 +576,15 @@ def test_keyframe_interpolation_sends_both_frames_in_order(
         stub,
         videos_dir,
         prompt="sunrise to snowfall",
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         first_frame_bytes=_PNG,
         last_frame_bytes=_PNG2,
     )
 
     created = stub.created()
-    assert created["generation_config"]["video_config"]["task"] == "image_to_video"
+    assert "generation_config" not in created
     content = created["input"][0]["content"]
-    # 1.1's own examples put the media ahead of the prompt.
+    # 1.2's own examples put the media ahead of the prompt.
     assert [part["type"] for part in content] == ["image", "image", "text"]
     assert base64.b64decode(content[0]["data"]) == _PNG
     assert base64.b64decode(content[1]["data"]) == _PNG2
@@ -539,7 +614,7 @@ def test_a_caller_written_role_tag_is_left_alone(
         stub,
         videos_dir,
         prompt=prompt,
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         first_frame_bytes=_PNG,
         last_frame_bytes=_PNG2,
     )
@@ -550,51 +625,16 @@ def test_a_caller_written_role_tag_is_left_alone(
 
 
 @pytest.mark.timeout(20.0)
-def test_reference_videos_are_numbered_after_the_source_video(
-    tmp_path: Path, no_poll_delay: None
-) -> None:
-    """<VIDEO_0> is the clip being edited; <VIDEO_REF_N> are likenesses.
-
-    They ride in one list, so the position each tag names has to match the
-    order the parts are emitted in or the model edits the wrong clip.
-    """
-    stub = _OmniStub()
-    videos_dir = tmp_path / "videos"
-    videos_dir.mkdir()
-
-    source = b"\x00\x00\x00\x18ftypmp42" + b"source"
-    ref = b"\x00\x00\x00\x18ftypmp42" + b"reference"
-    result = _run(
-        stub,
-        videos_dir,
-        prompt="the dog jumps onto the sofa",
-        model=OMNI_1_1_MODEL,
-        input_video_bytes=source,
-        reference_video_bytes_list=[ref],
-    )
-
-    content = stub.created()["input"][0]["content"]
-    videos = [part for part in content if part["type"] == "video"]
-    assert base64.b64decode(videos[0]["data"]) == source
-    assert base64.b64decode(videos[1]["data"]) == ref
-    text = content[-1]["text"]
-    assert "[# Sources <VIDEO_0>@Video1]" in text
-    assert "[# References <VIDEO_REF_0>@Video2]" in text
-    assert result["effective_prompt"] == text
-
-
-@pytest.mark.timeout(20.0)
-def test_an_uploaded_extension_sends_its_task_and_nothing_optional(
+def test_an_uploaded_extension_sends_its_task_and_no_aspect_ratio(
     tmp_path: Path, no_poll_delay: None
 ) -> None:
     """An extension rejects aspect_ratio, live-verified.
 
     "Aspect ratio cannot be set in response format for extend task" — a real
     400, against Vertex's own documented extend request, which sends both
-    aspect_ratio and duration. The service wins. `duration` goes too: its
-    acceptance was masked behind the aspect-ratio rejection, and the launch
-    post describes extension as fixed 10s increments, so there is nothing for
-    it to control and a 400 to lose.
+    aspect_ratio and duration. The service wins. `duration` stays: 1.2
+    documents it as the per-turn length ("a 3 to 10 second continuation ...
+    set using duration in response_format").
     """
     stub = _OmniStub()
     videos_dir = tmp_path / "videos"
@@ -604,7 +644,7 @@ def test_an_uploaded_extension_sends_its_task_and_nothing_optional(
         stub,
         videos_dir,
         prompt="Continue the scene.",
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         input_video_bytes=b"\x00\x00\x00\x18ftypmp42" + b"clip",
         task="extend",
         duration_seconds=8,
@@ -613,9 +653,14 @@ def test_an_uploaded_extension_sends_its_task_and_nothing_optional(
 
     created = stub.created()
     assert created["generation_config"]["video_config"]["task"] == "extend"
-    assert stub.response_format() == {"type": "video", "resolution": "720p"}
+    assert stub.response_format() == {
+        "type": "video",
+        "duration": "8s",
+        "resolution": "720p",
+    }
     assert result["task"] == "extend"
-    # Neither was sent, so neither can be reported as fact.
+    # The duration sent is the appended segment, not the assembled clip the
+    # render returns, and no ratio was sent: neither is reported as fact.
     assert result["duration_seconds"] is None
     assert result["aspect_ratio"] is None
 
@@ -628,7 +673,8 @@ def test_a_multi_turn_extension_cannot_send_a_task(
 
     Live-verified: "previous_interaction_id is not allowed when video task is
     set". So a multi-turn extension relies on the prompt, exactly as the
-    reference's own example does.
+    reference's own example does, and still carries 1.2's per-turn duration,
+    which the guide documents for "uploaded or model-generated videos".
     """
     stub = _OmniStub()
     videos_dir = tmp_path / "videos"
@@ -638,7 +684,7 @@ def test_a_multi_turn_extension_cannot_send_a_task(
         stub,
         videos_dir,
         prompt="Extend this video.",
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         previous_interaction_id="i-0",
         task="extend",
     )
@@ -646,18 +692,69 @@ def test_a_multi_turn_extension_cannot_send_a_task(
     created = stub.created()
     assert "generation_config" not in created
     assert created["previous_interaction_id"] == "i-0"
-    # A turn that cannot declare its task cannot risk duration either: the
-    # service infers the task, and an inferred "edit" rejects the field.
-    assert "duration" not in stub.response_format()
+    assert stub.response_format()["duration"] == "6s"
     assert "aspect_ratio" not in stub.response_format()
     assert result["duration_seconds"] is None
+
+
+@pytest.mark.timeout(20.0)
+@pytest.mark.parametrize("sends", [True, False])
+@pytest.mark.parametrize("continues", [True, False])
+def test_one_switch_decides_whether_a_conversational_extension_sends_duration(
+    tmp_path: Path,
+    no_poll_delay: None,
+    monkeypatch: pytest.MonkeyPatch,
+    sends: bool,
+    continues: bool,
+) -> None:
+    """Whether a turn carrying previous_interaction_id may send duration is
+    the open live question (tests/test_live_omni_1_2.py, L2). Its answer is
+    one switch; an uploaded turn sends duration either way."""
+    import src.omni as omni_module
+
+    monkeypatch.setattr(
+        omni_module, "OMNI_CONVERSATIONAL_EXTENSION_SENDS_DURATION", sends
+    )
+    stub = _OmniStub()
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    source: dict[str, Any] = (
+        {"previous_interaction_id": "i-0"}
+        if continues
+        else {"input_video_bytes": b"\x00\x00\x00\x18ftypmp42" + b"clip"}
+    )
+    result = _run(
+        stub,
+        videos_dir,
+        prompt="Extend this video.",
+        model=OMNI_1_2_MODEL,
+        task="extend",
+        duration_seconds=3,
+        **source,
+    )
+    sent = sends or not continues
+    assert ("duration" in stub.response_format()) is sent
+    if sent:
+        assert stub.response_format()["duration"] == "3s"
+    assert (
+        omni_module.omni_duration_is_sent(
+            OMNI_1_2_MODEL,
+            previous_interaction_id="i-0" if continues else None,
+            has_input_video=not continues,
+            task="extend",
+        )
+        is sent
+    )
+    # What the turn reports having sent follows the switch too.
+    note = next(w for w in result["warnings"] if "This extension sends" in w)
+    assert ("duration=3s" in note) is sent
 
 
 @pytest.mark.timeout(20.0)
 def test_the_preview_model_still_puts_its_text_first(
     tmp_path: Path, no_poll_delay: None
 ) -> None:
-    """The 1.1 media-first ordering must not leak onto the preview model.
+    """The 1.2 media-first ordering must not leak onto the preview model.
 
     Its request shape is live-verified; changing it to match a different
     model's documentation would be changing a working call on a hunch.
@@ -678,7 +775,7 @@ def test_the_preview_model_still_puts_its_text_first(
 # ============================================================================
 #
 # The preview model rendered 720p/<=10s and never came close to the limit.
-# 1.1 renders 1080p, 4K and 40s chains, so the inline default that had always
+# 1.2 renders 1080p, 4K and 40s chains, so the inline default that had always
 # been fine stops being fine — "for videos larger than 4MB (>720p when
 # available), use delivery='uri' in response_format to avoid payload size
 # limits."
@@ -702,7 +799,7 @@ def test_uri_delivery_is_requested_for_outputs_over_the_inline_limit(
     videos_dir = tmp_path / "videos"
     videos_dir.mkdir()
 
-    _ = _run(stub, videos_dir, model=OMNI_1_1_MODEL, allow_uri_delivery=True, **kwargs)
+    _ = _run(stub, videos_dir, model=OMNI_1_2_MODEL, allow_uri_delivery=True, **kwargs)
 
     fmt = stub.response_format()
     assert (fmt.get("delivery") == "uri") is expect_uri
@@ -724,7 +821,7 @@ def test_an_extension_also_asks_for_uri_delivery(
         stub,
         videos_dir,
         prompt="Continue the scene.",
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         input_video_bytes=b"\x00\x00\x00\x18ftypmp42" + b"clip",
         task="extend",
         allow_uri_delivery=True,
@@ -745,7 +842,7 @@ def test_a_gcs_destination_still_wins_over_bare_uri_delivery(
     _ = _run(
         stub,
         videos_dir,
-        model=OMNI_1_1_MODEL,
+        model=OMNI_1_2_MODEL,
         resolution="4K",
         allow_uri_delivery=True,
         output_gcs_uri="gs://bucket/out/",

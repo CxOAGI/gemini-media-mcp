@@ -370,6 +370,9 @@ async def test_out_of_retakes_the_best_take_is_returned_with_its_fails(
     assert block["chosen_take"] == 1
     assert payload["image_url"].endswith("take-1.png")
     assert any("Returned take 1" in w for w in payload["warnings"])
+    # "Image generated successfully" beside a failed review read as a pass.
+    assert "successfully" not in payload["message"], payload["message"]
+    assert "failed the director's review" in payload["message"]
 
 
 @pytest.mark.asyncio
@@ -2129,7 +2132,7 @@ async def test_every_omni_take_carries_its_interaction_id(
         await generate_video_omni(
             ctx=ctx,
             prompt="A mug turning",
-            omni_model="gemini-omni-1.1-flash",
+            omni_model="gemini-omni-1.2-flash",
             first_frame_uri=f"file://{first}",
             duration_seconds=4.0,
             director_notes=NOTES,

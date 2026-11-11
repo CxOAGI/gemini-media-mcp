@@ -38,9 +38,8 @@ than we would like):
   automatically.
 * **Free tier.** There is none for any model in this module: the Gemini
   Developer API pricing page lists "Not available" in the free-tier column
-  for all three image models and both omni models
-  (``gemini-omni-flash-preview`` and ``gemini-omni-1.1-flash``), and Veo
-  runs only on Vertex AI, which has no free tier. So a paid-tier price is
+  for all three image models and the omni models, and Veo runs only on
+  Vertex AI, which has no free tier. So a paid-tier price is
   always the right price here, and there is no free-tier branch to model.
 * **Audio.** The Veo rates here are the "Video + Audio generation" rows.
   The Vertex AI page also lists lower "Video generation" rates without
@@ -68,13 +67,16 @@ duplicating it, so a price quoted for
 ``imagen-4.0-generate-001`` is the price of the model that really runs. The
 same applies to the Veo ID translation in ``src.video``: the Gemini Developer
 API serves Veo under ``-preview`` IDs, and ``generate_video`` reports the
-translated ID back to the caller, so both spellings resolve to one price.
+translated ID back to the caller, so both spellings resolve to one price. And
+the retired ``gemini-omni-1.1-flash``, in either backend's spelling, runs on
+``gemini-omni-1.2-flash`` (``src.omni.canonical_omni_model``), so it prices as
+1.2 and has no table of its own.
 """
 
 import datetime
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, get_args
 
 from .image import (
@@ -84,11 +86,12 @@ from .image import (
     RetiredImageModel,
 )
 from .omni import (
-    OMNI_1_1_MODEL,
+    OMNI_1_2_MODEL,
     OMNI_MODEL,
     OMNI_MODEL_ALIASES,
     canonical_omni_model,
     is_omni_model,
+    omni_spec,
 )
 from .video import _CANONICAL_VIDEO_MODEL_IDS, VideoModel
 
@@ -99,24 +102,38 @@ from .video import _CANONICAL_VIDEO_MODEL_IDS, VideoModel
 # Re-read in full on 2026-10-26, when the understanding-model rows were added
 # for the virtual director: the three image rows on both pricing pages, the two
 # Veo tiers on the Vertex AI page (Google removed Veo from the Gemini Developer
-# API page after switching it off there on 2026-10-22), gemini-omni-1.1-flash,
-# and the understanding rows on both pages. The omni preview's row is gone now
-# that its endpoint is off; its record keeps the figures last published, which
-# are 1.1's. Anything automated reads THIS field, so a per-record note claiming
-# a later verification than this date is a contradiction, not a refinement —
-# bump here or not at all.
+# API page after switching it off there on 2026-10-22), gemini-omni-1.1-flash
+# (retired here since; its ID prices as 1.2), and the understanding rows on
+# both pages. The omni preview's row is gone now that its endpoint is off; its
+# record keeps the figures last published, which were the same row as 1.1's.
+# Anything automated reads the as-of date a cost REPORTS, so prose
+# alone can never move it: a per-record note claiming a later verification
+# than the date that record reports is a contradiction, not a refinement.
+#
+# This is the date of the last FULL re-read. A record verified on its own
+# afterwards (a model that launched since) carries that date in its own
+# `as_of`, and costs priced from it report that date instead. Bumping this
+# field for one new table would claim every other table was re-checked that
+# day too, which nobody did.
 PRICING_AS_OF = "2026-10-26"
+
+# gemini-omni-1.2-flash's generation and upscale rates, read on the Gemini
+# Developer API pricing page when the model launched (the record's
+# source_note: "Omni 1.2 rates verified November 6, 2026").
+_OMNI_1_2_PRICING_AS_OF = "2026-11-06"
+
+# Upscaling runs on Vertex AI only, yet its rates were read on the Gemini
+# Developer API page, so the source alone does not say whether they hold
+# where the upscale runs.
+_OMNI_UPSCALE_SOURCE_NOTE = (
+    "Omni 1.2's upscale token rates, read on the Gemini Developer API pricing "
+    "page; upscaling runs on Vertex AI only, and these rates have not been "
+    "confirmed against the Vertex AI pricing page."
+)
 
 PRICING_SOURCES: dict[str, str] = {
     "gemini_api": "https://ai.google.dev/gemini-api/docs/pricing",
     "vertex_ai": "https://cloud.google.com/vertex-ai/generative-ai/pricing",
-    # Not a pricing page, but the only Google source that states how Omni
-    # 1.1's 360p draft tier is charged relative to 720p. Cited on the rate it
-    # backs, so a caller can see exactly which figure rests on it.
-    "omni_1_1_launch": (
-        "https://blog.google/innovation-and-ai/technology/developers-tools/"
-        "build-with-gemini-omni-1-1-flash/"
-    ),
 }
 
 # Every embedded rate below was read from the Gemini Developer API pricing
@@ -124,7 +141,6 @@ PRICING_SOURCES: dict[str, str] = {
 # page (PRICING_SOURCES["vertex_ai"]), which publishes the same numbers.
 _SRC_GEMINI_API = PRICING_SOURCES["gemini_api"]
 _SRC_VERTEX_AI = PRICING_SOURCES["vertex_ai"]
-_SRC_OMNI_1_1_LAUNCH = PRICING_SOURCES["omni_1_1_launch"]
 
 # Per-rate provenance notes. ``source`` answers "where did this number come
 # from?"; these answer the follow-up question a caller on the *other* backend
@@ -177,6 +193,10 @@ class CostEstimate:
             figure against ``source`` (e.g. that the other backend's rate is
             assumed rather than confirmed). ``None`` when the source page
             stands on its own, or when components disagree.
+        as_of: ISO date the rates behind ``usd`` were last verified, when
+            that is later than ``PRICING_AS_OF`` (a table verified on its
+            own, after the last full re-read). ``None`` means
+            ``PRICING_AS_OF``; ``cost_to_dict`` reports whichever applies.
     """
 
     usd: float
@@ -189,6 +209,7 @@ class CostEstimate:
     # working; they simply report no provenance rather than a borrowed one.
     source: str | None = None
     source_note: str | None = None
+    as_of: str | None = None
 
 
 @dataclass(frozen=True)
@@ -255,13 +276,13 @@ class VideoModelPricing:
         input_usd_per_mtok: USD per 1M input tokens, when published.
         fixed_resolution: Set when the model only ever emits one resolution,
             so a differing request is priced at what is actually rendered.
-        resolution_notes: Per-resolution caveats appended to the estimate's
-            detail. A model whose published rate covers one resolution but
-            whose API accepts four (Omni 1.1) has to say which of its four
-            figures Google actually printed and which were derived.
         source: URL the numbers were read from.
         source_note: Optional one-liner about how far ``source`` can be
             trusted for a caller on the other backend; travels onto every
+            ``CostEstimate`` priced from this record.
+        as_of: ISO date this record was verified, when it was verified on its
+            own after ``PRICING_AS_OF`` (a model that launched after the last
+            full re-read). ``None`` means ``PRICING_AS_OF``. Travels onto every
             ``CostEstimate`` priced from this record.
     """
 
@@ -274,7 +295,7 @@ class VideoModelPricing:
     output_text_usd_per_mtok: float | None = None
     input_usd_per_mtok: float | None = None
     fixed_resolution: str | None = None
-    resolution_notes: Mapping[str, str] = field(default_factory=dict)
+    as_of: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -339,23 +360,16 @@ _IMAGE_PRICING: dict[str, ImageModelPricing] = {
 # module docstring).
 _OMNI_VIDEO_TOKENS_PER_SECOND = 5792
 _OMNI_VIDEO_USD_PER_MTOK = 17.50
+# Omni 1.2's video output rate, per 1M tokens: one figure for its render
+# table and its upscale prices alike.
+_OMNI_1_2_VIDEO_USD_PER_MTOK = 12.0
 
-# Both omni models sit on the same row shape of the pricing page: input $1.50
-# / 1M tokens, text output $9.00, video output $17.50, and the footnote
+# The preview model's row on the pricing page, before its switch-off removed
+# it: input $1.50 / 1M tokens, text output $9.00, video output $17.50, and the footnote
 # "Billing is based on total output token consumption, calculated at a rate of
 # 5,792 tokens per second of 720p video."
 _OMNI_INPUT_USD_PER_MTOK = 1.50
 _OMNI_OUTPUT_TEXT_USD_PER_MTOK = 9.00
-
-# gemini-omni-1.1-flash's 360p tier. The pricing page publishes ONE token rate
-# and pins it to 720p; the only statement about 360p is in the launch post —
-# "lightweight previews in 360p resolution up to 60% faster and at a third of
-# the cost compared to Omni 1.1's standard 720p resolution". A third is
-# therefore what is quoted, sourced to that post rather than to the pricing
-# page, and said so on every estimate that uses it. The two sources agree in
-# kind: the footnote's "per second of 720p video" only makes sense if the
-# token count moves with resolution.
-_OMNI_360P_COST_DIVISOR = 3.0
 
 
 def _omni_usd_per_second(tokens_per_second: float) -> float:
@@ -366,32 +380,6 @@ def _omni_usd_per_second(tokens_per_second: float) -> float:
     """
     return tokens_per_second * _OMNI_VIDEO_USD_PER_MTOK / _TOKENS_PER_MILLION
 
-
-# Why 1080p and 4K bill at the 720p rate here: both are documented as
-# *upscaled* from the base render, and Google publishes no second token rate
-# for them. Applying the one published figure is the only honest arithmetic
-# available; the estimate says outright that an upscaled render may meter
-# differently, so nobody reads the number as a confirmed tier.
-# STANDING EXPOSURE, re-check whenever PRICING_AS_OF moves: if Google ever
-# publishes a separate upscale rate, every 1080p and 4K omni quote is wrong by
-# the delta, silently and in the under-quoting direction if the tier is dearer.
-# There is no way to detect that from here — only the pricing page says.
-_OMNI_1_1_UPSCALE_NOTE = (
-    "1080p and 4K are upscaled from the base render and Google publishes no "
-    "separate token rate for them, so this prices them at the published 720p "
-    "rate ({tokens:,} tokens/s). Treat it as the best published figure, not a "
-    "confirmed tier: if a separate upscale rate is ever published, this quote "
-    "is wrong by the difference."
-).format(tokens=_OMNI_VIDEO_TOKENS_PER_SECOND)
-
-_OMNI_1_1_360P_NOTE = (
-    "360p is priced at one third of the published 720p token rate. That ratio "
-    "comes from Google's launch post ("
-    + _SRC_OMNI_1_1_LAUNCH
-    + "), not from the pricing page, which publishes only the 720p rate — so "
-    "this figure is the vendor's stated ratio rather than a metered one. The "
-    "real run bills the video output tokens the response reports."
-)
 
 _VIDEO_PRICING: dict[str, VideoModelPricing] = {
     "veo-3.1-generate-001": VideoModelPricing(
@@ -433,42 +421,27 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
             "no cross-backend equivalence is claimed."
         ),
     ),
-    OMNI_1_1_MODEL: VideoModelPricing(
-        # Same published row as the preview model — input $1.50, text $9.00,
-        # video $17.50 per 1M tokens, 5,792 tokens per second of 720p — but
-        # 1.1 has a real resolution parameter, so the table carries one rate
-        # per resolution instead of a single fixed one. See the notes above
-        # for which of these four figures Google actually printed.
+    OMNI_1_2_MODEL: VideoModelPricing(
         usd_per_second_by_resolution={
-            "360p": _omni_usd_per_second(
-                _OMNI_VIDEO_TOKENS_PER_SECOND / _OMNI_360P_COST_DIVISOR
-            ),
-            "720p": _omni_usd_per_second(_OMNI_VIDEO_TOKENS_PER_SECOND),
-            "1080p": _omni_usd_per_second(_OMNI_VIDEO_TOKENS_PER_SECOND),
-            "4K": _omni_usd_per_second(_OMNI_VIDEO_TOKENS_PER_SECOND),
+            resolution: tokens * _OMNI_1_2_VIDEO_USD_PER_MTOK / _TOKENS_PER_MILLION
+            for resolution, tokens in {
+                "360p": 1931,
+                "720p": 5792,
+                "1080p": 8688,
+                "4K": 17376,
+            }.items()
         },
         audio_included=True,
-        output_video_usd_per_mtok=_OMNI_VIDEO_USD_PER_MTOK,
-        tokens_per_second=_OMNI_VIDEO_TOKENS_PER_SECOND,
-        output_text_usd_per_mtok=_OMNI_OUTPUT_TEXT_USD_PER_MTOK,
-        input_usd_per_mtok=_OMNI_INPUT_USD_PER_MTOK,
-        # Deliberately unset: unlike the preview model, 1.1 renders what it is
-        # asked for, so there is no substitution to disclose.
-        fixed_resolution=None,
-        resolution_notes={
-            "360p": _OMNI_1_1_360P_NOTE,
-            "1080p": _OMNI_1_1_UPSCALE_NOTE,
-            "4K": _OMNI_1_1_UPSCALE_NOTE,
-        },
+        output_video_usd_per_mtok=_OMNI_1_2_VIDEO_USD_PER_MTOK,
+        tokens_per_second=5792,
+        output_text_usd_per_mtok=9.0,
+        input_usd_per_mtok=1.5,
         source=_SRC_GEMINI_API,
-        source_note=(
-            "Confirmed on the Gemini Developer API pricing page: "
-            "gemini-omni-1.1-flash carries the same published token rates as "
-            "the preview model ($1.50 input, $9.00 text output, $17.50 video "
-            "output per 1M tokens, 5,792 tokens per second of 720p). Neither "
-            "page states how omni's token rates apply on the other backend, "
-            "so no cross-backend equivalence is claimed."
-        ),
+        source_note="Omni 1.2 rates verified November 6, 2026; 1080p and 4K include upsampling.",
+        # Verified on its own, after the last full re-read (PRICING_AS_OF):
+        # 1.2 had not launched on that date, so reporting PRICING_AS_OF for
+        # these rates would date them before they existed.
+        as_of=_OMNI_1_2_PRICING_AS_OF,
     ),
 }
 
@@ -477,9 +450,8 @@ _VIDEO_PRICING: dict[str, VideoModelPricing] = {
 # like an unknown model.
 _VIDEO_MODEL_ALIASES: dict[str, str] = dict(_CANONICAL_VIDEO_MODEL_IDS)
 
-# Omni splits the same way: Vertex serves 1.1 as `gemini-omni-1.1-flash-preview`
-# and the Developer API as the bare name. Both spellings must price
-# identically, or a render reported back by Vertex looks like an unknown model.
+# A retired omni ID, in either backend's spelling, runs on its replacement, so
+# it prices as the replacement too -- the quote must match what is billed.
 _VIDEO_MODEL_ALIASES.update(
     {
         alias: canonical_omni_model(alias)
@@ -495,9 +467,9 @@ _VEO_ALLOWED_DURATIONS = (4, 6, 8)
 _VEO_REFERENCE_DURATION = 8  # reference_to_video is 8s only
 _VEO_EXTEND_DURATION = 7  # extend_video outputs exactly 7s
 
-# Omni clamps to [3, 10]s (src/omni.py) — both models.
+# Omni's shortest render; the longest is each model's own
+# (omni_spec(...).max_duration_seconds), 15s on 1.2 and 10s on the preview.
 _OMNI_MIN_DURATION = 3
-_OMNI_MAX_DURATION = 10
 
 # Image sizes with a published price somewhere in the table. A size outside
 # this set is not "unpriced for this model", it is meaningless — so it yields
@@ -515,7 +487,7 @@ _IMAGE_SIZE_ALIASES: dict[str, str] = {
 # Resolution spellings seen across src/video.py ("4K"), the Veo docs ("4k")
 # and casual callers.
 _RESOLUTION_ALIASES: dict[str, str] = {
-    # 360p arrived with gemini-omni-1.1-flash's draft tier.
+    # 360p is the Omni draft tier.
     "360P": "360p",
     "720P": "720p",
     "1080P": "1080p",
@@ -554,7 +526,8 @@ def resolve_model_id(model: str) -> str:
     if model_id.startswith("imagen"):
         return _SUPERSEDED_DEFAULT_TARGET
 
-    return _VIDEO_MODEL_ALIASES.get(model_id, model_id)
+    resolved = _VIDEO_MODEL_ALIASES.get(model_id, model_id)
+    return canonical_omni_model(resolved) if is_omni_model(resolved) else resolved
 
 
 def _normalize_image_size(image_size: str | None) -> str | None:
@@ -564,6 +537,75 @@ def _normalize_image_size(image_size: str | None) -> str | None:
     key = str(image_size).strip().upper()
     key = _IMAGE_SIZE_ALIASES.get(key, key)
     return key if key in _KNOWN_IMAGE_SIZES else None
+
+
+def estimate_omni_upscale_cost(
+    duration_seconds: float,
+    source_resolution: str,
+    resolution: str,
+    *,
+    actual: bool = False,
+    measured: bool | None = None,
+) -> CostEstimate:
+    """Standalone upscaling bills only output tokens for the resolution pair.
+
+    Args:
+        duration_seconds: Length of the upscaled video.
+        source_resolution: Resolution of the source being upscaled.
+        resolution: Resolution the upscale renders at.
+        actual: True when ``duration_seconds`` was measured from the rendered
+            file. A metered length needs no encoder allowance and is not an
+            estimate, the same rule ``actual_video_cost`` follows; anything
+            else (a source's length, an upper bound) is flagged as an
+            estimate.
+        measured: True when ``duration_seconds`` is a measured length, the
+            rendered file's or the source's, which upscaling preserves; it
+            is priced as measured, with no encoder allowance. Defaults to
+            ``actual``. A source measured at 3.03s was quoted at 3.0717s.
+
+    Raises:
+        ValueError: The resolution pair is not one Google publishes a rate for.
+    """
+    source = _normalize_resolution(source_resolution)
+    target = _normalize_resolution(resolution)
+    rates = {
+        ("360p", "720p"): 2896,
+        ("360p", "1080p"): 5792,
+        ("720p", "1080p"): 2896,
+        ("720p", "4K"): 11584,
+    }
+    tokens = rates.get((source, target)) if source and target else None
+    if tokens is None:
+        raise ValueError("Upscaling supports 360p to 720p/1080p or 720p to 1080p/4K.")
+    if measured is None:
+        measured = actual
+    seconds = float(duration_seconds)
+    allowance = 0.0 if measured else OMNI_ENCODER_ALLOWANCE_SECONDS
+    seconds += allowance
+    usd_per_second = tokens * _OMNI_1_2_VIDEO_USD_PER_MTOK / _TOKENS_PER_MILLION
+    usd = seconds * usd_per_second
+    breakdown = {
+        "seconds": seconds,
+        "usd_per_second": usd_per_second,
+        "video_usd": usd,
+        "input_usd": 0.0,
+        # Tokens are whole; a fractional count (8895.546667) is a projection
+        # artefact, not something the bill will show.
+        "video_output_tokens": float(round(seconds * tokens)),
+    }
+    if allowance:
+        breakdown["encoder_allowance_seconds"] = allowance
+    return CostEstimate(
+        usd=usd,
+        is_estimate=not actual,
+        unit="second-of-video",
+        detail=f"{seconds:g}s upscale {source} to {target} on {OMNI_1_2_MODEL}",
+        breakdown=breakdown,
+        source=_SRC_GEMINI_API,
+        source_note=_OMNI_UPSCALE_SOURCE_NOTE,
+        # The upscale rates were published with 1.2 and read with its table.
+        as_of=_VIDEO_PRICING[OMNI_1_2_MODEL].as_of,
+    )
 
 
 def _normalize_resolution(resolution: str | None) -> str | None:
@@ -612,7 +654,8 @@ def snap_video_duration(
 
     Veo does not honor arbitrary lengths: ``src.video`` snaps the request to
     the nearest of 4/6/8 seconds, forces 8s for reference-to-video and 7s for
-    extensions. Omni clamps to [3, 10]. Estimating against the *requested*
+    extensions. Omni clamps to [3, the model's maximum]: 15s on 1.2, 10s on
+    the preview. Estimating against the *requested*
     duration would therefore quote a price nobody is ever charged, so this
     mirrors that logic exactly.
 
@@ -639,7 +682,9 @@ def snap_video_duration(
             return max(_OMNI_MIN_DURATION, round(duration_seconds))
         # src/omni.py rounds then clamps into the documented range.
         clamped = round(duration_seconds)
-        return max(_OMNI_MIN_DURATION, min(_OMNI_MAX_DURATION, clamped))
+        return max(
+            _OMNI_MIN_DURATION, min(omni_spec(model_id).max_duration_seconds, clamped)
+        )
 
     if generation_mode == "reference_to_video":
         return _VEO_REFERENCE_DURATION
@@ -756,12 +801,13 @@ def estimate_video_cost(
     Args:
         model: Veo or Omni model ID; per-backend Veo spellings both work.
         duration_seconds: Requested duration; snapped before pricing.
-        resolution: "360p" (gemini-omni-1.1-flash only), "720p", "1080p" or
+        resolution: "360p" (gemini-omni-1.2-flash only), "720p", "1080p" or
             "4K" (case-insensitive).
         include_audio: Kept for interface symmetry and reporting. Veo 3.1 and
             Omni publish a single rate that already includes audio, so this
             does not change the price — only the detail string, so a caller
-            can see that disabling audio saves nothing.
+            can see that disabling Veo's audio saves nothing. Omni has no
+            audio switch, so it is ignored there.
         generation_mode: One of ``src.video``'s modes; affects only the
             duration snap (reference-to-video is 8s, extensions are 7s).
 
@@ -790,7 +836,8 @@ def estimate_video_cost(
     if requested is None:
         return None
 
-    # Omni only ever renders 720p, so a 1080p request still bills at 720p.
+    # A model with a fixed resolution (the Omni preview renders 720p whatever
+    # it is asked) bills at that; 1.2 bills the resolution it renders.
     effective_resolution = pricing.fixed_resolution or requested
     usd_per_second = pricing.usd_per_second_by_resolution.get(effective_resolution)
     if usd_per_second is None:
@@ -801,9 +848,8 @@ def estimate_video_cost(
 
     # Quote at or above what will be billed: omni renders a fraction over
     # nominal, so a bare snapped duration under-quotes every omni call.
-    seconds = quote_duration_for(
-        model_id, snap_video_duration(model_id, duration_seconds, generation_mode)
-    )
+    snapped = snap_video_duration(model_id, duration_seconds, generation_mode)
+    seconds = quote_duration_for(model_id, snapped)
     return _build_video_estimate(
         model_id=model_id,
         pricing=pricing,
@@ -813,6 +859,7 @@ def estimate_video_cost(
         usd_per_second=usd_per_second,
         include_audio=include_audio,
         is_estimate=True,
+        allowance_seconds=float(seconds) - float(snapped),
     )
 
 
@@ -826,8 +873,14 @@ def _build_video_estimate(
     usd_per_second: float,
     include_audio: bool,
     is_estimate: bool,
+    allowance_seconds: float = 0.0,
 ) -> CostEstimate:
-    """Assemble a per-second video ``CostEstimate`` (shared by both paths)."""
+    """Assemble a per-second video ``CostEstimate`` (shared by both paths).
+
+    ``allowance_seconds`` is the encoder allowance already inside
+    ``seconds``, reported in the breakdown so a quote's priced seconds can be
+    reconciled with the nominal length beside it.
+    """
     usd = seconds * usd_per_second
 
     detail = (
@@ -837,19 +890,14 @@ def _build_video_estimate(
     if effective_resolution != requested_resolution:
         detail += f"; {requested_resolution} was requested but {model_id} renders "
         detail += f"{effective_resolution}"
-    if pricing.audio_included and not include_audio:
+    # Omni has no audio switch: every render carries its native audio, so
+    # "audio disabled" would describe something that never happened. Only Veo,
+    # whose audio a caller can turn off, gets the note.
+    if pricing.audio_included and not include_audio and not is_omni_model(model_id):
         detail += "; audio disabled but the published rate bundles audio, so "
         detail += "there is no discount"
 
-    # A rate that is not the one Google printed says so on the figure itself,
-    # not only in the module's comments — this string is what a caller sees
-    # next to the money.
-    resolution_note = pricing.resolution_notes.get(effective_resolution)
     source_note = pricing.source_note
-    if resolution_note:
-        source_note = (
-            f"{source_note} {resolution_note}" if source_note else resolution_note
-        )
 
     return CostEstimate(
         usd=usd,
@@ -860,9 +908,15 @@ def _build_video_estimate(
             "seconds": seconds,
             "usd_per_second": usd_per_second,
             "video_usd": usd,
+            **(
+                {"encoder_allowance_seconds": allowance_seconds}
+                if allowance_seconds
+                else {}
+            ),
         },
         source=pricing.source,
         source_note=source_note,
+        as_of=pricing.as_of,
     )
 
 
@@ -1173,6 +1227,7 @@ def actual_video_cost(
             breakdown=breakdown,
             source=pricing.source,
             source_note=pricing.source_note,
+            as_of=pricing.as_of,
         )
 
     if duration_seconds is None:
@@ -1240,13 +1295,16 @@ def sum_costs(
         A ``CostEstimate`` whose ``unit`` is the shared unit of the components
         or "mixed", and whose ``is_estimate`` is True if any component was an
         estimate or could not be priced. ``source``/``source_note`` are carried
-        only when every priced component agrees on them.
+        only when every priced component agrees on them; ``as_of`` is the
+        OLDEST verification date among them. Where the notes or the dates
+        differ, ``source_note`` says so instead.
     """
     total = 0.0
     breakdown: dict[str, float] = {}
     units: set[str] = set()
     sources: set[str | None] = set()
     source_notes: set[str | None] = set()
+    as_of_dates: set[str] = set()
     counted = 0
     unpriced = 0
     any_estimate = False
@@ -1260,6 +1318,7 @@ def sum_costs(
         units.add(estimate.unit)
         sources.add(estimate.source)
         source_notes.add(estimate.source_note)
+        as_of_dates.add(estimate.as_of or PRICING_AS_OF)
         any_estimate = any_estimate or estimate.is_estimate
         for key, value in estimate.breakdown.items():
             if key in _RATE_BREAKDOWN_KEYS:
@@ -1280,6 +1339,15 @@ def sum_costs(
         if key in breakdown and breakdown[key] != breakdown[key]:
             del breakdown[key]
 
+    # Summed seconds pick up float noise (27.215000000000003); seconds and
+    # tokens are reported to the microsecond and the token, which is all the
+    # inputs carry.
+    for key in ("seconds", "encoder_allowance_seconds"):
+        if key in breakdown:
+            breakdown[key] = round(breakdown[key], 6)
+    for key in [k for k in breakdown if k.endswith("_tokens")]:
+        breakdown[key] = float(round(breakdown[key]))
+
     breakdown["components"] = float(counted)
     if unpriced:
         breakdown["unpriced_components"] = float(unpriced)
@@ -1297,6 +1365,26 @@ def sum_costs(
     # tells the caller the total is incomplete.
     source = sources.pop() if len(sources) == 1 else None
     source_note = source_notes.pop() if len(source_notes) == 1 else None
+    # A total is only as fresh as its stalest rate, so a mix reports the
+    # oldest date: every component was verified on or after it, which is the
+    # one claim true of all of them. ISO dates order as strings.
+    as_of = min(as_of_dates) if as_of_dates else None
+    # Said rather than left null. A directed render's total read
+    # pricing_source_note: null and a pricing_as_of older than its render's,
+    # which looked like missing data; it is the rule above. No component's
+    # caveat is lent to the total, only that they differ.
+    mixed: list[str] = []
+    if len(source_notes) > 1:
+        mixed.append(
+            "Its components were priced from tables with different notes, so "
+            "no one note applies to the total."
+        )
+    if len(as_of_dates) > 1:
+        mixed.append(
+            "pricing_as_of is the oldest of its components' verification dates."
+        )
+    if mixed:
+        source_note = " ".join(filter(None, (source_note, *mixed)))
 
     detail = f"{label}: {counted} priced component{'s' if counted != 1 else ''}"
     if unpriced:
@@ -1310,6 +1398,7 @@ def sum_costs(
         breakdown=breakdown,
         source=source,
         source_note=source_note,
+        as_of=as_of,
     )
 
 
@@ -1391,7 +1480,10 @@ def cost_to_dict(estimate: CostEstimate | None) -> dict[str, Any] | None:
         "unit": estimate.unit,
         "detail": estimate.detail,
         "breakdown": {k: round(v, 6) for k, v in estimate.breakdown.items()},
-        "pricing_as_of": PRICING_AS_OF,
+        # The date the rates behind THIS figure were verified: a table read
+        # on its own after the last full re-read reports its own date, so a
+        # 1.2 quote is not dated before 1.2 existed.
+        "pricing_as_of": estimate.as_of or PRICING_AS_OF,
         # The date alone is unfalsifiable: it says when someone checked, not
         # what they checked against. The URL is what lets a caller who doubts
         # a quote go and verify it, and the note is what stops them checking
@@ -1481,7 +1573,7 @@ def describe_model_pricing(model: str) -> dict[str, Any] | None:
             "model": model_id,
             "requested_model": str(model),
             "kind": "video",
-            "pricing_as_of": PRICING_AS_OF,
+            "pricing_as_of": video.as_of or PRICING_AS_OF,
             "source": video.source,
             "source_note": video.source_note,
             "usd_per_second": dict(video.usd_per_second_by_resolution),
@@ -1509,13 +1601,6 @@ def describe_model_pricing(model: str) -> dict[str, Any] | None:
                 else {}
             ),
             "fixed_resolution": video.fixed_resolution,
-            # Only present when some resolution's figure needs a sentence:
-            # an empty dict would read as "all four rates are published".
-            **(
-                {"resolution_notes": dict(video.resolution_notes)}
-                if video.resolution_notes
-                else {}
-            ),
         }
 
     return None
