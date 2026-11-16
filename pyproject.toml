@@ -29,6 +29,7 @@ dependencies = [
     "google-cloud-storage>=3.6.0",
     "imageio>=2.37.0",
     "imageio-ffmpeg>=0.6.0",
+    "tomlkit>=0.13,<1",
 ]
 
 [project.urls]

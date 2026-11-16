@@ -1,0 +1,65 @@
+name: Client plugins
+
+on:
+  pull_request:
+    paths:
+      - '.claude-plugin/**'
+      - 'plugins/**'
+      - 'gemini-extension.json'
+      - 'src/client_config.py'
+      - 'src/client_release.json'
+      - 'tests/test_claude_plugin.py'
+      - '.github/workflows/claude-plugin.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.claude-plugin/**'
+      - 'plugins/**'
+      - 'gemini-extension.json'
+      - 'src/client_config.py'
+      - 'src/client_release.json'
+      - 'tests/test_claude_plugin.py'
+      - '.github/workflows/claude-plugin.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/gemini-media-plugin-claude
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Claude validator
+        run: npm install --global @anthropic-ai/claude-code@2.1.325
+      - name: Validate marketplace and plugin
+        run: |
+          claude plugin validate --strict .
+          claude plugin validate --strict plugins/gemini-media
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.13'
+          enable-cache: true
+      - name: Install test dependencies
+        run: uv sync --locked --all-groups
+      - name: Test isolated installation and Claude MCP connection
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-media"
+          claude plugin marketplace add ./
+          claude plugin install gemini-media@cxoagi \
+            --config data_folder="$RUNNER_TEMP/plugin-media" \
+            --config gemini_api_key=plugin-smoke-placeholder
+          claude plugin details gemini-media
+          claude mcp list | grep -F '✔ Connected'
+      - name: Check Claude and Gemini CLI launches without generating media
+        env:
+          CLAUDE_PLUGIN_SMOKE: '1'
+        run: uv run pytest -q tests/test_claude_plugin.py

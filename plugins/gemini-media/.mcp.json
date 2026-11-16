@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "gemini-media": {
+      "command": "uvx",
+      "args": [
+        "--python", "3.13",
+        "--from", "gemini-media-mcp==0.1.14",
+        "gemini-media-mcp", "stdio"
+      ],
+      "env": {
+        "DATA_FOLDER": "${user_config.data_folder}",
+        "GEMINI_API_KEY": "${user_config.gemini_api_key}",
+        "GOOGLE_API_KEY": "",
+        "GOOGLE_SERVICE_ACCOUNT_JSON": "",
+        "GOOGLE_GENAI_USE_VERTEXAI": "${user_config.use_vertex}",
+        "GOOGLE_GENAI_USE_ENTERPRISE": "${user_config.use_vertex}",
+        "GOOGLE_CLOUD_PROJECT": "${user_config.google_cloud_project}",
+        "GOOGLE_CLOUD_LOCATION": "${user_config.google_cloud_location}",
+        "GOOGLE_APPLICATION_CREDENTIALS": "${user_config.google_application_credentials}",
+        "VIDEO_GCS_BUCKET": "${user_config.video_gcs_bucket}",
+        "OMNI_BACKEND": "${user_config.omni_backend}"
+      }
+    }
+  }
+}

@@ -39,9 +39,32 @@ from google.oauth2 import service_account
 
 _SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
 
+GOOGLE_ENV_DEFAULTS = {
+    "GEMINI_API_KEY": "",
+    "GOOGLE_API_KEY": "",
+    "GOOGLE_SERVICE_ACCOUNT_JSON": "",
+    "GOOGLE_APPLICATION_CREDENTIALS": "",
+    "GOOGLE_CLOUD_PROJECT": "",
+    "GOOGLE_CLOUD_LOCATION": "",
+    "GOOGLE_GENAI_USE_VERTEXAI": "false",
+    "GOOGLE_GENAI_USE_ENTERPRISE": "false",
+}
+
+
+def isolated_google_env(env: dict[str, str]) -> dict[str, str]:
+    """Use only the selected credentials and align both SDK backend switches."""
+    result = GOOGLE_ENV_DEFAULTS | env
+    result["GOOGLE_GENAI_USE_ENTERPRISE"] = result["GOOGLE_GENAI_USE_VERTEXAI"]
+    return result
+
+
 _creds: Any | None = None
 _project: str | None = None
 _lock = threading.Lock()
+
+
+class CredentialConfigurationError(ValueError):
+    """Operator-facing configuration error whose message contains no secrets."""
 
 
 def inline_service_account_json() -> tuple[str, str] | None:
@@ -93,15 +116,50 @@ def parse_service_account_json() -> dict[str, Any] | None:
     try:
         data = json.loads(sa_json)
     except json.JSONDecodeError as e:
-        raise ValueError(
+        raise CredentialConfigurationError(
             f"{source} is set but is not valid JSON: {e}. "
             "Refusing to fall back to ambient application-default "
             "credentials — that would run the server as a different "
             "identity than configured. Fix the JSON or unset the variable."
         ) from e
     if not isinstance(data, dict):
-        raise ValueError(f"{source} must be a JSON object, got {type(data).__name__}.")
+        raise CredentialConfigurationError(
+            f"{source} must be a JSON object, got {type(data).__name__}."
+        )
     return data
+
+
+def _load_service_account_credentials() -> tuple[Any, str | None] | None:
+    info = parse_service_account_json()
+    if info is None:
+        return None
+    normalize_environment()
+    required = ("client_email", "token_uri", "private_key")
+    missing = [key for key in required if not info.get(key)]
+    invalid = [
+        key for key in required if key not in missing and not isinstance(info[key], str)
+    ]
+    advice = "Fix GOOGLE_SERVICE_ACCOUNT_JSON, or unset it and configure GOOGLE_APPLICATION_CREDENTIALS / Application Default Credentials."
+    if missing or invalid:
+        reason = (
+            f"Missing required fields: {', '.join(missing)}."
+            if missing
+            else f"Fields must be strings: {', '.join(invalid)}."
+        )
+        raise CredentialConfigurationError(
+            f"The inline JSON is not a usable service-account key. {reason} {advice}"
+        )
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=list(_SCOPES)
+        )
+    except (ValueError, KeyError) as e:
+        raise CredentialConfigurationError(
+            f"The inline JSON is not a usable service-account key. Verify private_key contains a valid PEM signing key. {advice}"
+        ) from e
+    return creds, os.environ.get("GOOGLE_CLOUD_PROJECT") or info.get(
+        "project_id"
+    ) or None
 
 
 def service_account_credentials() -> tuple[Any, str | None] | None:
@@ -114,25 +172,16 @@ def service_account_credentials() -> tuple[Any, str | None] | None:
     with _lock:
         if _creds is not None:
             return _creds, _project
-        info = parse_service_account_json()
-        if info is None:
+        found = _load_service_account_credentials()
+        if found is None:
             return None
-        normalize_environment()
-        try:
-            creds = service_account.Credentials.from_service_account_info(
-                info, scopes=list(_SCOPES)
-            )
-        except (ValueError, KeyError) as e:
-            raise ValueError(
-                "The inline service-account JSON parsed but is not a usable "
-                f"service-account key: {e}."
-            ) from e
-        _creds = creds
-        _project = os.environ.get("GOOGLE_CLOUD_PROJECT") or info.get("project_id") or None
-        return creds, _project
+        _creds, _project = found
+        return found
 
 
-def vertex_client_kwargs(**extra: Any) -> dict[str, Any]:
+def vertex_client_kwargs(
+    *, cache_credentials: bool = True, **extra: Any
+) -> dict[str, Any]:
     """Keyword arguments for a Vertex ``genai.Client`` on this deployment.
 
     With inline credentials the project is always passed explicitly: google-genai
@@ -142,11 +191,15 @@ def vertex_client_kwargs(**extra: Any) -> dict[str, Any]:
     missing.
     """
     kwargs: dict[str, Any] = {"vertexai": True, **extra}
-    found = service_account_credentials()
+    found = (
+        service_account_credentials()
+        if cache_credentials
+        else _load_service_account_credentials()
+    )
     if found is not None:
         creds, project = found
         if not project:
-            raise ValueError(
+            raise CredentialConfigurationError(
                 "The inline service-account JSON has no project_id and "
                 "GOOGLE_CLOUD_PROJECT is unset, so the Vertex project is unknown. "
                 "Set GOOGLE_CLOUD_PROJECT."

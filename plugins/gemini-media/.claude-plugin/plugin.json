@@ -1,0 +1,64 @@
+{
+  "name": "gemini-media",
+  "version": "1.0.1",
+  "description": "Plan, generate, and edit images and video with Gemini, Veo, and Omni, with cost estimates before generation.",
+  "author": {
+    "name": "CxOAGI"
+  },
+  "homepage": "https://github.com/CxOAGI/gemini-media-mcp#claude-code-plugin",
+  "repository": "https://github.com/CxOAGI/gemini-media-mcp",
+  "license": "Apache-2.0",
+  "keywords": ["gemini", "veo", "omni", "images", "video", "mcp"],
+  "userConfig": {
+    "data_folder": {
+      "type": "directory",
+      "title": "Media output folder",
+      "description": "Absolute path to a writable folder for images and videos, outside Claude's plugin cache. Local media inputs must also be inside this folder.",
+      "required": true
+    },
+    "gemini_api_key": {
+      "type": "string",
+      "title": "Gemini API key",
+      "description": "Required for Gemini API mode. Leave blank for Vertex AI unless you also want Gemini API access for Omni.",
+      "sensitive": true,
+      "default": ""
+    },
+    "use_vertex": {
+      "type": "boolean",
+      "title": "Use Vertex AI",
+      "description": "Enable for Veo and Vertex AI features, then set the project and credentials below. Otherwise use the Gemini API key.",
+      "default": false
+    },
+    "google_cloud_project": {
+      "type": "string",
+      "title": "Google Cloud project",
+      "description": "Project ID for Vertex AI. Leave blank in Gemini API mode.",
+      "default": ""
+    },
+    "google_cloud_location": {
+      "type": "string",
+      "title": "Vertex AI location",
+      "description": "Google Cloud region for Vertex AI.",
+      "default": "us-central1"
+    },
+    "google_application_credentials": {
+      "type": "file",
+      "title": "Vertex AI service account file",
+      "description": "Absolute path to a service account JSON file. Leave blank to use Application Default Credentials, or when using the Gemini API.",
+      "default": ""
+    },
+    "video_gcs_bucket": {
+      "type": "string",
+      "title": "Video GCS bucket",
+      "description": "Optional gs://bucket for large video output on Vertex AI. Also seeds the bucket allowlist unless GCS_ALLOWED_BUCKETS is set.",
+      "default": ""
+    },
+    "omni_backend": {
+      "type": "string",
+      "title": "Omni backend",
+      "description": "Auto prefers the Gemini API whenever an API key is configured. Choose vertex to keep Omni usage in your Vertex project.",
+      "options": ["auto", "vertex", "gemini_api"],
+      "default": "auto"
+    }
+  }
+}

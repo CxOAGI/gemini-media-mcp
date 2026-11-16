@@ -511,7 +511,7 @@ Typical workflows:
 | `GOOGLE_CLOUD_PROJECT` | ✅ | Your Google Cloud project ID |
 | `GOOGLE_CLOUD_LOCATION` | ✅ | Region (e.g., `us-central1`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | ✅ | Path to service account JSON key (inside container). Also accepts the key as inline JSON |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | — | The service account key as inline JSON, instead of mounting a file. Written by `gemini-media-mcp setup`; the server materialises it into a temp file |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | — | The service account key as inline JSON, instead of mounting a file. Loaded into an in-memory credentials object; no temporary key file is created |
 | `DATA_FOLDER` | ✅ | Output directory path (must match host path in volume) |
 
 ### Gemini API Configuration (Images + Omni Videos)

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.CxOAGI/gemini-media-mcp",
+  "title": "Gemini Media",
+  "description": "Plan, generate and edit Gemini images and video, with cost estimates before generation.",
+  "version": "0.1.15",
+  "repository": {
+    "url": "https://github.com/CxOAGI/gemini-media-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/CxOAGI/gemini-media-mcp#quick-start",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "gemini-media-mcp",
+      "version": "0.1.15",
+      "runtimeHint": "uvx",
+      "runtimeArguments": [{"type": "named", "name": "--python", "value": "3.13"}],
+      "packageArguments": [{"type": "positional", "value": "stdio"}],
+      "transport": {"type": "stdio"},
+      "environmentVariables": [
+        {"name": "GEMINI_API_KEY", "description": "Gemini API key from Google AI Studio. For Vertex AI, use the repository setup wizard instead.", "isRequired": true, "isSecret": true},
+        {"name": "DATA_FOLDER", "description": "Absolute writable output directory; also contains local input media. Do not use ~.", "format": "filepath", "isRequired": true},
+        {"name": "GOOGLE_GENAI_USE_VERTEXAI", "value": "false"},
+        {"name": "GOOGLE_GENAI_USE_ENTERPRISE", "value": "false"},
+        {"name": "OMNI_BACKEND", "value": "gemini_api"}
+      ]
+    }
+  ]
+}
