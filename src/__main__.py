@@ -29,6 +29,7 @@ from google import genai
 from google.genai import types
 
 from . import credentials
+from .runtime_config import OMNI_BACKENDS, parse_omni_backend_env as _parse_omni_backend_env
 from .video import VEO_DEFAULT_TIMEOUT_SECONDS, VEO_MEASURED_4K_SECONDS
 from google.cloud import storage
 from mcp.server.fastmcp import Context, FastMCP, Image
@@ -458,7 +459,7 @@ def create_client() -> genai.Client:
         return genai.Client(**_vertex_client_kwargs())
     api_key = os.environ.get("GEMINI_API_KEY")
     if api_key:
-        return genai.Client(api_key=api_key)
+        return genai.Client(api_key=api_key, vertexai=False)
     raise RuntimeError("No credentials configured")
 
 
@@ -771,36 +772,6 @@ def _respond(app_ctx: AppContext, payload: dict[str, Any]) -> str:
         ),
         indent=2,
     )
-
-
-OMNI_BACKENDS = ("auto", "vertex", "gemini_api")
-
-
-def _parse_omni_backend_env(
-    *, primary_is_vertex: bool, gemini_api_available: bool
-) -> str:
-    """Read and validate OMNI_BACKEND at startup.
-
-    A pin the deployment cannot honour fails here, once, with the variable
-    named -- not on the first omni call, and not by quietly serving the other
-    backend.
-    """
-    raw = os.environ.get("OMNI_BACKEND", "auto").strip().lower() or "auto"
-    if raw not in OMNI_BACKENDS:
-        raise ValueError(
-            f"OMNI_BACKEND={raw!r} is not one of {', '.join(OMNI_BACKENDS)}."
-        )
-    if raw == "vertex" and not primary_is_vertex:
-        raise ValueError(
-            "OMNI_BACKEND=vertex, but this server's primary client is not "
-            "Vertex AI (GOOGLE_GENAI_USE_VERTEXAI is not true)."
-        )
-    if raw == "gemini_api" and primary_is_vertex and not gemini_api_available:
-        raise ValueError(
-            "OMNI_BACKEND=gemini_api, but this Vertex server has no "
-            "GEMINI_API_KEY to reach the Gemini Developer API with."
-        )
-    return raw
 
 
 # The one decision backend_note explains: the auto default sending omni to the
@@ -11325,7 +11296,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         )
 
     setup_parser = subparsers.add_parser(
-        "setup", help="Interactive setup wizard for credentials and Claude Desktop"
+        "setup", help="Configure credentials and a local MCP client"
     )
     setup_parser.add_argument(
         "--non-interactive",
@@ -11356,7 +11327,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument(
         "--video-gcs-bucket", help="Optional gs:// URI for large video output."
     )
+    from .client_config import CLIENTS
 
+    setup_parser.add_argument("--client", choices=CLIENTS, default="claude-desktop")
+    setup_parser.add_argument(
+        "--adc",
+        action="store_true",
+        help="Use Application Default Credentials instead of a service-account key.",
+    )
+    setup_parser.add_argument(
+        "--write",
+        action="store_true",
+        default=None,
+        help="Install into the selected client.",
+    )
+    setup_parser.add_argument(
+        "--config-path", help="Override the client's configuration file path."
+    )
+    setup_parser.add_argument(
+        "--output", help="Export a private config instead of installing it."
+    )
+    setup_parser.add_argument(
+        "--preview", action="store_true", help="Only show a redacted preview; do not install or export."
+    )
+    setup_parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip the live model-list check (offline setup).",
+    )
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check local runtime, output directory and credential configuration",
+    )
+    doctor_parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Also authenticate with a model-list call; never generates media.",
+    )
     return parser
 
 
@@ -11418,25 +11425,52 @@ def main() -> None:
     if args.command == "setup":
         from .setup_wizard import run_wizard
 
+        if args.preview and (args.write or args.output):
+            parser.error("--preview cannot be combined with --write or --output.")
+        if args.non_interactive and not (args.write or args.output or args.preview):
+            parser.error("Scripted setup requires --write, --output PATH, or --preview. For a usable private config, add --output PATH; previews redact credentials.")
         overrides: dict[str, Any] = {}
         if args.mode:
             overrides["mode"] = args.mode
-        if args.api_key:
+        if args.api_key is not None:
             overrides["api_key"] = args.api_key
         if args.project_id:
             overrides["project_id"] = args.project_id
         if args.location:
             overrides["location"] = args.location
-        if args.sa_path:
+        if args.sa_path is not None:
             overrides["sa_path"] = args.sa_path
-        if args.sa_json:
+        if args.sa_json is not None:
             overrides["sa_json"] = args.sa_json
         if args.data_folder:
             overrides["data_folder"] = args.data_folder
         if args.video_gcs_bucket:
             overrides["video_gcs_bucket"] = args.video_gcs_bucket
 
-        run_wizard(interactive=not args.non_interactive, **overrides)
+        overrides.update(
+            client=args.client,
+            adc=args.adc,
+            config_path=args.config_path,
+            output=args.output,
+            skip_validation=args.skip_validation,
+        )
+        try:
+            run_wizard(
+                interactive=not args.non_interactive,
+                write_config=False if args.preview else args.write,
+                **overrides,
+            )
+        except (ValueError, OSError, RuntimeError) as exc:
+            parser.exit(2, f"Setup failed: {exc}\n")
+        return
+
+    if args.command == "doctor":
+        from .doctor import diagnose
+
+        report = diagnose(live=args.live)
+        print(json.dumps(report, indent=2))
+        if any(item["status"] == "error" for item in report):
+            raise SystemExit(1)
         return
 
     transport = args.command or "stdio"

@@ -1,0 +1,15 @@
+{
+  "name": "cxoagi",
+  "owner": {
+    "name": "CxOAGI"
+  },
+  "description": "CxOAGI plugins for Claude Code",
+  "plugins": [
+    {
+      "name": "gemini-media",
+      "source": "./plugins/gemini-media",
+      "description": "Plan, generate, and edit images and video with Gemini, Veo, and Omni.",
+      "category": "media"
+    }
+  ]
+}

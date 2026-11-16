@@ -27,6 +27,21 @@ from src.__main__ import (
 )
 
 
+def test_service_account_error_names_missing_fields_without_key_values(monkeypatch):
+    from src.credentials import CredentialConfigurationError, vertex_client_kwargs
+
+    monkeypatch.setenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        '{"type":"service_account","token_uri":"https://example.invalid/token","private_key":"private-test-value"}',
+    )
+    with pytest.raises(CredentialConfigurationError) as exc:
+        vertex_client_kwargs(cache_credentials=False)
+    message = str(exc.value)
+    assert "client_email" in message and "GOOGLE_SERVICE_ACCOUNT_JSON" in message
+    assert "private-test-value" not in message
+    assert "--sa-path" not in message and "--adc" not in message
+
+
 def test_a_loopback_bind_keeps_the_localhost_rebinding_allowlist() -> None:
     """A local run must keep DNS-rebinding protection: a browser page must not
     be able to drive a localhost-bound server."""
@@ -224,7 +239,9 @@ def test_the_image_models_vertex_client_gets_the_same_credentials(
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
 
     built: list[dict[str, object]] = []
-    monkeypatch.setattr(image.genai, "Client", lambda **kw: built.append(kw) or object())
+    monkeypatch.setattr(
+        image.genai, "Client", lambda **kw: built.append(kw) or object()
+    )
     monkeypatch.setattr(image, "_vertex_global_client", None)
 
     image._get_vertex_global_client()

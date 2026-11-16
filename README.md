@@ -1,5 +1,7 @@
 # Gemini Media MCP
 
+<!-- mcp-name: io.github.CxOAGI/gemini-media-mcp -->
+
 Plan, generate, compose, and edit images and video with Gemini image models, Veo 3.1, and Gemini Omni, with a cost estimate before every call and an optional Gemini 4 Argon director that checks each take against your notes.
 
 ## What it does
@@ -13,26 +15,193 @@ Plan, generate, compose, and edit images and video with Gemini image models, Veo
 
 ## Quick start
 
-```bash
-uvx gemini-media-mcp setup
-```
-
-The `setup` wizard walks you through the whole onboarding flow end-to-end:
-
-1. Pick a credential mode: **Gemini API** (images + Omni video, easier to set up) or **Vertex AI** (images + Veo and Omni video, adds GCS output and Vertex-only features).
-2. Enter your API key, or your Google Cloud project plus a service account JSON (file path or inline paste).
-3. Choose where generated media should be written (defaults to `~/gemini-media`).
-4. Optionally set a `VIDEO_GCS_BUCKET` for large video output, and auto-populate `GCS_ALLOWED_BUCKETS`.
-5. Validate your credentials with a live check (constructs a Google GenAI client and lists models to confirm the key/credentials actually authenticate). Validation failures are non-fatal — you can continue anyway.
-6. Print a ready-to-paste Claude Desktop JSON block. On macOS, the wizard can also merge the block directly into `~/Library/Application Support/Claude/claude_desktop_config.json` (existing servers are preserved and the prior file is backed up to `.bak`).
-
-For scripted use, all prompts can be supplied via flags:
+For **Claude Code**, use the [URL plugin installation](#claude-code-plugin).
+For other local clients, use the shared setup wizard:
 
 ```bash
-uvx gemini-media-mcp setup --non-interactive --mode=gemini --api-key=AIzaSy...
+uv run gemini-media-mcp setup --client codex --write
 ```
 
-If you prefer to configure everything by hand, the manual steps are below.
+**Release status:** the multi-client wizard and `doctor` are new in this
+checkout. Until the next PyPI release, clone this repository and
+run these commands from its root with `uv run`. After release, replace `uv run`
+with `uvx --python 3.13`. Local client adapters and the Claude/Gemini plugins
+currently launch the released server **0.1.14**; they do not depend on unreleased
+runtime changes.
+
+The wizard asks for Gemini API or Vertex AI, reuses configured credentials, masks
+API-key entry, and defaults output to `~/gemini-media`. Vertex supports Application
+Default Credentials (ADC) or a service-account file. Omni uses the selected
+backend. A model-list request checks authentication without generating media;
+generation permissions and quota still depend on the model and project.
+
+Choose `claude-code`, `claude-desktop`, `codex`, `cursor`, `copilot`, `vscode`,
+`gemini-cli`, or `cline`. For VS Code's current Copilot harness, choose `copilot`.
+Config writes preserve unrelated settings and make a private `.bak` backup;
+previews redact secrets. Scripted setup requires `--write`, `--output PATH`, or
+`--preview`; add `--output PATH` to older scripts that expected a paste-ready
+configuration on stdout. See [client setup and troubleshooting](docs/clients.md).
+
+```bash
+# Gemini API: prompts for a hidden key, or reuses GEMINI_API_KEY
+uv run gemini-media-mcp setup --client cursor --mode gemini --write
+
+# Vertex: browser login once, then use your project
+gcloud auth application-default login
+uv run gemini-media-mcp setup --client codex --mode vertex --adc --project-id YOUR_PROJECT --write
+
+# Check the current shell's server environment, without generating media
+uv run gemini-media-mcp doctor
+uv run gemini-media-mcp doctor --live
+```
+
+For **Gemini CLI**, a [URL-installable extension](docs/clients.md#gemini-cli-extension)
+is also included. The wizard honors `GEMINI_CLI_HOME` when you use a separate
+Gemini CLI profile. Directory metadata and release steps are in
+[distribution and listings](docs/distribution.md).
+
+## Claude Code plugin
+
+Install this repository as a [Claude Code plugin marketplace](https://code.claude.com/docs/en/discover-plugins#add-a-marketplace).
+The plugin runs the MCP server locally and exposes its image and video tools.
+These instructions are validated with **Claude Code 2.1.325**; update Claude Code
+if the configuration commands or form are unavailable.
+
+We distribute the Claude Code plugin through **CxOAGI's GitHub marketplace**.
+We are not submitting it to Anthropic's official catalog. See
+[distribution eligibility](docs/distribution.md#anthropic-directory-eligibility).
+
+### Install and configure
+
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and check
+   that `uvx --version` works in the environment that starts Claude Code. `uvx`
+   downloads Python 3.13 if needed and installs the server on its first launch.
+2. Inside a Claude Code session, add the marketplace and install the plugin:
+
+   ```text
+   /plugin marketplace add https://github.com/CxOAGI/gemini-media-mcp
+   /plugin install gemini-media@cxoagi
+   ```
+
+3. Choose **User** scope to make it available across your projects. For the
+   simplest setup, fill in just **Gemini API key** and **Media output folder**
+   (an absolute path, such as `/Users/you/gemini-media`). Leave the remaining
+   options at their defaults. Get your key from [Google AI Studio](https://aistudio.google.com/apikey)
+   and enter it in Claude's configuration form, not the chat.
+4. Open `/mcp` and confirm the `gemini-media` plugin server is connected. If
+   Claude asks for a reload, run `/reload-plugins` or start a new session.
+
+Adding the marketplace makes the plugin appear in `/plugin` → **Discover**;
+installing `gemini-media@cxoagi` is the next step. You do not need to clone this
+repository or edit an MCP JSON file. The default setup provides Gemini images
+and Omni video. For Veo or an existing Google Cloud project, use the Vertex
+settings below.
+
+<details>
+<summary>Vertex AI and advanced configuration</summary>
+
+| Option | Gemini API | Vertex AI |
+|---|---|---|
+| Media output folder | Absolute, writable path, e.g. `/Users/you/gemini-media` | Same |
+| Gemini API key | Your key from [Google AI Studio](#gemini-api-setup) | On a fresh install, leave blank unless you also want Gemini API access for Omni |
+| Use Vertex AI | Off | On |
+| Google Cloud project | Leave blank | Your project ID |
+| Vertex AI location | Keep `us-central1` | `us-central1` or your supported region |
+| Vertex AI service account file | Leave blank | Absolute path to the JSON file, or blank for Application Default Credentials |
+| Video GCS bucket | Leave blank | Optional `gs://your-bucket` |
+| Omni backend | `auto` | `vertex` to keep Omni usage in your Vertex project |
+
+Gemini API mode supports images and Omni video. Veo requires Vertex AI; follow
+the [Vertex setup instructions](#vertex-ai-setup) for the Google-side setup.
+The form has a shared set of fields for both modes, so leave the irrelevant
+fields blank. An API key is required in Gemini API mode even though its field
+is optional to allow Vertex-only installations.
+
+</details>
+
+Change settings at any time with:
+
+```text
+/plugin configure gemini-media@cxoagi
+```
+
+The API key is marked sensitive so Claude masks it and uses its credential
+storage. An empty sensitive value does **not** clear a previously saved key.
+To switch an existing Gemini installation to Vertex only, use the setup wizard:
+`uv run gemini-media-mcp setup --client claude-code --mode vertex --adc --write`.
+It clears saved credentials through Claude's native reinstall flow with
+`--keep-data`, then verifies the selected configuration. See the
+[scope and recovery details](docs/clients.md#preview-export-and-scripts).
+
+The form's settings override the corresponding environment variables;
+exporting `GEMINI_API_KEY` alone does not configure this plugin.
+Other server options, such as `GCS_ALLOWED_BUCKETS` and `DIRECTOR_MODEL`,
+can still be supplied in the environment that starts Claude Code. The plugin
+clears inherited `GOOGLE_API_KEY` and `GOOGLE_SERVICE_ACCOUNT_JSON` so unrelated
+shell credentials cannot override its configuration. For Vertex, configure a
+service-account file or use ADC; the standalone server also supports inline JSON.
+
+Use a media output folder outside Claude's plugin cache, and enter its full
+absolute path rather than `~`. Images, videos, and manifests stay there across
+plugin updates and removal. Local input files must be inside this folder too.
+With `auto`, Omni prefers the Gemini API whenever an API key is configured,
+including when **Use Vertex AI** is on; choose `vertex` to avoid that switch.
+
+To check the tools without generating media, ask Claude:
+
+> Use plan_generation to suggest an image generation plan. Do not generate anything.
+
+Every generation tool also accepts `dry_run: true` for a free quote. Real
+generation uses your Google account and incurs API charges.
+
+### Install from a terminal
+
+The equivalent shell commands are:
+
+```bash
+claude plugin marketplace add https://github.com/CxOAGI/gemini-media-mcp
+claude plugin install gemini-media@cxoagi
+```
+
+The shell install does **not** prompt for credentials. Open a Claude session and
+run `/plugin configure gemini-media@cxoagi` before using the server. For automated
+configuration, Claude also supports `claude plugin configure gemini-media@cxoagi
+--values-stdin`, which reads a JSON object with single-line string values. Use
+the keys in [plugin.json](plugins/gemini-media/.claude-plugin/plugin.json), pass
+boolean values as `"true"` or `"false"`, and supply secrets through stdin rather
+than command arguments or committed files.
+
+### Updates and troubleshooting
+
+The plugin currently launches **`gemini-media-mcp==0.1.14`** through `uvx`. The
+package version is pinned so an unrelated PyPI release does not silently change
+the installed server. Plugin wrapper versions are separate from Python package
+versions. To refresh the marketplace and install its latest plugin version:
+
+```bash
+claude plugin marketplace update cxoagi
+claude plugin update gemini-media@cxoagi
+```
+
+Reload plugins when prompted, or start a new Claude session. Custom marketplaces
+have automatic updates off by default; enable them in `/plugin` → Marketplaces
+if desired. To remove the plugin, use `claude plugin uninstall gemini-media@cxoagi`.
+
+- **`uvx` not found:** install uv and restart Claude from an environment whose
+  `PATH` includes it. IDEs and GUI apps may have a different `PATH` from a terminal.
+- **First launch is slow:** Python and dependency downloads need network access.
+  Run `uvx --python 3.13 --from gemini-media-mcp==0.1.14 gemini-media-mcp --help`
+  in a terminal to finish the downloads and see installation errors, then reconnect.
+- **Missing credentials or a failed connection:** run `/plugin configure
+  gemini-media@cxoagi`, check the mode and output path, and inspect `/mcp` for the
+  server error. To configure the plugin with the source wizard, use
+  `uv run gemini-media-mcp setup --client claude-code --write`.
+- **Duplicate tools:** if you previously added this server manually with
+  `claude mcp add`, remove that manual registration or disable the plugin.
+- **Marketplace missing:** use the repository URL above, not the raw
+  `marketplace.json` URL. This marketplace uses a plugin directory inside the
+  cloned repository. Before these files are published, use the local developer
+  installation below.
 
 ## Setup
 
@@ -78,7 +247,7 @@ Other variables the server reads:
 | `VIDEO_GCS_BUCKET` | Default bucket for large video output; also seeds the `GCS_ALLOWED_BUCKETS` allowlist |
 | `OMNI_BACKEND` | Which backend serves the omni tools: `auto` (default), `vertex`, or `gemini_api`. `auto` uses the Gemini Developer API whenever `GEMINI_API_KEY` is set — even on a Vertex server, which is a different project, billing path and quota pool. Set `vertex` to keep omni traffic in the Vertex project. A per-call `omni_backend` argument overrides it; every omni response reports `backend` and `backend_reason`. |
 | `DIRECTOR_MODEL` | Model the [virtual director](#virtual-director) uses: `gemini-4-argon` (default) or `gemini-3.8-flash`, about a third of the price |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Service account key as inline JSON instead of a file path (Vertex mode only). Written by `setup`; the server materialises it into a temp file. `GOOGLE_APPLICATION_CREDENTIALS` also accepts inline JSON |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Service account key as inline JSON instead of a file path (Vertex mode only). Loaded into an in-memory credentials object; no temporary key file is created. `GOOGLE_APPLICATION_CREDENTIALS` also accepts inline JSON |
 | `RUNNING_IN_CONTAINER` | Set to `true` by the Docker image. Makes `DATA_FOLDER` mandatory and switches the sse/streamable-http bind address to `0.0.0.0` (`127.0.0.1` otherwise). Presence of `/.dockerenv` has the same effect |
 | `FASTMCP_HOST` | Bind address for the sse/streamable-http transports; `--host` wins over it |
 
@@ -558,6 +727,51 @@ uv run pytest
 ```
 
 This is hermetic and free: the paid live tests below skip unless you opt in.
+
+### Claude Code plugin development
+
+The marketplace is [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json).
+Its plugin is self-contained under [`plugins/gemini-media/`](plugins/gemini-media/).
+The plugin uses the pinned PyPI server; editing `src/` does not change the server
+it launches. To test local server changes, use the normal development environment.
+
+Validate both manifests from the repository root:
+
+```bash
+claude plugin validate --strict .
+claude plugin validate --strict plugins/gemini-media
+```
+
+To test installation without changing your normal Claude settings, create a
+temporary configuration directory (Bash example):
+
+```bash
+plugin_test_config=$(mktemp -d)
+CLAUDE_CONFIG_DIR="$plugin_test_config" claude plugin marketplace add ./
+CLAUDE_CONFIG_DIR="$plugin_test_config" claude plugin install gemini-media@cxoagi
+CLAUDE_CONFIG_DIR="$plugin_test_config" claude plugin details gemini-media
+```
+
+Run the optional package smoke tests with:
+
+```bash
+CLAUDE_PLUGIN_SMOKE=1 uv run pytest -q tests/test_claude_plugin.py
+```
+
+They launch the plugin's exact command from a temporary working directory, with
+dummy Gemini and Vertex credentials, and check MCP initialization, tool discovery,
+and a free planning call. They download the pinned public package if needed but
+never generate media or use your Google credentials. The plugin CI workflow also
+validates the manifests and tests installation in an isolated Claude configuration.
+When Claude Code is installed, the tests also exercise its native credential
+store with a unique disposable plugin: switching to Vertex removes the saved
+dummy key, a failed configuration disables the plugin, and retrying restores it.
+
+For a server upgrade, first publish and verify the Python release, update the
+`.mcp.json` package pin and both READMEs, and bump the plugin's `version` in
+`plugin.json` so Claude detects the update. Keep the version in that manifest
+only; the marketplace entry intentionally does not duplicate it. Re-run the
+checks above before publishing the marketplace changes.
 
 ### Live tests
 
