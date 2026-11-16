@@ -29,12 +29,12 @@ jobs:
   validate-and-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/gemini-media-plugin-claude
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Set isolated Claude configuration
+        run: echo "CLAUDE_CONFIG_DIR=$RUNNER_TEMP/gemini-media-plugin-claude" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
